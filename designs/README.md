@@ -251,6 +251,7 @@ LLM-agent stack).*
 | [familiar-localhttp-protocol](familiar-localhttp-protocol.md) | 2026-02-24 | 2026-02-25 | In Progress (partially implemented) |
 | [familiar-unified-weblet-server](familiar-unified-weblet-server.md) | 2026-02-14 | 2026-05-06 | In Progress |
 | [formula-inspector](formula-inspector.md) | 2026-02-14 | 2026-06-13 | In Progress |
+| [genie-integration](genie-integration.md) | 2026-05-02 | 2026-05-02 | Proposed |
 | [gateway-bearer-token-auth](gateway-bearer-token-auth.md) | 2026-03-02 | 2026-03-06 | **Implemented** |
 | [hardened-text-codecs-shim](hardened-text-codecs-shim.md) | 2026-05-04 | 2026-05-04 | Not Started |
 | [hardened-url-shim](hardened-url-shim.md) | 2026-05-04 | 2026-05-04 | Not Started |
@@ -968,6 +969,17 @@ Worker-authored TUI regions compose into the same layout.
 
 **Estimated duration (1 dev):** 10-14 weeks (research-heavy; Rust port
 includes codec, mailbox, supervisor, and terminal rendering substrates)
+
+---
+
+#### Off-roadmap evaluations
+
+These designs evaluate alternatives or capture decisions but are not
+themselves milestone deliverables.
+
+| Design | Status | Notes |
+|--------|--------|-------|
+| genie-integration | Proposed | Cross-cutting survey of `packages/genie` for opportunities to fold pi engine, memory, and scheduling into the daemon and share with `lal`/`fae`. Six-phase rollout sketch; estimates per phase rather than as one milestone item. Builds on `endoclaw-timer` (M1) and `daemon-mount` (M1). |
 
 ---
 
