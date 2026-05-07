@@ -12,7 +12,7 @@
  *
  * The Node daemon path passes `better-sqlite3` as the Database
  * constructor; the XS-on-Rust-supervisor path passes
- * `./better-sqlite3-xs.js`, which forwards prepared-statement
+ * `./rust-xs-sqlite.js`, which forwards prepared-statement
  * calls through host functions to rusqlite.  Both backends agree
  * on the on-disk schema (`<statePath>/endo.sqlite`), so a single
  * state directory can be opened by either supervisor without a
@@ -186,19 +186,40 @@ export const makeDaemonicPersistencePowers = (
     return makeSnapshotStore(rawStore);
   };
 
-  // Wrap synchronous database operations as async so that
-  // implementations using async I/O are not constrained.
+  // (Earlier revisions of this file kept file-path-based shims for
+  // readFormula / writeFormula / deleteFormula / listFormulas and an
+  // in-memory shim for agent-key / retention tables, because the
+  // pre-SQLite endor branch did not expose those primitives on
+  // `daemonDb`.  After the rebase onto post-SQLite endor, daemonDb
+  // is the authoritative source — see `daemon-database.js` — and
+  // the shims are pure duplicates that trip TS2451 redeclaration
+  // errors.  We drop them here.)
+
+  // The DaemonicPersistencePowers contract specifies these methods
+  // return promises; daemonDb's better-sqlite3-backed versions are
+  // synchronous.  Wrap them in async closures so the public surface
+  // matches the type.
+  /** @type {DaemonicPersistencePowers['readFormula']} */
+  const readFormulaAsync = async formulaNumber => readFormula(formulaNumber);
+  /** @type {DaemonicPersistencePowers['writeFormula']} */
+  const writeFormulaAsync = async (formulaNumber, nodeNumber, formula) =>
+    writeFormula(formulaNumber, nodeNumber, formula);
+  /** @type {DaemonicPersistencePowers['deleteFormula']} */
+  const deleteFormulaAsync = async formulaNumber =>
+    deleteFormula(formulaNumber);
+  /** @type {DaemonicPersistencePowers['listFormulas']} */
+  const listFormulasAsync = async () => listFormulas();
+
   return harden({
     statePath: config.statePath,
     initializePersistence,
     provideRootNonce,
     provideRootKeypair,
     makeContentStore,
-    readFormula: async formulaNumber => readFormula(formulaNumber),
-    writeFormula: async (formulaNumber, nodeNumber, formula) =>
-      writeFormula(formulaNumber, nodeNumber, formula),
-    deleteFormula: async formulaNumber => deleteFormula(formulaNumber),
-    listFormulas: async () => listFormulas(),
+    readFormula: readFormulaAsync,
+    writeFormula: writeFormulaAsync,
+    deleteFormula: deleteFormulaAsync,
+    listFormulas: listFormulasAsync,
     listFormulaNumbersByNode,
     writeAgentKey,
     getAgentKey,
