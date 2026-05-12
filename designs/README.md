@@ -1,8 +1,11 @@
 # Endo Design Documents
 
-*Last updated: 2026-05-11*
+*Last updated: 2026-05-12*
 
-*See also: [daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
+*See also: [agent-follow-stream-tool](agent-follow-stream-tool.md)
+(added 2026-05-12; agent-side analog of the Monitor harness tool;
+`followStream`/`cancelStream` for lal/fae over passable async
+iterators), [daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
 [filesystem-watchers](filesystem-watchers.md) (added 2026-05-07),
 [endo-posix-sandbox](endo-posix-sandbox.md) (added 2026-05-07; mirrors
 `PLAN/endo_posix_sandbox.md` for roadmap calibration),
@@ -57,6 +60,7 @@ PR #151 row-format unblocker; sibling of
 | [daemon-256-bit-identifiers](daemon-256-bit-identifiers.md) | 2026-02-24 | 2026-03-02 | **Complete** |
 | [daemon-agent-network-identity](daemon-agent-network-identity.md) | 2026-03-02 | 2026-03-02 | Not Started |
 | [daemon-agent-tools](daemon-agent-tools.md) | 2026-03-02 | 2026-03-02 | Not Started |
+| [agent-follow-stream-tool](agent-follow-stream-tool.md) | 2026-05-12 | 2026-05-12 | Proposed |
 | [daemon-commands-as-messages](daemon-commands-as-messages.md) | 2026-03-11 | 2026-03-11 | Not Started |
 | [daemon-capability-bank](daemon-capability-bank.md) | 2026-02-15 | 2026-02-24 | Not Started |
 | [daemon-checkin-checkout](daemon-checkin-checkout.md) | 2026-03-17 | 2026-03-17 | Not Started |
@@ -172,6 +176,7 @@ flowchart TD
         fagent[familiar-bundled-agents<br/><i>COMPLETE</i>]
         dtools[daemon-agent-tools]
         deval[daemon-guest-eval-simplification<br/><i>IMPLEMENTED</i>]
+        afollow[agent-follow-stream-tool<br/><i>PROPOSED</i>]
         dform --> lalfp
         dval --> lalfp
         laltx --> lalfp
@@ -182,6 +187,8 @@ flowchart TD
         dtools --> deval
         dbank --> deval
         lalfp --> deval
+        dtools --> afollow
+        lalfp --> afollow
     end
 
     subgraph Familiar
@@ -315,6 +322,7 @@ capabilities available to agents.
 | ~~gateway-bearer-token-auth~~ | **Implemented** | Agent ID as bearer token, rate limiting, CIDR filtering |
 | daemon-docker-selfhost | Not Started | Dockerfile, state persistence, network exposure, Chat hosting |
 | daemon-agent-tools | Not Started | Filesystem, shell, git tools backed by capabilities |
+| agent-follow-stream-tool | Proposed | `followStream`/`cancelStream` for lal/fae over passable async iterators; mirrors Claude Code's `Monitor` mental model |
 | platform-fs | In Progress | `@endo/platform/fs` — shared types, content store, tree adapters |
 | daemon-capability-filesystem | Not Started | `Dir`/`File` capabilities for structural filesystem confinement |
 | ~~daemon-content-store-gc~~ | **Complete** | Content-store pruning and scratch-mount directory cleanup at GC time; landed in PR #99 |
@@ -605,6 +613,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | ~~gateway-bearer-token-auth~~ | — | — | 1 | ✅ Implemented |
 | daemon-docker-selfhost | S-M | 3 days | 1 | Dockerfile, entrypoint, compose; PR #134 forwarded under bot, awaiting review |
 | daemon-agent-tools | M-L | 1.5 weeks | 1 | Shell, git, fs tool wrappers; PR #130 forwarded under bot |
+| agent-follow-stream-tool | S-M | 3 days | 1 | `followStream`/`cancelStream` registry + drain hook in lal/fae; per-handle ring-drop buffer; Justin frame rendering |
 | platform-fs | S-M | 3 days | 1 | Shared types, content store extraction, tree adapters; PR #122 forwarded under bot |
 | daemon-capability-filesystem | L | 1.5-3 weeks | 1 | Dir/File exos, physical backend (1.5x for L size) |
 | ~~daemon-content-store-gc~~ | S | — | 1 | ✅ Complete (PR #99, ~2 days actual vs 1 day estimate) |
