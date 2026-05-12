@@ -1,8 +1,11 @@
 # Endo Design Documents
 
-*Last updated: 2026-05-11*
+*Last updated: 2026-05-12*
 
-*See also: [daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
+*See also: [familiar-release](familiar-release.md) (added 2026-05-12;
+preliminary downloadable Familiar plan; identifies MVR gaps and
+phased follow-ups; closes issue #229),
+[daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
 [filesystem-watchers](filesystem-watchers.md) (added 2026-05-07),
 [endo-posix-sandbox](endo-posix-sandbox.md) (added 2026-05-07; mirrors
 `PLAN/endo_posix_sandbox.md` for roadmap calibration),
@@ -107,6 +110,7 @@ PR #151 row-format unblocker; sibling of
 | [familiar-electron-shell](familiar-electron-shell.md) | 2026-02-14 | 2026-02-26 | **Complete** |
 | [familiar-gateway-migration](familiar-gateway-migration.md) | 2026-02-14 | 2026-02-26 | **Complete** |
 | [familiar-localhttp-protocol](familiar-localhttp-protocol.md) | 2026-02-24 | 2026-02-25 | In Progress (partially implemented) |
+| [familiar-release](familiar-release.md) | 2026-05-12 | 2026-05-12 | Proposed |
 | [familiar-unified-weblet-server](familiar-unified-weblet-server.md) | 2026-02-14 | 2026-05-06 | In Progress |
 | [formula-inspector](formula-inspector.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [gateway-bearer-token-auth](gateway-bearer-token-auth.md) | 2026-03-02 | 2026-03-06 | **Implemented** |
@@ -138,7 +142,7 @@ PR #151 row-format unblocker; sibling of
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 
-**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 8 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (103 designs)
+**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 9 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (104 designs)
 
 ## Roadmap
 
