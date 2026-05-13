@@ -2,7 +2,11 @@
 
 *Last updated: 2026-05-14 (M½ project-hygiene milestone extracted from M1)*
 
-*Recently added or revised: [hardened-text-codecs-shim](hardened-text-codecs-shim.md)
+*Recently added or revised: [lal-jessie-blocky](lal-jessie-blocky.md)
+(added 2026-05-13; `define-jessie` tool variant for Lal with Blockly
+visual rendering in Chat; depends on
+[endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127)),
+[hardened-text-codecs-shim](hardened-text-codecs-shim.md)
 (added 2026-05-06; permits `TextEncoder`/`TextDecoder` in SES intrinsics),
 [hardened-url-shim](hardened-url-shim.md) (added 2026-05-06; vetted-shim
 treatment for the `URL` constructor and `URLSearchParams`).*
@@ -125,6 +129,7 @@ PR #151 row-format unblocker; sibling of
 | [inventory-drag-and-drop](inventory-drag-and-drop.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [inventory-grouping-by-type](inventory-grouping-by-type.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [lal-fae-form-provisioning](lal-fae-form-provisioning.md) | 2026-03-02 | 2026-03-05 | **Complete** |
+| [lal-jessie-blocky](lal-jessie-blocky.md) | 2026-05-13 | 2026-05-13 | Proposed |
 | [lal-reply-chain-transcripts](lal-reply-chain-transcripts.md) | 2026-02-26 | 2026-03-05 | **Complete** |
 | [lal-transcript-memory-management](lal-transcript-memory-management.md) | 2026-03-05 | 2026-03-05 | Not Started |
 | [ocapn-network-transport-separation](ocapn-network-transport-separation.md) | 2026-02-14 | 2026-02-24 | In Progress |
@@ -149,7 +154,7 @@ PR #151 row-format unblocker; sibling of
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 
-**Totals:** 28 Complete/Implemented, 17 In Progress, 44 Not Started, 7 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (106 designs)
+**Totals:** 28 Complete/Implemented, 17 In Progress, 44 Not Started, 8 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (107 designs)
 
 ## Roadmap
 
@@ -463,6 +468,7 @@ webhook events.
 | chat-view-edit-commands | Not Started | `/view` and `/edit` for blobs; Monaco editor, Markdown split preview |
 | chat-edit-message-ui | Not Started | `/edit` slash command, `e` focus shortcut, hover pencil for editing previously sent messages; revision-history panel |
 | lal-transcript-memory-management | Not Started | Durable transcript nodes outliving dismissed messages |
+| lal-jessie-blocky | Proposed | `define-jessie` Lal tool with Jessie validation; Chat renders proposal via Blockly visual editor; depends on [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127) |
 
 **Exit criterion:** Chat UI feature-complete for current design scope.
 Commands are non-blocking with visible pending state. Developer tools
@@ -707,6 +713,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | chat-view-edit-commands | M | 4-6 days | 4 | `/view`, `/edit` modal, Monaco reuse, Markdown split preview (Phase 4) |
 | chat-edit-message-ui | S-M | 3 days | 4 | `/edit` command, `e` focus shortcut, hover pencil; design merged (PR #88); daemon impl in PR #125 forwarded under bot |
 | lal-transcript-memory-management | S | 1 day | 4 | Durable message-to-node mapping, broken chain detection |
+| lal-jessie-blocky | M | 5 days | 4 | `define-jessie` tool variant + Chat Blockly form; M-bumped per 2026-05-08 calibration. Blocked on [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127) merging and publishing `@jessie/blockly-tools` + `@jessie/parse`. |
 | ~~daemon-os-sandbox-plugin~~ | — | — | 5 | Superseded by `endo-posix-sandbox` |
 | endo-posix-sandbox | L-XL | 6-10 weeks remaining | 5 | Phases 0-1 shipped (bwrap on Linux); Phase 2 (podman) and Phase 3 (nested slices) in flight; Phases 1.5, 4, 6 ahead. Per-phase estimates pending PLAN backfill |
 | daemon-capability-persona | S-M | 3 days | 5 | Handle extension, epithet tracking |
@@ -731,10 +738,10 @@ ready-to-merge and actually-merged for the in-flight backlog.
 | M1: Remote Access & Tools | 10 remaining (after M½ extraction) | 8-10 weeks | 10-12 weeks |
 | M2: Networking | 7 | 4-5 weeks | 5-7 weeks |
 | M3: Weblets & Integrations | 9 | 5-7 weeks | 6-9 weeks |
-| M4: UX & Tooling | 12 | 8-11 weeks | 10-13 weeks |
+| M4: UX & Tooling | 13 | 8-11 weeks | 10-13 weeks |
 | M5: Confinement & Ecosystem | 6 active (1 superseded) | 14-20 weeks | 16-22 weeks |
 | M6: Rust Daemon (`endor`) | 2 | 12-17 weeks | 14-19 weeks |
-| **Total remaining** | **52** (M½+1+2 forward) | **~52-72 weeks** | **~64-86 weeks** |
+| **Total remaining** | **53** (M½+1+2 forward, M4+1) | **~53-73 weeks** | **~65-87 weeks** |
 
 The 2026-05-14 extraction of M½ pulled six hygiene-shaped rows out of
 M1 (`endo-bytes` and `chat-playwright-smoke` already shipped;
@@ -742,8 +749,12 @@ M1 (`endo-bytes` and `chat-playwright-smoke` already shipped;
 `base64-native-fallthrough` still in flight or unstarted).
 M1's remaining count drops from 14 to 10, and its effort from 10-13 weeks
 to 8-10 weeks. M½ absorbs ~1-2 weeks of remaining effort on top.
-The total-remaining count is invariant (52); only the bucketing changed.
-M2, M3, M4 counts unchanged.
+The total-remaining count is invariant under the M½ extraction (52);
+only the bucketing changed.
+M4 grew by 1 with `lal-jessie-blocky` (M-size, 5 days, blocked on
+[endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127)),
+raising the grand total to 53.
+M2, M3 counts unchanged.
 
 ### Timeline
 
