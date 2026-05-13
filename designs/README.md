@@ -27,7 +27,11 @@ PR #151 row-format unblocker; sibling of
 [unhandled-rejection-display](unhandled-rejection-display.md) (added
 2026-05-10; closes issue #171),
 [cli-edit-verb](cli-edit-verb.md) (added 2026-05-08; sibling of PR #153
-`cli-store-verb-text-modes`; hashline patches for AI agents).*
+`cli-store-verb-text-modes`; hashline patches for AI agents),
+[familiar-run-apps-vfs](familiar-run-apps-vfs.md) (added 2026-05-13;
+hosts and guests run applications out of mount caps; confined XS path
+uses npm-to-sqlite plus Go-style transitive resolution; host-eject path
+shells out to Node; Posix-sandbox follow-up gated).*
 
 ## Summary
 
@@ -106,6 +110,7 @@ PR #151 row-format unblocker; sibling of
 | [exo-zip-package](exo-zip-package.md) | 2026-05-08 | 2026-05-08 | Proposed (PR #154 open questions resolved) |
 | [familiar-bundled-agents](familiar-bundled-agents.md) | 2026-03-02 | 2026-03-05 | **Complete** |
 | [familiar-chat-weblet-hosting](familiar-chat-weblet-hosting.md) | 2026-02-14 | 2026-02-26 | Not Started |
+| [familiar-run-apps-vfs](familiar-run-apps-vfs.md) | 2026-05-13 | 2026-05-13 | Proposed |
 | [familiar-daemon-bundling](familiar-daemon-bundling.md) | 2026-02-14 | 2026-03-05 | **Complete** |
 | [familiar-electron-shell](familiar-electron-shell.md) | 2026-02-14 | 2026-02-26 | **Complete** |
 | [familiar-gateway-migration](familiar-gateway-migration.md) | 2026-02-14 | 2026-02-26 | **Complete** |
@@ -319,6 +324,7 @@ capabilities available to agents.
 | daemon-capability-filesystem | Not Started | `Dir`/`File` capabilities for structural filesystem confinement |
 | ~~daemon-content-store-gc~~ | **Complete** | Content-store pruning and scratch-mount directory cleanup at GC time; landed in PR #99 |
 | daemon-mount | In Progress | Phases 1-3, 5 implemented; symlink confinement, 20 integration tests; Phase 4 (sub-mounts, snapshot) and Phase 6 (CLI) remaining |
+| familiar-run-apps-vfs | Proposed | JS-side mirror of `endor` Form 3: hosts and guests run apps over mount caps; confined XS path uses sqlite-backed module store + Go-style transitive resolution; host-eject path shells out to Node; Posix-sandbox follow-up gated |
 | filesystem-watchers | Not Started | `EndoMount.followNameChanges` parity with `EndoDirectory`; Node `fs.watch` adapter on `FilePowers` |
 | daemon-locator-terminology | Not Started | Clean locator API; unblocked |
 | daemon-rename-to-manager | Not Started | Rename `daemon.js`/`Daemon`/`MignonicPowers` to `manager.js`/`Manager`/`WorkerPowers` to align JS with Rust `endor` nomenclature |
@@ -609,6 +615,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | daemon-capability-filesystem | L | 1.5-3 weeks | 1 | Dir/File exos, physical backend (1.5x for L size) |
 | ~~daemon-content-store-gc~~ | S | — | 1 | ✅ Complete (PR #99, ~2 days actual vs 1 day estimate) |
 | daemon-mount | M-L | 1.5 weeks | 1 | Mount exo, symlink confinement; Phase 4 in PR #135 forwarded under bot |
+| familiar-run-apps-vfs | L | 2-3 weeks | 1 | JS-side mirror of `endor` Form 3; sqlite-backed module store, Go-style transitive resolution, ad-hoc compartment map, host-eject path; depends on `daemon-mount`, `endor-npm-registry-proxy`, `daemon-cas-management` |
 | ~~filesystem-watchers~~ (design) | S | — | 1 | ✅ Design merged (PR #115); implementation TBD |
 | daemon-locator-terminology | S | 1 day | 1 | locator.js + host.js changes |
 | daemon-rename-to-manager | S | 1 day | 1 | Mechanical rename; design merged (PR #85); implementation TBD |
