@@ -217,16 +217,30 @@ verbatim, since the slot model is identical; only the source editor differs.
 
 A slot in a Jessie program is a free variable in the source whose value the
 host will bind at submit time.
-In the Blockly workspace, slots appear as a custom block type
-(`jessie_slot`) with a single dropdown field naming the slot and an output
-shaped like a value (no statement plug).
-The block's code generator emits the slot identifier as a bare reference.
-Adding a slot in the slot panel adds a draggable instance of that block to
-the toolbox; removing a slot removes the toolbox entry and (with
-confirmation) any uses of the slot in the workspace.
+Two candidate representations land in Phase 3 behind a feature flag and
+are bake-off-compared (see Open Question 4):
 
-This keeps slots in lockstep between the visual program and the slot panel
-without needing a parallel free-variable analysis on the generated source.
+1. **Custom `jessie_slot` block.**
+   A custom block type with a single dropdown field naming the slot and
+   an output shaped like a value (no statement plug).
+   The block's code generator emits the slot identifier as a bare
+   reference.
+   Adding a slot in the slot panel adds a draggable instance of that
+   block to the toolbox; removing a slot removes the toolbox entry and
+   (with confirmation) any uses of the slot in the workspace.
+   Keeps slots in lockstep between the visual program and the slot
+   panel without needing a parallel free-variable analysis on the
+   generated source.
+
+2. **Standard Blockly variable blocks.**
+   Slots are surfaced through Blockly's built-in variable category, so
+   the visual UX matches `endojs/Jessie#127`'s Blockly editor for users
+   who have seen Jessie tooling elsewhere.
+   The slot panel reflects the variable registry rather than acting as
+   the source of truth.
+
+The winner is picked in a follow-up commit on this design before Phase
+3 freezes.
 
 #### Validation errors
 
@@ -414,16 +428,24 @@ can start:
    `@endo/jessie-blockly` becomes a thin re-export and can be ejected
    back out of the Endo monorepo with a single-package rename.
 
-4. **Slot block design (custom block vs. variable block).**
-   Blockly has built-in support for "variable" blocks; the proposed
-   `jessie_slot` block is a custom alternative that ties slot identity
-   to the slot panel rather than to Blockly's variable registry.
-   The trade-off is between reusing Blockly's variable UX (familiar to
-   Blockly users) and keeping the slot panel as the single source of
-   truth for slot identity.
-   The recommended approach is the custom `jessie_slot` block, but the
-   maintainer may prefer the standard variable approach for consistency
-   with PR #127's tooling.
+4. **Slot block design (custom block vs. variable block).** Resolved
+   2026-05-14: run a bake-off of the two implementations under Phase 3
+   rather than picking on paper.
+   Build both variants behind a feature flag in `define-jessie-form.js`:
+   one wires `jessie_slot` as a custom block keyed to the slot panel,
+   the other reuses Blockly's standard variable blocks keyed to the
+   variable registry.
+   Compare on three axes: (a) consistency with `endojs/Jessie#127`'s
+   tooling for users who have seen Jessie's editor elsewhere, (b)
+   round-trip stability between the slot panel and the workspace under
+   slot rename and removal, and (c) the size of the implementation in
+   `@endo/jessie-blockly`.
+   Run the bake-off on at least three real proposals (the slot-heavy
+   counter example, a small Lal-defined formula, and one capability
+   composition) and pick the winner in a follow-up commit on this
+   design before Phase 3 freezes.
+   The fallback if both work is to ship the standard variable approach
+   for consistency with PR #127's tooling.
 
 5. **System-prompt steering effectiveness.**
    "Prefer `define-jessie` over `define` when ..." is a soft nudge.
