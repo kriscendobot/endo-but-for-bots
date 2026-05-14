@@ -49,8 +49,10 @@ A `define-jessie` proposal carries:
 - The same `slots` shape as `define`.
 
 The Chat UI renders a `define-jessie` proposal with the Blockly visual editor
-from `@jessie/blockly-tools`, so the host sees the proposal as a tree of
-labelled blocks with capability holes, edits it visually, and submits.
+from a new `@endo/jessie-blockly` package (which vendors the upstream
+Jessie tooling until it publishes), so the host sees the proposal as a
+tree of labelled blocks with capability holes, edits it visually, and
+submits.
 The result on the host side is identical to the existing `define` (a
 formula-graph node with the host's chosen bindings), so the rest of the
 system, follow-on use of the result, retention, GC, formula history, is
@@ -63,11 +65,11 @@ unchanged.
 ```mermaid
 flowchart LR
     LLM[LLM] -->|tool_call: define-jessie| Lal[Lal agent.js]
-    Lal -->|validate via @jessie/parse| JV{Jessie<br/>valid?}
+    Lal -->|validate via @endo/jessie-blockly| JV{Jessie<br/>valid?}
     JV -->|no| TR[tool_result: error]
     JV -->|yes| HM[host inbox: package message<br/>kind=jessie-define]
     HM --> Chat[Chat UI]
-    Chat -->|render via @jessie/blockly-tools| BE[Blockly editor + slot list]
+    Chat -->|render via @endo/jessie-blockly| BE[Blockly editor + slot list]
     BE -->|user fills slots, submits| Eval[E powers .define source slots]
     Eval --> Result[formula-graph node]
 ```
@@ -75,13 +77,22 @@ flowchart LR
 The variant reuses every existing piece of plumbing.
 The new code is:
 
+- A new `@endo/jessie-blockly` package (`packages/jessie-blockly/`)
+  that bundles the Jessie parser/checker and the Blockly workspace
+  tools.
+  Lal imports the parser from this package; the Chat package imports
+  the Blockly workspace from the same place.
+  The package vendors content from `endojs/Jessie#127` until that PR
+  lands and `@jessie/parse` / `@jessie/blockly-tools` publish on npm,
+  at which point `@endo/jessie-blockly` becomes a thin re-export.
 - A `define-jessie` entry in Lal's tool registry (`packages/lal/agent.js`)
   with its own JSON schema and case in `executeTool`.
 - A Jessie-validation step in that case, citing the checker from
-  `@jessie/parse` (the parser/grammar surface that Jessie PR #127's blocks
-  themselves build on).
-- A new Chat UI component, `define-jessie-form.js`, that wraps
-  `@jessie/blockly-tools`'s Jessie workspace and accepts/produces a
+  `@endo/jessie-blockly` (the parser/grammar surface that Jessie PR
+  #127's blocks themselves build on, re-exported from the new package).
+- A new Chat UI component in the Chat package,
+  `packages/chat/define-jessie-form.js`, that wraps
+  `@endo/jessie-blockly`'s Jessie workspace and accepts/produces a
   `{ source, slots }` shape compatible with the existing `define-form.js`
   submit path.
 - A small dispatch in `chat-bar-component.js` (or the equivalent message
@@ -133,7 +144,7 @@ case 'define-jessie': {
     throw new Error('slots is required');
   }
   // Validate against the Jessie grammar.
-  const { parseJessie } = await import('@jessie/parse');
+  const { parseJessie } = await import('@endo/jessie-blockly');
   try {
     parseJessie(source);
   } catch (parseError) {
@@ -151,9 +162,9 @@ The reserved-slot-key and sibling-method alternatives were considered
 and dropped in favor of the explicit `options` bag, which is also the
 natural carrier for future per-proposal flags.
 
-The Jessie checker import path (`@jessie/parse` vs
-`@endojs/jessie-parse` vs whatever PR #127 lands) is pinned at design
-time once Jessie #127 merges and publishes; see "Open questions".
+The Lal-side validator imports from `@endo/jessie-blockly`, the new
+Endo-monorepo package that vendors the Jessie parser until upstream
+publishes; see "Open questions" below for the eject-back plan.
 
 ### Host side: package message tagging
 
@@ -190,7 +201,8 @@ A new component, `packages/chat/define-jessie-form.js`, mirrors the API of
 export const createDefineJessieForm = async ({ $container, onSubmit, onClose }) => { /* ... */ };
 ```
 
-The component embeds the Jessie workspace from `@jessie/blockly-tools`.
+The component embeds the Jessie workspace from `@endo/jessie-blockly`
+(which vendors the upstream Jessie tooling until it publishes).
 Initial source from the LLM is parsed and reconstructed as a Blockly
 workspace via Blockly's standard
 [JSON serialization format](https://developers.google.com/blockly/guides/configure/web/serialization)
@@ -258,45 +270,58 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
 | [lal-fae-form-provisioning](lal-fae-form-provisioning.md) | Defines the manager/worker split that owns Lal's tool surface. `define-jessie` is added to the same surface. |
 | [chat-slot-slash-commands](chat-slot-slash-commands.md) | Sibling: a user-driven path for inlining anonymous values into slots. `define-jessie`'s slot panel uses the same slot-value model and benefits if slash-slot fillers are available. |
 | [chat-markdown-render](chat-markdown-render.md) | Independent. Slot labels and the form's chrome use the standard Chat Markdown renderer. |
-| [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127) | Upstream dependency. The `@jessie/blockly-tools` package and the underlying `@jessie/parse` checker land here. Implementation of this design waits on Jessie #127 merging and publishing the relevant packages. |
+| [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127) | Upstream dependency. The `@jessie/blockly-tools` package and the underlying `@jessie/parse` checker land here, eventually. Until they publish on npm (neither was published as of 2026-05-14), the new `@endo/jessie-blockly` package in this monorepo vendors the equivalent surface so this design is not gated on Jessie #127's merge timeline. |
 
 ### Phased implementation
 
-1. **Phase 1: Lal tool registration.**
+1. **Phase 0: `@endo/jessie-blockly` package.**
+   Create `packages/jessie-blockly/` with the Jessie parser/checker and
+   the Blockly workspace tools, vendored from `endojs/Jessie#127` (or
+   re-bundled from scratch against the same grammars).
+   The package exposes a `parseJessie` validator for Lal and a Blockly
+   workspace factory for the Chat package.
+   Mergeable on its own; gives downstream phases a single import surface.
+
+2. **Phase 1: Lal tool registration.**
    Add the `define-jessie` entry to `agent.js`'s tool array, the
-   `executeTool` case, and the `@jessie/parse` import (gated on the Jessie
-   package being published).
+   `executeTool` case, and the `@endo/jessie-blockly` import.
    The tool call works end-to-end through the existing `define-form` (the
    Chat UI does not yet know about `language: 'jessie'`).
    This phase is mergeable on its own and gives Lal a Jessie-validating
    tool even before the Blockly UI lands.
 
-2. **Phase 2: Host-side language tag.**
-   Extend `E(powers).define` (or the package-message construction
-   downstream of it) to carry the `language` tag.
+3. **Phase 2: Host-side language tag.**
+   Extend `E(powers).define` to accept the `options?` bag with
+   `options.language` (per Open Question 2's resolution), and wire the
+   package-message construction downstream to carry the tag.
    Wire the Chat UI message-router to read the tag and choose between
    `define-form` and (still-stub) `define-jessie-form`.
 
-3. **Phase 3: Blockly form component.**
-   Implement `define-jessie-form.js`.
-   Embed the `@jessie/blockly-tools` Jessie workspace.
+4. **Phase 3: Blockly form component in the Chat package.**
+   Implement `packages/chat/define-jessie-form.js`.
+   Embed the `@endo/jessie-blockly` Jessie workspace.
    Wire slot blocks, source view toggle, and slot panel.
    Add the system-prompt nudge that steers the LLM towards
    `define-jessie`.
 
-4. **Phase 4: Tests and docs.**
-   Vitest fixtures from PR #127's `test/test-data.json` (where applicable)
-   cover the source-to-workspace and workspace-to-source round trip.
+5. **Phase 4: Tests and docs.**
+   AVA fixtures from `endojs/Jessie#127`'s `test/test-data.json` (where
+   applicable, mirrored into `@endo/jessie-blockly`) cover the
+   source-to-workspace and workspace-to-source round trip.
    Update `packages/lal/primer/tools.md` to document `define-jessie`.
    Update `packages/chat`'s component index to list the new form.
 
+Phase 0 is S-sized (one day; the package is mostly vendoring and a
+build wire-up).
 Phases 1 and 2 are S-sized (one day each).
-Phase 3 is M-sized (3 days; the Blockly integration is mostly wiring, but
-the slot-block design needs care to keep the workspace and slot panel in
-sync).
+Phase 3 is M-sized (3 days; the Blockly integration is mostly wiring,
+but the slot-block design needs care to keep the workspace and slot
+panel in sync).
 Phase 4 is S-sized (one day).
 
-Total estimate: M-sized, ~5 days.
+Total estimate: M-sized, ~6 days (Phase 0 adds one day for the
+`@endo/jessie-blockly` package; the original ~5-day estimate is
+otherwise intact).
 
 ## Alternatives Considered
 
@@ -353,14 +378,18 @@ Total estimate: M-sized, ~5 days.
 These need maintainer input or an upstream landing before implementation
 can start:
 
-1. **`@jessie/parse` package name and checker API.**
-   The Lal-side validation step imports a parser from
-   `endojs/Jessie`'s `packages/parse`.
-   PR #127 builds blocks against the grammars there; what does the
-   checker's import path and call signature look like after PR #127 lands
-   and is published?
-   Worst case: bundle a small Jessie-validation function inside Lal
-   itself, derived from the same grammar source.
+1. **`@jessie/parse` package name and checker API.** Resolved
+   2026-05-14: as of this date, `@jessie/parse` is not on npm
+   (`npm view @jessie/parse` returns 404), and `endojs/Jessie#127` has
+   not yet landed.
+   The Lal-side validation step therefore depends on whichever Jessie
+   parser surface lands first.
+   Practical path: bundle the validator inside the new
+   `@endo/jessie-blockly` package (see Q3 below) so Lal can import the
+   parser and the Chat UI can import the blocks from the same place.
+   When the upstream Jessie packages publish, `@endo/jessie-blockly`
+   re-exports the upstream parser and the eventual eject-back is a
+   single-package rename rather than two.
 
 2. **`E(powers).define` extension for the `language` tag.** Resolved
    2026-05-14: extend `define` with an optional options bag, so the
@@ -372,13 +401,18 @@ can start:
    per-proposal flags (e.g. confinement hints, presentation hints) so
    the cost is paid once.
 
-3. **`@jessie/blockly-tools` packaging for embedded use.**
-   PR #127 ships a Vite app, not a library export.
-   Embedding the Jessie workspace inside Chat needs either a library
-   build of `@jessie/blockly-tools` (preferred) or a copy of the block
-   and generator modules into `packages/chat` (less preferred; duplicates
-   maintenance).
-   Either way, the Chat UI's existing esbuild bundle absorbs the cost.
+3. **Packaging the Blockly tools for embedded use.** Resolved
+   2026-05-14: create a new `@endo/jessie-blockly` package in
+   `packages/jessie-blockly/` to keep this prototype moving while the
+   upstream Jessie tooling stabilizes.
+   The package bundles the Jessie parser/checker and the Blockly
+   workspace tools that Lal and the Chat package need, vendored from
+   `endojs/Jessie#127` until that PR lands and the upstream packages
+   publish.
+   The Chat UI's existing esbuild bundle absorbs the cost.
+   Once `@jessie/parse` and `@jessie/blockly-tools` publish on npm,
+   `@endo/jessie-blockly` becomes a thin re-export and can be ejected
+   back out of the Endo monorepo with a single-package rename.
 
 4. **Slot block design (custom block vs. variable block).**
    Blockly has built-in support for "variable" blocks; the proposed

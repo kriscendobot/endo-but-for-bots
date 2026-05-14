@@ -713,7 +713,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | chat-view-edit-commands | M | 4-6 days | 4 | `/view`, `/edit` modal, Monaco reuse, Markdown split preview (Phase 4) |
 | chat-edit-message-ui | S-M | 3 days | 4 | `/edit` command, `e` focus shortcut, hover pencil; design merged (PR #88); daemon impl in PR #125 forwarded under bot |
 | lal-transcript-memory-management | S | 1 day | 4 | Durable message-to-node mapping, broken chain detection |
-| lal-jessie-blocky | M | 5 days | 4 | `define-jessie` tool variant + Chat Blockly form; M-bumped per 2026-05-08 calibration. Blocked on [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127) merging and publishing `@jessie/blockly-tools` + `@jessie/parse`. |
+| lal-jessie-blocky | M | 6 days | 4 | `define-jessie` tool variant + Chat Blockly form; M-bumped per 2026-05-08 calibration. Vendors Jessie tooling in a new `@endo/jessie-blockly` package (Phase 0, +1 day) so the work is not gated on [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127); the package re-exports the upstream surface once it publishes. |
 | ~~daemon-os-sandbox-plugin~~ | — | — | 5 | Superseded by `endo-posix-sandbox` |
 | endo-posix-sandbox | L-XL | 6-10 weeks remaining | 5 | Phases 0-1 shipped (bwrap on Linux); Phase 2 (podman) and Phase 3 (nested slices) in flight; Phases 1.5, 4, 6 ahead. Per-phase estimates pending PLAN backfill |
 | daemon-capability-persona | S-M | 3 days | 5 | Handle extension, epithet tracking |
