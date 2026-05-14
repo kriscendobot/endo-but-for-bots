@@ -58,6 +58,19 @@ formula-graph node with the host's chosen bindings), so the rest of the
 system, follow-on use of the result, retention, GC, formula history, is
 unchanged.
 
+Two surfaces change to support the variant:
+
+- A new `language` option on `define` itself.
+  `E(powers).define(source, slots, options?)` carries `options.language`
+  so the Chat UI can route the proposal to the right renderer.
+  The option is open-ended (`'jessie'` initially, room for future
+  language tags) and the absence of the option is treated as the
+  existing `define` behavior, so the change is fully back-compatible.
+  See Open Question 2 for the maintainer-confirmed shape.
+- A new `@endo/jessie-blockly` package that bundles the Jessie
+  parser/checker and the Blockly workspace tools.
+  See Open Question 3.
+
 ## Design
 
 ### Overview
