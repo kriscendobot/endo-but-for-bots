@@ -129,7 +129,7 @@ PR #151 row-format unblocker; sibling of
 | [inventory-drag-and-drop](inventory-drag-and-drop.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [inventory-grouping-by-type](inventory-grouping-by-type.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [lal-fae-form-provisioning](lal-fae-form-provisioning.md) | 2026-03-02 | 2026-03-05 | **Complete** |
-| [lal-jessie-blocky](lal-jessie-blocky.md) | 2026-05-13 | 2026-05-13 | Proposed |
+| [lal-jessie-blocky](lal-jessie-blocky.md) | 2026-05-13 | 2026-05-14 | Proposed |
 | [lal-reply-chain-transcripts](lal-reply-chain-transcripts.md) | 2026-02-26 | 2026-03-05 | **Complete** |
 | [lal-transcript-memory-management](lal-transcript-memory-management.md) | 2026-03-05 | 2026-03-05 | Not Started |
 | [ocapn-network-transport-separation](ocapn-network-transport-separation.md) | 2026-02-14 | 2026-02-24 | In Progress |

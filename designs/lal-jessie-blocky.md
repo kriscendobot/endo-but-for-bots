@@ -3,6 +3,7 @@
 | | |
 |---|---|
 | **Created** | 2026-05-13 |
+| **Updated** | 2026-05-14 |
 | **Author** | Kris Kowal (prompted) |
 | **Status** | Proposed |
 
@@ -143,14 +144,12 @@ case 'define-jessie': {
 }
 ```
 
-The third argument to `E(powers).define` is the proposed extension point.
-If the daemon's `define` cannot accept an extra argument without a wider
-refactor, the alternative is to tag the proposal via the slots map itself
-(a reserved `__language__` key) or to add a sibling `defineJessie` host
-method that records the language tag in the resulting package message.
-The recommended approach is to add an optional `options` parameter to
-`define` rather than a sibling method, since the daemon-side machinery is
-otherwise identical (see "Open questions" below for the host-API surface).
+The third argument to `E(powers).define` is the agreed extension point:
+`define(source, slots, options?)` with `options.language` (maintainer
+decision 2026-05-14, see "Open questions" below).
+The reserved-slot-key and sibling-method alternatives were considered
+and dropped in favor of the explicit `options` bag, which is also the
+natural carrier for future per-proposal flags.
 
 The Jessie checker import path (`@jessie/parse` vs
 `@endojs/jessie-parse` vs whatever PR #127 lands) is pinned at design
@@ -363,17 +362,15 @@ can start:
    Worst case: bundle a small Jessie-validation function inside Lal
    itself, derived from the same grammar source.
 
-2. **`E(powers).define` extension for the `language` tag.**
-   Today `define(source, slots)`.
-   The cleanest extension is a third optional `options` argument
-   (`define(source, slots, options?)` with `options.language`), but this
-   touches the daemon's `EndoGuest` interface.
-   Alternative: encode the language tag in a reserved slot key
-   (`{ __language__: { label: 'jessie' }, ...realSlots }`) to avoid the
-   interface change.
-   The recommended approach is the explicit `options` argument; the
-   reserved-key alternative is the fallback if the daemon refactor is
-   undesirable in the same PR cycle.
+2. **`E(powers).define` extension for the `language` tag.** Resolved
+   2026-05-14: extend `define` with an optional options bag, so the
+   signature becomes `define(source, slots, options?)` with
+   `options.language`.
+   The reserved-slot-key alternative is dropped.
+   The daemon-side `EndoGuest` interface change is in scope for this
+   prototype; the same `options` bag is the natural carrier for future
+   per-proposal flags (e.g. confinement hints, presentation hints) so
+   the cost is paid once.
 
 3. **`@jessie/blockly-tools` packaging for embedded use.**
    PR #127 ships a Vite app, not a library export.
