@@ -275,6 +275,12 @@ flowchart TD
         dpers --> dbank
         dbank --> icancel
     end
+
+    subgraph Module Substrate
+        sesia[ses-import-attributes]
+        cmia[compartment-mapper-import-attributes]
+        sesia --> cmia
+    end
 ```
 
 ### Milestones
@@ -333,6 +339,7 @@ capabilities available to agents.
 | base64-native-fallthrough | Not Started | `@endo/base64` dispatches to `Uint8Array.fromBase64` / `toBase64` when available |
 | hex-package | Not Started | New `@endo/hex` ponyfill with native fallthrough; audit and migrate scattered hex sites |
 | endo-bytes | Implemented | New `@endo/bytes` package for portable `Uint8Array` helpers (`concatBytes`, `bytesEqual`, `bytesFromText`, `bytesToText`); retires duplicates in `cli`, `ocapn`, and `daemon` (PR #142) |
+| compartment-mapper-import-attributes | Proposed | Propagate TC39 import-attributes (`with { ... }`) through `@endo/compartment-mapper`: per-import attribute record, `link.js` partition into `moduleMap` and `modulesWithAttributes`, two-arg synthetic `importHook`, archive read/write paths, schema bump. Depends on `ses-import-attributes`. |
 
 **Exit criterion:** Someone can self-host a daemon with our Docker image
 and remote control it, by whatever means, using a local Familiar or a
@@ -621,6 +628,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | base64-native-fallthrough | S | 1 day | 1 | Detect `Uint8Array.fromBase64`, dispatch, dual-path tests |
 | hex-package | S-M | 3 days | 1 | New `@endo/hex` package, migrate `daemon/src/hex.js`, `relay-server/src/protocol.js`, OCapN hex sites |
 | ~~endo-bytes~~ | S | — | 1 | ✅ Implemented (PR #142): `@endo/bytes` with `concatBytes`, `bytesEqual`, `bytesFromText`, `bytesToText`; consumers in `cli`, `ocapn`, `daemon` migrated |
+| compartment-mapper-import-attributes | M-L | 1 week | 1 | Six-file touchpoint walk in `@endo/compartment-mapper` (`node-modules.js`, `infer-exports.js`, `link.js`, `archive-lite.js`, `import-archive-lite.js`, `types/compartment-map-schema.ts`); design-only PR #264, builder dispatch deferred to a separate PR rooted on `master`. Depends on `ses-import-attributes`. |
 | ocapn-network-transport-separation | M-L | 1.5 weeks | 2 | Architectural refactor (M-L bumped 1.2x) |
 | ocapn-tcp-for-test-extraction | S-M | 3 days | 2 | Code relocation |
 | ocapn-tcp-syrups-framing | S-M | 3 days | 2 | `@endo/syrups` package, new `tcp+syrups` netlayer; design merged (PR #108); impl PR #109 open |
@@ -674,13 +682,13 @@ ready-to-merge and actually-merged for the in-flight backlog.
 | Milestone | Items | Effort Estimate | Plus Review Queue (current rate) |
 |-----------|-------|-----------------|----------------------------------|
 | M0: AI Agent Experience | 0 remaining | **Complete** | — |
-| M1: Remote Access & Tools | 12 remaining | 8-10 weeks | 10-12 weeks |
+| M1: Remote Access & Tools | 13 remaining | 9-11 weeks | 11-13 weeks |
 | M2: Networking | 7 | 4-5 weeks | 5-7 weeks |
 | M3: Weblets & Integrations | 9 | 5-7 weeks | 6-9 weeks |
 | M4: UX & Tooling | 12 | 8-11 weeks | 10-13 weeks |
 | M5: Confinement & Ecosystem | 6 active (1 superseded) | 14-20 weeks | 16-22 weeks |
 | M6: Rust Daemon (`endor`) | 2 | 12-17 weeks | 14-19 weeks |
-| **Total remaining** | **50** | **~51-70 weeks** | **~61-82 weeks** |
+| **Total remaining** | **51** | **~52-71 weeks** | **~62-83 weeks** |
 
 ### Timeline
 
@@ -718,12 +726,12 @@ Add ~2 weeks per milestone if the current review-queue depth persists.
 | Milestone | Duration | Cumulative | Target Date |
 |-----------|----------|------------|-------------|
 | M0: AI Agent Experience | 18 days (actual) | **Complete** | March 5, 2026 |
-| M1: Remote Access & Tools | 8-10 weeks | 8-10 weeks | Mid July 2026 |
-| M2: Networking | 4-5 weeks | 12-15 weeks | Mid August 2026 |
-| M3: Weblets & Integrations | 5-7 weeks | 17-22 weeks | Late September 2026 |
-| M4: UX & Tooling | 8-11 weeks | 25-33 weeks | Late November 2026 |
-| M5: Confinement & Ecosystem | 14-20 weeks | 39-53 weeks | Mid-Late March 2027 |
-| M6: Rust Daemon (`endor`) | 12-17 weeks | 51-70 weeks | Q3-Q4 2027 |
+| M1: Remote Access & Tools | 9-11 weeks | 9-11 weeks | Mid July 2026 |
+| M2: Networking | 4-5 weeks | 13-16 weeks | Mid August 2026 |
+| M3: Weblets & Integrations | 5-7 weeks | 18-23 weeks | Late September 2026 |
+| M4: UX & Tooling | 8-11 weeks | 26-34 weeks | Late November 2026 |
+| M5: Confinement & Ecosystem | 14-20 weeks | 40-54 weeks | Mid-Late March 2027 |
+| M6: Rust Daemon (`endor`) | 12-17 weeks | 52-71 weeks | Q3-Q4 2027 |
 
 *Milestones 3 and 4 are less order-dependent and can be interleaved.
 Milestones 0, 1, and 2 form the critical path. Weblets prioritized over
