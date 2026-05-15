@@ -436,7 +436,8 @@ otherwise intact).
 
 - **Render Jessie source in Monaco with a Jessie-aware linter rather than
   Blockly.**
-  Rejected for v1.
+  Rejected.
+  Deferred to a possible later power-user toggle; not in v1.
   This addresses problem 1 (Jessie subset) but not problem 2 (text-editor
   presentation does not match the proposal model).
   Blockly is the documented user-facing tool from PR #127 and is the more
@@ -446,7 +447,8 @@ otherwise intact).
 
 - **Embed the Blockly workspace inline in the chat message bubble rather
   than as a modal form.**
-  Rejected for v1.
+  Rejected.
+  Deferred to a possible later iteration; not in v1.
   The existing `define-form` is a modal because slot filling needs the
   user's full focus.
   Inline Blockly in the conversation flow is interesting (the proposal
@@ -457,7 +459,8 @@ otherwise intact).
 - **Build Lal-specific Blockly blocks that bake in Endo capability
   references (e.g., a `lookup-petname` block) rather than reusing PR
   #127's vanilla Jessie blocks.**
-  Rejected for v1.
+  Rejected.
+  Deferred to a possible follow-up design; not in v1.
   This couples Lal's tool surface to Blockly block definitions and
   diverges from the Jessie tooling that students and other Jessie users
   will share.
