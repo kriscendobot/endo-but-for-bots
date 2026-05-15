@@ -1,8 +1,12 @@
 # Endo Design Documents
 
-*Last updated: 2026-05-11*
+*Last updated: 2026-05-15*
 
-*See also: [daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
+*See also: [ses-top-level-await](ses-top-level-await.md) (added
+2026-05-14; SES + ModuleSource top-level await per 262 cyclic-module-records
+algorithm; extreme low priority, no milestone assignment; held in the queue
+for a future builder),
+[daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
 [filesystem-watchers](filesystem-watchers.md) (added 2026-05-07),
 [endo-posix-sandbox](endo-posix-sandbox.md) (added 2026-05-07; mirrors
 `PLAN/endo_posix_sandbox.md` for roadmap calibration),
@@ -138,10 +142,11 @@ PR #151 row-format unblocker; sibling of
 | [endo-bytes](endo-bytes.md) | 2026-05-08 | 2026-05-10 | Implemented |
 | [endo-gateway](endo-gateway.md) | 2026-05-10 | 2026-05-10 | Proposed |
 | [unhandled-rejection-display](unhandled-rejection-display.md) | 2026-05-10 | 2026-05-10 | Proposed |
+| [ses-top-level-await](ses-top-level-await.md) | 2026-05-14 | 2026-05-15 | Proposed |
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 
-**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 9 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (104 designs)
+**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 10 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (105 designs)
 
 ## Roadmap
 
@@ -662,6 +667,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | endoclaw-skill-registry | S-M | 3 days | 5 | Skills directory with capability declarations; PR #105 open |
 | endor-tui | XL | 5-8 weeks | 6 | Rust TUI: ratatui/crossterm, concept-map of every Chat component, XS `mxDebug` debugger integration (XL bumped 1.3x) |
 | endor-bus-tui | XL | 4-7 weeks | 6 | Bus-verb spec, XS handle API, Exo/CapTP wrapper; cross-worker layout composition (XL bumped 1.3x) |
+| ses-top-level-await | L | 1.5-3 weeks | Unscheduled | Adds [[AsyncEvaluation]]/[[PendingAsyncDependencies]]/[[AsyncParentModules]] to SES module-instance, async-IIFE wrapper in module-source transform, bundle-source coupling, sibling check-bundle gating. Synchronous fast path preserved. Extreme low priority; no roadmap pull. (L size; 1.5x bump already applied per calibration round.) |
 
 #### Summary by Milestone
 
@@ -729,6 +735,18 @@ Milestones 0, 1, and 2 form the critical path. Weblets prioritized over
 UX polish (swapped 2026-03-06).
 M6 (Rust `endor`) is research-heavy and may run in parallel to later
 chat/UX milestones once basic host scaffolding is in place.*
+
+### Unscheduled Platform Designs
+
+These designs sit outside the M0-M6 milestone trajectory because they
+target platform substrates (SES shim, module-source pipeline,
+bundle-source format) on a longer horizon than the agent-experience
+roadmap requires. They are queued for a future builder and do not
+affect the milestone critical path.
+
+| Design | Priority | Rationale |
+|--------|----------|-----------|
+| ses-top-level-await | **extreme low** | Adds top-level-await (TLA) to the SES shim and the `@endo/module-source` pipeline per 262's cyclic-module-records algorithm. The synchronous fast path is preserved for the 99% of modules that do not use TLA; the design's scope is the new async-evaluation path only. No near-term roadmap pull. The design's load-bearing implementation surfaces are SES, `@endo/module-source`, `@endo/bundle-source`, and a sibling change in `@endo/check-bundle` for the policy gate. See the [bundle-source coupling section](ses-top-level-await.md#bundle-source-coupling) for the check-bundle composition with the Agoric chain's upgrade pattern. Size: L (architectural, multi-package). |
 
 ### Strategic Early Items
 
