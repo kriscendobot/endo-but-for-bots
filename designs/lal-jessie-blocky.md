@@ -528,8 +528,9 @@ can start:
    The fallback if both work is to ship the standard variable approach
    for consistency with PR #127's tooling.
 
-5. **System-prompt steering effectiveness.**
-   "Prefer `define-jessie` over `define` when ..." is a soft nudge.
+5. **System-prompt steering effectiveness.** Acknowledged (deferred to
+   Phase 4+): "Prefer `define-jessie` over `define` when ..." is a soft
+   nudge.
    If LLMs systematically pick the wrong one, we may need a harder rule
    (e.g., reject `define()` proposals that would have validated as Jessie
    and return a tool error suggesting `define-jessie` instead).
