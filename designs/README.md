@@ -1,8 +1,13 @@
 # Endo Design Documents
 
-*Last updated: 2026-05-11*
+*Last updated: 2026-05-15*
 
-*See also: [daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
+*See also: [endopen](endopen.md) (added 2026-05-15; OpenCode comparative analysis + 4 gap-closing
+spin-outs: [endopen-concurrent-subagents](endopen-concurrent-subagents.md),
+[endopen-openrouter](endopen-openrouter.md),
+[endopen-tui-shell](endopen-tui-shell.md),
+[endopen-acp-server](endopen-acp-server.md); mirrors the [endoclaw](endoclaw.md) precedent),
+[daemon-make-archive](daemon-make-archive.md) (added 2026-04-23),
 [filesystem-watchers](filesystem-watchers.md) (added 2026-05-07),
 [endo-posix-sandbox](endo-posix-sandbox.md) (added 2026-05-07; mirrors
 `PLAN/endo_posix_sandbox.md` for roadmap calibration),
@@ -87,6 +92,11 @@ PR #151 row-format unblocker; sibling of
 | [daemon-make-archive](daemon-make-archive.md) | 2026-04-23 | 2026-04-24 | In Progress |
 | [daemon-form-request](daemon-form-request.md) | 2026-02-25 | 2026-03-02 | **Complete** |
 | [endoclaw](endoclaw.md) | 2026-03-03 | 2026-03-03 | Reference |
+| [endopen](endopen.md) | 2026-05-15 | 2026-05-15 | Reference |
+| [endopen-concurrent-subagents](endopen-concurrent-subagents.md) | 2026-05-15 | 2026-05-15 | Not Started |
+| [endopen-openrouter](endopen-openrouter.md) | 2026-05-15 | 2026-05-15 | Not Started |
+| [endopen-tui-shell](endopen-tui-shell.md) | 2026-05-15 | 2026-05-15 | Not Started |
+| [endopen-acp-server](endopen-acp-server.md) | 2026-05-15 | 2026-05-15 | Not Started |
 | [endoclaw-browser](endoclaw-browser.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [endoclaw-channel-bridges](endoclaw-channel-bridges.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [endoclaw-network-fetch](endoclaw-network-fetch.md) | 2026-03-03 | 2026-03-03 | Not Started |
@@ -141,7 +151,7 @@ PR #151 row-format unblocker; sibling of
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 
-**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 9 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (104 designs)
+**Totals:** 27 Complete/Implemented, 15 In Progress, 47 Not Started, 9 Proposed, 3 Active, 4 Reference, 2 Deprecated, 1 Draft, 1 Superseded (109 designs)
 
 ## Roadmap
 
@@ -220,10 +230,15 @@ flowchart TD
         ebridge[endoclaw-channel-bridges]
         eskill[endoclaw-skill-registry]
         evoice[endoclaw-voice]
+        enopr[endopen-openrouter]
+        enopanel[endopen-concurrent-subagents]
+        enacp[endopen-acp-server]
         enetfetch --> eoauth
         etimer --> eproactive
         eoauth --> ebridge
         eoauth --> eproactive
+        etimer --> enopanel
+        enopr --> enopanel
     end
 
     subgraph OCapN
@@ -241,9 +256,11 @@ flowchart TD
         cvedit[chat-view-edit-commands]
         cemui[chat-edit-message-ui]
         cliedit[cli-edit-verb]
+        enotui[endopen-tui-shell]
         dcmd --> cpend
         dmount --> cvedit
         dmount --> cliedit
+        dmount --> enotui
         dmstream[daemon-message-streaming] --> cemui
         cscheme[chat-color-schemes<br/><i>COMPLETE</i>]
         cspace[chat-per-space-color-scheme<br/><i>COMPLETE</i>]
@@ -325,6 +342,7 @@ capabilities available to agents.
 | daemon-xs-worker-snapshot | In Progress | XS heap snapshot/restore; Phases 1-2 implemented — streaming CAS write/read, suspend/resume supervisor integration, CBOR control verbs; 12 passing tests; Phase 2 integration test and ephemeral GC roots remaining |
 | endoclaw-timer | In Progress | **Strategic:** Core capability concern — SES removes `setTimeout`/`setInterval`; Timer is the only way agents get scheduled execution. Prerequisite for proactive behavior. First implementation in `@endo/genie`. |
 | endoclaw-network-fetch | Not Started | **Strategic:** `HttpClient` with origin allowlist. Self-hosted agents need outbound HTTP; foundation for OAuth and all external integrations. Reference: [`trust-on-first-bind`](trust-on-first-bind.md) (TOFU-style prompt-and-pin for allowlist-bearing caps). |
+| endopen-openrouter | Not Started | OpenRouter provider for Lal + registry refactor; first cut is one new file. From the OpenCode comparative analysis ([endopen](endopen.md)). |
 | ~~daemon-cross-peer-gc~~ | **Complete** | Replaced the proposed CRDT-of-pet-stores with a one-way retention-set sync per peer connection (`retention-accumulator.js`, `EndoGateway.followRetentionSet`, SQLite `retention` table). Solves the GC gap; bidirectional shared namespace deferred as YAGNI. |
 | ~~daemon-guest-eval-simplification~~ | **Implemented** | Eval-proposal handshake removed; guest eval delegates directly to `formulateEval`. Type-system cleanup and regression test in PR #92. |
 | ci-no-npm-lifecycle | Not Started | Pin `enableScripts: false` posture into CI; enforcement check for workflows |
@@ -389,6 +407,8 @@ automation.
 | endoclaw-notifications | Not Started | `Notify` exo → Electron `Notification`; needs daemon↔Electron bridge |
 | endoclaw-webhooks | Not Started | Gateway webhook endpoints → agent inbox as messages |
 | endoclaw-voice | Not Started | Web Speech API or Whisper in Chat UI; UI feature only |
+| endopen-acp-server | Not Started | ACP (Agent Client Protocol) server adapter; lets Zed and other ACP clients drive Endo while preserving the capability story. From [endopen](endopen.md). |
+| endopen-concurrent-subagents | Not Started | First-class panel-of-subagents UX surface; Endo's capability/formula model makes this concurrent by construction. From [endopen](endopen.md). |
 
 **Exit criterion:** Users can install and interact with weblets. Agents
 can authenticate to external services (Gmail, Calendar, etc.) via OAuth
@@ -419,6 +439,7 @@ webhook events.
 | chat-view-edit-commands | Not Started | `/view` and `/edit` for blobs; Monaco editor, Markdown split preview |
 | chat-edit-message-ui | Not Started | `/edit` slash command, `e` focus shortcut, hover pencil for editing previously sent messages; revision-history panel |
 | lal-transcript-memory-management | Not Started | Durable transcript nodes outliving dismissed messages |
+| endopen-tui-shell | Not Started | Browser-side opencode-shaped *space kind*: file-tree sidebar, inline diff, todo pane, status bar. Browser-side complement of M6 `endor-tui`. From [endopen](endopen.md). |
 
 **Exit criterion:** Chat UI feature-complete for current design scope.
 Commands are non-blocking with visible pending state. Developer tools
@@ -639,6 +660,11 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | endoclaw-notifications | S | 1 day | 3 | Electron Notification API, rate-limited exo; needs daemon↔Electron bridge |
 | endoclaw-webhooks | S-M | 3 days | 3 | Gateway webhook routes → inbox messages |
 | endoclaw-voice | S | 1-2 days | 3 | Web Speech API in Chat UI |
+| endopen | — | — | — | Reference comparative analysis (OpenCode); spin-outs carry the work |
+| endopen-openrouter | S-M | 3 days | 1 | OpenRouter provider for Lal; Phase 1 minimal (1 day), Phase 2 registry refactor (2 days), Phase 3 form deferred |
+| endopen-concurrent-subagents | M | 3-4 weeks | 3 | Panel guest pattern + Chat widget + CLI `endo panel` verb |
+| endopen-acp-server | M-L | 4-5 weeks | 3 | ACP adapter (7 phases); MCP-server adapter sibling deferred |
+| endopen-tui-shell | M-L | 4-5 weeks | 4 | New `coding` space kind in Chat; layout shell, file-tree, diff viewer, todo pane, status bar |
 | ~~chat-reply-chain-visualization~~ | — | — | 4 | Deprecated (superseded by chat-focus-message) |
 | chat-pending-commands | S-M | 3 days | 4 | Pending region, unlocked command bar (UI only); PR #133 forwarded under bot |
 | chat-slot-slash-commands | M | 4-5 days | 4 | Slot-level verb registry, transient-pin extension of `formulateEval`, shared slot-input component (1.2x bump) |
@@ -673,13 +699,13 @@ ready-to-merge and actually-merged for the in-flight backlog.
 | Milestone | Items | Effort Estimate | Plus Review Queue (current rate) |
 |-----------|-------|-----------------|----------------------------------|
 | M0: AI Agent Experience | 0 remaining | **Complete** | — |
-| M1: Remote Access & Tools | 12 remaining | 8-10 weeks | 10-12 weeks |
+| M1: Remote Access & Tools | 13 remaining | 8-10 weeks | 10-12 weeks |
 | M2: Networking | 7 | 4-5 weeks | 5-7 weeks |
-| M3: Weblets & Integrations | 9 | 5-7 weeks | 6-9 weeks |
-| M4: UX & Tooling | 12 | 8-11 weeks | 10-13 weeks |
+| M3: Weblets & Integrations | 11 | 6-8 weeks | 7-10 weeks |
+| M4: UX & Tooling | 13 | 9-12 weeks | 11-14 weeks |
 | M5: Confinement & Ecosystem | 6 active (1 superseded) | 14-20 weeks | 16-22 weeks |
 | M6: Rust Daemon (`endor`) | 2 | 12-17 weeks | 14-19 weeks |
-| **Total remaining** | **50** | **~51-70 weeks** | **~61-82 weeks** |
+| **Total remaining** | **54** | **~54-74 weeks** | **~64-86 weeks** |
 
 ### Timeline
 
