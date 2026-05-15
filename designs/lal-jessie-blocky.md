@@ -213,14 +213,14 @@ case 'define-jessie': {
 
 The third argument to `E(powers).define` is the agreed extension point:
 `define(source, slots, options?)` with `options.language` (maintainer
-decision 2026-05-14, see "Open questions" below).
+decision 2026-05-14, see Open Question 2 below).
 The reserved-slot-key and sibling-method alternatives were considered
 and dropped in favor of the explicit `options` bag, which is also the
 natural carrier for future per-proposal flags.
 
 The Lal-side validator imports from `@endo/jessie-blockly`, the new
 Endo-monorepo package that vendors the Jessie parser until upstream
-publishes; see "Open questions" below for the eject-back plan.
+publishes; see Open Question 3 below for the eject-back plan.
 
 ### Host side: package message tagging
 
