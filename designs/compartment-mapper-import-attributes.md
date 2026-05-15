@@ -37,8 +37,9 @@ A `compartment-mapper` workflow has three legs:
    `packages/compartment-mapper/src/import-archive-lite.js` are the
    seats.
 
-The SES sibling design lands a six-line summary of the touchpoints in
-its `## Compartment-mapper implications` section.
+The SES sibling design lands a summary of the touchpoints in its
+[`## Compartment-mapper implications`](./ses-import-attributes.md#compartment-mapper-implications)
+section.
 This design walks each touchpoint at the level of detail a future
 builder dispatch needs to land an implementation PR.
 The design intentionally stops at the propagation contract; the
@@ -269,13 +270,16 @@ Under this design:
   For a `with { type: 'json' }` import, the hook reads the resolved
   bytes, decodes them as JSON, and returns a `VirtualModuleSource`
   whose `execute` binds the parsed value to `default` per the SES
-  design's *Source dispatch* section.
+  design's
+  [`## Source dispatch`](./ses-import-attributes.md#source-dispatch)
+  section.
 
 `moduleMapHook` stays untouched.
-Per the SES design's *Compartment construction* section, attributes
-do not pass through `moduleMapHook` (the hook returns a specifier-
-keyed module record and the linker collapses attribute-free entries
-through it).
+Per the SES design's
+[`## Compartment construction: priming attribute-bearing modules`](./ses-import-attributes.md#compartment-construction-priming-attribute-bearing-modules)
+section, attributes do not pass through `moduleMapHook` (the hook
+returns a specifier-keyed module record and the linker collapses
+attribute-free entries through it).
 A compartment that needs to thread an attribute-bearing entry seats
 it via `modulesWithAttributes` at construction time and lets the
 attribute-aware `importHook` handle the dynamic case.
@@ -504,10 +508,11 @@ catalogue, in `packages/compartment-mapper/test/`:
   every existing tool (digest, archive, bundle) walk the same shape
   it already does, with one new branch on the value's type.
 - **Carry attributes through `resolveHook` as well.**
-  Rejected for symmetry with the SES design's *Resolution and
-  resolveHook* section: resolution does not need attributes and the
-  burden on every existing `resolveHook` is not justified by any
-  current use case.
+  Rejected for symmetry with the SES design's
+  [`## Resolution and resolveHook`](./ses-import-attributes.md#resolution-and-resolvehook)
+  section: resolution does not need attributes and the burden on
+  every existing `resolveHook` is not justified by any current use
+  case.
 
 ## Open questions
 
