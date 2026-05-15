@@ -313,6 +313,13 @@ Two validation surfaces:
    that has been removed from the slot panel produces a code-generation
    warning shown inline in the slot panel and blocks the submit button
    until the user resolves it.
+   Caveat: the by-construction claim depends on the block grammar
+   shipped in `@endo/jessie-blockly` matching the Jessie grammar that
+   `endojs/Jessie#127` settles on.
+   The vendor package's `parseJessie` validator is the binding
+   correctness check on the Lal side; Lal-side validation (above) is the
+   contract that fails closed if the block grammar and the parser drift
+   in `@endo/jessie-blockly`.
 
 A "View source" toggle in the form footer reveals the generated Jessie
 source as read-only text, so power users can audit the rendering.
