@@ -96,7 +96,25 @@ Out of scope:
 ## Propagation overview
 
 The flow from `package.json` to module-record construction has four
-hops; this design adds an `Attributes` companion to the existing
+hops, threaded through five participants. Listed in the order they
+appear in the diagram below:
+
+1. **`pkg`**: the application's `package.json` files (one per package
+   in the graph).
+2. **`mod`**: `@endo/module-source`, the parser, which reads each
+   module's body and emits an `imports` set of `{ specifier,
+   attributes }` records.
+3. **`graph`**: `packages/compartment-mapper/src/node-modules.js` plus
+   `packages/compartment-mapper/src/infer-exports.js`, which walk
+   `node_modules` and the `exports`/`imports` fields of each
+   `package.json` to produce the compartment-map descriptor.
+4. **`link`**: `packages/compartment-mapper/src/link.js`, which
+   constructs the runtime DAG of `Compartment` instances from the
+   descriptor.
+5. **`ses`**: the runtime SES `Compartment`, with its module-load
+   memo and `importHook`.
+
+This design adds an `Attributes` companion to the existing
 specifier-shaped data at each hop without changing the resolver's
 single-pass shape.
 
@@ -109,6 +127,7 @@ sequenceDiagram
   participant ses as SES Compartment<br/>(memo + importHook)
 
   Note over pkg,mod: design-time map leg
+  pkg->>mod: module source bytes
   pkg->>graph: exports / imports / conditions
   mod->>graph: ModuleSource.imports records<br/>(specifier, attributes)
   graph->>graph: gather per-import attributes<br/>into module descriptor
@@ -336,7 +355,7 @@ Concrete touchpoints in `link.js`:
 
 | Site                                | Change                                                                                                              |
 |-------------------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `makeModuleMapHook`                 | Unchanged.  Continues to return a single-argument specifier-keyed hook.                                             |
+| `makeModuleMapHook`                 | Unchanged. Continues to return a single-argument specifier-keyed hook.                                              |
 | `link` body, per-compartment loop   | Partition the `modules` record into legacy-collapse (`moduleMap`) and extended (`modulesWithAttributes`) seats.     |
 | `importHook` construction call      | The caller's `makeImportHook` becomes a factory for a two-argument hook (see *Implications for callers* below).     |
 | `new Compartment({ ... })` call     | Pass `modulesWithAttributes` when the partition produced non-empty entries; otherwise omit the option for parity.   |
@@ -354,7 +373,7 @@ design.
 (`assemble`, `loadArchive`, `parseArchive`, and a small number of
 direct `link()` callers).
 Under the legacy single-argument signature, the caller's hook
-implementation looked like:
+implementation looks like:
 
 ```js
 const makeImportHook = ({ packageLocation, ... }) => {
