@@ -120,12 +120,26 @@ sequenceDiagram
   link->>ses: ModuleDescriptor<br/>(dispatched on attributes)
 ```
 
-The carry rule for every hop is the same.
-A specifier-shaped value becomes a `(specifier, attributes)` pair.
-The attributes half is the normalized frozen object SES exposes; an
-absent or empty `with` clause is the `EMPTY_ATTRIBUTES` sentinel from
-the sibling design, which collapses to the legacy specifier-only
-slot in every keyed structure (memo, module-map, descriptor record).
+The carry rule for every hop is the same: a specifier-shaped value
+becomes a `(specifier, attributes)` pair, where the attributes half
+is the normalized frozen object SES exposes, and an absent or empty
+`with` clause is the `EMPTY_ATTRIBUTES` sentinel from the sibling
+design, which collapses to the legacy specifier-only slot in every
+keyed structure (memo, module-map, descriptor record).
+
+**SES arity rule.** This design leans repeatedly on the SES loader's
+hook-arity discriminator (defined in the sibling design's
+[`## importHook signature`](./ses-import-attributes.md#importhook-signature)
+section). The rule: when a hook (`importHook`, `importNowHook`, the
+synthetic archive hook) reports `length === 2`, the SES loader passes
+the normalized attribute object on every invocation, including the
+empty case; when the hook reports `length === 1`, the loader calls it
+specifier-only (and throws if the loader's own dispatch ever reaches
+the hook with a non-empty attribute bag). The rule is what gives a
+v0 caller of `link.js` a soft landing: a `makeImportHook` that still
+returns a one-arg hook keeps working for graphs that contain no
+attribute-bearing imports. Every later reference to "the arity rule"
+in this design points back to this paragraph.
 
 ## Per-import attribute record in the compartment-map descriptor
 
@@ -283,6 +297,40 @@ attribute-free entries through it).
 A compartment that needs to thread an attribute-bearing entry seats
 it via `modulesWithAttributes` at construction time and lets the
 attribute-aware `importHook` handle the dynamic case.
+
+**`moduleMapHook` + attribute-bearing entry, in detail.**
+Three cases exhaust the interaction between `moduleMapHook` (the
+specifier-keyed dynamic linker hook) and an import whose parser-side
+record carries non-empty attributes:
+
+1. *Attribute-bearing import whose specifier is also seated through
+   `moduleMapHook`.*
+   The linker's partition step (see the table below) routes the
+   attribute-bearing record to `modulesWithAttributes` at construction
+   time. The SES loader resolves the extended memo key first, hits
+   the primed entry, and the `moduleMapHook` is not consulted for
+   that `(specifier, attributes)` pair. The same specifier with the
+   empty attribute bag continues to flow through `moduleMapHook`
+   under the legacy-collapse rule.
+2. *`moduleMapHook` returns a record whose underlying source carries
+   parser-emitted attributes.*
+   `moduleMapHook`'s return shape is specifier-keyed by contract
+   ([SES sibling](./ses-import-attributes.md#compartment-construction-priming-attribute-bearing-modules))
+   so it cannot itself surface an attribute bag. The linker treats
+   any record returned by `moduleMapHook` as if its caller-side
+   attribute set were empty; the hook's job remains specifier-keyed
+   substitution, not attribute-aware dispatch. A compartment that
+   wants attribute-aware dynamic substitution uses
+   `modulesWithAttributes` at construction time, or implements the
+   dispatch inside its `importHook` (the two-arg one).
+3. *Attribute-free import whose specifier is not in
+   `modulesWithAttributes`.*
+   Unchanged from today: `moduleMapHook` is consulted, then
+   `moduleMap`, then the two-arg `importHook` with an empty
+   attribute bag. The arity rule keeps the empty-bag case
+   indistinguishable from today's specifier-only call from the
+   `importHook`'s point of view (a v0 single-arg hook still
+   satisfies the call).
 
 Concrete touchpoints in `link.js`:
 
@@ -486,6 +534,16 @@ catalogue, in `packages/compartment-mapper/test/`:
   A reader's pattern match on `imports[spec]` returns the right
   shape for each form, and a serializer's choice between forms is
   driven entirely by attribute-bag emptiness.
+- **Policy: attribute-passthrough invariant.**
+  Per `## Open questions` § 5, this design assumes the policy gate
+  keys on specifier alone and that attributes do not affect policy
+  evaluation. The implementation test catalogue therefore includes
+  one explicit policy-passthrough check: a compartment whose policy
+  permits a specifier admits the same specifier under both an empty
+  attribute bag and a `with { type: 'json' }` bag (no extra
+  per-attribute gate runs). A follow-up design that adds a
+  per-attribute policy axis would replace this test with a richer
+  one; until then the invariant is the contract.
 
 ## Alternatives considered
 
