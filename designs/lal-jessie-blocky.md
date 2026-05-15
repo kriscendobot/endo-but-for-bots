@@ -328,7 +328,7 @@ should use the existing `define` (the LLM should propose `define` instead
 of `define-jessie` when the program does not fit the Jessie subset, and
 the system prompt should say so).
 
-### LLM system-prompt change
+### LLM System-Prompt Change
 
 In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
 `define()` guidance:
@@ -349,7 +349,7 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
 | [chat-markdown-render](chat-markdown-render.md) | Independent. Slot labels and the form's chrome use the standard Chat Markdown renderer. |
 | [endojs/Jessie#127](https://github.com/endojs/Jessie/pull/127) | Upstream dependency. The `@jessie/blockly-tools` package and the underlying `@jessie/parse` checker land here, eventually. Until they publish on npm (neither was published as of 2026-05-14), the new `@endo/jessie-blockly` package in this monorepo vendors the equivalent surface so this design is not gated on Jessie #127's merge timeline. |
 
-### Phased implementation
+### Phased Implementation
 
 1. **Phase 0: `@endo/jessie-blockly` package.**
    Create `packages/jessie-blockly/` with the Jessie parser/checker and
