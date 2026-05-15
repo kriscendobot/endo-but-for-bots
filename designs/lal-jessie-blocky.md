@@ -52,9 +52,9 @@ This works, but the surface has two problems for non-programmer users:
 1. The proposal language is unconstrained JavaScript.
    A Lal proposal may use ambient globals, control-flow that the host did not
    expect, or syntax the host cannot evaluate intuitively.
-   Reviewing such a proposal is the same cognitive load as code review of
-   arbitrary code, which is precisely what a capability-constrained UI ought
-   to be able to avoid.
+   Because the proposal language is unconstrained, reviewing such a proposal
+   is the same cognitive load as code review of arbitrary code, which is
+   precisely what a capability-constrained UI ought to be able to avoid.
 2. The text-editor presentation does not match the proposal model.
    A proposal is "this shape of expression with these slots", not "edit this
    program freely".
@@ -134,13 +134,11 @@ The variant reuses every existing piece of plumbing.
 The new code is:
 
 - A new `@endo/jessie-blockly` package (`packages/jessie-blockly/`)
-  that bundles the Jessie parser/checker and the Blockly workspace
-  tools.
-  Lal imports the parser from this package; the Chat package imports
-  the Blockly workspace from the same place.
-  The package vendors content from `endojs/Jessie#127` until that PR
-  lands and `@jessie/parse` / `@jessie/blockly-tools` publish on npm,
-  at which point `@endo/jessie-blockly` becomes a thin re-export.
+  that bundles the Jessie parser/checker (imported by Lal) and the
+  Blockly workspace tools (imported by the Chat package), vendored
+  from `endojs/Jessie#127` until `@jessie/parse` and
+  `@jessie/blockly-tools` publish on npm, at which point
+  `@endo/jessie-blockly` becomes a thin re-export.
 - A `define-jessie` entry in Lal's tool registry (`packages/lal/agent.js`)
   with its own JSON schema and case in `executeTool`.
 - A Jessie-validation step in that case, citing the checker from
@@ -257,12 +255,13 @@ A new component, `packages/chat/define-jessie-form.js`, mirrors the API of
 export const createDefineJessieForm = async ({ $container, onSubmit, onClose }) => { /* ... */ };
 ```
 
-The component embeds the Jessie workspace from `@endo/jessie-blockly`
-(which vendors the upstream Jessie tooling until it publishes).
+The component embeds the Jessie workspace from `@endo/jessie-blockly`,
+which vendors the upstream Jessie tooling until it publishes.
 Initial source from the LLM is parsed and reconstructed as a Blockly
 workspace via Blockly's standard
-[JSON serialization format](https://developers.google.com/blockly/guides/configure/web/serialization)
-(the same format the PR #127 tests use as fixtures).
+[JSON serialization format](https://developers.google.com/blockly/guides/configure/web/serialization).
+This is the same format the PR #127 tests use as fixtures, so the
+round-trip fixtures from Phase 4 reuse the upstream test data directly.
 Slot variables in the source are surfaced as **slot blocks** in a dedicated
 toolbox category; the user does not edit slot identifiers directly.
 
@@ -351,6 +350,12 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
 
 ### Phased Implementation
 
+The implementation lands in five phases.
+Phase 0 lands the shared `@endo/jessie-blockly` package every later phase
+imports from; Phases 1 through 4 then layer the Lal tool registration,
+the host-side language tag, the Chat UI form component, and the tests
+and documentation in turn.
+
 1. **Phase 0: `@endo/jessie-blockly` package.**
    Create `packages/jessie-blockly/` with the Jessie parser/checker and
    the Blockly workspace tools, vendored from `endojs/Jessie#127` (or
@@ -410,15 +415,15 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
    Not mergeable on its own: the fixtures presume the implementations
    from Phases 0 through 3 are in place.
 
-Phase 0 is S-sized (one day; the package is mostly vendoring and a
+Phase 0 is S-sized (1 day; the package is mostly vendoring and a
 build wire-up).
-Phases 1 and 2 are S-sized (one day each).
+Phases 1 and 2 are S-sized (1 day each).
 Phase 3 is M-sized (3 days; the Blockly integration is mostly wiring,
 but the slot-block design needs care to keep the workspace and slot
 panel in sync).
-Phase 4 is S-sized (one day).
+Phase 4 is S-sized (1 day).
 
-Total estimate: M-sized, ~6 days (Phase 0 adds one day for the
+Total estimate: M-sized, ~6 days (Phase 0 adds 1 day for the
 `@endo/jessie-blockly` package; the original ~5-day estimate is
 otherwise intact).
 
@@ -543,6 +548,12 @@ can start:
    and return a tool error suggesting `define-jessie` instead).
    This is a Phase 4+ tuning question, not a blocker for the initial
    design.
+   Proposed Phase 4 exit criterion for this question: at least 80% of a
+   curated test-set of proposals that fit the Jessie subset route to
+   `define-jessie` rather than `define`, measured against a frozen
+   prompt-and-fixture pair recorded in `packages/lal/test/`.
+   The exact threshold is a Phase 4+ tuning knob; the existence of a
+   measurable criterion is what makes the question terminable.
 
 ## Prompt
 
