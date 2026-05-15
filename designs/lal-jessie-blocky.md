@@ -380,6 +380,9 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
    to work without change, and the package-message body carries no
    `language` tag in the absent-options case (so the Chat UI router
    defaults to `define-form`).
+   Mergeable on its own; the daemon-side change is a no-op for existing
+   two-argument callers, and the Chat UI router's `define-jessie-form`
+   branch routes to a stub until Phase 3 lands.
 
 4. **Phase 3: Blockly form component in the Chat package.**
    Implement `packages/chat/define-jessie-form.js`.
@@ -387,6 +390,8 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
    Wire slot blocks, source view toggle, and slot panel.
    Add the system-prompt nudge that steers the LLM towards
    `define-jessie`.
+   Not mergeable on its own: depends on the Phase 2 router branch and the
+   `@endo/jessie-blockly` workspace surface from Phase 0.
 
 5. **Phase 4: Tests and docs.**
    AVA fixtures from `endojs/Jessie#127`'s `test/test-data.json` (where
@@ -402,6 +407,8 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
    error as a tool error and retries.
    Update `packages/lal/primer/tools.md` to document `define-jessie`.
    Update `packages/chat`'s component index to list the new form.
+   Not mergeable on its own: the fixtures presume the implementations
+   from Phases 0 through 3 are in place.
 
 Phase 0 is S-sized (one day; the package is mostly vendoring and a
 build wire-up).
