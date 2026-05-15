@@ -137,11 +137,19 @@ attribute representation](./ses-import-attributes.md#normalized-attribute-repres
 The compartment-mapper's grapher consumes those records and writes
 them into the per-compartment module descriptor.
 
-Today's per-module descriptor records a `resolvedImports` map of
-`Record<importSpecifier, fullSpecifier>` and, in the archive form,
-records the imports as part of the `FileModuleConfiguration` for the
-module (`packages/compartment-mapper/src/types/compartment-map-schema.ts`
-§ `FileModuleConfiguration`).
+Today's per-module descriptor (`FileModuleConfiguration` in
+`packages/compartment-mapper/src/types/compartment-map-schema.ts`)
+records `location`, `parser`, and `sha512` and carries no per-import
+shape on the persisted form.
+The resolved-import map of `Record<importSpecifier, fullSpecifier>`
+that `bundle-lite.js`, `parse-cjs.js`, and `policy.js` walk under the
+name `resolvedImports` is an in-memory and execution-side construct,
+not a schema field; the JSON-serialized compartment-map descriptor
+does not record it today.
+This design adds an optional `imports` field to
+`FileModuleConfiguration` (and a parallel field on
+`CompartmentModuleConfiguration`) so the archive can name each
+import's resolved specifier *and* its attribute bag.
 The extended shape carries the attributes alongside the resolved
 specifier:
 
@@ -334,9 +342,12 @@ Two changes:
 
 1. **Per-import attributes.**
    When a module's parser-emitted import records include a non-empty
-   attributes bag, the serializer writes that bag onto the
-   `resolvedImports` entry.
-   An attribute-free import omits the field.
+   attributes bag, the serializer writes the bag onto the
+   `imports[specifier]` entry of the persisted
+   `FileModuleConfiguration` (the new schema field introduced under
+   `## Compartment-map JSON schema` below).
+   An attribute-free import serializes as a bare-string entry,
+   matching the legacy-collapse rule.
 2. **Compartment-map schema version bump.**
    The top-level `tags` array gains a sentinel (e.g.,
    `'import-attributes-v1'`) when the archive contains any
@@ -395,9 +406,15 @@ Backward compatibility on the read side:
 
 ## Compartment-map JSON schema
 
-The schema bump is one optional field on the per-module
+The schema bump adds one optional field, `imports`, to the per-module
 `FileModuleConfiguration` (and a parallel field on
-`CompartmentModuleConfiguration` for forwarded modules):
+`CompartmentModuleConfiguration` for forwarded modules).
+`FileModuleConfiguration` currently records only `location`, `parser`,
+and `sha512`; the field is net-new, not a widening of an existing
+property.
+The optional shape means an archive whose graph is purely JavaScript
+and whose author has not opted into per-import metadata still
+serializes byte-identically to today.
 
 ```diff
  export interface FileModuleConfiguration extends BaseModuleConfiguration {
