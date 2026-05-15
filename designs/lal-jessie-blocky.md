@@ -7,6 +7,39 @@
 | **Author** | Kris Kowal (prompted) |
 | **Status** | Proposed |
 
+## Background
+
+This design uses terminology from several adjacent projects.
+A reader new to Lal and the Endo monorepo can decode the rest of the
+document from this glossary.
+
+- **Lal**: the LLM-driven agent shipped in `@endo/lal` (`packages/lal/`).
+  Lal proposes structured tool calls to the host on behalf of an LLM
+  conversation; the host's Chat UI renders those proposals for human
+  review before they execute.
+- **The `define` tool**: a tool that Lal exposes to the LLM, taking a
+  source string and a `slots` map of named capability holes the host
+  fills from their own inventory.
+  `define`'s proposal arrives in the host's inbox as a package message;
+  the Chat UI renders it in `define-form.js` as a Monaco editor over the
+  raw source plus a list of slots, and the host fills slots, optionally
+  edits, and submits.
+  On submit the proposal becomes a formula-graph node bound to the
+  host's chosen slot values.
+- **Jessie**: a confined subset of JavaScript that an Endo guest can
+  evaluate safely (no ambient globals, no `eval`, no `new Function`, no
+  loops outside Justin expressions).
+  The Jessie grammar and parser live in `endojs/Jessie`.
+- **Justin**: the pure-expression sub-language of Jessie (no statements,
+  no `const`/`let`, no imports).
+  Justin underpins Jessie's expression-level grammar but is too narrow
+  for whole-module proposals.
+- **Slots (= capability holes)**: named placeholders in a `define`
+  proposal that stand in for capabilities the host owns.
+  This document uses "slots" and "capability holes" interchangeably; the
+  capability-hole framing is the original mental model from Endo's
+  capability literature and the `slots` term is the in-code identifier.
+
 ## What is the Problem Being Solved?
 
 `@endo/lal` already exposes a `define(source, slots)` tool that lets the agent
@@ -86,6 +119,16 @@ flowchart LR
     BE -->|user fills slots, submits| Eval[E powers .define source slots]
     Eval --> Result[formula-graph node]
 ```
+
+Diagram key.
+`JV` is the Jessie-validity gate (Lal's `parseJessie` call against the
+proposed source).
+`TR` is the `tool_result` error the LLM sees if `JV` rejects.
+`HM` is the host's inbox package message that carries an accepted
+proposal forward.
+`BE` is the Blockly editor plus slot-list panel the host interacts with.
+`Eval` is the `E(powers).define(source, slots)` call the host submits
+once slots are filled.
 
 The variant reuses every existing piece of plumbing.
 The new code is:
