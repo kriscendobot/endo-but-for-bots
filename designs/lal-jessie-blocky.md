@@ -366,6 +366,13 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
    package-message construction downstream to carry the tag.
    Wire the Chat UI message-router to read the tag and choose between
    `define-form` and (still-stub) `define-jessie-form`.
+   Back-compat invariant: the new third parameter is optional and the
+   daemon-side `EndoGuest.define` implementation treats an absent
+   `options` argument identically to its prior two-argument behavior.
+   Every existing two-argument caller of `E(powers).define` continues
+   to work without change, and the package-message body carries no
+   `language` tag in the absent-options case (so the Chat UI router
+   defaults to `define-form`).
 
 4. **Phase 3: Blockly form component in the Chat package.**
    Implement `packages/chat/define-jessie-form.js`.
