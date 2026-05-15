@@ -5,7 +5,7 @@
 | **Created** | 2026-05-15 |
 | **Updated** | 2026-05-15 |
 | **Author** | Kris Kowal (prompted) |
-| **Status** | Draft |
+| **Status** | Proposed |
 
 ## Problem statement
 
