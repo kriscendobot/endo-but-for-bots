@@ -385,6 +385,14 @@ In `agent.js`'s `systemPrompt`, add a short paragraph after the existing
    AVA fixtures from `endojs/Jessie#127`'s `test/test-data.json` (where
    applicable, mirrored into `@endo/jessie-blockly`) cover the
    source-to-workspace and workspace-to-source round trip.
+   Add a Lal-side validation-error fixture that feeds a non-Jessie source
+   (one with an ambient global, an `eval` call, or a `for-of` loop
+   outside a Justin expression) to the `define-jessie` `executeTool`
+   case and asserts the call surfaces a normal `tool_result` error whose
+   message matches the `Jessie validation failed: ...` shape produced by
+   `makeError(X\`Jessie validation failed: ${q(parseError.message)}\`)`.
+   This fixture pins the design's claim that the LLM sees the validation
+   error as a tool error and retries.
    Update `packages/lal/primer/tools.md` to document `define-jessie`.
    Update `packages/chat`'s component index to list the new form.
 
