@@ -140,7 +140,7 @@ PR #151 row-format unblocker; sibling of
 | [unhandled-rejection-display](unhandled-rejection-display.md) | 2026-05-10 | 2026-05-10 | Proposed |
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
-| [ses-import-attributes](ses-import-attributes.md) | 2026-05-14 | 2026-05-14 | Draft |
+| [ses-import-attributes](ses-import-attributes.md) | 2026-05-14 | 2026-05-15 | Draft |
 
 **Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 9 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (104 designs)
 
