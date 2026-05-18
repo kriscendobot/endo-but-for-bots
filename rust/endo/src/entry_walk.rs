@@ -2233,4 +2233,98 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
+
+    // ---- adversarial: resolution-cascade and node_modules edge cases ----
+
+    /// Top-level string-shorthand `"exports": "./top.js"` is the
+    /// terser sibling of the `"exports": { ".": "./top.js" }`
+    /// shape covered by [`load_package_metadata_reads_exports_dot_string`].
+    /// The Node resolution spec treats the two as equivalent and
+    /// the design's "exports.default → main → index.js" cascade
+    /// is meaningless if the top-level shorthand isn't read.
+    ///
+    /// Regression: if a future refactor of
+    /// [`load_package_metadata`]'s `match exp` arm dropped the
+    /// `Value::String(s) => Some(s.to_string())` branch (only
+    /// honouring the `Value::Object(...)` shape), a package whose
+    /// `package.json` reads `"exports": "./top.js"` would silently
+    /// fall through to `main` / `index.<ext>`, picking the wrong
+    /// entry. This test pins the shorthand path.
+    #[test]
+    fn load_package_metadata_reads_top_level_exports_string_shorthand() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "package.json",
+            br#"{"name":"foo","version":"1.0.0","exports":"./top.js"}"#,
+        );
+        let m = load_package_metadata(dir.path()).unwrap();
+        assert_eq!(m.exports_dot_default.as_deref(), Some("./top.js"));
+    }
+
+    /// A `node_modules/<pkg>/` directory that exists but contains
+    /// no `package.json` is a real failure mode (a partially
+    /// installed dependency, a manual rmrf that left the dir
+    /// behind, a corrupted yarn install). The walker must surface
+    /// the missing file rather than crashing the process or
+    /// returning a successful empty archive.
+    ///
+    /// Regression: if [`load_package_metadata`] were to swallow
+    /// the read error (e.g., default to a synthetic
+    /// `PackageMetadata { name: "<dirname>", version: "0.0.0",
+    /// .. }` and continue), the walker would emit a compartment
+    /// pointing at a non-existent entry file and the eventual
+    /// `load_archive_from_cas` would fail with a confusing
+    /// downstream error. By failing early at the bare-resolve
+    /// step, the user sees the actual missing `package.json`.
+    #[test]
+    fn ingest_surfaces_missing_package_json_in_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = ContentStore::open(&tmp.path().join("cas")).unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        write_file(proj.path(), "app.js", br#"import 'broken-pkg';"#);
+        // The package directory exists but has no package.json
+        // and no index.js either — a partially-installed dep.
+        std::fs::create_dir_all(proj.path().join("node_modules/broken-pkg")).unwrap();
+
+        let err = match ingest_entry_point_with_deps(&cas, &proj.path().join("app.js")) {
+            Ok(_) => panic!("expected error for node_modules/<pkg>/ without package.json"),
+            Err(e) => e,
+        };
+        // `std::fs::read` on a missing `package.json` returns
+        // `NotFound`; the walker propagates it verbatim.
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// `scan_static_imports` must skip line and block comments,
+    /// otherwise a benign `// import foo from "evil";` doc-comment
+    /// would inject a phantom dependency. The scan recognises both
+    /// `//` and `/* */`. This test exercises both forms in a
+    /// single source; the bare-but-otherwise-real spec `"real"` in
+    /// the non-commented `import` is the only one expected to
+    /// surface.
+    ///
+    /// Regression: the block-comment skip is the load-bearing
+    /// branch — the multi-line block-comment body below contains a
+    /// `\n` followed by a bare `import` keyword at the start of a
+    /// line (no leading `*` decoration). Without the block-comment
+    /// skip, the parser's statement-start tracking would treat
+    /// that `import` as a real statement start and emit
+    /// `phantom-block-multiline` as a spurious specifier. The
+    /// line-comment skip is defensive: the parser is also robust
+    /// to a `// import ...` line because the leading `//` consumes
+    /// `at_stmt_start` before the `import` keyword is reached, but
+    /// we exercise it alongside the block form to pin the
+    /// contract.
+    #[test]
+    fn scan_ignores_imports_inside_comments() {
+        let src = "// import phantom from \"phantom-line\";\n\
+                   /* not-a-statement-start-spec import phantom from \"phantom-block\"; */\n\
+                   /*\n\
+                   import phantom from \"phantom-block-multiline\";\n\
+                   */\n\
+                   import real from \"real\";\n";
+        let s = scan_static_imports(src);
+        assert_eq!(s.specifiers, vec!["real"]);
+    }
 }
