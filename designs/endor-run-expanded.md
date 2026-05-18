@@ -10,8 +10,11 @@
 ## Status
 
 Phases 1-2 and Phase 4 (no-dependency case) implemented; Phase 3
-is in review on PR #278; Phase 5 (entry-point with dependency
-resolution) remains.
+is in review on PR #278; Phase 5's local-`node_modules` walk is
+implemented on this PR (stacked on PR #279). The registry-table
+path for Phase 5 (item 3 of the original phase list) and the
+XS-hosted compartment mapper bundle that was deferred from
+Phase 4 both remain.
 
 - **Phase 1**: `ContentStore` is available standalone via
   `endo::cas::ContentStore::open()` (implemented in
@@ -40,29 +43,92 @@ resolution) remains.
   `run_xs_archive_loaded`, so the same XS install path runs all
   three forms.
 
-### Deviation from the design's Option B (deferred to Phase 5)
+- **Phase 5** (entry-point with local `node_modules` walk):
+  `rust/endo/src/entry_walk.rs` —
+  `ingest_entry_point_with_deps(cas, entry_path)` walks the
+  static-import graph starting from `entry_path`, classifies
+  each specifier as relative (same compartment) or bare
+  (resolved via sibling `node_modules` upward from the
+  importer), and emits a multi-compartment archive whose
+  compartment-map.json carries one `<unscoped-name>-v<version>`
+  compartment per resolved package plus the entry compartment
+  (`entry-v1.0.0` when the entry has no sibling `package.json`,
+  `<pkg>-v<ver>` when it does). Cross-compartment references
+  are encoded as `ModuleDescriptor::Link` entries so the
+  XS-side install path lights up unchanged.
+  `rust/endo/src/bin/endor.rs` — `cmd_run_entry_point_with_cas`
+  pre-scans the entry source for static imports and routes to
+  the walker when any are present; entries without imports stay
+  on the Phase 4 fast path (the no-deps regression surface is
+  unchanged).
+  Acceptance: the design's Phase 5 test (`endor run app.js`
+  where `app.js` imports from a local `node_modules` package)
+  is covered by `ingest_walks_bare_import_into_separate_compartment`
+  in the test suite plus a hand smoke-test of the CLI binary.
+
+### Deviation from the design's Option B (XS-hosted mapper still deferred)
 
 The design proposes an XS-hosted compartment mapper bundle
 (Option B § Compartment mapper implementation) as the chosen
-near-term approach for Phase 4. For the no-dependency case the
-design pins for Phase 4 ("`endor run hello.js` with a simple
-module that has no dependencies"), the XS-hosted mapper would
-walk an empty `package.json` and produce exactly the
-one-compartment, one-module shape `ingest_entry_point`
-synthesises directly. The Rust-side synthesis is the smallest
-change that satisfies Phase 4's acceptance criterion without
-landing the (substantial) bundling, fs-power-wiring, and
-two-machine-handshake infrastructure the XS-hosted mapper
-requires.
+near-term approach. Phase 4 deferred it ("the XS-hosted mapper
+becomes load-bearing in Phase 5"); Phase 5 chose Option A (a
+Rust-native mapper) instead, for the same reason Phase 4 chose
+Rust-side synthesis: the infrastructure the XS-hosted mapper
+requires (bundling `@endo/compartment-mapper` for XS, wiring
+filesystem host powers into a fresh mapper machine, and a
+two-machine handshake that captures the mapper's
+CompartmentMap output before the execution machine boots) is
+large enough to warrant its own phase, separate from "walk
+local dependencies into a multi-compartment archive".
 
-The XS-hosted mapper becomes load-bearing in Phase 5, where it
-walks `package.json`, follows `dependencies`, and resolves a
-non-trivial graph. Phase 5 lands the bundle and the
-mapper-machine handshake; at that point Phase 4's synthetic
-helper can either remain (as the fast path for the
-no-dependency case) or be replaced by a single XS-mapper
-invocation with an empty resolver. The choice is a Phase 5
-design decision and is not pre-empted here.
+For the Phase 5 acceptance test (static ES imports →
+relative/bare resolution → `package.json` `exports.default` /
+`main` / `index.js` cascade → `node_modules` upward walk),
+Option A and Option B converge on the same `CompartmentMap`
+shape and the same on-disk CAS layout. The XS-hosted mapper
+becomes load-bearing whenever the dependency walk needs
+features Option A's Rust-native walk does not implement:
+
+- Conditional `exports` resolution beyond `default` (the
+  Rust walk reads `exports["."]["default"]` only).
+- Dynamic `import("...")` and CommonJS `require("...")`
+  walking. The Rust walk follows static `import` and
+  `export ... from` only.
+- Subpath patterns (`"./*.js": "./src/*.js"`) and per-condition
+  exports tables (`"node"`, `"browser"`).
+- The registry-table path from
+  `designs/endor-npm-registry-proxy.md` § Phase 4, where bare
+  specifiers that aren't in any sibling `node_modules` are
+  resolved against the local registry table (and on miss,
+  fetched from the npm registry, extracted to the CAS, and
+  inserted into the table).
+
+Those features land in follow-up work that either extends the
+Rust walk (each feature is a localised addition) or lands the
+XS-hosted mapper bundle alongside the Rust walk so the two
+paths cover complementary cases.
+
+### Deviation from the design's Phase 5 plan: local node_modules first
+
+The design's Phase 5 plan calls out three sub-items:
+
+1. `package.json` resolution to the XS-hosted mapper.
+2. `node_modules` tree walking for local dependencies.
+3. Registry-table lookup for remote dependencies (requires
+   `designs/endor-npm-registry-proxy.md` Phase 4).
+
+This PR ships items 1 and 2 (in the Rust walk per the
+above deviation note) plus the design's acceptance test for
+the phase. Item 3 depends on a registry-proxy phase that has
+not yet landed (`endor-npm-registry-proxy.md` Phase 4 is
+itself open; that design's Phase 2 — HTTP fetching — shipped
+via PR #276 and Phase 3 — MVS — via the registry-proxy work
+that preceded this PR, but Phase 4 — compartment-mapper
+integration — is the gating phase). When the registry proxy
+Phase 4 lands, a follow-up extends the walker's
+`resolve_bare` to try the registry table on `find_node_modules
+_package` miss; the walker's compartment-emission and CAS
+layout do not change.
 
 ### Cross-PR coordination with Phase 3
 
@@ -382,13 +448,50 @@ section.
 
 ### Phase 5: Entry-point with dependencies
 
-1. Add `package.json` resolution to the XS-hosted mapper.
-2. Support `node_modules` tree walking for local
-   dependencies.
-3. Support registry table lookup for remote dependencies
-   (requires [endor-npm-registry-proxy](endor-npm-registry-proxy.md)).
-4. **Test**: `endor run app.js` where `app.js` imports from
-   a local `node_modules` package.
+**Status**: items 1 and 2 implemented in Rust (Option A) on
+this PR; item 3 deferred behind
+`designs/endor-npm-registry-proxy.md` Phase 4. The XS-hosted
+mapper (Option B) is deferred to a follow-up phase whose
+acceptance is "conditional `exports` / dynamic `import()` /
+subpath patterns / per-condition exports". See the *Deviation
+from the design's Option B (XS-hosted mapper still deferred)*
+note in the Status section.
+
+1. (Done in Rust.) `package.json` resolution: the walker reads
+   `name`, `version`, `main`, `module`, and
+   `exports["."]["default"]` (with the
+   `exports["."]` string shorthand and the bare `exports`
+   shorthand). Resolution cascades
+   `exports.default` → `module` → `main` → `index.<ext>` per
+   `entry_walk::resolve_package_main`.
+2. (Done in Rust.) `node_modules` tree walking via
+   `entry_walk::find_node_modules_package`: walks upward from
+   the importing file's directory, honouring scoped packages
+   (`@scope/name`) and subpaths
+   (`pkg/sub/foo.js`). Each resolved package becomes its own
+   compartment in the synthesised compartment-map.
+3. (Deferred to a follow-up.) Registry-table lookup for remote
+   dependencies. Requires
+   [endor-npm-registry-proxy](endor-npm-registry-proxy.md)
+   Phase 4 (compartment-mapper integration), which itself
+   depends on that design's Phase 2 (HTTP fetch, shipped via
+   PR #276) and Phase 3 (MVS). When the registry proxy's
+   Phase 4 lands, a follow-up extends `entry_walk::resolve
+   _bare` to try the registry table on a `find_node_modules
+   _package` miss; the walker's emission and CAS layout do
+   not change.
+4. **Test** (done): 35 new `entry_walk::tests` cases (164 lib
+   tests total, up from 129 after Phase 4) cover the
+   acceptance test (`ingest_walks_bare_import_into_separate
+   _compartment`) plus the scan grammar (default / named /
+   namespace / side-effect / re-export forms; dynamic
+   `import()` and `import.meta` exclusion; comment and string
+   skipping), the package-metadata reader (the four resolution
+   cascades), the resolver (relative / extension fall-back /
+   directory-index, bare / scoped / subpath, escape rejection,
+   missing-bare-specifier rejection), and the end-to-end walk
+   (transitive deps, shared-dep dedup, deterministic root hash
+   across runs).
 
 ## Design decisions
 

@@ -17,8 +17,13 @@
 //!                               # standalone archive runner (ZIP file)
 //!   endor run     [-e xs] <entry.js>
 //!                               # standalone runner for a single
-//!                               # entry-point source (no deps;
-//!                               # Phase 4 of `endor-run-expanded`).
+//!                               # entry-point source. Phase 4 of
+//!                               # `endor-run-expanded` handles the
+//!                               # no-dependency case; Phase 5
+//!                               # walks static `import` specifiers
+//!                               # through a sibling `node_modules`
+//!                               # tree into a multi-compartment
+//!                               # archive.
 //!
 //! The manager is hosted in-process by `endor daemon` on a
 //! dedicated `std::thread`; there is no separate `manager`
@@ -154,7 +159,9 @@ fn print_help() {
     eprintln!("  worker  [-e xs]                Run a supervised worker child");
     eprintln!("  run     [-e xs] <archive.zip>  Run a compartment-map ZIP archive");
     eprintln!("  run     [-e xs] <entry>        Run a single entry-point source");
-    eprintln!("                                 (no deps; .js, .mjs, .cjs, .json)");
+    eprintln!("                                 (.js, .mjs, .cjs, .json). Walks");
+    eprintln!("                                 sibling node_modules for static");
+    eprintln!("                                 import specifiers.");
     eprintln!("                                 Files without an extension that begin");
     eprintln!("                                 with the ZIP magic (PK\\x03\\x04) are");
     eprintln!("                                 also recognised as archives.");
@@ -230,11 +237,15 @@ fn print_subcommand_help(sub: &str) {
             eprintln!();
             eprintln!("<path> is one of:");
             eprintln!("  archive.zip   A compartment-map ZIP file (Phase 2).");
-            eprintln!("  entry.js      A single source file (Phase 4, no");
-            eprintln!("                dependencies). Synthesises a one-compartment");
-            eprintln!("                archive around the file and ingests it into");
-            eprintln!("                the CAS. Recognised extensions: .js, .mjs,");
-            eprintln!("                .cjs, .json.");
+            eprintln!("  entry.js      A single source file. With no static");
+            eprintln!("                imports, synthesises a one-compartment");
+            eprintln!("                archive (Phase 4). With one or more");
+            eprintln!("                `import`/`export ... from` specifiers,");
+            eprintln!("                walks the dependency graph (relative paths");
+            eprintln!("                within the entry directory, bare specifiers");
+            eprintln!("                resolved via sibling `node_modules`) into a");
+            eprintln!("                multi-compartment archive (Phase 5).");
+            eprintln!("                Recognised extensions: .js, .mjs, .cjs, .json.");
             eprintln!();
             eprintln!("Both forms ingest the contents into the CAS and execute the");
             eprintln!("loaded archive in an XS machine, printing the root hash to");
@@ -453,25 +464,46 @@ fn cmd_run_with_cas(archive_path: &std::path::Path) -> Result<(), EndoError> {
 }
 
 fn cmd_run_entry_point_with_cas(entry_path: &std::path::Path) -> Result<(), EndoError> {
-    // Phase 4 (no-dependencies) entry-point form. The synthetic
-    // single-compartment archive is ingested into a temporary
-    // CAS, the root hash is printed to stderr so the user can
-    // re-run via `endor run --cas <hash>`, and execution proceeds
-    // through the shared `run_xs_archive_loaded` path used by
-    // both ZIP and (on PR #278) directory forms.
+    // Phase 4 / Phase 5 entry-point form dispatch.
+    //
+    // Phase 4 handles the no-dependencies case via
+    // `ingest_entry_point` (synthetic one-compartment archive).
+    // Phase 5 (`endo::entry_walk::ingest_entry_point_with_deps`)
+    // handles entries with one or more static import specifiers
+    // by walking the dependency graph and emitting a
+    // multi-compartment archive.
+    //
+    // The dispatch reads the entry source once and routes to the
+    // walker only when a static import is present; entries with
+    // no imports stay on the (faster, simpler, more battle-tested)
+    // Phase 4 path so the regression surface for import-free runs
+    // is unchanged.
     let cas_dir = std::env::temp_dir().join("endor-cas");
     let cas = endo::cas::ContentStore::open(&cas_dir)
         .map_err(|e| EndoError::Config(format!("CAS open: {e}")))?;
+
+    let has_imports = match std::fs::read_to_string(entry_path) {
+        Ok(src) => !endo::entry_walk::scan_static_imports(&src)
+            .specifiers
+            .is_empty(),
+        // A binary or unreadable file routes to Phase 4, which
+        // will surface a `NotFound`/`InvalidData` consistent with
+        // the pre-Phase-5 behaviour.
+        Err(_) => false,
+    };
 
     // Match `cmd_run_with_cas`'s wrapping: the inner error from
     // `ingest_entry_point` already names the offending path
     // (`unsupported entry-point extension: /tmp/foo.txt`, `not a
     // regular file: /tmp/bar`), so the outer prefix only names
-    // the operation. Doubling the path produced the awkward
-    // `CAS ingest from /tmp/foo.txt: unsupported entry-point
-    // extension: /tmp/foo.txt` users saw before the fix.
-    let ingested = endo::cas_archive::ingest_entry_point(&cas, entry_path)
-        .map_err(|e| EndoError::Config(format!("CAS ingest: {e}")))?;
+    // the operation.
+    let ingested = if has_imports {
+        endo::entry_walk::ingest_entry_point_with_deps(&cas, entry_path)
+            .map_err(|e| EndoError::Config(format!("CAS ingest: {e}")))?
+    } else {
+        endo::cas_archive::ingest_entry_point(&cas, entry_path)
+            .map_err(|e| EndoError::Config(format!("CAS ingest: {e}")))?
+    };
 
     eprintln!("endor[run]: archive root {}", ingested.root_hash);
 

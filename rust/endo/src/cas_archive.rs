@@ -323,7 +323,7 @@ pub fn ingest_entry_point(cas: &ContentStore, entry_path: &Path) -> io::Result<I
 /// extension-to-form contract would silently diverge (the CLI
 /// would accept the input, then `ingest_entry_point` would reject
 /// it as `InvalidData`).
-fn parser_for_extension(ext: Option<&OsStr>) -> Option<&'static str> {
+pub(crate) fn parser_for_extension(ext: Option<&OsStr>) -> Option<&'static str> {
     let ext = ext?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "js" | "mjs" => Some("mjs"),
