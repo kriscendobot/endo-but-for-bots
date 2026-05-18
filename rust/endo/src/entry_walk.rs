@@ -1211,9 +1211,10 @@ impl<'a> Walker<'a> {
         spec: &str,
     ) -> io::Result<()> {
         let comp_root = {
-            let comp = self.compartments.get(compartment_id).ok_or_else(|| {
-                io::Error::other(format!("missing compartment {compartment_id}"))
-            })?;
+            let comp = self
+                .compartments
+                .get(compartment_id)
+                .ok_or_else(|| io::Error::other(format!("missing compartment {compartment_id}")))?;
             comp.root.clone()
         };
 
