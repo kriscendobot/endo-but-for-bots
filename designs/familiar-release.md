@@ -150,6 +150,8 @@ build:package` on a single CI host per target platform; the
 output `out/make/Familiar-<version>-<plat>-<arch>.zip` (and the
 DMG on macOS) is the artifact users download.
 The user installs the artifact and never needs Yarn.
+A builder pass wires the existing pipeline into a CI workflow
+(see Axis-2 followups).
 **Effort:** Day, if CI is willing to run the existing pipeline.
 The pipeline already exists; the missing step is automation.
 
@@ -207,7 +209,7 @@ script change to add `signtool` invocation under
 
 ### G4. Linux distribution shape
 
-**Severity:** Important (Linux).
+**Severity:** Important (Linux). Flatpak chosen; other formats deferred (resolved 2026-05-19).
 **Current:** `make-distributables.mjs` emits a `.zip`.
 A Linux user who unzips it gets a directory of files including
 the `Familiar` ELF binary, `chrome-sandbox` (which must be
@@ -215,20 +217,26 @@ the `Familiar` ELF binary, `chrome-sandbox` (which must be
 suid sandbox to work, otherwise Electron falls back to
 `--no-sandbox` or refuses to launch), and a tree of Chromium
 runtime files.
-**Target:** Ship at least one of `.AppImage`, `.deb`, `.rpm`,
-`.tar.gz`, or a Flatpak manifest, with documentation for the
+**Target:** Ship a Flatpak manifest, with documentation for the
 chrome-sandbox setup.
+A separate builder pass will propose the Flatpak pipeline (see
+Axis-2 followups).
+The other packaging systems (`.AppImage`, `.deb`, `.rpm`,
+`.tar.gz`) are deferred.
 The MVR position can defer downstream packaging and
 ship the existing `.zip` plus a brief README; the followups
-phase ships AppImage at minimum.
-**Effort:** Day for the README; week for AppImage; multi-week
-for `.deb`/`.rpm` if we want to host a repository.
+phase ships Flatpak.
+**Effort:** Day for the README; week for the Flatpak manifest
+(builder-dispatched).
 
 ### G5. Bundled Node binary version pin policy
 
 **Severity:** Important.
 **Current:** `scripts/download-node.mjs` defaults to
 `v20.18.1` (a string literal in the script).
+Node 20 is no longer the current LTS; per maintainer direction
+(2026-05-19) the pin needs to advance to a currently-supported
+LTS (Node 22 or 24).
 A vulnerability disclosure against Node 20.x or a Node EOL
 event has no documented response cadence.
 **Target:** A documented policy in the package README that
@@ -238,8 +246,15 @@ posture for external deps.
 The release engineer pins to the latest LTS in each release
 cycle and ships a security release if a CVE affecting the
 embedded Node lands.
+A builder pass advances the current pin to the working LTS
+(see Axis-2 followups).
+A gardener pass proposes an automated mechanism for sensing
+motion on the Node.js LTS supported-versions window and
+maintaining an upgrade PR (against this version and the CI
+matrix) as that window shifts (see Axis-2 followups).
 **Effort:** Day (write the policy and the release-cycle
-checklist).
+checklist); day for the LTS pin bump; multi-day for the
+gardener-designed motion-sensing mechanism.
 
 ### G6. Auto-update channel
 
@@ -273,11 +288,16 @@ resolution.
 The `package.json` has no `productName` or
 `CFBundleDisplayName`; the packager defaults to "Familiar"
 which is acceptable.
-**Effort:** Day.
+A builder pass improves the automation for projecting these
+file formats from the source icon (see Axis-2 followups).
+Where the projection is platform-specific, the built artifact
+may be checked in, with automation that runs in a CI
+environment using platform-specific tool kits to refresh it.
+**Effort:** Day for the projection automation (builder-dispatched).
 
 ### G8. The dev-mode `endo` CLI bundle is in the production runtime path
 
-**Severity:** Important.
+**Severity:** Important. Deferred for MVR (resolved 2026-05-19).
 **Current:**
 [`src/daemon-manager.js`](../packages/familiar/src/daemon-manager.js)
 calls `runEndoCommand(['stop'])` and `['purge']` from menu
@@ -291,6 +311,9 @@ second time inside `endo-cli.cjs`.
 A followup folds stop/purge into a direct CapTP message from
 the Electron main, removing the need to bundle the CLI in the
 production app.
+A builder pass implements the consolidated solution so the
+reviewable material exists (see Axis-2 followups), even though
+the consolidation itself is deferred past MVR.
 **Effort:** Day for the followup; zero for MVR.
 
 ### G9. ENDO_ADDR and gateway port collision
@@ -339,7 +362,7 @@ packaging story (tracked under
 
 ### G10. State directory shape on a fresh install
 
-**Severity:** Important.
+**Severity:** Deferred (resolved 2026-05-19).
 **Current:** The Familiar uses `@endo/where` to resolve
 `whereEndoState`, which on Linux is `~/.local/state/endo/`,
 on macOS `~/Library/Application Support/endo/`, on Windows
@@ -351,11 +374,15 @@ persists.
 **Target:** Acceptable for MVR.
 A first-run dialog could explain where state lives so the user
 can delete it after uninstall; defer to followups.
-**Effort:** Day for the dialog.
+Cleanup may fall out naturally from an uninstall hook in the
+platform-specific packaging once that lands, in which case the
+explicit dialog becomes unnecessary.
+**Effort:** Day for the dialog if pursued; zero if the
+packaging uninstall hook handles it.
 
 ### G11. LLM credential entry UX
 
-**Severity:** Important.
+**Severity:** Deferred (resolved 2026-05-19).
 **Current:** The user supplies their LLM provider host, model
 name, and auth token through a form sent to their inbox by the
 agent.
@@ -364,10 +391,9 @@ Chat UI honours the secret marker by masking the input.
 On submission, the value is stored in the daemon's CAS.
 **Target:** The MVR can ship this flow as-is; it is functional
 and user-tested by the maintainer.
-A followup adds an in-band "test connection" button on the
-form so the user gets a positive confirmation before the
-agent's first inference call.
-**Effort:** Zero for MVR; day for the followup test button.
+The follow-up "test connection" button is deferred.
+**Effort:** Zero for MVR; day for the followup test button if
+revisited.
 
 ### G12. Outbound network policy
 
@@ -397,8 +423,11 @@ There is no upload mechanism, no opt-in, and no UI for
 "submit logs".
 **Target:** For MVR, document the log locations in the README
 so a user can attach the file to a bug report.
-A followup adds an opt-in Sentry-style uploader.
-**Effort:** Day for the README; multi-week for the uploader.
+A followup adds an opt-in Sentry-style uploader; a designer
+pass fleshes out the opt-in telemetry / crash-reporting shape
+before any implementation work (see Axis-2 followups).
+**Effort:** Day for the README; multi-week for the uploader
+once the designer's shape is in hand.
 
 ### G14. Third-party license aggregation
 
@@ -414,7 +443,9 @@ included in the bundles via an `oss-attribution-generator`
 or `license-checker` step in `make-distributables.mjs`, and
 ship the result as `LICENSE.third-party.txt` next to the
 binary.
-**Effort:** Day.
+A builder pass implements the aggregation step (see Axis-2
+followups).
+**Effort:** Day (builder-dispatched).
 
 ### G15. macOS arm64 vs x64 build matrix
 
@@ -426,7 +457,10 @@ user needs `x64`.
 **Target:** The build runs on both architectures (or uses
 universal binaries via `@electron/universal`) and the
 distribution surface offers both.
-**Effort:** Day per CI host; multi-day for universal binaries.
+A builder pass lands the multi-arch matrix (see Axis-2
+followups).
+**Effort:** Day per CI host; multi-day for universal binaries
+(builder-dispatched).
 
 ### G16. Verify the Primer-into-CAS path in the packaged build
 
@@ -444,7 +478,9 @@ under a clean state directory, exercise the form, submit
 config, observe the Primer tree appearing in the host
 namespace and the worker loop receiving a `primer`
 reference.
-**Effort:** Day for the test scaffold.
+A builder pass adds the tests for this flow (see Axis-2
+followups).
+**Effort:** Day for the test scaffold (builder-dispatched).
 
 ## Primer-into-CAS migration
 
@@ -510,36 +546,38 @@ No developer tooling is touched on the user's machine.
 | Item | Resolves | Effort |
 |---|---|---|
 | Wire the existing build pipeline into a CI workflow that emits per-platform artifacts | G1 | day |
-| macOS Developer ID + notarization | G2 | multi-week (admin) |
 | Verify the Primer-into-CAS path in a packaged-build smoke test | G16 | day |
 | Aggregate third-party LICENSE notices into the bundle | G14 | day |
 | Document Node version pin policy in the package README | G5 | day |
+| Advance the bundled Node pin from v20.18.1 to a current LTS (22 or 24) | G5 | day |
 | Document log locations and state directory in the package README | G10, G13 | day |
 | Document the `127.0.0.1:8920` collision case in the README | G9 | day |
 | Confirm icon assets resolve on every target platform | G7 | day |
-| macOS arm64 build host (defer x64 until requested) | G15 (partial) | day |
+| Build CI pipeline producing releases for macOS arm64, macOS x64, and Linux x64 | G15 (full), G4 | multi-day |
 
-The MVR is macOS arm64 only.
-This is the maintainer's primary platform, the platform with the
-most stringent distribution requirements (notarization), and the
+The MVR coverage matrix widened (per Open Question 4's
+resolution) from "macOS arm64 alone" to macOS arm64, macOS x64,
+and Linux x64.
+macOS arm64 remains the maintainer's primary platform and the
 one that exercises every interesting code path in the build
-pipeline.
-A successful macOS release is the proof that the bundling story
-works.
+pipeline; the other two ride the same CI shape.
+macOS notarization is deferred (G2); early users on macOS unstick
+the Gatekeeper dialog with the documented `xattr` workaround.
+Windows is out of scope for MVR (G3).
 
 ### Followups (post-MVR, pre-Milestone-1-completion)
 
 | Item | Resolves | Effort |
 |---|---|---|
-| Linux AppImage (or `.deb`) | G4 | week |
-| Windows code signing (after EV cert acquisition) | G3 | multi-week (admin) |
-| Auto-update channel | G6 | multi-day |
+| Flatpak manifest for Linux | G4 | week |
 | First-run "test connection" on the LLM config form | G11 | day |
-| Fold stop/purge into Electron main; drop the bundled CLI | G8 | day |
+| Consolidated stop/purge via CapTP from Electron main (reviewable material; consolidation deferred past MVR) | G8 | day |
 | OS-assigned gateway port to dodge collisions with developer daemons | G9 | day |
-| First-run dialog explaining state-directory location for clean uninstall | G10 | day |
+| First-run dialog explaining state-directory location for clean uninstall (or rely on packaging uninstall hook) | G10 | day |
 | Universal macOS binary via `@electron/universal` | G15 | multi-day |
+| Designer pass to flesh out the opt-in telemetry / crash-reporting shape | G13 | designer dispatch |
 | Opt-in crash reporter | G13 | multi-week |
+| Gardener-designed Node LTS motion-sensing mechanism that maintains an upgrade PR as the LTS window shifts | G5 | gardener dispatch + multi-day |
 
 ### Out of scope for this release
 
@@ -553,7 +591,8 @@ works.
   ([`daemon-docker-selfhost`](daemon-docker-selfhost.md)) is
   Milestone 1.
 - The Endo Gateway split
-  ([`endo-gateway`](endo-gateway.md)) is multi-milestone.
+  ([`endo-gateway`](endo-gateway.md)) is multi-milestone; G9's
+  long-term shape aligns with that split.
 - Multi-agent provisioning (Familiar ships only `lal`; Fae,
   bundled in
   [`familiar-bundled-agents`](familiar-bundled-agents.md), is
@@ -595,31 +634,28 @@ answers are recorded inline below.
    project pursues notarization.
 
 3. **Versioning policy.**
-   `package.json` has `"version": "0.1.0"` and `"private": true`.
-   For the first downloadable build, do we bump to `0.2.0`,
-   `1.0.0-rc.1`, or stay at `0.1.0` and ship under "preview"?
-   Does the `private` flag stay in place (it does not block the
-   build) or do we publish a marker package to `npm` to claim
-   the name?
+   *Resolution (2026-05-19):* The Familiar package stays
+   `"private": true` and is never published to npm.
+   It is distributed only as a downloadable artifact (per question
+   1).
+   Whether the `"version"` field bumps from `0.1.0` to a richer
+   identifier on the first downloadable build is a follow-on
+   versioning question for the release engineer to decide; the
+   important constraint is that no npm publish step is added.
 
 4. **Operating-system coverage matrix for MVR.**
-   Is macOS arm64 alone sufficient for the preliminary release,
-   or does the maintainer want macOS x64 and Linux x64 in the
-   same drop?
-   Each additional target adds a CI host and an additional
-   testing surface.
+   *Resolution (2026-05-19):* Build the CI pipeline for producing
+   releases for all supported targets: macOS arm64, macOS x64, and
+   Linux x64.
+   The earlier draft's "arm64 alone" position is widened.
 
 5. **Bundled daemon vs. published `@endo/daemon` package.**
-   The Familiar today bundles the daemon at build time from
-   workspace source.
-   Should the released Familiar pin a published version of
-   `@endo/daemon` (and the related `@endo/cli`,
-   `@endo/lal`) so that release engineering can be done
-   without a fresh checkout?
-   The current shape (workspace bundling) is operationally
-   simpler and is the recommendation for MVR; the question is
-   whether the maintainer wants the npm-published shape on the
-   roadmap.
+   *Resolution (2026-05-19):* The daemon and the Familiar are
+   orthogonal concerns.
+   Eventually the project will publish the daemon and the Familiar
+   separately, and may also host Chat as a separate interface.
+   For MVR the current workspace-bundling shape stays; the
+   separation is a roadmap concern, not an MVR one.
 
 6. **Auto-update opt-in posture.**
    *Resolution (2026-05-19):* Defer auto-update entirely.
