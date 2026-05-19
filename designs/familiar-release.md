@@ -3,6 +3,7 @@
 | | |
 |---|---|
 | **Created** | 2026-05-12 |
+| **Updated** | 2026-05-19 (review pass: deferrals, scope tightening, gateway alignment, open-question resolutions) |
 | **Author** | Kris Kowal (prompted) |
 | **Status** | Proposed |
 | **Source** | Issue [#229](https://github.com/endojs/endo-but-for-bots/issues/229) |
@@ -154,7 +155,7 @@ The pipeline already exists; the missing step is automation.
 
 ### G2. macOS code signing and notarization
 
-**Severity:** Blocker (macOS).
+**Severity:** Deferred for MVR (resolved 2026-05-19).
 **Current:** `package-app.mjs` calls
 `@electron/packager` without `osxSign` or `osxNotarize` options.
 A user who downloads the resulting `.dmg` from a browser is
@@ -163,12 +164,20 @@ the developer" dialog and must `xattr -d com.apple.quarantine`
 the bundle by hand.
 A non-developer will not do this and will assume the app is
 broken.
-**Target:** The build runs `osxSign` with a Developer ID
+**Target:** The build eventually runs `osxSign` with a Developer ID
 Application certificate and `osxNotarize` against an Apple ID
 configured in the build environment; the DMG carries a notarized
 ticket that Gatekeeper accepts on a user's machine without
 prompts.
-**Effort:** Multi-day to multi-week, dominated by the
+**MVR resolution:** Skip the notarization integration for MVR.
+The early user pool is small enough to accept the manual
+`xattr -d com.apple.quarantine` workaround documented in the
+README.
+The certificate-acquisition process is tracked in a separate
+issue (see G3 for the parallel ask on Windows; the macOS issue
+covers the Developer ID Application certificate and the
+App Store Connect API key administratively).
+**Effort:** Multi-day to multi-week when undertaken, dominated by the
 administrative cost of obtaining a Developer ID and an App
 Store Connect API key, plus debugging the entitlements file
 that notarization will demand.
@@ -177,7 +186,7 @@ configuration, not code.
 
 ### G3. Windows code signing
 
-**Severity:** Important (Windows).
+**Severity:** Out of scope for MVR (resolved 2026-05-19).
 **Current:** No Windows signing.
 A user double-clicking `Familiar-<version>-win32-x64.zip` and the
 extracted `Familiar.exe` triggers SmartScreen's "unrecognised
@@ -185,10 +194,16 @@ publisher" dialog.
 **Target:** Sign the exe with an EV (or OV) certificate; the EV
 certificate yields immediate SmartScreen reputation, the OV
 certificate accumulates reputation over downloads.
-**Effort:** Multi-week, dominated by certificate acquisition (an
-EV cert ships on a hardware token); the in-tree script change to
-add `signtool` invocation under `make-distributables.mjs` is a
-day.
+**MVR resolution:** MVR targets macOS only; Windows signing is out
+of scope.
+The certificate-acquisition process is tracked in a separate
+issue (see Axis-2 followups) that records the steps for
+beginning the EV / OV certificate process so that a future
+maintainer can pick it up.
+**Effort:** Multi-week when undertaken, dominated by certificate
+acquisition (an EV cert ships on a hardware token); the in-tree
+script change to add `signtool` invocation under
+`make-distributables.mjs` is a day.
 
 ### G4. Linux distribution shape
 
@@ -228,16 +243,20 @@ checklist).
 
 ### G6. Auto-update channel
 
-**Severity:** Nice-to-have for MVR; important for sustained use.
+**Severity:** Out of scope (resolved 2026-05-19).
 **Current:** None.
 A user who installs Familiar 0.1.0 will still be running 0.1.0
 when 0.2.0 ships unless they re-download.
 **Target:** `electron-updater` against an S3 bucket (or GitHub
 Releases) with a public update manifest, signature-verified
 against the same code-signing certificate as G2/G3.
-**Effort:** Multi-day; signature verification depends on G2 and
-G3 being in place first.
-Defer to followups.
+**MVR resolution:** Defer auto-update entirely (see Open
+Question 6).
+Users re-download when a new release is announced; the GitHub
+Releases distribution channel (see Open Question 1) is the
+publication venue.
+**Effort:** Multi-day when revisited; signature verification
+depends on G2 and G3 being in place first.
 
 ### G7. Application icon and metadata for `assets/icon`
 
@@ -518,25 +537,39 @@ works.
   not in MVR scope).
 - The Chat UI's pending command, edit-message, and slot-slash
   features tracked under Milestone 4.
+- Auto-update (G6) is deferred entirely per the maintainer's
+  resolution of Open Question 6.
+- macOS code-signing and notarization (G2) are deferred for MVR
+  per the maintainer's 2026-05-19 directive; an issue tracks the
+  cert-acquisition admin work.
+- Windows code-signing (G3) is out of scope for MVR; an issue
+  tracks the EV / OV certificate-acquisition process.
 
 ## Open questions
 
-These need a maintainer decision before MVR work begins.
+These were the questions the original draft posed before MVR work
+began.
+The maintainer answered them in the 2026-05-19 review pass; the
+answers are recorded inline below.
 
 1. **Distribution channel.**
-   Does the project host the DMG on a `endojs.org` page, on
-   GitHub Releases under `endojs/endo-but-for-bots`, on
-   `endojs/endo`, or on a new `endojs/familiar` repo?
-   Each choice has implications for the auto-update channel
-   (G6) and for the public face of the release.
+   *Resolution (2026-05-19):* Post artifacts as GitHub releases on
+   `endojs/endo-but-for-bots`.
+   This implies two follow-on processes that are out of scope for
+   the release pipeline itself but on the roadmap for the surrounding
+   project: a ferrying process to copy the release artifacts to the
+   `endojs/endo` repository, and a process for proposing a PR on
+   `endojs/endo` that updates a document for deployment on
+   `docs.endojs.org`.
+   Carry-over to `endojs.org` is out of band.
 
 2. **Signing identity.**
-   Whose Developer ID Application certificate does the macOS
-   build use?
-   The Apple developer program is per-individual or per-team;
-   the certificate is the public key of the project's release
-   identity and binds the binary to the project's reputation.
-   This is the long-pole admin item.
+   *Resolution (2026-05-19):* A separate issue records the
+   instructions to set up the signing identity (see Axis-2
+   followups).
+   The macOS-side signing flow is itself deferred (see G2); the
+   issue stages the certificate-acquisition work for whenever the
+   project pursues notarization.
 
 3. **Versioning policy.**
    `package.json` has `"version": "0.1.0"` and `"private": true`.
@@ -566,13 +599,10 @@ These need a maintainer decision before MVR work begins.
    roadmap.
 
 6. **Auto-update opt-in posture.**
-   Auto-update is a security feature (a user who does not
-   update misses CVE fixes for the bundled Node, Electron, and
-   SDKs); it is also a privacy feature in reverse (the auto-
-   updater contacts a server on every launch).
-   Is opt-in (the user must enable updates) or opt-out (updates
-   are checked by default, the user may disable) the right
-   default?
+   *Resolution (2026-05-19):* Defer auto-update entirely.
+   G6 is moved to the Out-of-scope section above; the opt-in vs.
+   opt-out question is deferred until the project is ready to
+   pursue auto-update at all.
 
 ## References
 
