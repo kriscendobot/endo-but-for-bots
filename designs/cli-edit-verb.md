@@ -3,9 +3,46 @@
 | | |
 |---|---|
 | **Created** | 2026-05-08 |
+| **Updated** | 2026-05-18 |
 | **Author** | Kris Kowal (prompted) |
-| **Status** | Proposed |
+| **Status** | In Progress |
 | **Source** | PR [#153](https://github.com/endojs/endo-but-for-bots/pull/153) inline review comment [discussion_r3212462309](https://github.com/endojs/endo-but-for-bots/pull/153#discussion_r3212462309) on `designs/cli-store-verb-text-modes.md:403` |
+
+## Status
+
+The design landed via PR [#162](https://github.com/endojs/endo-but-for-bots/pull/162)
+(merged 2026-05-12) as a sibling to
+[`cli-store-verb-text-modes`](cli-store-verb-text-modes.md) (PR #153).
+
+Implementation is in progress, in phased form:
+
+- PR [#204](https://github.com/endojs/endo-but-for-bots/pull/204)
+  (`feat(cli,daemon): tentative endo edit verb impl (per design #162)
+  — surfaces design gaps`, closed 2026-05-11) was the tentative
+  builder probe that surfaced 14 design gaps by reducing the design
+  to code. Twelve of those gaps are resolved inline below
+  (see "Resolved during builder dispatch"); two remain in "Open
+  Questions surfaced by builder dispatch".
+- PR [#256](https://github.com/endojs/endo-but-for-bots/pull/256)
+  (`feat(daemon): hashline edit-patch skeleton (tracking
+  designs/cli-edit-verb.md)`, open) is the Phase 1 tracking PR. It
+  lands the wire-shape types (`EditPatch`, `EditOp`, `Anchor`,
+  `EditResult`, `EditFailure`, `AnchorMismatch`, `EditOptions`) in
+  `packages/daemon/src/` and the textual `hashline` parser /
+  `hashline-json` validator skeleton; the runtime bodies stub with
+  `not_implemented` until Phase 2 lands.
+- Phase 2 (daemon-side splice with mount-internal lock), Phase 3
+  (secondary `udiff` / `search-replace` formats), and Phase 4
+  (multi-file `editBatch`) are scheduled per the "Phase" sections
+  below; they land as follow-up PRs once Phase 1 merges and the two
+  remaining open questions are resolved.
+
+The `endo edit` CLI verb is the thin wrapper around the
+daemon-side `EndoGuest.edit` / `EndoDirectory.edit` capability; the
+daemon API is the load-bearing surface (it holds the mount-internal
+lock across the read-validate-splice-write critical section), and
+the CLI exists for human ergonomics. See "Design framing: agent
+tool-calls drive the daemon, not the CLI" below for the framing.
 
 ## What is the Problem Being Solved?
 
