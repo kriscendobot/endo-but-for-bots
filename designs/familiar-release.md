@@ -309,10 +309,33 @@ the daemon fail to start.
 **Target:** For MVR, document the collision case in the
 README; the Familiar already detects the existing-daemon
 case and joins the running daemon.
-For followups, change the gateway default to a per-user
-deterministic high port (or honour an `ENDO_ADDR` value of
-`127.0.0.1:0` and persist the OS-assigned port).
-**Effort:** Day for the README; day for the followup.
+For followups, align with the shared-host-gateway direction
+described in [`endo-gateway`](endo-gateway.md): the Familiar
+participates as a per-user daemon that connects to a
+host-wide Gateway service rather than terminating external
+HTTP itself.
+Package a gateway daemon (or system service) for Windows,
+macOS, and Linux that is consistent with each platform's local
+idioms for installing and running services; this would
+typically be installed by an administrator on behalf of all
+users.
+Provide a fallback for the single-user case: a Familiar-managed
+gateway listening on an ephemeral OS-assigned port (the
+existing `127.0.0.1:0` posture, with the assigned port
+persisted).
+The Familiar weblet story collapses to a single flavour:
+Familiar iframe weblets served through the custom protocol
+scheme (`localhttp://`) and HTTP virtual-host proxy on the
+shared gateway, per
+[`familiar-localhttp-protocol`](familiar-localhttp-protocol.md)
+and
+[`familiar-unified-weblet-server`](familiar-unified-weblet-server.md).
+The "weblet on a user-assigned localhost port" variant is no
+longer pursued.
+**Effort:** Day for the README; multi-day for the OS-assigned
+fallback; multi-week to multi-month for the host-wide Gateway
+packaging story (tracked under
+[`endo-gateway`](endo-gateway.md), out of MVR scope).
 
 ### G10. State directory shape on a fresh install
 
