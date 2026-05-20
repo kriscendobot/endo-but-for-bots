@@ -3,6 +3,13 @@
 *Last updated: 2026-05-20 (full grooming pass: milestone-totals reconciled to current table contents, calibration round 2026-05-20 added, Summary by Milestone and Gantt re-projected, Progress-as-of refreshed; landed on top of the 2026-05-19 status-only sweep that reconciled Status fields with shipped state on `llm`, M½ project-hygiene milestone extracted from M1, endopi raft added, PR #302 consolidation absorbed, and patterns-diagnostic-feedback added)*
 
 *Recently added or revised:
+[familiar-flatpak-pipeline](familiar-flatpak-pipeline.md) (added
+2026-05-19; Flatpak packaging pipeline for the Familiar Linux
+distribution: `org.freedesktop.Platform//24.08` runtime,
+`org.electronjs.Electron2.BaseApp` base, narrow `finish-args`,
+single-file `.flatpak` bundle attached to GitHub Releases;
+implements [`familiar-release.md`](familiar-release.md) G4
+followup),
 [patterns-diagnostic-feedback](patterns-diagnostic-feedback.md) (added
 2026-05-19, revised 2026-05-20; opt-in
 `@endo/patterns/explain-mismatch.js` submodule with a Rust-compiler-style
@@ -133,6 +140,7 @@ PR #151 row-format unblocker; sibling of
 | [familiar-chat-weblet-hosting](familiar-chat-weblet-hosting.md) | 2026-02-14 | 2026-02-26 | Not Started |
 | [familiar-daemon-bundling](familiar-daemon-bundling.md) | 2026-02-14 | 2026-03-05 | **Complete** |
 | [familiar-electron-shell](familiar-electron-shell.md) | 2026-02-14 | 2026-02-26 | **Complete** |
+| [familiar-flatpak-pipeline](familiar-flatpak-pipeline.md) | 2026-05-19 | 2026-05-19 | Proposed |
 | [familiar-gateway-migration](familiar-gateway-migration.md) | 2026-02-14 | 2026-02-26 | **Complete** |
 | [familiar-localhttp-protocol](familiar-localhttp-protocol.md) | 2026-02-24 | 2026-02-25 | In Progress (partially implemented) |
 | [familiar-unified-weblet-server](familiar-unified-weblet-server.md) | 2026-02-14 | 2026-05-06 | In Progress |
@@ -169,7 +177,7 @@ PR #151 row-format unblocker; sibling of
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 
-**Totals:** 39 Complete/Implemented, 18 In Progress, 36 Not Started, 15 Proposed, 2 Active, 6 Reference, 2 Deprecated, 1 Superseded (119 designs). Refreshed 2026-05-19 by a status-only sweep (consolidating the 2026-05-18 sweep with the 2026-05-19 batch update for 11 additional designs from closed PR #302) plus the patterns-diagnostic-feedback Proposed entry; the 12-design jump in Complete/Implemented over the 2026-05-08 snapshot reflects shipped work whose Status field had not previously been updated, not new completions in this pass; see the corresponding "## Status" sections in each design file for evidence pointers (commit SHA or PR number). Totals reflect the 11 design files added on `llm` since the sweep's branch point (the endopi raft of `endopi` + 8 `endopi-*` gap-closing designs plus `hardened-text-codecs-shim` and `hardened-url-shim`).
+**Totals:** 39 Complete/Implemented, 18 In Progress, 36 Not Started, 16 Proposed, 2 Active, 6 Reference, 2 Deprecated, 1 Superseded (120 designs). Refreshed 2026-05-19 by a status-only sweep (consolidating the 2026-05-18 sweep with the 2026-05-19 batch update for 11 additional designs from closed PR #302) plus the patterns-diagnostic-feedback Proposed entry; the 12-design jump in Complete/Implemented over the 2026-05-08 snapshot reflects shipped work whose Status field had not previously been updated, not new completions in this pass; see the corresponding "## Status" sections in each design file for evidence pointers (commit SHA or PR number). Totals reflect the 11 design files added on `llm` since the sweep's branch point (the endopi raft of `endopi` + 8 `endopi-*` gap-closing designs plus `hardened-text-codecs-shim` and `hardened-url-shim`).
 
 ## Roadmap
 
