@@ -230,6 +230,7 @@ LLM-agent stack).*
 | [chat-test-coverage](chat-test-coverage.md) | 2026-03-02 | 2026-03-02 | **Complete** |
 | [daemon-256-bit-identifiers](daemon-256-bit-identifiers.md) | 2026-02-24 | 2026-03-02 | **Complete** |
 | [daemon-agent-network-identity](daemon-agent-network-identity.md) | 2026-03-02 | 2026-03-02 | Not Started |
+| [daemon-ocapn-external-connectivity](daemon-ocapn-external-connectivity.md) | 2026-05-21 | 2026-05-21 | In Progress |
 | [daemon-agent-tools](daemon-agent-tools.md) | 2026-03-02 | 2026-07-13 | In Progress |
 | [daemon-commands-as-messages](daemon-commands-as-messages.md) | 2026-03-11 | 2026-03-11 | Not Started |
 | [daemon-capability-bank](daemon-capability-bank.md) | 2026-02-15 | 2026-02-24 | Not Started |
@@ -466,11 +467,16 @@ flowchart TD
         orev[ocapn-noise-cryptographic-review]
         onoise[ocapn-noise-network<br/><i>COMPLETE</i>]
         oreconn[ocapn-noise-session-reconnect]
+        docapn[daemon-ocapn-external-connectivity<br/><i>IN PROGRESS</i>]
         onet --> otcp --> onoise
         orev --> onoise
         dnet --> onoise
         onoise --> oreconn
         orev --> oreconn
+        onet --> docapn
+        onoise --> docapn
+        oreconn --> docapn
+        dnet --> docapn
     end
 
     subgraph Chat UX
@@ -723,6 +729,7 @@ finalized.
 | cbor-codec | Proposed | Shared canonical-CBOR primitive codec (`@endo/cbor`) extracted from `packages/ocapn/src/cbor` and PR #124's `packages/slots/src/cbor.js`; also serves the M11 `endor` slot-machine line; complement of the framing package `@endo/cbor-frame` (impl PR #288; proposed as `@endo/cbors`) |
 | ocapn-noise-cryptographic-review | Not Started | External review coordination |
 | daemon-agent-network-identity | Not Started | Per-agent keypairs for network identity |
+| daemon-ocapn-external-connectivity | In Progress | Daemon adopts `@endo/ocapn` for the daemon-to-daemon peer edge; retires the bespoke `EndoNetwork`/`EndoGreeter`/`RemoteControl` CapTP peer stack. Worker, CLI, and web-gateway edges stay CapTP. Satisfies the daemon-integration half of the M4 exit criterion (implementation in-flight: PRs #340, #684, #688, #693) |
 | ~~ocapn-noise-network~~ | **Complete** | Noise IK netlayer for OCapN landed via PR #137 (merged 2026-05-08), consolidating the stacked PRs #111 (CBOR codec) + #112 (Noise IK netlayer) + #113 (transport tests) |
 
 **Exit criterion:** Two Endo daemons can connect securely over
