@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@endo/bytes": "workspace:^",
+    "@endo/cbor-frame": "workspace:^",
     "@endo/eventual-send": "workspace:^",
     "@endo/harden": "workspace:^",
     "@endo/hex": "workspace:^",
