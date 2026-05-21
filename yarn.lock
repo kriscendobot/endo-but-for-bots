@@ -2504,7 +2504,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@endo/ocapn-noise@workspace:packages/ocapn-noise":
+"@endo/ocapn-noise@workspace:^, @endo/ocapn-noise@workspace:packages/ocapn-noise":
   version: 0.0.0-use.local
   resolution: "@endo/ocapn-noise@workspace:packages/ocapn-noise"
   dependencies:
