@@ -110,6 +110,7 @@ PR #151 row-format unblocker; sibling of
 | [familiar-electron-shell](familiar-electron-shell.md) | 2026-02-14 | 2026-02-26 | **Complete** |
 | [familiar-gateway-migration](familiar-gateway-migration.md) | 2026-02-14 | 2026-02-26 | **Complete** |
 | [familiar-localhttp-protocol](familiar-localhttp-protocol.md) | 2026-02-24 | 2026-02-25 | In Progress (partially implemented) |
+| [familiar-telemetry-crash-reporting](familiar-telemetry-crash-reporting.md) | 2026-05-19 | 2026-05-22 | Proposed |
 | [familiar-unified-weblet-server](familiar-unified-weblet-server.md) | 2026-02-14 | 2026-05-06 | In Progress |
 | [formula-inspector](formula-inspector.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [gateway-bearer-token-auth](gateway-bearer-token-auth.md) | 2026-03-02 | 2026-03-06 | **Implemented** |
@@ -141,7 +142,7 @@ PR #151 row-format unblocker; sibling of
 | [weblet-next](weblet-next.md) | 2026-03-24 | 2026-03-24 | Reference |
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 
-**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 9 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (104 designs)
+**Totals:** 27 Complete/Implemented, 15 In Progress, 43 Not Started, 10 Proposed, 3 Active, 3 Reference, 2 Deprecated, 1 Draft, 1 Superseded (105 designs)
 
 ## Roadmap
 
@@ -192,6 +193,7 @@ flowchart TD
         dci[daemon-checkin-checkout]
         dapp[daemon-weblet-application]
         exozip[exo-zip-package]
+        ftel[familiar-telemetry-crash-reporting<br/><i>PROPOSED</i>]
         fbund --> fweb --> fchat
         fweb --> dapp
         fchat --> dapp
@@ -199,6 +201,8 @@ flowchart TD
         dci --> dapp
         exozip --> dci
         exozip --> dapp
+        enetfetch --> ftel
+        lalfp --> ftel
     end
 
     subgraph Remote Access
@@ -418,6 +422,7 @@ webhook events.
 | retention-path-notation | Proposed | Canonical string notation for one path; bulk `listRetentionPaths(targetIds)` and `describeRetentionPaths(targetIds)`; row-format unblocker for `endo workers` (PR #151); sibling of daemon-retention-paths |
 | chat-view-edit-commands | Not Started | `/view` and `/edit` for blobs; Monaco editor, Markdown split preview |
 | chat-edit-message-ui | Not Started | `/edit` slash command, `e` focus shortcut, hover pencil for editing previously sent messages; revision-history panel |
+| familiar-telemetry-crash-reporting | Proposed | Three-pipeline (always-local logs / opt-in crash reports / opt-in usage telemetry deferred), preview-as-contract, `DiagnosticsUploader` exo after `endoclaw-network-fetch`'s allowlist pattern; closes [`familiar-release`](familiar-release.md) G13 |
 | lal-transcript-memory-management | Not Started | Durable transcript nodes outliving dismissed messages |
 
 **Exit criterion:** Chat UI feature-complete for current design scope.
@@ -652,6 +657,7 @@ Recalibrated on 2026-03-02 using observed velocity from 15 active work days
 | retention-path-notation | S-M | 3 days | 4 | Notation renderer + parser, bulk `describeRetentionPaths` host method, `endo workers` and chat tenant-chip integration; sibling of daemon-retention-paths |
 | chat-view-edit-commands | M | 4-6 days | 4 | `/view`, `/edit` modal, Monaco reuse, Markdown split preview (Phase 4) |
 | chat-edit-message-ui | S-M | 3 days | 4 | `/edit` command, `e` focus shortcut, hover pencil; design merged (PR #88); daemon impl in PR #125 forwarded under bot |
+| familiar-telemetry-crash-reporting | M-L | 1.5 weeks | 4 | Phase 1 (crash capture + log relocation + rotation) S-M; Phase 2 (redactor + `DiagnosticLogReader` + bundle assembler + preview pane) M; Phase 3 (uploader exo + consent surface + receiving service stand-up) M-L; Phase 4 (usage telemetry) gated and optional |
 | lal-transcript-memory-management | S | 1 day | 4 | Durable message-to-node mapping, broken chain detection |
 | ~~daemon-os-sandbox-plugin~~ | — | — | 5 | Superseded by `endo-posix-sandbox` |
 | endo-posix-sandbox | L-XL | 6-10 weeks remaining | 5 | Phases 0-1 shipped (bwrap on Linux); Phase 2 (podman) and Phase 3 (nested slices) in flight; Phases 1.5, 4, 6 ahead. Per-phase estimates pending PLAN backfill |
@@ -676,10 +682,10 @@ ready-to-merge and actually-merged for the in-flight backlog.
 | M1: Remote Access & Tools | 12 remaining | 8-10 weeks | 10-12 weeks |
 | M2: Networking | 7 | 4-5 weeks | 5-7 weeks |
 | M3: Weblets & Integrations | 9 | 5-7 weeks | 6-9 weeks |
-| M4: UX & Tooling | 12 | 8-11 weeks | 10-13 weeks |
+| M4: UX & Tooling | 13 | 8-11 weeks | 10-13 weeks |
 | M5: Confinement & Ecosystem | 6 active (1 superseded) | 14-20 weeks | 16-22 weeks |
 | M6: Rust Daemon (`endor`) | 2 | 12-17 weeks | 14-19 weeks |
-| **Total remaining** | **50** | **~51-70 weeks** | **~61-82 weeks** |
+| **Total remaining** | **51** | **~51-70 weeks** | **~61-82 weeks** |
 
 ### Timeline
 
