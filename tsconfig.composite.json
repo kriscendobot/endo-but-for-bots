@@ -132,6 +132,9 @@
       "path": "packages/promise-kit/tsconfig.composite.json"
     },
     {
+      "path": "packages/registry-capability/tsconfig.composite.json"
+    },
+    {
       "path": "packages/sandbox/tsconfig.composite.json"
     },
     {
