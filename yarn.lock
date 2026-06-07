@@ -1988,6 +1988,25 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@endo/exo-npm@workspace:packages/exo-npm":
+  version: 0.0.0-use.local
+  resolution: "@endo/exo-npm@workspace:packages/exo-npm"
+  dependencies:
+    "@endo/bytes": "workspace:^"
+    "@endo/errors": "workspace:^"
+    "@endo/exo": "workspace:^"
+    "@endo/far": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/mem-cas": "workspace:^"
+    "@endo/patterns": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
+    ava: "catalog:dev"
+    c8: "catalog:dev"
+    eslint: "catalog:dev"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
 "@endo/exo-stream@workspace:^, @endo/exo-stream@workspace:packages/exo-stream":
   version: 0.0.0-use.local
   resolution: "@endo/exo-stream@workspace:packages/exo-stream"
@@ -2388,6 +2407,22 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@endo/mem-cas@workspace:^, @endo/mem-cas@workspace:packages/mem-cas":
+  version: 0.0.0-use.local
+  resolution: "@endo/mem-cas@workspace:packages/mem-cas"
+  dependencies:
+    "@endo/bytes": "workspace:^"
+    "@endo/errors": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/patterns": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
+    ava: "catalog:dev"
+    c8: "catalog:dev"
+    eslint: "catalog:dev"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
 "@endo/memoize@workspace:packages/memoize":
   version: 0.0.0-use.local
   resolution: "@endo/memoize@workspace:packages/memoize"
@@ -2614,24 +2649,6 @@ __metadata:
   resolution: "@endo/promise-kit@workspace:packages/promise-kit"
   dependencies:
     "@endo/harden": "workspace:^"
-    ava: "catalog:dev"
-    c8: "catalog:dev"
-    eslint: "catalog:dev"
-    typescript: "catalog:dev"
-  languageName: unknown
-  linkType: soft
-
-"@endo/registry-capability@workspace:packages/registry-capability":
-  version: 0.0.0-use.local
-  resolution: "@endo/registry-capability@workspace:packages/registry-capability"
-  dependencies:
-    "@endo/bytes": "workspace:^"
-    "@endo/errors": "workspace:^"
-    "@endo/exo": "workspace:^"
-    "@endo/far": "workspace:^"
-    "@endo/init": "workspace:^"
-    "@endo/patterns": "workspace:^"
-    "@endo/ses-ava": "workspace:^"
     ava: "catalog:dev"
     c8: "catalog:dev"
     eslint: "catalog:dev"
