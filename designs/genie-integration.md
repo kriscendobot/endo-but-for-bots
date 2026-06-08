@@ -1,11 +1,11 @@
 # Genie Integration Survey
 
-| | |
-|---|---|
-| **Created** | 2026-05-02 |
-| **Updated** | 2026-05-02 |
-| **Author** | Kris Kowal (prompted) |
-| **Status** | Proposed |
+|             |                       |
+| ----------- | --------------------- |
+| **Created** | 2026-05-02            |
+| **Updated** | 2026-06-08            |
+| **Author**  | Kris Kowal (prompted) |
+| **Status**  | Proposed              |
 
 ## What is the Problem Being Solved?
 
@@ -317,73 +317,85 @@ The path-confinement story is genie's own `safePath()` — basically
 `vfs.resolve()` plus a null-byte check.
 This is exactly the problem `daemon-mount` was built to solve.
 
-### What it would mean to host this in the daemon
+### Stand the agent on its pet store
 
-Replace the workspace/VFS/FTS5 stack with three already-existing daemon
-primitives: **`Mount`** (or `ScratchMount`) for the file storage,
-**pet-name directories** for the namespace, and a new **`memory-index`
-formula** (or capability backed by the daemon's existing SQLite store)
-for the FTS5 layer.
+Per the maintainer's framing on this design's review: every agent in
+the daemon already has a pet store that can store values, hold
+formula references, and host nested directories.
+That is *sufficient* substrate for an agent's memory; backing it with
+an actual host filesystem is incidental rather than required.
+The right shape is to **stand the agent fully on the pet store**, a
+daemon-native typed namespace, rather than to graft the agent onto a
+physical filesystem through a `Mount`.
 
-Concretely:
+The pet store's primitive operations (`has`, `list`, `lookup`,
+`storeIdentifier`, `remove`, `rename`, plus the host's
+`storeValue` / `provideDirectory` / `provideMessageHub`) compose into
+a structured namespace.
+The chat-spaces design ([`chat-spaces-gutter.md`](chat-spaces-gutter.md))
+is the worked precedent: it encodes a *typed namespace* — spaces,
+inboxes, members — on top of the same untyped pet-store primitives,
+with no new daemon API.
+The same shape applies to agent memory.
 
-- The agent guest has a **`memory` pet name** that resolves to a
-  daemon-managed `ScratchMount` (no host-side path needed) or to a
-  `Mount` over a user-supplied directory if the agent should share
-  memory with on-disk files.
-  All `memoryGet`/`memorySet`/`memorySearch` calls go through that
-  capability instead of through `process.cwd()` and `node:fs`.
-  Path confinement, `..` clamping, symlink containment, and read-only
-  attenuation come from `Mount` for free — no `safePath()` to write or
-  audit.
-- **Pet-name structure** replaces the magic-filename layout.
-  Instead of "agents look for `memory/observations.md`", the observer
-  is granted a pet name `observations` that points to a single
-  writable file capability (a `MountFile` or a content-addressed
-  `ReadableBlob` written by `memorySet`).
-  The reflector gets `observations`, `reflections`, `profile` as
-  separate pet names with whatever attenuation we want
-  (read-only `observations`, write `reflections`).
-  The user (or a parent agent) controls the namespace; the sub-agents
-  see only what they were granted.
-- **Search** lives as a daemon-side `memory-index` capability
-  (proposed new formula type) that the agent can `subscribe` files to
-  via the same pattern as the existing `index` queue.
-  The daemon already ships `better-sqlite3` and a SQLite store
-  (`packages/daemon/src/sqlite-*.js`); the FTS5 virtual table can sit
-  alongside the daemon's existing tables instead of in a per-workspace
-  `memory-fts.db` file the agent can stomp on.
+Concretely, replace the workspace/VFS/FTS5 stack with three already
+existing daemon facilities and one small addition:
 
-### Example
+- **Memory is a sub-namespace of the agent's own pet store.**
+  Instead of "the agent's workspace directory contains
+  `memory/observations.md`", the agent's pet store contains
+  pet names `observations`, `reflections`, `profile`, each bound
+  through `storeValue` (for small structured values) or
+  `provideDirectory` (for grouped sub-namespaces).
+  Memory entries inherit the pet store's existing properties: GC
+  participation, cross-peer sync via `daemon-cross-peer-gc`,
+  rename/copy/remove without the agent noticing, and pet-name
+  validation already enforced by `pet-name.js`.
+  No magic-filename layout; no `safePath()` to audit; no off-fence
+  reach into `process.cwd()` and `node:fs`.
+- **Sub-agent attenuation by pet-name granting.**
+  The observer is granted a guest whose `introducedNames` map carries
+  *only* `observations` (writable).
+  The reflector is granted `observations` (read-only), `reflections`
+  (writable), `profile` (writable).
+  The main chat agent gets a read-only mirror of the same
+  sub-namespace.
+  The same enforcement the genie observer's `tool-gate.js` tries to
+  achieve at the prompt level happens at the capability boundary, by
+  not naming the names the sub-agent must not write.
+  This is the standard pet-name-granting pattern from
+  [`daemon-agent-tools.md`](daemon-agent-tools.md) (`endo grant fae
+  fs /home/user/project`), applied to memory rather than filesystem.
+- **Search lives as a daemon-side capability.**
+  Genie's FTS5 backend (`packages/genie/src/tools/fts5-backend.js`,
+  ~250 lines of `better-sqlite3` over a `<workspace>/memory-fts.db`
+  file) graduates into a daemon-side **memory-index capability** that
+  subscribes to changes in a pet store sub-namespace and maintains an
+  FTS5 virtual table alongside the daemon's existing SQLite tables.
+  The daemon already depends on `better-sqlite3`; no new platform
+  surface.
+  The capability is granted to the agent by pet name and follows the
+  recursive-attenuation discipline (granting an index on a narrowed
+  sub-namespace narrows what the agent can search).
 
-Today the genie daemon plugin spawns a guest like this
-(`main.js:923`):
+The shape under this rewrite — viewed from the daemon plugin that
+spawns the guest:
 
 ```js
-agentGuest = await E(hostAgent).provideGuest(agentName, {
+// On first spawn, the host (or a parent agent) prepares the namespace
+// directly in the agent's pet store; no Mount required.
+const agentGuest = await E(hostAgent).provideGuest(agentName, {
   agentName: profileName,
-  introducedNames: harden({ 'workspace-mount': 'workspace' }),
+  introducedNames: harden({}),
 });
-// ... sub-guest then calls makeMemoryTools({ root: workspaceDir }) directly,
-// reaching outside the daemon's capability fence to read/write files.
-```
-
-Under the proposal, the same guest would be set up as:
-
-```js
-// On first spawn, the host (or a parent agent) prepares the namespace:
-await E(hostAgent).provideScratchMount('main-genie-memory');
-await E(hostAgent).provideMemoryIndex('main-genie-memory-index', {
-  mount: 'main-genie-memory',
-});
-
-// The guest is granted just those two pet names:
-agentGuest = await E(hostAgent).provideGuest(agentName, {
-  agentName: profileName,
-  introducedNames: harden({
-    'main-genie-memory': 'memory',
-    'main-genie-memory-index': 'memory-index',
-  }),
+await E(agentGuest).makeDirectory('memory');
+await E(agentGuest).storeValue('', ['memory', 'observations.md']);
+await E(agentGuest).storeValue('', ['memory', 'reflections.md']);
+await E(agentGuest).storeValue('', ['memory', 'profile.md']);
+// The memory-index capability subscribes to the 'memory' sub-namespace.
+await E(hostAgent).provideMemoryIndex(['memory-index'], {
+  namespace: agentGuest,
+  path: ['memory'],
 });
 ```
 
@@ -393,11 +405,10 @@ The genie code that today reads:
 const result = await memoryGet.execute({ path: 'memory/observations.md' });
 ```
 
-becomes:
+becomes a single pet-store lookup on the agent's own namespace:
 
 ```js
-const memory = await E(powers).lookup('memory');
-const text = await E(memory).readText(['observations.md']);
+const text = await E(powers).lookup('memory', 'observations.md');
 ```
 
 and `memorySearch` becomes:
@@ -407,49 +418,66 @@ const index = await E(powers).lookup('memory-index');
 const hits = await E(index).search('user preferences', { limit: 5 });
 ```
 
-The observer can be granted a *narrowed* `memory` capability that only
-permits writes to `observations.md` (a `MountFile` capability) while
-the main chat agent gets the read-only `Mount.snapshot()` of memory —
-the same enforcement the genie observer's `tool-gate.js` tries to
-achieve at the prompt level can now be done at the capability boundary.
-
 ### What this respects from the daemon CLAUDE.md
 
-- **Disk before graph** — `provideScratchMount` and the proposed
-  `provideMemoryIndex` follow the existing `formulateMount` pattern:
-  the formula is written to disk before the in-memory graph entry.
-  No new lifecycle to design.
-- **Pet-name semantics** — the introduced-name path is the same
-  one `daemon-mount.md` Phase 5 already implements.
-  `memory` is a pet name; `memory-index` is a pet name; both can be
-  renamed, copied, or removed by the host without the agent noticing.
-- **Special names off-limits** — the namespace is plain pet names
-  (no `@`-prefix), matching the introducedNames rule from the daemon
-  CLAUDE.md.
-- **Mount semantics** — `Mount.has`, `list`, `lookup`, `readText`,
-  `writeText`, `remove`, `move`, `makeDirectory`, `readOnly`,
-  `snapshot` cover everything `memoryGet`/`memorySet` need.
-  The only gap is that `Mount` works on individual files; a "fetch
-  lines N..M" helper would need to be added either to `Mount` or to a
-  thin agent-side adapter.
+- **Pet-name semantics.** Memory entries are plain pet names
+  (lowercase, matching `pet-name.js`'s validator).
+  Renames, copies, and removes are first-class operations on memory,
+  not file-rename hacks.
+- **Special names off-limits.** The memory namespace is plain pet
+  names (no `@`-prefix), matching the `introducedNames` rule.
+- **Disk-before-graph.** `storeValue` / `provideDirectory` /
+  `provideMemoryIndex` all follow the existing formula lifecycle:
+  the formula is written to disk before the in-memory graph entry,
+  per the daemon's [§ Formula Lifecycle](../../packages/daemon/CLAUDE.md)
+  norm.
+- **No ambient authority.** The agent reaches memory only through
+  granted pet names; nothing in its namespace points at host paths,
+  so no path-traversal class of bug arises and `safePath()` retires
+  with `VFS`.
 
-### Open question on storage shape
+### Open Questions
 
-There is a tension between "memory is markdown files an agent
-edits in-place" (the current model) and "memory is a structured store
-that the daemon owns and the agent manipulates through capabilities"
-(the daemon-native model).
-A pure daemon-native version might use `ReadableBlob`s (immutable,
-content-addressed) for each observation snapshot, with a directory of
-the latest version per topic.
-That respects daemon GC and cross-peer sync (`daemon-cross-peer-gc` is
-complete and would Just Work) but means the agent sees a different
-shape than "edit observations.md".
-For the first cut, **stick with `ScratchMount` and let memory be live
-markdown files** so the agent's mental model from
-`packages/genie/workspace_template/MEMORY.md` etc. doesn't change.
-Move to blob-per-snapshot in a later phase if cross-peer memory
-mirroring becomes interesting.
+- **Pure pet-store-as-memory vs. `ScratchMount` over the pet store.**
+  The pet-store-as-typed-namespace shape above is the recommended
+  default per the maintainer's framing and the chat-spaces precedent.
+  An alternative shape would keep the markdown-as-files model and
+  back it with a `ScratchMount` (a daemon-managed scratch directory)
+  whose entries the agent edits in place; `MEMORY.md`, `HEARTBEAT.md`,
+  and the `memory/*.md` layout would continue to exist as on-disk
+  files.
+  The trade-off: pure pet-store gives the agent first-class memory
+  primitives (rename, attenuation by sub-namespace, structured values
+  beyond markdown) but breaks continuity with
+  `packages/genie/workspace_template/MEMORY.md` and the agent's
+  mental model of "edit a markdown file"; `ScratchMount` preserves
+  that mental model but reintroduces a filesystem the agent must
+  reason about and the daemon must enforce confinement over.
+  This question is decision-level and the design defers to the
+  maintainer; the implementation phase picks one of the two shapes
+  based on the resolution.
+- **Markdown-bag-of-files vs. blob-per-snapshot.** Whichever shape
+  wins above, observation / reflection / profile entries can be
+  stored either as a single file the agent edits in place (bag-of-files)
+  or as a sequence of immutable `ReadableBlob`s with a per-topic
+  directory of the latest version (blob-per-snapshot).
+  Blob-per-snapshot is the daemon-native answer, respects daemon GC,
+  and would Just Work under cross-peer sync; bag-of-files matches
+  the agent's current mental model and is one less migration to
+  perform.
+  Starting with bag-of-files is the pragmatic choice and forecloses
+  no future move to blobs.
+- **Memory-index subscription shape.** The memory-index capability
+  needs a way to be notified when its watched sub-namespace changes,
+  so the FTS5 index stays in sync without polling.
+  The pet store already exposes `followNameChanges` /
+  `followIdNameChanges`; the index should compose on top of those
+  rather than introducing a new subscription primitive.
+  Whether the index is owned by the daemon (a new formula type) or
+  by an agent the host grants (sharing the daemon's
+  `better-sqlite3` dependency through `@endo/sqlite-store` or
+  equivalent) is the granularity question the implementation phase
+  resolves.
 
 ## 3. Scheduling
 
@@ -480,84 +508,42 @@ endoclaw-timer Phase 0 — no resolve/reschedule, no missed-tick
 coalescing, no per-tick deadline, no `IntervalControl` host facet, no
 pause/resume.
 
-### Reframing as daemon formulas
+### Reframing as a daemon `scheduler` capability
 
-The genie interval scheduler should land as a richer `interval-scheduler`
-formula type in the daemon, supplanting (or generalising) the existing
-`timer` formula:
+The genie interval scheduler should land as a richer daemon-side
+**scheduler** capability that supplants (or generalises) the existing
+`timer` formula.
+Per the maintainer's framing on this design's review the capability
+is named **scheduler** rather than the prototype's *interval-scheduler*
+label, to keep the user-facing name short and the namespace consistent
+with the rest of the daemon-capability-bank family.
 
-- **Formula type:** `interval-scheduler`.
-  Persisted entry shape mirrors the existing `IntervalEntry` typedef.
-  Each individual interval is itself a per-formula entry rather than a
-  shared scheduler — or, more naturally, the scheduler is a single
-  formula that owns multiple labeled intervals and exposes them through
-  pet names.
-  The latter matches genie's current `IntervalSchedulerFacet` /
-  `IntervalControlFacet` split and is the right shape for a host-managed
-  resource.
-- **Host method:** `provideIntervalScheduler(petName, opts)` returns a
-  scheduler capability.
-  `IntervalControl` (pause, resume, revoke, setMaxActive,
-  setMinPeriodMs) is retained by the host; the scheduler facet is
-  granted via pet name to a guest.
-- **Tick delivery:** The genie prototype delivers ticks through an
-  `onTick` callback today and then bridges to mail with a side-channel
-  `pendingHeartbeatTicks` map.
-  The daemon-native version should deliver each tick directly as a
-  `type: 'package'` message to a configurable recipient — by default
-  the holder of the scheduler capability.
-  The `tickResponse.resolve()` / `reschedule()` map onto an
-  `E(scheduler).resolveTick(tickId)` /
-  `E(scheduler).rescheduleTick(tickId)` round-trip, eliminating the
-  side-channel map entirely.
-- **Persistence:** lives in the daemon's existing state directory
-  (likely a new SQLite table or a per-formula JSON file alongside the
-  formula itself), not a `persistDir` argument the agent has to supply.
-  Restart recovery (replay missed ticks) and the existing
-  `withFormulaGraphLock` pattern are already established.
-- **Capability narrowing:** the agent doesn't see "the scheduler"; it
-  sees a pet name like `daily-reflect` whose value is an
-  `IntervalHandle` for a single pre-configured interval that fires once
-  a day with a specific label.
-  This is the **principle-of-least-authority** angle: a host can grant
-  an agent the right to *be told once a day* without granting the right
-  to create or cancel arbitrary intervals.
-  Today `setInterval` would let an agent burn the host's CPU; a granted
-  `IntervalHandle` cannot.
+The detail — formula shape, host facet vs. guest facet, tick delivery
+as daemon mail, persistence layout, capability narrowing via per-pet-
+name `Interval` handles, the `serial-jobs`-backed coalescing mode that
+retires genie's hand-rolled `drainPendingHeartbeats`, and the security
+considerations that fall out of granting a single `Interval` rather
+than the whole scheduler — lives in the dedicated sibling design at
+[`scheduler.md`](scheduler.md).
+That design also names the precise relationship to the existing
+`designs/endoclaw-timer.md` prototype (Phase-1 in `packages/genie/src/interval/`)
+and to the existing `timer` formula type.
 
 ### What lal and fae get
 
-Both gain the ability to schedule:
+Both gain the ability to schedule, by holding a granted `Interval`
+capability:
 
 - A **heartbeat** equivalent — daily summary, periodic context refresh.
 - **Idle observation** — fae's `replyTracker.sent` fallback could be
   paired with a "no message in 5 minutes → run memory consolidation"
   scheduled task.
 - **Cross-agent triggers** — a parent agent can schedule a child by
-  granting it an `IntervalHandle` whose ticks fire into the child's
-  inbox.
+  granting it an `Interval` capability whose ticks fire into the
+  child's inbox.
 
-### Subordinate use case: `serial-jobs`
-
-The daemon already uses `serial-jobs` (`packages/daemon/src/serial-jobs.js`,
-imported in `daemon.js` and `mail.js`) as an internal task queue.
-Genie's heartbeat coalescing logic in `runAgentLoop`
-(`drainPendingHeartbeats` etc.) is essentially a hand-rolled
-single-consumer serial-jobs queue.
-A daemon-hosted `interval-scheduler` formula could expose a
-"coalescing on" mode that internally uses `serial-jobs` to ensure at
-most one tick is in flight per label, eliminating that code from genie
-entirely.
-
-### Is this `serve-private-path` territory?
-
-`serve-private-path` is the daemon's UNIX-socket CapTP server, not a
-job-scheduling primitive — it does not apply directly to scheduling.
-Including it in the prompt was a slight category error.
-The relevant primitives are `timer` (existing, simple) and
-`serial-jobs` (existing, internal); the proposal here is to upgrade
-`timer` into a proper `interval-scheduler` modelled on the genie
-prototype.
+Granular shape and security considerations are in
+[`scheduler.md`](scheduler.md).
 
 ## 4. Other Components — Integrate / Share / Leave / Retire
 
@@ -613,37 +599,42 @@ Estimate: **M**, ~3–5 days; the bulk is verifying behavioral parity
 across the four lal providers.
 Blocked on Phase 1.
 
-**Phase 3: Graduate `interval-scheduler` into the daemon.**
-Per `designs/endoclaw-timer.md`: extend the existing `timer` formula
-(or add a new `interval-scheduler` formula) with the resolve/reschedule
-semantics, missed-tick coalescing, and host-controlled limits from the
-genie prototype.
-Add `provideIntervalScheduler` to `HostInterface`.
-Switch genie's `runHeartbeatTicker` to use the daemon scheduler;
-delete the per-agent `intervalsDir` persistence.
+**Phase 3: Graduate the scheduler into the daemon.**
+Per [`scheduler.md`](scheduler.md): land the `scheduler` formula
+type with resolve / reschedule semantics, missed-tick coalescing,
+start-to-start timing, host-controlled limits, and tick delivery as
+daemon mail per [`daemon-value-message.md`](daemon-value-message.md).
+Add `makeScheduler` to `HostInterface`.
+Switch genie's heartbeat to use the daemon scheduler;
+delete the per-agent `intervalsDir` persistence and the
+`drainPendingHeartbeats` coalescing code (the scheduler's
+`serial-jobs`-backed coalescing replaces it).
 Blocked on the engine extraction only insofar as the heartbeat code
 calls into the engine — independent in terms of the daemon work.
 Estimate: **M-L**, ~1 week, mostly daemon plumbing and
 formula-type integration tests.
 
-**Phase 4: Move memory to `Mount` + `memory-index`.**
-Replace `safePath`+`VFS` in `tools/memory.js` with calls to a granted
-`Mount` capability.
-Add a new `memory-index` formula type that wraps the FTS5 backend in a
-daemon exo.
-Update the genie plugin to provision a `ScratchMount` and a
-`memory-index` per agent at spawn time.
-Sub-agents (observer, reflector) receive narrowed memory capabilities
-via `introducedNames`.
-Blocked on **Phase 4 of `daemon-mount`** (sub-mounts and `snapshot()`)
-because narrowing observer to "writes only `observations.md`" is most
-naturally a sub-mount.
-Estimate: **L**, ~1–1.5 weeks.
+**Phase 4: Move memory onto the agent's pet store.**
+Per § 2 above: stand the agent fully on its pet store as a typed
+namespace, retiring `safePath` / `VFS` in `tools/memory.js`.
+Replace `vfs-node.js` / `vfs-memory.js` with calls into the agent's
+own pet store via the host's `storeValue` / `provideDirectory`
+primitives.
+Add the memory-index capability (a daemon-side exo over
+`better-sqlite3` that subscribes to a pet-store sub-namespace via
+`followNameChanges`).
+Update the genie plugin to provision the memory sub-namespace and the
+memory-index per agent at spawn time, granting sub-agents (observer,
+reflector) narrowed pet-name slices via `introducedNames`.
+Resolution of the *pet-store vs. `ScratchMount`* trade-off in § 2 Open
+Questions selects between this shape and the original `Mount`-backed
+shape; the rest of the rollout is the same.
+Estimate: **L**, ~1–1.5 weeks (under either resolution).
 
 **Phase 5: Make scheduling capabilities granular.**
 Once Phase 3 ships, change the genie plugin to grant each agent a
-*scoped* `IntervalHandle` (a single named interval) rather than an
-arbitrary `IntervalScheduler`.
+*scoped* `Interval` (a single named interval) rather than an
+arbitrary `Scheduler`.
 Lal and fae start using the same primitives — first for memory
 consolidation, then for whatever proactive behaviour their agent
 authors want.
@@ -670,24 +661,16 @@ Estimate: **S**, ~1 day.
   **I am guessing about pi's stability** — a quick survey of recent
   pi-ai releases would inform this.
 
-- **Should `interval-scheduler` replace the existing `timer` formula
-  or live alongside it?**
-  The existing timer is used by host code that hasn't been audited as
-  part of this design.
-  Conservative answer: add `interval-scheduler` as a new formula type;
-  deprecate `timer` once nothing depends on it.
-  More aggressive: extend `timer` itself.
-
-- **Markdown-bag-in-mount vs. blob-per-snapshot for memory.**
-  Phase 4 picks bag-in-mount for continuity with how agents already
-  think about memory.
-  But bag-in-mount means every memory edit replaces the whole file —
-  bad for cross-peer GC, bad for per-snapshot retention, and bad for
-  audit.
-  Blob-per-snapshot is the daemon-native answer and it would be
-  cleaner.
-  **Flagging this as a contentious call**: starting with bag-in-mount
-  is the pragmatic choice but it forecloses no future move to blobs.
+- **Memory and scheduling open questions live on the sibling designs.**
+  The trade-offs around memory storage shape (pet-store-as-typed-
+  namespace vs. `ScratchMount`, markdown-bag-of-files vs. blob-per-
+  snapshot, memory-index subscription shape) are owned by § 2 above.
+  The trade-offs around the scheduler (whether to replace or extend
+  the existing `timer` formula, per-`Interval` `setPeriod` ceilings,
+  tick-message envelope shape, whether the whole `Scheduler` is
+  grantable) are owned by [`scheduler.md`](scheduler.md) § Open
+  Questions.
+  This document defers to those.
 
 - **The observer/reflector are thin sub-agents that read the main
   agent's `state.messages` directly.**
@@ -704,15 +687,6 @@ Estimate: **S**, ~1 day.
   engine requires teaching the engine about per-tool middleware (or
   doing the post-processing in the harness loop).
   Either is fine; the choice between them is contentious.
-
-- **Granting an agent a single `IntervalHandle` instead of a full
-  scheduler is a real capability narrowing only if the agent cannot
-  request more intervals from the daemon.**
-  Today the daemon's `formulateTimer` is exposed via `HostInterface`,
-  and a guest who reaches the host (e.g. via `@host`) can ask for one.
-  The narrowing is meaningful only inside the agent's own pet-store —
-  which is the right answer per the daemon's existing capability
-  model, but worth being explicit about.
 
 - **`web-fetch` and `web-search` overlap with `endoclaw-network-fetch`
   (M1).**

@@ -1,13 +1,27 @@
 # EndoClaw: Core Heartbeat Scheduler
 
-|             |                            |
-|-------------|----------------------------|
-| **Created** | 2026-03-03                 |
-| **Updated** | 2026-03-18                 |
-| **Author**  | Kris Kowal (prompted)      |
-| **Author**  | Joshua T Corbin (evolving) |
-| **Status**  | In Progress                |
-| **Parent**  | [endoclaw](endoclaw.md)    |
+|                  |                                  |
+|------------------|----------------------------------|
+| **Created**      | 2026-03-03                       |
+| **Updated**      | 2026-06-08                       |
+| **Author**       | Kris Kowal (prompted)            |
+| **Author**       | Joshua T Corbin (evolving)       |
+| **Status**       | In Progress                      |
+| **Parent**       | [endoclaw](endoclaw.md)          |
+| **Superseded by**| [scheduler](scheduler.md)        |
+
+> Phase 1 of this design shipped as a prototype in
+> `packages/genie/src/interval/`.
+> The daemon-side graduation is the
+> [scheduler](scheduler.md) capability proposed via PR #89; that
+> design carries forward this document's § Capability Shape,
+> § Resolve/Reschedule Semantics, § Start-to-Start Timing,
+> § Persistence, § Pause and Resume, § Revocation, and § Design
+> Decisions verbatim, and adds the daemon-side integration shape
+> (tick delivery as mail, `serial-jobs`-backed coalescing,
+> capability narrowing by per-`Interval` pet-name granting, host
+> facet / guest facet split per the daemon-capability-bank's six
+> Design Principles).
 
 ## Status
 
