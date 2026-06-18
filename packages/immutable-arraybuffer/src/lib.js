@@ -853,7 +853,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [predicate]
+   * @param {Function} predicate
    * @param {any} [thisArg]
    * @returns {boolean}
    */
@@ -877,7 +877,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [predicate]
+   * @param {Function} predicate
    * @param {any} [thisArg]
    * @returns {any}
    */
@@ -886,7 +886,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [predicate]
+   * @param {Function} predicate
    * @param {any} [thisArg]
    * @returns {number}
    */
@@ -898,7 +898,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [predicate]
+   * @param {Function} predicate
    * @param {any} [thisArg]
    * @returns {any}
    */
@@ -915,7 +915,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [predicate]
+   * @param {Function} predicate
    * @param {any} [thisArg]
    * @returns {number}
    */
@@ -932,7 +932,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [callback]
+   * @param {Function} callback
    * @param {any} [thisArg]
    * @returns {void}
    */
@@ -995,7 +995,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [callback]
+   * @param {Function} callback
    * @param {any} [thisArg]
    * @returns {object}
    */
@@ -1004,7 +1004,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [callback]
+   * @param {Function} callback
    * @param {any} [initialValue]
    * @returns {any}
    */
@@ -1017,7 +1017,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [callback]
+   * @param {Function} callback
    * @param {any} [initialValue]
    * @returns {any}
    */
@@ -1039,7 +1039,7 @@ export const freezableTypedArrayLibProperties = {
   },
   /**
    * @this {object}
-   * @param {Function} [predicate]
+   * @param {Function} predicate
    * @param {any} [thisArg]
    * @returns {boolean}
    */
