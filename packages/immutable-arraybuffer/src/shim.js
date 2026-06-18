@@ -8,15 +8,20 @@ import {
 } from './lib.js';
 
 // eslint-disable-next-line no-restricted-globals
-const { ArrayBuffer, Object } = globalThis;
+const {
+  ArrayBuffer,
+  Object,
+  Reflect,
+} = globalThis;
+
 
 const {
   getOwnPropertyDescriptors,
   defineProperties,
   defineProperty,
   getPrototypeOf,
-  entries,
 } = Object;
+const { ownKeys } = Reflect;
 const { prototype: arrayBufferPrototype } = ArrayBuffer;
 
 // Stage-3 install policy: detect-then-skip.
@@ -72,9 +77,13 @@ if (!('sliceToImmutable' in arrayBufferPrototype)) {
   // `writable: true` for data descriptors) so the install matches the
   // shape of the native %TypedArrayPrototype% methods.
   const libDescs = getOwnPropertyDescriptors(freezableTypedArrayLibProperties);
+  // Use `Reflect.ownKeys` rather than `Object.entries` so that Symbol-keyed
+  // properties (specifically `[Symbol.iterator]`) are included. `Object.entries`
+  // silently skips symbol keys; `ownKeys` covers both string and symbol keys.
   /** @type {PropertyDescriptorMap} */
   const configurableDescs = {};
-  for (const [key, desc] of entries(libDescs)) {
+  for (const key of ownKeys(libDescs)) {
+    const desc = libDescs[key];
     const reopened = { ...desc, configurable: true };
     if ('value' in reopened) {
       reopened.writable = true;
@@ -85,7 +94,7 @@ if (!('sliceToImmutable' in arrayBufferPrototype)) {
 
   // Replace each of the eleven concrete global TypedArray constructors with
   // the pseudo-constructor produced by the lib. The pseudo-constructor
-  // discriminates on `hiddenBuffers` brand membership and falls through to
+  // discriminates on `buffers` brand membership and falls through to
   // the genuine constructor for all other call shapes.
   for (const { name, Ctor } of concreteTypedArrayCtors) {
     const PseudoCtor = makePseudoTypedArrayConstructor(Ctor);
