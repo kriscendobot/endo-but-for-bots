@@ -282,3 +282,61 @@ test('intersectRankCovers (covers, compare?) signature', t => {
   // Empty intersection returns identity element ['', '{']
   t.deepEqual(intersectRankCovers(harden([])), ['', '{']);
 });
+
+// Constructs a byteArray pass-style value (a hardened frozen `Uint8Array`
+// backed by an immutable `ArrayBuffer`) from a list of byte values. On the
+// emulated `@endo/immutable-arraybuffer` path this wrapper has no
+// integer-indexed own properties, so a direct `wrapper[i]` read returns
+// `undefined`; `compareRank` must read its bytes through an amplified
+// path. See `@endo/bytes/compare.js`.
+const byteArrayOf = bytes => {
+  const ab = new ArrayBuffer(bytes.length);
+  new Uint8Array(ab).set(bytes);
+  return harden(new Uint8Array(ab.sliceToImmutable()));
+};
+
+test('compareRank orders byteArrays by shortlex, reading bytes correctly', t => {
+  // Equal length, differ only in their bytes: this case exercises the
+  // per-byte comparison, which a direct-integer-index read (broken on the
+  // emulated immutable-arraybuffer path, where `wrapper[i]` is `undefined`)
+  // would collapse to a spurious tie.
+  const a = byteArrayOf([0x10, 0x20, 0x30]);
+  const b = byteArrayOf([0x10, 0x20, 0x31]);
+  t.is(compareRank(a, b), -1, 'a < b on a later differing byte');
+  t.is(compareRank(b, a), 1, 'antisymmetric');
+  t.is(compareRank(a, a), 0, 'reflexive on equal contents');
+
+  // A distinct wrapper with byte-for-byte equal contents must tie.
+  const aAgain = byteArrayOf([0x10, 0x20, 0x30]);
+  t.is(
+    compareRank(a, aAgain),
+    0,
+    'equal contents tie across distinct wrappers',
+  );
+
+  // Differ in the first byte.
+  const c = byteArrayOf([0x00, 0xff, 0xff]);
+  const d = byteArrayOf([0x01, 0x00, 0x00]);
+  t.is(compareRank(c, d), -1, 'compares lexicographically among equal length');
+
+  // Shortlex: the shorter byteArray sorts first even when its bytes are
+  // larger, so the length pre-check must dominate the lexicographic order.
+  const short = byteArrayOf([0xff]);
+  const long = byteArrayOf([0x00, 0x00]);
+  t.is(compareRank(short, long), -1, 'shorter sorts first (shortlex)');
+  t.is(compareRank(long, short), 1, 'antisymmetric across lengths');
+
+  // Empty byteArray sorts before any non-empty one.
+  const empty = byteArrayOf([]);
+  t.is(compareRank(empty, a), -1, 'empty sorts first');
+  t.is(compareRank(empty, empty), 0, 'empty ties itself');
+
+  // A fully rank-sorted sequence stays sorted under compareRank: empty
+  // (len 0), short (len 1), long (len 2), then the three len-3 byteArrays
+  // in lexicographic order.
+  const sorted = harden([empty, short, long, c, a, b]);
+  t.true(
+    isRankSorted(sorted, compareRank),
+    'shortlex order is internally consistent',
+  );
+});

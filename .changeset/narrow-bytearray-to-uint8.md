@@ -83,8 +83,13 @@ encoding and decoding that are aware of the byteArray passable form:
   `ArrayBufferView` to a string, throwing on malformed sequences.
 
 `@endo/marshal`: the byteArray rank-compare's `ArrayBuffer.prototype`
-dispatch arm becomes dead code and is removed; values arrive as
-`Uint8Array` and are read via the integer-indexed protocol directly.
+dispatch arm becomes dead code and is removed. Values arrive as a frozen
+`Uint8Array` backed by an immutable `ArrayBuffer`. On the emulated
+`@endo/immutable-arraybuffer` path such a wrapper has no integer-indexed
+own properties, so the bytes are read by first copying each wrapper into
+a genuine mutable `Uint8Array` (via `slice`, which the shim amplifies)
+and then delegating the equal-length lexicographic comparison to
+`@endo/bytes`'s `compareBytes`, deduplicating the byte-comparison loop.
 
 `@endo/patterns`: the `byteArray` matcher's `TypeFromPattern` and
 `getMatcherKind` types resolve to `Uint8Array` (was `ArrayBuffer`).

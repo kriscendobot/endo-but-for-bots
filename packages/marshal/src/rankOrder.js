@@ -2,6 +2,7 @@ import harden from '@endo/harden';
 import { getEnvironmentOption as getenv } from '@endo/env-options';
 import { Fail, q } from '@endo/errors';
 import { getTag, passStyleOf, nameForPassableSymbol } from '@endo/pass-style';
+import { compareBytes } from '@endo/bytes/compare.js';
 import {
   passStylePrefixes,
   recordNames,
@@ -295,24 +296,22 @@ export const makeComparatorKit = (compareRemotables = (_x, _y) => NaN) => {
         }
 
         // The byteArray pass style is a frozen Uint8Array backed by an
-        // immutable ArrayBuffer; the values arrive here already in that
-        // shape and can be read directly via the integer-indexed
-        // protocol (the prototype-chain amplifier on the emulated path,
-        // the integer-indexed exotic on the native path). No copy is
-        // required.
-        const leftArray = /** @type {Uint8Array} */ (left);
-        const rightArray = /** @type {Uint8Array} */ (right);
-        for (let i = 0; i < leftLen; i += 1) {
-          const leftByte = leftArray[i];
-          const rightByte = rightArray[i];
-          if (leftByte < rightByte) {
-            return -1;
-          }
-          if (leftByte > rightByte) {
-            return 1;
-          }
-        }
-        return 0;
+        // immutable ArrayBuffer. On the emulated
+        // `@endo/immutable-arraybuffer` path the wrapper is a plain object
+        // with no integer-indexed own properties, so a direct `array[i]`
+        // read returns `undefined` rather than the byte: emulated frozen
+        // Uint8Arrays do not have integer-index behavior. `compareBytes`
+        // (and any other byte reader) needs genuine integer-indexable
+        // Uint8Arrays, so first copy each wrapper into a fresh mutable
+        // Uint8Array via `slice`, which the shim amplifies (and which is a
+        // genuine no-amplification copy on the native path). `slice(0)`
+        // honors the wrapper's own [0, length) window regardless of any
+        // `byteOffset`. The lengths are already known equal here, so the
+        // lexicographic `compareBytes` agrees with the shortlex order the
+        // length pre-check established. See `@endo/bytes/compare.js`.
+        const leftArray = /** @type {Uint8Array} */ (left).slice(0);
+        const rightArray = /** @type {Uint8Array} */ (right).slice(0);
+        return compareBytes(leftArray, rightArray);
       }
       case 'tagged': {
         // Lexicographic by `[Symbol.toStringTag]` then `.payload`.

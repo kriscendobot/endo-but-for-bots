@@ -42,6 +42,7 @@
   },
   "homepage": "https://github.com/endojs/endo#readme",
   "dependencies": {
+    "@endo/bytes": "workspace:^",
     "@endo/common": "workspace:^",
     "@endo/env-options": "workspace:^",
     "@endo/errors": "workspace:^",
