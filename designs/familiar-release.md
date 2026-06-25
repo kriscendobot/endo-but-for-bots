@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Created** | 2026-05-12 |
-| **Updated** | 2026-05-19 (review pass: deferrals, scope tightening, gateway alignment, open-question resolutions) |
+| **Updated** | 2026-06-25 (added the macOS CI verification plan for the assumed-working chain, per review) |
 | **Author** | Kris Kowal (prompted) |
 | **Status** | Proposed |
 | **Source** | Issue [#229](https://github.com/endojs/endo-but-for-bots/issues/229) |
@@ -480,6 +480,10 @@ namespace and the worker loop receiving a `primer`
 reference.
 A builder pass adds the tests for this flow (see Axis-2
 followups).
+The concrete CI mechanism (tiers, assertions, mock gateway, and
+macOS-runner hazards) is in the
+[Verifying the assumed-working chain in CI (macOS)](#verifying-the-assumed-working-chain-in-ci-macos)
+section.
 **Effort:** Day for the test scaffold (builder-dispatched).
 
 ## Primer-into-CAS migration
@@ -532,6 +536,145 @@ first form submission.
 The setup script need not change.
 The agent need not change.
 The bundle script need not change.
+
+## Verifying the assumed-working chain in CI (macOS)
+
+The "What works today (assumed)" list above is a set of
+unverified runtime claims.
+The maintainer has asked for a plan to verify them in CI,
+specifically on the macOS environment.
+This section turns each assumption into a concrete CI check and
+names the macOS-runner hazards the plan must design around.
+
+### What already runs on macOS CI
+
+`familiar-release.yml` already builds the bundles and chat dist
+on `ubuntu-latest`, then runs a `make` matrix whose macOS cells
+are `macos-14` (darwin arm64, the MVR primary) and `macos-13`
+(darwin x64).
+Those cells download the matching embedded Node binary, prepare
+the package, and produce a `.dmg`.
+That proves the *build* half of G1 and G15 on real macOS runners,
+but only that the artifact packages.
+It says nothing about whether the packaged app *runs*: the
+workflow fires only on `workflow_dispatch` and `familiar-v*`
+tags, and it never launches the result.
+The seven assumptions are runtime claims, so the plan adds a
+runtime tier on top of the existing build tier.
+
+### Three verification tiers
+
+The assumptions split by how much of the stack each one needs,
+so the plan is tiered from cheapest and most deterministic to
+most expensive and most display-dependent.
+
+**Tier 0: build smoke (extends what exists).**
+Promote a build-only job to per-PR CI, path-filtered to
+`packages/familiar/**`, `packages/lal/**`, and
+`packages/daemon/**`, running on `macos-14`.
+It runs the existing bundle, download, prepare, and make steps
+and asserts the `.app` and `.dmg` are produced.
+This catches a familiar-touching PR that breaks packaging on
+macOS arm64 without waiting for a release tag.
+It covers no runtime assumption on its own; it is the
+precondition the next two tiers build on.
+
+**Tier 1: headless daemon smoke (the deterministic core).**
+Six of the seven assumptions are daemon-level and need no
+window.
+Launch the packaged daemon bundle under the embedded Node binary
+from the Tier-0 `.app`, against a clean state directory, and
+drive the form path through the daemon's CapTP API instead of the
+Chat renderer.
+Point the agent at an in-process mock LLM gateway (see below) so
+no live credentials or public network sit in the assertion path.
+One assertion per assumption:
+
+| Assumption | CI assertion |
+|---|---|
+| Bundled daemon spawns under embedded Node | the daemon process starts under the bundled `node` and answers on its endpoint |
+| `lal` setup provisions the manager guest | `setup.js` `main(host)` completes and the manager guest resolves |
+| Agent sends a config form to the host inbox | a form message appears in the host inbox |
+| (stand-in for) user fills the form in Chat | submit the form over CapTP with the mock gateway's host, model, and token |
+| Agent stores the Primer as a `readable-tree` in CAS | `E(host).identify('lal-primer')` resolves to a readable-tree |
+| Each spawned worker loop receives a `primer` reference | a spawned worker guest has a `primer` reference |
+
+This is G16 made concrete and given a macOS runner.
+It is deterministic (no display, no live model) and is the tier
+worth gating per-PR, because it covers six assumptions at once.
+
+**Tier 2: GUI launch smoke (the one display-bound claim).**
+Only "the Electron app launches" needs the real window, plus the
+renderer reaching `localhttp://` and the navigation guard
+holding.
+macOS runners expose a WindowServer, so unlike headless Linux
+(which needs `xvfb`) the packaged `.app` can launch with a real
+window.
+Drive it with Playwright's Electron runner
+(`_electron.launch({ executablePath: <binary inside the .app> })`),
+asserting the `BrowserWindow` opens, the renderer reaches its
+`localhttp://` ready state, and an off-origin navigation is
+rejected by the guard.
+Tier 2 is slower and more display-dependent, so it runs on
+`familiar-release.yml` after `make` and on a nightly schedule,
+not on the per-PR gate, until its flake rate is measured.
+
+### The mock LLM gateway
+
+The form provisioning
+([`lal-fae-form-provisioning`](lal-fae-form-provisioning.md))
+points the agent at an LLM provider host, model, and token.
+The CI stand-in for "the user points it at a provider" is a tiny
+HTTP server bound to `127.0.0.1` that speaks the minimal provider
+surface the agent needs to complete one turn (or replays a
+recorded fixture).
+Injecting its address as the form's host keeps the assertion path
+off the public network and fully deterministic, which is what
+makes Tier 1 gate-able.
+
+### macOS-runner hazards the plan must design around
+
+The macOS runners have documented failure modes that would make a
+naive smoke flaky or unusable.
+
+1. **The corepack yarn DNS flake is a hard precondition.**
+   The investigation under
+   [issue #260](https://github.com/endojs/endo-but-for-bots/issues/260)
+   found that the dominant macOS-CI failure is not a test flake
+   but `getaddrinfo ENOTFOUND repo.yarnpkg.com` during corepack's
+   `yarn@4.13.0` auto-download, at roughly eight percent of macOS
+   jobs, aborting before any familiar code runs.
+   The smoke is only meaningful once the canonical fix lands:
+   vendor `.yarn/releases/yarn-4.13.0.cjs` and set `yarnPath` in
+   `.yarnrc.yml` so corepack never fetches.
+   This is a blocking dependency of the smoke, optionally with a
+   setup-step retry as belt and suspenders.
+2. **The embedded-Node arch must match the runner.**
+   `macos-14` is arm64 and `macos-13` is x64; the smoke downloads
+   and prepares the `darwin-<arch>` Node that matches its runner,
+   as the existing `make` matrix already does through
+   `TARGET_ARCH`.
+3. **Gatekeeper and quarantine.**
+   Notarization (G2) is deferred, but the smoke does not need it:
+   it launches the locally-built binary inside the `.app`
+   directly, not the `.dmg` and not through `open`, so there is
+   no `com.apple.quarantine` attribute and no Gatekeeper prompt.
+4. **Flake budget.**
+   Keep the mock gateway in-process so no external network is in
+   the assertion path, wrap the network-touching setup steps in a
+   retry, and hold Tier 2 non-blocking until its flake rate is
+   measured against the Tier-1 baseline.
+
+### Where this lands in the plan
+
+Tier 0 and Tier 1 are the per-PR macOS gate and resolve G16 with
+a concrete mechanism, so they join the MVR list.
+Tier 2 and the broader cross-platform launch matrix ride the
+release workflow and a nightly schedule, so they sit in
+followups.
+The yarn-vendoring precondition (hazard 1) is a blocking
+dependency that should land before the smoke is gated, so a flake
+in CI infrastructure is not charged to the familiar smoke.
 
 ## Phased plan
 
