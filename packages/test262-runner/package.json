@@ -47,6 +47,24 @@
     "extends": [
       "plugin:@endo/internal"
     ],
+    "overrides": [
+      {
+        "files": [
+          "scripts/node-prelude-header.js"
+        ],
+        "env": {
+          "node": true
+        },
+        "rules": {
+          "no-var": "off",
+          "vars-on-top": "off",
+          "prefer-const": "off",
+          "no-plusplus": "off",
+          "no-empty-function": "off",
+          "no-underscore-dangle": "off"
+        }
+      }
+    ],
     "ignorePatterns": [
       "prelude/"
     ]
