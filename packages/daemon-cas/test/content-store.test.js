@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import crypto from 'node:crypto';
+import { Buffer } from 'node:buffer';
 
 import { makeContentStore } from '../src/content-store.js';
 
@@ -174,6 +175,10 @@ test('store then fetch round-trips the same bytes', async t => {
 
   const blob = store.fetch(sha);
   t.is(await blob.text(), 'hello, content store');
+  const stream = /** @type {any} */ (blob.streamBase64());
+  const first = await stream.next();
+  t.is(first.value, Buffer.from(payload).toString('base64'));
+  t.false(first.done);
 });
 
 test('store concatenates multi-chunk streams before hashing', async t => {
@@ -345,7 +350,7 @@ test('fetch surfaces size, range reads, and a byte reader', async t => {
 
   // `size` and `readRange` are optional on the platform `ReadableBlob`
   // type; the filesystem-backed store always provides them.
-  const { size, readRange, makeFileReader } = blob;
+  const { size, readRange, makeFileReader } = /** @type {any} */ (blob);
   if (!size || !readRange) {
     t.fail('filesystem content store must surface size and readRange');
     return;

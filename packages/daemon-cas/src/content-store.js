@@ -2,6 +2,7 @@
 /// <reference types="ses"/>
 
 import harden from '@endo/harden';
+import { makeReaderRef } from '@endo/platform/fs/lite';
 
 /** @import { ContentStore } from '@endo/platform/fs/lite/types' */
 /** @import { ContentStoreOptions } from '../types.js' */
@@ -66,6 +67,7 @@ export const makeContentStore = options => {
     fetch(sha256) {
       const storagePath = filePowers.joinPath(storageDirectoryPath, sha256);
       const makeFileReader = () => filePowers.makeFileReader(storagePath);
+      const streamBase64 = () => makeReaderRef(makeFileReader());
       const text = async () => filePowers.readFileText(storagePath);
       const json = async () => {
         await null;
@@ -82,7 +84,14 @@ export const makeContentStore = options => {
       // requested `[offset, offset + length)` window leaves disk.
       const readRange = (offset, length) =>
         filePowers.readFileRange(storagePath, offset, length);
-      return harden({ makeFileReader, text, json, size, readRange });
+      return harden({
+        streamBase64,
+        text,
+        json,
+        makeFileReader,
+        size,
+        readRange,
+      });
     },
     /**
      * @param {string} sha256
