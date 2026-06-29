@@ -52,7 +52,7 @@ The four-method `ContentStore` contract this package implements
 | Method | Signature | Notes |
 |--------|-----------|-------|
 | `store` | `(readable) => Promise<string>` | Streams to a temp file, hashes as bytes land, atomically renames to the sha256 hex name. |
-| `fetch` | `(sha256) => ReadableBlob` | Returns `{ makeFileReader, text, json, size, readRange }` over the blob: a whole-blob byte reader, decoded text and JSON, the blob's byte length (`bigint`), and a windowed `(offset, length)` range read. |
+| `fetch` | `(sha256) => ReadableBlob` | Returns `{ streamBase64, text, json }` over the blob, matching the current platform `ReadableBlob` shape. |
 | `has` | `(sha256) => Promise<boolean>` | Probes by attempting a read. |
 | `remove` | `(sha256) => Promise<void>` | Idempotent: removing a missing blob is not an error. |
 

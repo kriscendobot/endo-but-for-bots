@@ -31,14 +31,17 @@ const makeFilePowers = () => {
   return harden({
     makeFileReader(p) {
       // Returns an async iterator that yields Uint8Array chunks.  The
-      // CAS exposes this directly through `fetch().makeFileReader`; we
-      // shape it as a minimal stream-shaped reader.
+      // CAS wraps this through `fetch().streamBase64`; we shape it as
+      // a minimal stream-shaped reader.
       const stream = fs.createReadStream(p);
       const iterator = stream[Symbol.asyncIterator]();
       return /** @type {any} */ (
         harden({
           next: () => iterator.next(),
           return: value => iterator.return && iterator.return(value),
+          [Symbol.asyncIterator]() {
+            return this;
+          },
         })
       );
     },
@@ -66,31 +69,6 @@ const makeFilePowers = () => {
     },
     async readFileText(p) {
       return fs.promises.readFile(p, 'utf-8');
-    },
-    async readFileRange(p, offset, length) {
-      const handle = await fs.promises.open(p, 'r');
-      try {
-        const buffer = new Uint8Array(length);
-        const { bytesRead } = await handle.read(buffer, 0, length, offset);
-        return buffer.subarray(0, bytesRead);
-      } finally {
-        await handle.close();
-      }
-    },
-    async statPath(p) {
-      const stat = await fs.promises.stat(p, { bigint: true });
-      let kind = /** @type {'file' | 'directory' | 'symlink'} */ ('file');
-      if (stat.isDirectory()) {
-        kind = 'directory';
-      } else if (stat.isSymbolicLink()) {
-        kind = 'symlink';
-      }
-      return harden({
-        kind,
-        size: stat.size,
-        mtime: stat.mtimeNs,
-        atime: stat.atimeNs,
-      });
     },
     async makePath(p) {
       await fs.promises.mkdir(p, { recursive: true });
@@ -330,55 +308,6 @@ test('store on Windows-style path: joinPath is the only path primitive', async t
   await store.remove(sha);
   // store, fetch, has, remove each call joinPath at least once.
   t.true(joinCalls >= 4);
-});
-
-test('fetch surfaces size, range reads, and a byte reader', async t => {
-  // The blob handle returned by `fetch` exposes the range-I/O surface
-  // the daemon's `EndoBlob` relies on: `size` (a bigint byte count),
-  // `readRange` (a windowed read that only touches the requested
-  // span), and `makeFileReader` (a whole-blob byte stream).
-  const storageDirectoryPath = await makeTemporaryDirectory(t);
-  const store = makeContentStore({
-    filePowers: makeFilePowers(),
-    cryptoPowers: makeCryptoPowers(),
-    storageDirectoryPath,
-  });
-
-  const payload = encoder.encode('content store range reads');
-  const sha = await store.store(asAsyncIterable([payload]));
-  const blob = store.fetch(sha);
-
-  // `size` and `readRange` are optional on the platform `ReadableBlob`
-  // type; the filesystem-backed store always provides them.
-  const { size, readRange, makeFileReader } = /** @type {any} */ (blob);
-  if (!size || !readRange) {
-    t.fail('filesystem content store must surface size and readRange');
-    return;
-  }
-
-  t.is(await size(), BigInt(payload.length), 'size is the byte length');
-
-  // A window in the middle of the blob: bytes [8, 13) spell "store".
-  const window = await readRange(8, 5);
-  t.is(new TextDecoder().decode(window), 'store');
-
-  // A range clamped past the end returns only the bytes that exist.
-  const tail = await readRange(payload.length - 5, 100);
-  t.is(new TextDecoder().decode(tail), 'reads');
-
-  // makeFileReader streams the whole blob back; drive the reader by
-  // hand so the test only depends on the `next`/`return` surface of
-  // the `ContentStoreReader` contract.
-  const reader = makeFileReader();
-  const decoder = new TextDecoder();
-  let joined = '';
-  let result = await reader.next();
-  while (!result.done) {
-    joined += decoder.decode(result.value);
-    // eslint-disable-next-line no-await-in-loop
-    result = await reader.next();
-  }
-  t.is(joined, 'content store range reads');
 });
 
 // Suppress unused-import linting on the Node-only globals when the

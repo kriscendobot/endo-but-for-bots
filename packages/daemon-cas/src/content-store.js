@@ -67,31 +67,18 @@ export const makeContentStore = options => {
     fetch(sha256) {
       const storagePath = filePowers.joinPath(storageDirectoryPath, sha256);
       const makeFileReader = () => filePowers.makeFileReader(storagePath);
-      const streamBase64 = () => makeReaderRef(makeFileReader());
+      const streamBase64 = () =>
+        makeReaderRef(
+          harden({
+            [Symbol.asyncIterator]: () => makeFileReader(),
+          }),
+        );
       const text = async () => filePowers.readFileText(storagePath);
       const json = async () => {
         await null;
         return JSON.parse(await text());
       };
-      // Byte length of the stored blob (bigint) — the `size` half of the
-      // content-addressed `getInfo()` triple, and the clamp bound for
-      // range reads.
-      const size = async () => {
-        await null;
-        return (await filePowers.statPath(storagePath)).size;
-      };
-      // Windowed read for `BlobRef.fetch`-style range access: only the
-      // requested `[offset, offset + length)` window leaves disk.
-      const readRange = (offset, length) =>
-        filePowers.readFileRange(storagePath, offset, length);
-      return harden({
-        streamBase64,
-        text,
-        json,
-        makeFileReader,
-        size,
-        readRange,
-      });
+      return harden({ streamBase64, text, json });
     },
     /**
      * @param {string} sha256

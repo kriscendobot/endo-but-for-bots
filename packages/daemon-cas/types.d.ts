@@ -10,10 +10,10 @@
 // the daemon's formula GC depends on.
 
 /**
- * Byte reader handed back by `fetch().makeFileReader`.  This is the
- * `@endo/stream` `Reader<Uint8Array>` the platform `ReadableBlob`
- * contract requires; aliased here so the rest of this declaration file
- * reads in package-local terms.
+ * Byte reader supplied by the host file powers.  The content store
+ * wraps this in `fetch().streamBase64()` to satisfy the platform
+ * `ReadableBlob` contract; aliased here so the rest of this
+ * declaration file reads in package-local terms.
  */
 export type ContentStoreReader = import('@endo/stream').Reader<Uint8Array>;
 
@@ -36,21 +36,10 @@ export interface ContentStoreFilePowers {
   makeFileReader(path: string): ContentStoreReader;
   makeFileWriter(path: string): ContentStoreWriter;
   readFileText(path: string): Promise<string>;
-  readFileRange(
-    path: string,
-    offset: number,
-    length: number,
-  ): Promise<Uint8Array>;
   makePath(path: string): Promise<void>;
   joinPath(...components: string[]): string;
   renamePath(source: string, target: string): Promise<void>;
   removePath(path: string): Promise<void>;
-  statPath(path: string): Promise<{
-    kind: 'file' | 'directory' | 'symlink';
-    size: bigint;
-    mtime: bigint;
-    atime: bigint;
-  }>;
 }
 
 /**
