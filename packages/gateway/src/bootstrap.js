@@ -66,7 +66,6 @@ const RegistrationInterface = M.interface('GatewayRegistration', {
   listWeblets: M.call().returns(M.promise()),
   listPublicKeys: M.call().returns(M.promise()),
 });
-harden(RegistrationInterface);
 
 const GatewayBootstrapInterface = M.interface('GatewayBootstrap', {
   challenge: M.call().returns(M.promise()),
@@ -75,7 +74,6 @@ const GatewayBootstrapInterface = M.interface('GatewayBootstrap', {
   getBindAddress: M.call().returns(M.promise()),
   getApps: M.call().returns(M.promise()),
 });
-harden(GatewayBootstrapInterface);
 
 /**
  * @typedef {object} ChallengePayload The shape returned to a caller
