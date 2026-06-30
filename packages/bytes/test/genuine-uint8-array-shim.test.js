@@ -97,7 +97,10 @@ test('the captured toStringTag getter still rejects the emulated wrapper', t => 
   // returns `undefined`, not `'Uint8Array'`. A genuine array still tags
   // correctly.
   t.is(apply(getTypedArrayToStringTag, frozen, []), undefined);
-  t.is(apply(getTypedArrayToStringTag, new Uint8Array([1, 2, 3]), []), 'Uint8Array');
+  t.is(
+    apply(getTypedArrayToStringTag, new Uint8Array([1, 2, 3]), []),
+    'Uint8Array',
+  );
 });
 
 test('assertGenuineUint8Array rejects a real shim-emulated frozen Uint8Array', t => {
