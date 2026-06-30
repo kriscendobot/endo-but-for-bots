@@ -42,6 +42,7 @@
   },
   "devDependencies": {
     "@endo/eventual-send": "workspace:^",
+    "@endo/immutable-arraybuffer": "workspace:^",
     "@endo/init": "workspace:^",
     "@endo/ses-ava": "workspace:^",
     "ava": "catalog:dev",
