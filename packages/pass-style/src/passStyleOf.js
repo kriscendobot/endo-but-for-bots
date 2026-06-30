@@ -144,8 +144,25 @@ const makePassStyleOf = passStyleHelpers => {
     };
 
     const passStyleOfInternal = inner => {
-      const typestr = typeof inner;
+      // `document.all` is the only known value for which `typeof` returns
+      // `'undefined'` even though the value is actually an object (it has the
+      // [[IsHTMLDDA]] internal slot). It is `== null` (loose equality) but
+      // neither `=== null` nor `=== undefined`. We classify it as `'object'`
+      // so the object branch can reject it (it is not frozen and cannot be
+      // frozen) rather than mis-classifying it as the primitive `undefined`.
+      let typestr;
+      if (inner != null) {
+        typestr = typeof inner;
+      } else if (inner === null) {
+        typestr = 'null';
+      } else if (inner === undefined) {
+        typestr = 'undefined';
+      } else {
+        // probably document.all
+        typestr = 'object';
+      }
       switch (typestr) {
+        case 'null':
         case 'undefined':
         case 'boolean':
         case 'number':
@@ -161,9 +178,6 @@ const makePassStyleOf = passStyleHelpers => {
           return 'symbol';
         }
         case 'object': {
-          if (inner === null) {
-            return 'null';
-          }
           if (!isFrozen(inner)) {
             assert.fail(
               // TypedArrays get special treatment in harden()
@@ -194,15 +208,6 @@ const makePassStyleOf = passStyleHelpers => {
               return helper.styleName;
             }
           }
-          // A TypedArray that was not claimed by any helper (most commonly a
-          // Uint8Array backed by a mutable ArrayBuffer) must not fall through to
-          // the remotable path with a confusing "non-methods" error. Provide the
-          // same diagnostic as the early `isFrozen` gate above, which normally
-          // catches the mutable case before it reaches here. Under unsafe harden
-          // taming `isFrozen` may return true for unfrozen objects, so the early
-          // gate can be bypassed; this check closes that gap.
-          isTypedArray(inner) &&
-            assert.fail(X`Cannot pass mutable typed arrays like ${inner}.`);
           assertValid(remotableHelper, inner, passStyleOfRecur);
           return 'remotable';
         }

@@ -38,7 +38,7 @@ const canonicalZero64 = freeze([0, 0, 0, 0, 0, 0, 0, 0]);
  * @param {string} name
  * @returns {boolean}
  */
-function readBoolean(bufferReader, name) {
+const readBoolean = (bufferReader, name) => {
   const cc = bufferReader.readByte();
   if (cc === TRUE) {
     return true;
@@ -49,7 +49,7 @@ function readBoolean(bufferReader, name) {
   throw Error(
     `Unexpected byte ${quote(toChar(cc))}, Syrup booleans must start with ${quote(toChar(TRUE))} or ${quote(toChar(FALSE))} at index ${bufferReader.index} of ${name}`,
   );
-}
+};
 
 /** @typedef {'boolean' | 'float64' | 'integer' | 'bytestring' | 'string' | 'selector'} SyrupAtomType */
 /** @typedef {'list' | 'set' | 'dictionary' | 'record'} SyrupStructuredType */
@@ -73,7 +73,7 @@ function readBoolean(bufferReader, name) {
  * @returns {ReadTypeAndMaybeValueResult}
  * Reads until it can determine the type of the next value.
  */
-function readTypeAndMaybeValue(bufferReader, name) {
+const readTypeAndMaybeValue = (bufferReader, name) => {
   const start = bufferReader.index;
   const cc = bufferReader.readByte();
   // Structure types, don't read value
@@ -150,7 +150,7 @@ function readTypeAndMaybeValue(bufferReader, name) {
   throw Error(
     `Unexpected character ${quote(toChar(typeByte))}, at index ${bufferReader.index} of ${name}`,
   );
-}
+};
 
 /**
  * @param {BufferReader} bufferReader
@@ -158,7 +158,7 @@ function readTypeAndMaybeValue(bufferReader, name) {
  * @param {string} name
  * @returns {any}
  */
-function readAndAssertType(bufferReader, expectedType, name) {
+const readAndAssertType = (bufferReader, expectedType, name) => {
   const start = bufferReader.index;
   const { value, type } = readTypeAndMaybeValue(bufferReader, name);
   if (type !== expectedType) {
@@ -167,43 +167,39 @@ function readAndAssertType(bufferReader, expectedType, name) {
     );
   }
   return value;
-}
+};
 
 /**
  * @param {BufferReader} bufferReader
  * @param {string} name
  * @returns {bigint}
  */
-function readInteger(bufferReader, name) {
-  return readAndAssertType(bufferReader, 'integer', name);
-}
+const readInteger = (bufferReader, name) =>
+  readAndAssertType(bufferReader, 'integer', name);
 
 /**
  * @param {BufferReader} bufferReader
  * @param {string} name
  * @returns {string}
  */
-function readString(bufferReader, name) {
-  return readAndAssertType(bufferReader, 'string', name);
-}
+const readString = (bufferReader, name) =>
+  readAndAssertType(bufferReader, 'string', name);
 
 /**
  * @param {BufferReader} bufferReader
  * @param {string} name
  * @returns {string}
  */
-function readSelectorAsString(bufferReader, name) {
-  return readAndAssertType(bufferReader, 'selector', name);
-}
+const readSelectorAsString = (bufferReader, name) =>
+  readAndAssertType(bufferReader, 'selector', name);
 
 /**
  * @param {BufferReader} bufferReader
  * @param {string} name
  * @returns {Uint8Array}
  */
-function readBytestring(bufferReader, name) {
-  return readAndAssertType(bufferReader, 'bytestring', name);
-}
+const readBytestring = (bufferReader, name) =>
+  readAndAssertType(bufferReader, 'bytestring', name);
 
 /**
  * @param {BufferReader} bufferReader
@@ -211,7 +207,7 @@ function readBytestring(bufferReader, name) {
  * @returns {{value: string, type: 'selector'} | {value: Uint8Array, type: 'bytestring'} | {value: string, type: 'string'}}
  * see https://github.com/ocapn/syrup/issues/22
  */
-function readRecordLabel(bufferReader, name) {
+const readRecordLabel = (bufferReader, name) => {
   const start = bufferReader.index;
   const { value, type } = readTypeAndMaybeValue(bufferReader, name);
   if (type === 'selector' || type === 'string' || type === 'bytestring') {
@@ -221,13 +217,13 @@ function readRecordLabel(bufferReader, name) {
   throw Error(
     `Unexpected type ${quote(type)}, Syrup record labels must be strings, selectors, or bytestrings at index ${start} of ${name}`,
   );
-}
+};
 
 /**
  * @param {BufferReader} bufferReader
  * @param {string} name
  */
-function readFloat64Body(bufferReader, name) {
+const readFloat64Body = (bufferReader, name) => {
   const start = bufferReader.index;
   const value = bufferReader.readFloat64(false); // big end
 
@@ -245,13 +241,13 @@ function readFloat64Body(bufferReader, name) {
   }
 
   return value;
-}
+};
 
 /**
  * @param {BufferReader} bufferReader
  * @param {string} name
  */
-function readFloat64(bufferReader, name) {
+const readFloat64 = (bufferReader, name) => {
   const cc = bufferReader.readByte();
   if (cc !== FLOAT64) {
     throw Error(
@@ -259,7 +255,7 @@ function readFloat64(bufferReader, name) {
     );
   }
   return readFloat64Body(bufferReader, name);
-}
+};
 
 /** @typedef {'float64' | 'number-prefix' | 'list' | 'set' | 'dictionary' | 'record' | 'boolean'} TypeHintTypes */
 
@@ -268,7 +264,7 @@ function readFloat64(bufferReader, name) {
  * @param {string} name
  * @returns {TypeHintTypes}
  */
-export function peekTypeHint(bufferReader, name) {
+export const peekTypeHint = (bufferReader, name) => {
   const cc = bufferReader.peekByte();
   if (cc >= ZERO && cc <= NINE) {
     return 'number-prefix';
@@ -295,7 +291,7 @@ export function peekTypeHint(bufferReader, name) {
   throw Error(
     `Unexpected character ${quote(toChar(cc))}, at index ${index} of ${name}`,
   );
-}
+};
 
 /** @typedef {{type: string, start: number}} SyrupReaderStackEntry */
 
