@@ -1044,6 +1044,7 @@ __metadata:
     "@endo/errors": "workspace:^"
     "@endo/eventual-send": "workspace:^"
     "@endo/harden": "workspace:^"
+    "@endo/hex": "workspace:^"
     "@endo/init": "workspace:^"
     "@endo/lockdown": "workspace:^"
     "@endo/nat": "workspace:^"
