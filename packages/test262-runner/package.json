@@ -53,7 +53,8 @@
           "scripts/node-prelude-header.js"
         ],
         "env": {
-          "node": true
+          "node": true,
+          "es2021": true
         },
         "rules": {
           "no-var": "off",
@@ -61,7 +62,8 @@
           "prefer-const": "off",
           "no-plusplus": "off",
           "no-empty-function": "off",
-          "no-underscore-dangle": "off"
+          "no-underscore-dangle": "off",
+          "global-require": "off"
         }
       }
     ],
