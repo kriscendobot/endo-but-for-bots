@@ -149,6 +149,11 @@ const assertRestValidImmutableArrayBuffer = candidate => {
  * present on a native-shape wrapper but whose value disagrees with the
  * underlying buffer byte are also rejected.
  *
+ * The view must additionally span its whole backing buffer one-to-one
+ * (`byteOffset === 0 && length === buffer.byteLength`): a sub-view is
+ * rejected (the restrictive choice, issue #573), so the marshalled value
+ * never conveys a hidden tail of the buffer beyond what the view reveals.
+ *
  * Assumes the candidate has already passed the `isFrozen` gate that
  * `passStyleOf` applies before reaching any helper.
  *
@@ -167,6 +172,29 @@ const assertRestValidPlainFrozenUint8Array = candidate => {
   apply(immutableGetter, buffer, []) ||
     Fail`Uint8Array byteArray must be backed by an immutable ArrayBuffer: ${candidate}`;
   assertRestValidImmutableArrayBuffer(buffer);
+  // Whole-buffer span (restrictive, issue #573): the view must cover its
+  // entire backing buffer one-to-one. A sub-view (`byteOffset > 0`, or a
+  // `length` shorter than `buffer.byteLength`) is rejected, because its
+  // backing buffer can carry more data than the view intends to reveal: a
+  // data-reachability hazard, since the marshalled value would convey the
+  // hidden tail of the buffer to any holder who reconstructs the view.
+  // `frozenBytes` always slices its window into a fresh immutable buffer,
+  // so every value it produces is a whole-buffer-spanning view and is
+  // unaffected; a hand-constructed sub-view must be re-sliced into its own
+  // immutable buffer (`frozenBytes(subview)`) to become a byteArray. This
+  // is the restrictive choice recorded in the design (Design Decisions §3),
+  // tracked for possible relaxation to the permissive sub-view form at
+  // https://github.com/endojs/endo-but-for-bots/issues/573 .
+  candidate.byteOffset === 0 ||
+    assert.fail(
+      X`Plain frozen Uint8Array byteArray must span its whole backing buffer (expected byteOffset 0, got ${candidate.byteOffset}): ${candidate}`,
+      TypeError,
+    );
+  candidate.length === buffer.byteLength ||
+    assert.fail(
+      X`Plain frozen Uint8Array byteArray must span its whole backing buffer (length ${candidate.length} must equal buffer byteLength ${buffer.byteLength}): ${candidate}`,
+      TypeError,
+    );
   // `length` is the count of bytes the wrapper exposes. It is read via
   // the prototype's `length` accessor, which on the emulated path
   // delegates to the hidden genuine TypedArray and on the native path

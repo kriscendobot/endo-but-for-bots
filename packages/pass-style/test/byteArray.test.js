@@ -26,6 +26,7 @@ import test from '@endo/ses-ava/test.js';
 
 import harden from '@endo/harden';
 import { passStyleOf } from '../src/passStyleOf.js';
+import { frozenBytes } from '../src/to-bytes.js';
 
 const { defineProperty, freeze, getOwnPropertyDescriptor } = Object;
 const { ownKeys } = Reflect;
@@ -83,6 +84,77 @@ test('byteArray accepts a plain frozen Uint8Array on a zero-length immutable Arr
   const view = new Uint8Array(iab);
   harden(view);
   t.is(passStyleOf(view), 'byteArray');
+});
+
+// ---------------------------------------------------------------------------
+// Whole-buffer span (restrictive, issue #573).
+//
+// A byteArray view must cover its entire backing buffer one-to-one. A
+// sub-view (`byteOffset > 0`, or a `length` shorter than the buffer's
+// `byteLength`) is rejected, so a marshalled byteArray never conveys a
+// hidden tail of its backing buffer beyond what the view reveals. The
+// restrictive form is tracked for possible relaxation at
+// https://github.com/endojs/endo-but-for-bots/issues/573 .
+// ---------------------------------------------------------------------------
+
+test('byteArray accepts a whole-buffer-spanning view (byteOffset 0, length === buffer.byteLength)', t => {
+  const ab = new ArrayBuffer(4);
+  new Uint8Array(ab).set([1, 2, 3, 4]);
+  const iab = ab.sliceToImmutable();
+  const view = new Uint8Array(iab);
+  // Witness the whole-buffer span explicitly.
+  t.is(view.byteOffset, 0);
+  t.is(view.length, iab.byteLength);
+  harden(view);
+  t.is(passStyleOf(view), 'byteArray');
+});
+
+test('byteArray rejects a sub-view with a non-zero byteOffset', t => {
+  // A window into the middle of a larger immutable buffer. Its bytes are a
+  // strict subset of the buffer, so the buffer carries more data than the
+  // view reveals: the data-reachability hazard the restrictive span check
+  // closes. Producers must re-slice such a window into its own immutable
+  // buffer (via `frozenBytes`) to obtain a byteArray.
+  const ab = new ArrayBuffer(8);
+  new Uint8Array(ab).set([1, 2, 3, 4, 5, 6, 7, 8]);
+  const iab = ab.sliceToImmutable();
+  const sub = new Uint8Array(iab, 2, 4);
+  t.is(sub.byteOffset, 2);
+  harden(sub);
+  t.throws(() => passStyleOf(sub), {
+    message: /must span its whole backing buffer.*byteOffset 0/,
+  });
+});
+
+test('byteArray rejects a sub-view shorter than its backing buffer (byteOffset 0, short length)', t => {
+  // A prefix window: byteOffset is 0 but the view stops short of the
+  // buffer's end, leaving a hidden tail. Rejected for the same
+  // data-reachability reason.
+  const ab = new ArrayBuffer(8);
+  new Uint8Array(ab).set([1, 2, 3, 4, 5, 6, 7, 8]);
+  const iab = ab.sliceToImmutable();
+  const sub = new Uint8Array(iab, 0, 4);
+  t.is(sub.byteOffset, 0);
+  t.is(sub.length, 4);
+  t.not(sub.length, iab.byteLength);
+  harden(sub);
+  t.throws(() => passStyleOf(sub), {
+    message: /must span its whole backing buffer.*must equal buffer byteLength/,
+  });
+});
+
+test('frozenBytes of a sub-view re-slices into a whole-buffer-spanning byteArray', t => {
+  // `frozenBytes` slices the view's window into a fresh immutable buffer,
+  // so the value it produces always spans its whole buffer one-to-one and
+  // passes the restrictive check even when the input is a sub-view.
+  const ab = new ArrayBuffer(8);
+  new Uint8Array(ab).set([1, 2, 3, 4, 5, 6, 7, 8]);
+  const window = new Uint8Array(ab, 2, 4);
+  const passable = frozenBytes(window);
+  t.is(passable.byteOffset, 0);
+  t.is(passable.length, passable.buffer.byteLength);
+  t.is(passStyleOf(passable), 'byteArray');
+  t.deepEqual([...passable], [3, 4, 5, 6]);
 });
 
 test('byteArray accepts a plain frozen non-empty emulated Uint8Array with no own indexed properties', t => {
