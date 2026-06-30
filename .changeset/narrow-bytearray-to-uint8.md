@@ -98,3 +98,13 @@ and then delegating the equal-length lexicographic comparison to
 from `@endo/pass-style` under the new names; replaced ASCII encoding
 wrappers with direct calls to `@endo/ascii`; factored the
 `compareUint8Arrays` subrange comparison into `@endo/bytes/compare.js`.
+
+`@endo/bytes` now validates its `Uint8Array` arguments. `compareBytes`,
+`bytesEqual`, and `concatBytes` read each byte through the
+integer-indexed protocol, which a counterfeit that merely inherits from
+`Uint8Array.prototype` (the emulated frozen byteArray wrapper) answers
+with `undefined`. Previously such an argument completed successfully
+with a wrong answer and no diagnostic; each function now rejects a
+non-genuine integer-indexed `Uint8Array` argument up front with a
+`TypeError`, enforcing the "passing a frozen byteArray throws" contract
+the package README already stated.

@@ -52,6 +52,15 @@ import qualified names without needing a namespace import.
 
 ## API
 
+Every function validates that each `Uint8Array` argument is a genuine
+integer-indexed typed array and throws a `TypeError` otherwise, rather than
+silently producing a wrong answer.
+An emulated frozen byteArray wrapper (a plain object that inherits from
+`Uint8Array.prototype` but has no integer-indexed bytes) is rejected by this
+guard, as is any other typed array (such as an `Int8Array`) and any non-array
+value.
+This is the enforcement of the "will throw" contract stated above.
+
 ### `concatBytes(chunks) -> Uint8Array`
 
 Concatenates a list of mutable `Uint8Array` chunks into a single contiguous

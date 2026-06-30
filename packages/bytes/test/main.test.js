@@ -2,6 +2,20 @@ import test from '@endo/ses-ava/test.js';
 
 import { bytesEqual } from '../src/equals.js';
 import { concatBytes } from '../src/concat.js';
+import { compareBytes } from '../src/compare.js';
+import { assertGenuineUint8Array } from '../src/genuine-uint8-array.js';
+
+// A stand-in for an emulated frozen byteArray wrapper: an object whose
+// `[[Prototype]]` is `Uint8Array.prototype` (so `instanceof Uint8Array` is
+// true) but which has no typed-array internal slot, so `wrapper[i]` reads as
+// `undefined` rather than a byte. This is the shape the integer-indexed guard
+// must reject.
+const makeCounterfeitUint8Array = length => {
+  const wrapper = Object.create(Uint8Array.prototype);
+  Object.defineProperty(wrapper, 'length', { value: length });
+  // Deliberately leave the indexed slots absent, mirroring the emulated path.
+  return wrapper;
+};
 
 test('concatBytes: empty input yields empty Uint8Array', t => {
   const result = concatBytes([]);
@@ -97,4 +111,86 @@ test('bytesEqual: differs at first byte', t => {
   const a = new Uint8Array([0, 1, 2]);
   const b = new Uint8Array([1, 1, 2]);
   t.false(bytesEqual(a, b));
+});
+
+test('compareBytes: equal, less, and greater on genuine Uint8Arrays', t => {
+  t.is(compareBytes(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3])), 0);
+  t.is(compareBytes(new Uint8Array([1, 2]), new Uint8Array([1, 2, 3])), -1);
+  t.is(compareBytes(new Uint8Array([1, 3]), new Uint8Array([1, 2, 3])), 1);
+});
+
+test('compareBytes: subrange comparison stays allocation free', t => {
+  const buffer = new Uint8Array([0, 1, 2, 1, 2, 9]);
+  // Compare bytes [1,2] (indices 1..3) against bytes [1,2] (indices 3..5).
+  t.is(compareBytes(buffer, buffer, 1, 3, 3, 5), 0);
+});
+
+// The whole point of erights's review on PR #475: a reader that takes a
+// counterfeit integer-indexed Uint8Array must reject it loudly, not complete
+// successfully with the wrong answer and no diagnostic.
+test('assertGenuineUint8Array: accepts a genuine Uint8Array', t => {
+  t.notThrows(() => assertGenuineUint8Array(new Uint8Array([1, 2, 3])));
+  t.notThrows(() => assertGenuineUint8Array(new Uint8Array()));
+});
+
+test('assertGenuineUint8Array: rejects an emulated byteArray wrapper', t => {
+  const counterfeit = makeCounterfeitUint8Array(3);
+  // The stand-in superficially looks like bytes but reads as undefined.
+  t.true(counterfeit instanceof Uint8Array);
+  t.is(counterfeit[0], undefined);
+  t.throws(() => assertGenuineUint8Array(counterfeit, 'left'), {
+    instanceOf: TypeError,
+    message: /left must be a genuine integer-indexed Uint8Array/,
+  });
+});
+
+test('assertGenuineUint8Array: rejects other typed arrays and non-arrays', t => {
+  t.throws(() => assertGenuineUint8Array(new Int8Array([1, 2, 3])), {
+    instanceOf: TypeError,
+    message: /a Int8Array/,
+  });
+  t.throws(() => assertGenuineUint8Array([1, 2, 3]), {
+    instanceOf: TypeError,
+  });
+  t.throws(() => assertGenuineUint8Array({}), { instanceOf: TypeError });
+  t.throws(() => assertGenuineUint8Array(42), { instanceOf: TypeError });
+  t.throws(() => assertGenuineUint8Array(null), {
+    instanceOf: TypeError,
+    message: /got null/,
+  });
+});
+
+test('compareBytes: rejects a counterfeit argument instead of lying', t => {
+  const genuine = new Uint8Array([1, 2, 3]);
+  const counterfeit = makeCounterfeitUint8Array(3);
+  t.throws(() => compareBytes(counterfeit, genuine, 0, 3, 0, 3), {
+    instanceOf: TypeError,
+    message: /left must be a genuine integer-indexed Uint8Array/,
+  });
+  t.throws(() => compareBytes(genuine, counterfeit, 0, 3, 0, 3), {
+    instanceOf: TypeError,
+    message: /right must be a genuine integer-indexed Uint8Array/,
+  });
+});
+
+test('bytesEqual: rejects a counterfeit argument instead of lying', t => {
+  const genuine = new Uint8Array([1, 2, 3]);
+  const counterfeit = makeCounterfeitUint8Array(3);
+  t.throws(() => bytesEqual(counterfeit, genuine), {
+    instanceOf: TypeError,
+    message: /a must be a genuine integer-indexed Uint8Array/,
+  });
+  t.throws(() => bytesEqual(genuine, counterfeit), {
+    instanceOf: TypeError,
+    message: /b must be a genuine integer-indexed Uint8Array/,
+  });
+});
+
+test('concatBytes: rejects a counterfeit chunk instead of copying zeros', t => {
+  const genuine = new Uint8Array([1, 2, 3]);
+  const counterfeit = makeCounterfeitUint8Array(2);
+  t.throws(() => concatBytes([genuine, counterfeit]), {
+    instanceOf: TypeError,
+    message: /chunk must be a genuine integer-indexed Uint8Array/,
+  });
 });

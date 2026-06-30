@@ -2,6 +2,8 @@
 
 import harden from '@endo/harden';
 
+import { assertGenuineUint8Array } from './genuine-uint8-array.js';
+
 /**
  * Compare two `Uint8Array` values lexicographically, with optional
  * start/end slicing.
@@ -22,10 +24,17 @@ import harden from '@endo/harden';
  * rather than the byte; such emulated wrappers do not have integer-index
  * behavior. A caller holding a byteArray pass-style value (or any
  * possibly-emulated wrapper) must first copy it into a genuine mutable
- * `Uint8Array` (for example with `wrapper.slice(0)`, which the shim
+ * `Uint8Array` (for example with `thawnBytes` from
+ * `@endo/pass-style/from-bytes.js`, or `wrapper.slice(0)`, which the shim
  * amplifies) before calling this function. Keeping the conversion at the
  * call boundary lets the common, already-mutable case stay allocation
  * free.
+ *
+ * `compareBytes` rejects a non-genuine argument up front with a
+ * `TypeError` rather than silently returning a wrong answer. The guard
+ * runs against the full argument (it does not consult the optional
+ * subrange bounds), so the conservative diagnostic fires even when the
+ * compared subrange would have been empty.
  *
  * @param {Uint8Array} left
  * @param {Uint8Array} right
@@ -43,6 +52,8 @@ export const compareBytes = (
   rightStart = 0,
   rightEnd = right.length,
 ) => {
+  assertGenuineUint8Array(left, 'left');
+  assertGenuineUint8Array(right, 'right');
   const leftLength = leftEnd - leftStart;
   const rightLength = rightEnd - rightStart;
   let leftIndex = leftStart;
