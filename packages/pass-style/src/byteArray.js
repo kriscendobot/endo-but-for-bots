@@ -37,10 +37,11 @@ const immutableGetter =
 // freezable-TypedArray path installed by `@endo/immutable-arraybuffer`,
 // this captured reference points at the shim-installed amplifier, which
 // resolves the wrapper to its hidden genuine TypedArray and reads from
-// the underlying immutable buffer. On the native path (post-Stage-3), it
-// points at the genuine `%TypedArrayPrototype%.at`, which reads via the
-// integer-indexed exotic. Either way, the read bypasses any own data
-// property on the wrapper.
+// the underlying immutable buffer. On the native path (once a JS engine
+// ships the TC39 Immutable ArrayBuffer proposal, which is at Stage 3 as
+// of the June 2025 108th TC39 meeting), it points at the genuine
+// `%TypedArrayPrototype%.at`, which reads via the integer-indexed exotic.
+// Either way, the read bypasses any own data property on the wrapper.
 const { prototype: uint8ArrayPrototype } = Uint8Array;
 const typedArrayPrototype = getPrototypeOf(uint8ArrayPrototype);
 const { at: typedArrayAt } = typedArrayPrototype;
@@ -303,3 +304,4 @@ export const ByteArrayHelper = harden({
     assertRestValidPlainFrozenUint8Array(candidate);
   },
 });
+
