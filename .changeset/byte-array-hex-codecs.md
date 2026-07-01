@@ -7,8 +7,9 @@ A `byteArray` (a plain frozen `Uint8Array` backed by an immutable
 encode-passable, and marshal-justin codecs.
 
 - **capdata**: byteArray encodes as `{"@qclass":"byteArray","data":"<hex>"}`.
-- **smallcaps**: byteArray encodes as `"*<hex>"`.  The `*` prefix is now
-  reserved.
+- **smallcaps**: byteArray encodes as `"*<hex>"`.  The `*` prefix, reserved
+  from the beginning of smallcaps, is now assigned to byteArray (moved from
+  the reserved-for-future set into the in-use set).
 - **encode-passable**: byteArray encodes as
   `a<encodeBigInt(byteLength)>:<hex>`.  The Elias-delta length prefix gives
   shortlex ordering (matching `compareRank`) with no arbitrary size cap, and
