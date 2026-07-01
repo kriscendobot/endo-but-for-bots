@@ -101,7 +101,7 @@ wrappers with direct calls to `@endo/ascii`; factored the
 
 `@endo/bytes` now validates its `Uint8Array` arguments. `compareBytes`,
 `bytesEqual`, and `concatBytes` read each byte through the
-integer-indexed protocol, which a counterfeit that merely inherits from
+integer-indexed protocol, which an emulated wrapper that merely inherits from
 `Uint8Array.prototype` (the emulated frozen byteArray wrapper) answers
 with `undefined`. Previously such an argument completed successfully
 with a wrong answer and no diagnostic; each function now rejects a

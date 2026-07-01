@@ -36,8 +36,8 @@ if (typeof getTypedArrayToStringTag !== 'function') {
  * value.
  *
  * Every read-only reader in this package reaches each byte through the
- * integer-indexed protocol (`array[i]`, `array.set(...)`). A counterfeit that
- * merely inherits from `Uint8Array.prototype` (the emulated immutable-buffer
+ * integer-indexed protocol (`array[i]`, `array.set(...)`). An emulated wrapper
+ * that merely inherits from `Uint8Array.prototype` (the emulated immutable-buffer
  * byteArray wrapper) answers those reads with `undefined`, so a reader given
  * one would complete successfully with the wrong answer and no diagnostic.
  * This guard converts that silent corruption into a loud `TypeError` at the
@@ -63,7 +63,7 @@ export const assertGenuineUint8Array = (candidate, label = 'argument') => {
   } else if (candidate instanceof Uint8Array) {
     // Prototype is `Uint8Array.prototype` but the typed-array internal slot is
     // absent: an emulated immutable-`ArrayBuffer` byteArray wrapper (or a
-    // similar counterfeit) whose `candidate[i]` reads would return `undefined`.
+    // similar emulated wrapper) whose `candidate[i]` reads would return `undefined`.
     received =
       'a Uint8Array-prototyped wrapper with no integer-indexed bytes (such as a frozen byteArray backed by an emulated immutable ArrayBuffer); thaw it into a genuine mutable Uint8Array first, for example with `thawnBytes` from `@endo/pass-style/from-bytes.js` or `wrapper.slice(0)`';
   } else {

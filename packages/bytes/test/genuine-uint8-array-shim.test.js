@@ -9,7 +9,7 @@
 // `%TypedArray%.prototype[Symbol.toStringTag]` getter at module-load time. If
 // the `@endo/immutable-arraybuffer` shim ran first and replaced that getter
 // with one that answers `'Uint8Array'` for its emulated frozen wrappers, then
-// the captured getter would admit a counterfeit and `assertGenuineUint8Array`
+// the captured getter would admit an emulated wrapper and `assertGenuineUint8Array`
 // would wave it through.
 //
 // This test reproduces exactly that ordering. The `import` of the shim is
@@ -41,7 +41,7 @@ const { toStringTag: toStringTagSymbol } = Symbol;
 
 // Reconstruct the same getter `genuine-uint8-array.js` captures, so the test can
 // observe directly what the brand check sees. Typed loosely because the test
-// applies it to deliberate counterfeits whose static type is not the getter's
+// applies it to a deliberately emulated wrapper whose static type is not the getter's
 // nominal `this`.
 const typedArrayPrototype = getPrototypeOf(Uint8Array.prototype);
 const getTypedArrayToStringTag = /** @type {any} */ (
@@ -53,7 +53,7 @@ const getTypedArrayToStringTag = /** @type {any} */ (
 // the global `Uint8Array` is the pseudo-constructor, which on an immutable
 // buffer produces a plain wrapper object whose `[[Prototype]]` is
 // `Uint8Array.prototype` but which has no integer-indexed bytes. This is the
-// genuine counterfeit erights's question is about, not a hand-rolled stand-in.
+// real emulated wrapper erights's question is about, not a hand-rolled stand-in.
 //
 // Typed `any`: the value masquerades as a `Uint8Array` but its integer-indexed
 // reads answer `undefined`, so the test deliberately treats it untyped.
@@ -76,7 +76,7 @@ test('the immutable-arraybuffer shim is actually installed', t => {
   );
 });
 
-test('a real shim-emulated frozen Uint8Array is a faithful counterfeit', t => {
+test('a real shim-emulated frozen Uint8Array is a faithful emulation', t => {
   const frozen = makeEmulatedFrozenUint8Array(1, 2, 3);
   // It passes the naive prototype test...
   t.true(frozen instanceof Uint8Array);
