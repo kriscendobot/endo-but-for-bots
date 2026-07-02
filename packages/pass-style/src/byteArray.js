@@ -304,4 +304,3 @@ export const ByteArrayHelper = harden({
     assertRestValidPlainFrozenUint8Array(candidate);
   },
 });
-
