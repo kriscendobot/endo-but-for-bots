@@ -123,7 +123,18 @@ impl Meter {
         if self.interval != 0 && self.index > self.count {
             self.last_reported = self.computrons();
             if host(self.last_reported) {
-                self.count = self.index + self.interval;
+                // C-XS advances `meterCount` in unsigned (`txU8`)
+                // arithmetic, which wraps on overflow; mirror that with a
+                // wrapping add so the guard below can observe the wrap.
+                self.count = self.index.wrapping_add(self.interval);
+                // `fxCheckMetering`'s overflow-wrap guard (xsRun.c:4475):
+                // if advancing `meterCount` wrapped it below `meterIndex`,
+                // restart the window at zero. Practically unreachable at
+                // u64 width, but parity is the whole premise.
+                if self.count < self.index {
+                    self.index = 0;
+                    self.count = self.interval;
+                }
                 MeterCheck::Continue
             } else {
                 MeterCheck::Abort
@@ -131,5 +142,53 @@ impl Meter {
         } else {
             MeterCheck::Continue
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_disabled_when_interval_zero() {
+        // The default (un-armed) meter never consults the host, even
+        // once the index passes any plausible threshold: the
+        // differential harness relies on this.
+        let mut m = Meter::new();
+        m.tick_code();
+        let mut consulted = false;
+        let out = m.check(&mut |_| {
+            consulted = true;
+            true
+        });
+        assert_eq!(out, MeterCheck::Continue);
+        assert!(!consulted, "un-armed meter must not consult the host");
+    }
+
+    #[test]
+    fn check_wrap_guard_restarts_window() {
+        // Force `meterCount` to wrap: with the index already past the
+        // count so the check fires, an interval large enough that
+        // `index + interval` overflows u64 must reset the window to
+        // `interval` rather than leave `count` below `index`.
+        let mut m = Meter::new();
+        m.begin(4);
+        m.index = 8; // index(8) > count(4): the check fires
+        m.interval = u64::MAX - 2; // advancing count by this overflows u64
+        let out = m.check(&mut |_| true);
+        assert_eq!(out, MeterCheck::Continue);
+        assert_eq!(m.index, 0, "wrap guard resets meterIndex to 0");
+        assert_eq!(m.count, m.interval, "wrap guard resets meterCount to interval");
+    }
+
+    #[test]
+    fn check_advances_window_without_wrap() {
+        let mut m = Meter::new();
+        m.begin(2);
+        m.index = 3; // > count(2): fires
+        let out = m.check(&mut |_| true);
+        assert_eq!(out, MeterCheck::Continue);
+        assert_eq!(m.count, 5, "count advances by interval: 3 + 2");
+        assert_eq!(m.index, 3, "index untouched when no wrap");
     }
 }

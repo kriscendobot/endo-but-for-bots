@@ -13,7 +13,7 @@
 //! No JIT, no code generation, no execution-count-dependent behavior
 //! (requirement 4): a straight `match` LLVM lowers to a jump table.
 
-use crate::meter::Meter;
+use crate::meter::{Meter, MeterCheck};
 use crate::opcode::Opcode;
 use crate::value::{number_to_ecma_string, to_int32, ChunkArena, Kind, Payload, Slot, SlotArena};
 
@@ -71,6 +71,13 @@ pub struct Interp {
     stack: Vec<Slot>,
     result: Slot,
     meter: Meter,
+    /// The host metering callback, installed by [`Interp::arm_meter`].
+    /// `None` is the default un-metered interpreter the differential
+    /// harness uses: the check points then never consult a host and
+    /// never abort. When `Some`, each loop-closing check point passes
+    /// the current computron count to it and halts with
+    /// [`Halt::MeterAbort`] on refusal.
+    meter_host: Option<Box<dyn FnMut(u64) -> bool>>,
     /// The machine slot heap (design § Value and heap model).
     pub slots: SlotArena,
     /// The machine chunk heap (CESU-8 strings and later data).
@@ -89,8 +96,32 @@ impl Interp {
             stack: Vec::with_capacity(64),
             result: Slot::undefined(),
             meter: Meter::new(),
+            meter_host: None,
             slots: SlotArena::new(),
             chunks: ChunkArena::new(),
+        }
+    }
+
+    /// Arm metering (`fxBeginMetering`): install a check `interval` and
+    /// the `host` callback the loop-closing check points consult with
+    /// `meterIndex >> 16` ("computrons"). This does **not** change the
+    /// index accumulation or the un-metered default — a fresh `Interp`
+    /// never checks — so the differential harness (which never arms) is
+    /// unaffected. On host refusal, the run halts with
+    /// [`Halt::MeterAbort`].
+    pub fn arm_meter(&mut self, interval: u64, host: Box<dyn FnMut(u64) -> bool>) {
+        self.meter.begin(interval);
+        self.meter_host = Some(host);
+    }
+
+    /// A loop-closing metering check (`mxCheckMeter`). Consults the host
+    /// only when metering is armed; otherwise (the default) it is a
+    /// no-op that keeps running. Adds nothing to `meterIndex`.
+    #[inline]
+    fn check_meter(&mut self) -> MeterCheck {
+        match self.meter_host.as_mut() {
+            Some(host) => self.meter.check(host),
+            None => MeterCheck::Continue,
         }
     }
 
@@ -340,11 +371,21 @@ impl Interp {
 
                 // ---- branches ---------------------------------------
                 // mxBranch: target = pc + INDEX(size) + OFFSET(operand).
+                // C-XS runs `mxCheckMeter` only when the taken offset is
+                // negative (a backward branch — the loop-closing point);
+                // an armed host refusal aborts with `Halt::MeterAbort`.
                 XS_CODE_BRANCH_1 => {
-                    pc = branch_target(pc, size, s1!(1));
+                    let off = s1!(1);
+                    if off < 0 && self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                    pc = branch_target(pc, size, off);
                 }
                 XS_CODE_BRANCH_2 => {
                     let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                    if off < 0 && self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
                     pc = branch_target(pc, size, off);
                 }
                 XS_CODE_BRANCH_4 => {
@@ -354,33 +395,64 @@ impl Interp {
                         code[pc + 3],
                         code[pc + 4],
                     ]);
+                    if off < 0 && self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
                     pc = branch_target(pc, size, off);
                 }
+                // mxBranchElse: the fall-through (cond true) takes INDEX
+                // with no check; only the branch-taken (cond false) path
+                // is an `mxBranch`, so it checks when its offset < 0.
                 XS_CODE_BRANCH_ELSE_1 => {
+                    let off = s1!(1);
                     let cond = to_boolean(&self.pop());
-                    pc = if cond {
-                        pc + size as usize
+                    if cond {
+                        pc += size as usize;
                     } else {
-                        branch_target(pc, size, s1!(1))
-                    };
+                        if off < 0 && self.check_meter() == MeterCheck::Abort {
+                            return Halt::MeterAbort;
+                        }
+                        pc = branch_target(pc, size, off);
+                    }
                 }
                 XS_CODE_BRANCH_ELSE_2 => {
                     let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let cond = to_boolean(&self.pop());
-                    pc = if cond { pc + size as usize } else { branch_target(pc, size, off) };
-                }
-                XS_CODE_BRANCH_IF_1 => {
-                    let cond = to_boolean(&self.pop());
-                    pc = if cond {
-                        branch_target(pc, size, s1!(1))
+                    if cond {
+                        pc += size as usize;
                     } else {
-                        pc + size as usize
-                    };
+                        if off < 0 && self.check_meter() == MeterCheck::Abort {
+                            return Halt::MeterAbort;
+                        }
+                        pc = branch_target(pc, size, off);
+                    }
+                }
+                // mxBranchIf: the branch-taken (cond true) path is the
+                // `mxBranch`, so it checks when its offset < 0; the
+                // fall-through takes INDEX with no check.
+                XS_CODE_BRANCH_IF_1 => {
+                    let off = s1!(1);
+                    let cond = to_boolean(&self.pop());
+                    if cond {
+                        if off < 0 && self.check_meter() == MeterCheck::Abort {
+                            return Halt::MeterAbort;
+                        }
+                        pc = branch_target(pc, size, off);
+                    } else {
+                        pc += size as usize;
+                    }
                 }
                 XS_CODE_BRANCH_IF_2 => {
                     let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let cond = to_boolean(&self.pop());
-                    pc = if cond { branch_target(pc, size, off) } else { pc + size as usize };
+                    if cond {
+                        if off < 0 && self.check_meter() == MeterCheck::Abort {
+                            return Halt::MeterAbort;
+                        }
+                        pc = branch_target(pc, size, off);
+                    } else {
+                        pc += size as usize;
+                    }
                 }
 
                 // ---- result / return --------------------------------
@@ -394,6 +466,11 @@ impl Interp {
                     pc += size as usize;
                 }
                 XS_CODE_RETURN | XS_CODE_END => {
+                    // C-XS checks the meter at returns (the frame-pop
+                    // reaches its caller's `mxFirstCode`/`mxCheckMeter`).
+                    if self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
                     return Halt::Return;
                 }
 
@@ -651,6 +728,94 @@ fn loose_equals(a: &Slot, b: &Slot) -> bool {
                 strict_equals(a, b)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opcode::Opcode;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn b(op: Opcode) -> u8 {
+        op as u8
+    }
+
+    #[test]
+    fn armed_meter_aborts_at_threshold() {
+        // A tight infinite backward-`BRANCH_1` self-loop: `BRANCH_1 -2`
+        // jumps to itself (target = pc + size(2) + (-2) = pc). It only
+        // terminates because the armed meter refuses more computation.
+        let code = [b(Opcode::XS_CODE_BRANCH_1), 0xFE]; // -2
+
+        // Record every computron value the host is shown; refuse at 5.
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_cb = Rc::clone(&seen);
+        let mut interp = Interp::new();
+        // interval 1 (raw fixed-point): the check fires every iteration,
+        // so the host sees computrons 1, 2, 3, ... one per dispatch.
+        interp.arm_meter(
+            1,
+            Box::new(move |computrons| {
+                seen_cb.borrow_mut().push(computrons);
+                computrons < 5
+            }),
+        );
+        let out = interp.run(&code);
+
+        assert_eq!(out.halt, Halt::MeterAbort, "armed meter must abort the loop");
+        assert!(!out.completed);
+        // Aborted on the 5th backward branch: 5 dispatched opcodes.
+        assert_eq!(out.dispatched, 5, "abort at the expected computron threshold");
+        assert_eq!(out.computrons, 5 + PROGRAM_INVOCATION_COMPUTRONS);
+        assert_eq!(
+            *seen.borrow(),
+            vec![1, 2, 3, 4, 5],
+            "host consulted once per backward branch until refusal"
+        );
+    }
+
+    #[test]
+    fn unarmed_meter_accumulates_without_checking() {
+        // A finite path that still exercises a backward branch, so we can
+        // observe the index accumulating with no check on the default
+        // (un-armed) interpreter the differential harness uses:
+        //   pc0: BRANCH_1 +1  -> forward to pc3   (offset >= 0, never checks)
+        //   pc2: END                              (halt)
+        //   pc3: BRANCH_1 -3  -> backward to pc2  (offset < 0, would check)
+        let code = [
+            b(Opcode::XS_CODE_BRANCH_1),
+            0x01, // +1 -> pc3
+            b(Opcode::XS_CODE_END),
+            b(Opcode::XS_CODE_BRANCH_1),
+            0xFD, // -3 -> pc2 (END)
+        ];
+
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Return, "un-armed meter never aborts");
+        assert!(out.completed);
+        // Three dispatched opcodes: the forward branch, the backward
+        // branch, and END — the index accumulated, no host was consulted.
+        assert_eq!(out.dispatched, 3, "meter accumulates without checking");
+    }
+
+    #[test]
+    fn armed_but_permissive_meter_runs_to_return() {
+        // Same finite path, armed with a host that always allows more:
+        // the backward-branch and END check points fire but never abort.
+        let code = [
+            b(Opcode::XS_CODE_BRANCH_1),
+            0x01,
+            b(Opcode::XS_CODE_END),
+            b(Opcode::XS_CODE_BRANCH_1),
+            0xFD,
+        ];
+        let mut interp = Interp::new();
+        interp.arm_meter(1, Box::new(|_| true));
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert_eq!(out.dispatched, 3);
     }
 }
 

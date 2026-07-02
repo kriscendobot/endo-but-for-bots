@@ -58,7 +58,14 @@ impl DualRun {
     pub fn is_bit_exact(&self) -> bool {
         match self.agreement {
             Agreement::BothComplete => self.result_agrees && self.computrons_agree,
-            Agreement::BothAbort => true,
+            // A shared abort is bit-exact only when endor aborted for a
+            // reason the oracle can share: a JS-level `Throw`. An
+            // `Unsupported` (opcode outside the subset) or `Decode`
+            // (truncated/invalid bytecode) halt means endor bailed on
+            // bytecode it cannot model — the oracle "also aborting"
+            // (a parse error, a different throw) is not agreement and
+            // must never pass silently.
+            Agreement::BothAbort => matches!(self.endor_halt, Halt::Throw(_)),
             _ => false,
         }
     }
@@ -159,9 +166,19 @@ pub fn run_corpus(programs: &[String]) -> (Vec<DualRun>, Summary) {
                             s.computron_divergences += 1;
                         }
                     }
+                    // A non-bit-exact `BothAbort` is an endor
+                    // `Unsupported`/`Decode` bail masquerading as a
+                    // shared abort (finding 3): count it so it can never
+                    // pass silently.
+                    Agreement::BothAbort => s.unsupported += 1,
                     _ => s.completion_divergences += 1,
                 }
-                if matches!(r.endor_halt, Halt::Unsupported(_)) {
+                // An unsupported-opcode bail while the oracle diverged
+                // the other way (e.g. `OracleOnlyComplete`); `BothAbort`
+                // is already accounted for above.
+                if matches!(r.endor_halt, Halt::Unsupported(_))
+                    && !matches!(r.agreement, Agreement::BothAbort)
+                {
                     s.unsupported += 1;
                 }
             }
@@ -174,6 +191,73 @@ pub fn run_corpus(programs: &[String]) -> (Vec<DualRun>, Summary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A `DualRun` with the given agreement and endor halt; the other
+    // fields are irrelevant to `is_bit_exact` for aborts.
+    fn abort_run(agreement: Agreement, endor_halt: Halt) -> DualRun {
+        DualRun {
+            source: String::new(),
+            agreement,
+            result_agrees: false,
+            oracle_result: String::new(),
+            endor_result: String::new(),
+            computrons_agree: false,
+            oracle_computrons: 0,
+            endor_computrons: 0,
+            endor_dispatched: 0,
+            endor_halt,
+            bytecode: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn both_abort_bit_exact_only_when_endor_throws() {
+        // A matching JS-level throw is a genuine shared abort.
+        let throwing = abort_run(Agreement::BothAbort, Halt::Throw("boom".into()));
+        assert!(throwing.is_bit_exact(), "BothAbort with a Throw is bit-exact");
+
+        // An `Unsupported` bail is not agreement even if the oracle also
+        // aborted (finding 3): it must never pass silently.
+        let unsupported = abort_run(Agreement::BothAbort, Halt::Unsupported("XS_CODE_CALL"));
+        assert!(
+            !unsupported.is_bit_exact(),
+            "BothAbort with an Unsupported halt is not bit-exact"
+        );
+
+        // A `Decode` bail (truncated/invalid bytecode) is likewise not
+        // agreement.
+        let decode = abort_run(Agreement::BothAbort, Halt::Decode("truncated".into()));
+        assert!(
+            !decode.is_bit_exact(),
+            "BothAbort with a Decode halt is not bit-exact"
+        );
+    }
+
+    #[test]
+    fn non_throw_both_abort_is_counted_not_silent() {
+        // The summary must count a non-`Throw` `BothAbort` (here under
+        // `unsupported`) rather than let it slip through as bit-exact.
+        let runs = [
+            abort_run(Agreement::BothAbort, Halt::Unsupported("XS_CODE_CALL")),
+            abort_run(Agreement::BothAbort, Halt::Decode("truncated".into())),
+        ];
+        let mut s = Summary::default();
+        for r in &runs {
+            s.total += 1;
+            if r.is_bit_exact() {
+                s.bit_exact += 1;
+            } else {
+                match r.agreement {
+                    Agreement::BothComplete => {}
+                    Agreement::BothAbort => s.unsupported += 1,
+                    _ => s.completion_divergences += 1,
+                }
+            }
+        }
+        assert_eq!(s.bit_exact, 0, "neither run may count as bit-exact");
+        assert_eq!(s.unsupported, 2, "both non-Throw aborts are counted");
+        assert!(!s.met_bar());
+    }
 
     #[test]
     fn stage1_corpus_is_bit_exact_against_oracle() {
