@@ -4,7 +4,7 @@
 |---|---|
 | **Created** | 2026-07-02 |
 | **Author** | endolinbot (prompted) |
-| **Status** | Proposed |
+| **Status** | Approved (2026-07-02, program supervisor `port-xs-to-rust-memory-safe-engine`; all ten open questions resolved, see § Resolved Questions) |
 
 Feasibility, architecture, and a staged roadmap for porting the XS
 JavaScript engine to Rust as a crate the `endor` daemon embeds
@@ -372,9 +372,9 @@ version matrix handled), and no endor use case requires migrating
 a live C-XS heap: the endo daemon restarts workers from durable
 persistence, and agoric replays from transcripts and rebuilds
 snapshots. The design therefore ships the Rust-native writer and
-reader first, and treats the C-XS snapshot importer as a bounded,
-optional stage gated on an actual migration need (open question
-3).
+reader first, and treats the C-XS snapshot importer as bounded,
+optional work gated on an actual migration need (resolved
+question 3: out of scope for the build phase).
 
 ### Debugger (requirement 1b)
 
@@ -518,7 +518,7 @@ Reconciliation with the design cluster, per document:
 
 | Design | Reconciliation |
 |---|---|
-| [daemon-endor-architecture](daemon-endor-architecture.md) | `Machine` API preserved; machine-runner threads and `!Send` pinning unchanged initially (a Send-able Rust machine is a possible later relaxation, open question 8); the `shared` platform is the primary beneficiary of memory safety |
+| [daemon-endor-architecture](daemon-endor-architecture.md) | `Machine` API preserved; machine-runner threads and `!Send` pinning unchanged initially (a Send-able Rust machine is a possible later relaxation; resolved question 8 keeps `!Send`); the `shared` platform is the primary beneficiary of memory safety |
 | [daemon-rust-xs-performance](daemon-rust-xs-performance.md) | The three-variant benchmark gains a fourth variant (Rust supervisor + endor engine) and is the performance-envelope harness; the `fxHasPendingJobs` check-and-reset global latch is replaced by a per-machine pending-jobs query with identical pump-loop semantics; the host-frame off-by-one bug class is designed out |
 | [daemon-xs-worker-metering](daemon-xs-worker-metering.md) | Crank lifecycle, admission gate, meter-report envelope, and the `Machine` metering API unchanged; `xsnap-platform.c` helpers (`fxAbort` longjmp, metered promise drain) become safe Rust equivalents |
 | [daemon-xs-worker-snapshot](daemon-xs-worker-snapshot.md) | Streaming write/read, CAS layout, callback-table signature discipline, and suspend/resume verbs unchanged; endor snapshots carry an endor `VERS` |
@@ -559,7 +559,7 @@ the Compartment seam, and bootstraps test262, before any breadth.
 |---|---|---|
 | 1. Thin slice: interpreter core + meter + oracle harness | `endor-vm` arenas and value model; interpreter for the arithmetic/logic/branch/call/stack opcode subset; meter with XS weights and check points; `endor-oracle` compiling source with C-XS and executing bytecode on both engines; a primordial `Compartment.evaluate` (fresh globals, shared intrinsics seam, no modules); `endor-262` dual-run skeleton with the stage corpus; fuzz targets 1 and 2 | Bit-exact (result, computron) agreement with the oracle on the stage corpus; `forbid(unsafe_code)` holds outside `endor-oracle` |
 | 2. Object model and control flow | Objects, prototypes, property ops, closures, exceptions (jump-chain with JS/host flags), full 245-opcode coverage (built-ins stubbed); GC v1 (mark-sweep + chunk compaction) | test262 `language/` dual-run agreement on the covered grammar; GC test suite under Miri |
-| 3. Built-ins | Object/Array/String (CESU-8)/Math (canonical NaN)/JSON/Map/Set/TypedArray/BigInt; promises and job queue with the pump-loop latch semantics; RegExp port decision executed (open question 6) | Built-ins sections dual-run agreement including computrons (the `mxMeterSome` fast-path annotations land here) |
+| 3. Built-ins | Object/Array/String (CESU-8)/Math (canonical NaN)/JSON/Map/Set/TypedArray/BigInt; promises and job queue with the pump-loop latch semantics; RegExp port decision executed (resolved question 6: port `xsre`) | Built-ins sections dual-run agreement including computrons (the `mxMeterSome` fast-path annotations land here) |
 | 4. Hardened JavaScript | `lockdown`, `harden`, `petrify`, `mutabilities`; full native `Compartment` + module machinery (ModuleSource, module maps); async/generators complete | The endor daemon boot bundles (`polyfills.js`, `ses_boot.js`, HandledPromise) run identically on both engines; SES conformance suites pass |
 | 5. Compiler port | `endor-compile`: lexer, parser, scoper, coder replacing the oracle compiler; parse metering | Byte-identical bytecode versus the oracle compiler on the full conformance corpus; parse computrons agree; parser fuzz target armed |
 | 6. Snapshots | `endor-snapshot` atom writer/reader; `Machine` snapshot surface; suspend/resume through the supervisor; meter state across suspend | Round-trip invariance under fuzzing; supervisor suspend/resume integration test passes on `-e endor-rs` |
@@ -619,78 +619,78 @@ so a computron divergence always has exactly one suspect.
    endor running side by side until parity is demonstrated, and
    after, for as long as the differential oracle earns its keep.
 
-## Open Questions
+## Resolved Questions
 
-Per the program contract, these are for the supervising agent to
-decide; each is framed with options and the trade-off.
+The ten questions below were posed to the supervising agent of
+program `port-xs-to-rust-memory-safe-engine` per the program
+contract, and were resolved by that supervisor on 2026-07-02.
+Each entry states the decision and its grounds; the decisions are
+binding on the build stages, and reopening one is a design
+amendment, not a code-review discussion.
 
-1. **Which C-XS is the parity oracle: the `c/moddable` submodule
-   pin (upstream metering, 16.16 fixed point) or the agoric-labs
-   fork (XS 13.3, integer meter, what `xs-meter-37` actually
-   measures)?** Option A, the in-tree pin: coherent with the endor
-   daemon, modern XS, one submodule. Option B, the agoric fork:
-   makes stage 9's agoric validation bit-exact against production,
-   but pins the port to a 2023-era engine and a divergent meter.
-   Recommendation: A; treat agoric-fleet meter parity as a
-   separate later target with its own oracle pin, reached via the
-   meter-version mechanism.
-2. **Is mixed-fleet consensus operation (endor validators
-   alongside C-XS validators under the same `xs-meter-N`) a
-   requirement, or is a coordinated-upgrade `endor-meter-1`
-   acceptable?** Mixed-fleet demands bit-exact equality against
-   the deployed fork build (strictly harder, forces option B
-   above); coordinated-upgrade only demands internal determinism
-   plus a published equivalence corpus. Recommendation:
-   coordinated-upgrade; it is how every XS meter change has ever
-   shipped.
-3. **Snapshot importer for C-XS-produced snapshots: in scope
-   (stage 6.5) or dropped until a migration need exists?** In
-   scope costs a decoder over every slot kind and a version
-   matrix; dropped costs nothing now but leaves "restore a C-XS
-   snapshot on endor" unsupported. Recommendation: dropped for
-   the build phase; the design documents the format overlap that
-   keeps it bounded.
-4. **Internal string encoding: CESU-8 (XS parity, snapshot and
-   allocation-count compatibility) or UTF-8 with boundary
-   conversion (Rust-idiomatic, cheaper host interop)?**
-   Recommendation: CESU-8; the endor build already sets `mxCESU8`,
-   the xsnap crate already carries the codec, and allocation
-   observability stays comparable.
-5. **Slot-record packing: hold the 32-byte-per-slot layout (heap
-   accounting and snapshot-image parity) even where a Rust enum
-   would like more room, or let the arena record grow?**
-   Recommendation: hold 32 bytes; it is achievable (kind + flag +
-   ID + next-index + 16-byte payload fits) and keeps
-   `currentHeapCount` semantics aligned.
-6. **RegExp: port `xsre` (11.6 KLOC, metered, deterministic,
-   exactly XS's observable behavior) or adopt an existing Rust
-   engine such as `regress` (cheaper, but different internals
-   mean different metering and subtle semantic drift)?**
-   Recommendation: port `xsre`; RegExp execution is metered and
-   guest-reachable, so it sits inside the parity bar.
-7. **Naming: workspace at `rust/engine/` with `endor-vm`,
-   `endor-oracle`, `endor-262`, `endor-fuzz` (and later
-   `endor-compile`, `endor-ses`, `endor-snapshot`,
-   `endor-debug`), engine flag value `endor-rs`?** Any coherent
-   alternative is fine; the constraint is that crate names not
-   collide with the existing `endo` and `xsnap` crates and that
-   the flag distinguish the two engines permanently.
-8. **Machine `Send`-ability: preserve `!Send` parity (machines
-   pinned to their runner thread, as today) or exploit the Rust
-   engine's freedom from C thread-locals to allow machine
-   migration across runner threads?** Recommendation: preserve
-   `!Send` initially; migration is a separate scheduler design
-   with its own determinism questions.
-9. **Does stage 1 build in this repository's `rust/` workspace
-   directly, or incubate in a separate directory until stage 4?**
-   Recommendation: in-repo at `rust/engine/` from the first
-   commit; the program already binds design and implementation to
-   this branch, and the oracle harness wants the existing xsnap
-   crate as a path dependency.
-10. **Intl: omit `intl402` permanently (XS parity, smaller
-    engine) or leave a seam for a future ICU4X-backed Intl?**
-    Recommendation: omit, matching the oracle; note that adding
-    Intl later is meter-affecting and therefore version-gated.
+1. **Parity oracle: the in-tree `c/moddable` submodule pin**
+   (upstream metering, 16.16 fixed point), not the agoric-labs
+   fork (XS 13.3, integer meter, `xs-meter-37`). Grounds: the
+   oracle must be the engine endor actually replaces, and the
+   endor daemon compiles the in-tree pin today; pinning the port
+   to a 2023-era fork would trade the whole program's modernity
+   for a bit-exactness the meter-version mechanism (question 2)
+   makes unnecessary. Agoric-fleet meter parity is a separate
+   later target with its own oracle pin and its own program.
+2. **Consensus entry is by coordinated upgrade (`endor-meter-1`),
+   not mixed-fleet operation.** Endor is not required to run
+   alongside C-XS validators under the same `xs-meter-N`. Grounds:
+   every XS meter change has ever shipped as a coordinated
+   `xs-meter-N` bump at a chain upgrade; mixed-fleet bit-exactness
+   would force decision 1 onto the divergent fork oracle and make
+   the strictly harder target load-bearing for no operational
+   gain. What remains unconditional is internal determinism plus
+   the published equivalence corpus against the pinned oracle.
+3. **The C-XS snapshot importer is out of scope for the build
+   phase.** No endor or agoric use case migrates a live C-XS
+   heap (workers restart from durable persistence; chains replay
+   transcripts). The shared atom grammar documented in § Snapshots
+   keeps a future importer bounded; building one now would spend
+   a stage on a decoder with no consumer. Revisit only against an
+   actual migration need, as its own design amendment.
+4. **Internal string encoding is CESU-8.** The endor build
+   already sets `mxCESU8`, the xsnap crate already carries the
+   codec, and snapshot content plus allocation observability stay
+   comparable with the oracle. UTF-8 boundary conversion would
+   perturb chunk sizes and therefore heap accounting.
+5. **The 32-byte slot-record layout holds.** Kind + flag + ID +
+   next-index + 16-byte payload fits in 32 bytes; holding it keeps
+   `currentHeapCount` semantics and snapshot slot images aligned
+   with the oracle. A roomier Rust enum is not worth divergent
+   heap accounting.
+6. **RegExp: port `xsre`.** RegExp execution is metered and
+   guest-reachable, so it sits inside the computron-parity bar;
+   an off-the-shelf engine such as `regress` has different
+   internals, hence different metering and subtle semantic drift.
+   The 11.6 KLOC cost lands in stage 3 per the roadmap, with the
+   differential fuzz target (item 5 of § Fuzzability) as its
+   enforcement.
+7. **Naming as proposed: workspace at `rust/engine/`, crates
+   `endor-vm`, `endor-oracle`, `endor-262`, `endor-fuzz` (later
+   `endor-compile`, `endor-ses`, `endor-snapshot`, `endor-debug`),
+   engine flag value `endor-rs`.** No collision with the existing
+   `endo` and `xsnap` crates, and `-e xs` / `-e endor-rs`
+   distinguishes the engines permanently.
+8. **Machines stay `!Send`.** Preserving thread-pinned parity
+   with today's runner model keeps the port's behavior envelope
+   identical; cross-thread machine migration is a separate
+   scheduler design with its own determinism questions and earns
+   nothing during the parity campaign.
+9. **Stage 1 builds in-repo at `rust/engine/` from the first
+   commit.** The program binds design and implementation to this
+   branch and PR, and the oracle harness consumes the existing
+   xsnap crate as a path dependency; an incubation directory would
+   only defer the integration it exists to prove.
+10. **Intl is omitted (`intl402` stays out), matching the
+    oracle.** Parity with C-XS is the acceptance bar and XS
+    deliberately omits Intl. Adding an ICU4X-backed Intl later is
+    meter-affecting and therefore version-gated behind a meter
+    bump; no seam is reserved for it beyond that rule.
 
 ## Prompt
 
