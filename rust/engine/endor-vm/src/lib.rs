@@ -21,15 +21,17 @@
 //! instruction sizes, and mnemonics match the oracle exactly.
 
 pub mod compartment;
+pub mod gc;
 pub mod interp;
 pub mod meter;
 pub mod opcode;
 pub mod value;
 
 pub use compartment::{Compartment, Intrinsics, Machine};
+pub use gc::{GcStats, Heap};
 pub use interp::{Halt, Interp, RunOutcome, PROGRAM_INVOCATION_COMPUTRONS};
 pub use meter::{Meter, MeterCheck};
-pub use opcode::Opcode;
+pub use opcode::{instruction_len, Opcode};
 pub use value::{ChunkArena, ChunkOffset, Kind, Payload, Slot, SlotArena, SlotIndex};
 
 /// Run a program bytecode buffer (as emitted by the C-XS compiler) on
@@ -38,10 +40,11 @@ pub fn run_program(bytecode: &[u8]) -> RunOutcome {
     Interp::new().run(bytecode)
 }
 
-/// Disassemble a bytecode buffer to `(offset, mnemonic)` pairs using
-/// the generated size table. Fixed-size opcodes advance by their size;
-/// a size of 0 (variable-length, not emitted by the stage-1 subset)
-/// stops disassembly.
+/// Disassemble a bytecode buffer to `(offset, mnemonic)` pairs, walking
+/// instruction lengths with [`opcode::instruction_len`] so ID-operand
+/// and length-prefixed variable opcodes (functions, strings, embedded
+/// code blocks) advance correctly rather than stopping disassembly.
+/// A truncated or invalid instruction ends the walk.
 pub fn disassemble(bytecode: &[u8]) -> Vec<(usize, &'static str)> {
     let mut out = Vec::new();
     let mut pc = 0usize;
@@ -49,11 +52,10 @@ pub fn disassemble(bytecode: &[u8]) -> Vec<(usize, &'static str)> {
         match Opcode::from_u8(bytecode[pc]) {
             Some(op) => {
                 out.push((pc, op.name()));
-                let sz = op.size();
-                if sz <= 0 {
-                    break;
+                match opcode::instruction_len(bytecode, pc) {
+                    Some(len) if len > 0 => pc += len,
+                    _ => break,
                 }
-                pc += sz as usize;
             }
             None => break,
         }

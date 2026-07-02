@@ -1011,12 +1011,65 @@ impl Opcode {
         })
     }
 
-    /// Instruction size in bytes (opcode + operands) from gxCodeSizes.
-    /// Size 0 marks a variable-length opcode; the stage-1 subset emits none.
+    /// Raw `gxCodeSizes` entry. A positive value is the fixed
+    /// instruction size; `0` marks an ID-operand opcode (size `1 +
+    /// ID_SIZE`); a negative `-n` marks a length-prefixed variable
+    /// opcode (`1 + n + payload`). Use [`Opcode::instruction_len`] to
+    /// resolve the concrete length against a byte stream.
     #[inline]
     pub fn size(self) -> i8 { CODE_SIZES[self as usize] }
 
     /// Lowercase mnemonic from gxCodeNames, for disassembly.
     #[inline]
     pub fn name(self) -> &'static str { CODE_NAMES[self as usize] }
+}
+
+/// The width of an ID operand in the code stream. XS builds endor with
+/// 2-byte IDs (`mxRunID == mxRunS2`, no `mx32bitID`), so an ID-bearing
+/// opcode (`gxCodeSizes == 0`) is `1 + ID_SIZE` = 3 bytes.
+pub const ID_SIZE: usize = 2;
+
+/// The concrete byte length of the instruction at `code[pc]`, resolving
+/// the `gxCodeSizes` sentinels exactly as XS's `fxReadCode`
+/// (`xsSnapshot.c`) walks the stream:
+///
+/// - `size > 0`: fixed length `size`.
+/// - `size == 0`: `1 + ID_SIZE` (an ID operand).
+/// - `size == -1`: `1 + 1 + code[pc+1]` (u8 length prefix, then bytes).
+/// - `size == -2`: `1 + 2 + u16` (u16 LE length prefix, then bytes).
+/// - `size == -4`: `1 + 4 + u32` (u32 LE length prefix, then bytes).
+///
+/// Returns `None` on an unknown opcode byte or a truncated length
+/// prefix (a corrupt or truncated stream), never panicking — the
+/// bytecode-decoder fuzz target (design § Fuzzability, target 2) relies
+/// on this.
+pub fn instruction_len(code: &[u8], pc: usize) -> Option<usize> {
+    let byte = *code.get(pc)?;
+    let op = Opcode::from_u8(byte)?;
+    let size = op.size();
+    if size > 0 {
+        return Some(size as usize);
+    }
+    match size {
+        0 => Some(1 + ID_SIZE),
+        -1 => {
+            let n = *code.get(pc + 1)? as usize;
+            Some(2 + n)
+        }
+        -2 => {
+            let lo = *code.get(pc + 1)? as usize;
+            let hi = *code.get(pc + 2)? as usize;
+            Some(3 + (lo | (hi << 8)))
+        }
+        -4 => {
+            let b0 = *code.get(pc + 1)? as usize;
+            let b1 = *code.get(pc + 2)? as usize;
+            let b2 = *code.get(pc + 3)? as usize;
+            let b3 = *code.get(pc + 4)? as usize;
+            Some(5 + (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)))
+        }
+        // Every negative sentinel XS emits is -1/-2/-4; anything else is
+        // an impossible table entry.
+        _ => None,
+    }
 }

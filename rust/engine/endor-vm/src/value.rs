@@ -119,6 +119,41 @@ impl Slot {
         }
     }
 
+    /// Invoke `f` with every slot index this slot references as a GC
+    /// edge: its `next` link (property/frame chains) and any
+    /// reference-bearing payload arm. The mark-sweep tracer
+    /// ([`crate::gc`]) uses this; extend it whenever a new
+    /// reference-bearing [`Payload`] arm lands.
+    #[inline]
+    pub fn each_ref_slot(&self, mut f: impl FnMut(SlotIndex)) {
+        if !self.next.is_null() {
+            f(self.next);
+        }
+        match self.value {
+            Payload::Reference(r) => f(r),
+            _ => {}
+        }
+    }
+
+    /// The chunk this slot references (a heap-string payload), if any —
+    /// what the slide-compactor must relocate and rewrite.
+    #[inline]
+    pub fn chunk_ref(&self) -> Option<ChunkOffset> {
+        match self.value {
+            Payload::String(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Rewrite this slot's chunk reference after compaction. A no-op on
+    /// a slot that holds no chunk offset.
+    #[inline]
+    pub fn set_chunk_ref(&mut self, off: ChunkOffset) {
+        if let Payload::String(_) = self.value {
+            self.value = Payload::String(off);
+        }
+    }
+
     #[inline]
     pub fn as_integer(&self) -> Option<i32> {
         match self.value {
@@ -136,14 +171,19 @@ impl Slot {
 }
 
 /// A slot arena: fixed-size 32-byte records that never move, with a
-/// free list. This is XS's slot heap; the mark-sweep collector that
-/// sweeps it to the free list lands in stage 2 (design § Value and
-/// heap model). Because it is index-based it is safe code: a stale
-/// index is a kind-checked logic bug, not undefined behavior.
+/// free list. This is XS's slot heap; the mark-sweep collector
+/// ([`crate::gc`]) sweeps it to the free list (design § Value and heap
+/// model). Because it is index-based it is safe code: a stale index is
+/// a kind-checked logic bug, not undefined behavior.
 #[derive(Default)]
 pub struct SlotArena {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    /// One mark bit per slot, used by the mark-sweep collector. A slot
+    /// is never both free and marked; the collector clears all marks
+    /// before a collection and sweeps the unmarked-and-not-already-free
+    /// slots onto the free list.
+    marks: Vec<bool>,
     /// Count of live (non-free) slots, mirroring `currentHeapCount`.
     live: u32,
 }
@@ -153,6 +193,7 @@ impl SlotArena {
         SlotArena {
             slots: Vec::new(),
             free: Vec::new(),
+            marks: Vec::new(),
             live: 0,
         }
     }
@@ -162,10 +203,12 @@ impl SlotArena {
         self.live += 1;
         if let Some(i) = self.free.pop() {
             self.slots[i as usize] = slot;
+            self.marks[i as usize] = false;
             SlotIndex(i)
         } else {
             let i = self.slots.len() as u32;
             self.slots.push(slot);
+            self.marks.push(false);
             SlotIndex(i)
         }
     }
@@ -186,6 +229,66 @@ impl SlotArena {
         &mut self.slots[index.0 as usize]
     }
 
+    /// Total slot records ever allocated (live + free). The collector
+    /// walks this range when sweeping.
+    #[inline]
+    pub fn capacity(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
+    // --- mark-sweep support (see `crate::gc`) ---
+
+    /// Clear every mark bit. Called at the start of a collection.
+    pub fn clear_marks(&mut self) {
+        for m in self.marks.iter_mut() {
+            *m = false;
+        }
+    }
+
+    /// Mark a slot reachable. Returns `true` if it was not already
+    /// marked, so the tracer can avoid re-following an already-visited
+    /// slot (cycle safety).
+    #[inline]
+    pub fn mark(&mut self, index: SlotIndex) -> bool {
+        if index.is_null() {
+            return false;
+        }
+        let i = index.0 as usize;
+        if self.marks[i] {
+            false
+        } else {
+            self.marks[i] = true;
+            true
+        }
+    }
+
+    #[inline]
+    pub fn is_marked(&self, index: SlotIndex) -> bool {
+        !index.is_null() && self.marks[index.0 as usize]
+    }
+
+    /// Whether `index` currently sits on the free list (a swept or
+    /// never-live record). Linear in the free-list length; used only by
+    /// the sweep bookkeeping and tests, not on any hot path.
+    fn is_free(&self, i: u32) -> bool {
+        self.free.contains(&i)
+    }
+
+    /// Sweep: every allocated slot that is not marked and not already
+    /// free returns to the free list. Returns the number of slots
+    /// reclaimed. Mirrors `fxSweep` reclaiming unmarked slots.
+    pub fn sweep(&mut self) -> u32 {
+        let mut reclaimed = 0u32;
+        for i in 0..self.slots.len() as u32 {
+            if !self.marks[i as usize] && !self.is_free(i) {
+                self.free.push(i);
+                self.live -= 1;
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
     /// Live slot count. XS accounts 32 bytes per slot; this is the
     /// count `currentHeapCount` reports.
     #[inline]
@@ -201,10 +304,17 @@ impl SlotArena {
     }
 }
 
+/// The size of a chunk's length header, in bytes. Each block in the
+/// arena is laid out `[u32 length][payload...]`, mirroring XS's
+/// `txChunk` header discipline (a size field precedes each chunk) so
+/// the slide-compactor can walk and relocate blocks without external
+/// bookkeeping.
+const CHUNK_HEADER: usize = 4;
+
 /// The chunk arena: variable-size data (strings in CESU-8, and later
-/// ArrayBuffers, BigInt digits, bytecode). Slide-compaction during GC
-/// rewrites `ChunkOffset`s exactly where XS rewrites chunk pointers;
-/// that compaction lands with the collector in stage 2.
+/// ArrayBuffers, BigInt digits, bytecode). Each block carries a length
+/// header so [`ChunkArena::compact`] can slide-compact during GC,
+/// rewriting `ChunkOffset`s exactly where XS rewrites chunk pointers.
 #[derive(Default)]
 pub struct ChunkArena {
     bytes: Vec<u8>,
@@ -215,18 +325,76 @@ impl ChunkArena {
         ChunkArena { bytes: Vec::new() }
     }
 
-    /// Append bytes, returning their offset. Strings are stored in
-    /// CESU-8 exactly as XS holds them (resolved question 4).
+    /// Append bytes behind a length header, returning the offset of the
+    /// payload (not the header). Strings are stored in CESU-8 exactly as
+    /// XS holds them (resolved question 4).
     pub fn alloc(&mut self, data: &[u8]) -> ChunkOffset {
+        let header = self.bytes.len();
+        self.bytes
+            .extend_from_slice(&(data.len() as u32).to_le_bytes());
         let off = self.bytes.len() as u32;
         self.bytes.extend_from_slice(data);
+        debug_assert_eq!(off as usize, header + CHUNK_HEADER);
         ChunkOffset(off)
+    }
+
+    /// The stored length of the block whose payload begins at `off`.
+    #[inline]
+    pub fn len_of(&self, off: ChunkOffset) -> usize {
+        let h = off.0 as usize - CHUNK_HEADER;
+        u32::from_le_bytes([
+            self.bytes[h],
+            self.bytes[h + 1],
+            self.bytes[h + 2],
+            self.bytes[h + 3],
+        ]) as usize
     }
 
     #[inline]
     pub fn slice(&self, off: ChunkOffset, len: usize) -> &[u8] {
         let start = off.0 as usize;
         &self.bytes[start..start + len]
+    }
+
+    /// The whole payload of the block at `off`, using its stored length.
+    #[inline]
+    pub fn payload(&self, off: ChunkOffset) -> &[u8] {
+        self.slice(off, self.len_of(off))
+    }
+
+    /// Slide-compact: keep only the blocks whose payload offsets are in
+    /// `live`, packing them to the front of the arena in ascending
+    /// offset order, and return the old→new payload-offset remap the
+    /// caller applies to every live `ChunkOffset` (design § Value and
+    /// heap model: "offsets are rewritten exactly where XS rewrites
+    /// pointers"). Duplicate/unknown offsets in `live` are ignored.
+    pub fn compact(&mut self, live: &[ChunkOffset]) -> std::collections::HashMap<ChunkOffset, ChunkOffset> {
+        use std::collections::{HashMap, HashSet};
+        let mut seen: Vec<ChunkOffset> = live
+            .iter()
+            .copied()
+            .filter(|o| !o.is_null())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        // Relocate in ascending source order so the copy never overlaps
+        // a not-yet-moved block.
+        seen.sort_by_key(|o| o.0);
+
+        let mut fresh: Vec<u8> = Vec::with_capacity(self.bytes.len());
+        let mut remap: HashMap<ChunkOffset, ChunkOffset> = HashMap::new();
+        for old in seen {
+            let len = self.len_of(old);
+            let start = old.0 as usize;
+            let header = fresh.len();
+            fresh.extend_from_slice(&(len as u32).to_le_bytes());
+            let new_off = fresh.len() as u32;
+            fresh.extend_from_slice(&self.bytes[start..start + len]);
+            debug_assert_eq!(new_off as usize, header + CHUNK_HEADER);
+            remap.insert(old, ChunkOffset(new_off));
+        }
+        self.bytes = fresh;
+        remap
     }
 
     #[inline]
