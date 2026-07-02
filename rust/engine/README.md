@@ -27,6 +27,27 @@ git -C c/moddable fetch --depth 1 --filter=blob:none \
 git -C c/moddable checkout 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
 ```
 
+The shallow sha-fetch above only works while the pin is an advertised
+tip; GitHub now rejects it (`upload-pack: not our ref` — the `public`
+branch has moved past the pin). Two working fallbacks (verified
+2026-07-02):
+
+```sh
+# (a) full (non-shallow) fetch of public; the pin is an ancestor of it
+git -C c/moddable fetch https://github.com/Moddable-OpenSource/moddable public
+git -C c/moddable checkout 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
+
+# (b) fetch from any sibling checkout that already holds the pin
+git -C c/moddable fetch /path/to/sibling/c/moddable 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
+git -C c/moddable checkout 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
+```
+
+Caution: `c/moddable` in a fresh checkout is an **empty gitlink
+directory with no `.git`**, so a `git -C c/moddable ...` there walks up
+and operates on the *superproject*. `git clone` a moddable repo into
+`c/moddable` (or `git init` it) before running any of the fetches
+above.
+
 Two frictions the supervisor should note (they do not affect the
 stage-1 result, which is bit-exact against this pin, but they affect
 reproducibility and the "path dependency on xsnap" phrasing):

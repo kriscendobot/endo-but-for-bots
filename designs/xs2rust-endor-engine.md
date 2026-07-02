@@ -571,6 +571,34 @@ Stages 1 through 4 keep the oracle compiler in the loop, which is
 deliberate: interpreter parity and compiler parity are separated
 so a computron divergence always has exactly one suspect.
 
+**Stage-2 amendment (supervisor, 2026-07-02).** Stage 2 executes as two
+sub-stages on this PR, because the stage-2 build established — and the
+supervisor verified against the pin's `xsMemory.c` — that bit-exact
+computron parity on *any* program that allocates at run time requires
+the allocation-faithful object heap first: XS meters every `fxNewSlot`
+(`XS_SLOT_ALLOCATION_METERING`, 1<<8), every chunk byte
+(`XS_CHUNK_ALLOCATION_METERING`, 1), and built-in steps (1<<14) on the
+property paths, so the count depends on the engine's exact allocation
+sequence, not just its dispatch sequence. **Stage 2a (landed):** program
+frame + scope/variable/loop interpreter over compiler-emitted bytecode,
+GC v1 (mark-sweep + chunk slide-compaction, Miri-green), real
+`Compartment.evaluate` global binding, and the instruction-length
+walker; its new grammar is verified for **result agreement only** and
+deliberately kept out of the bit-exact corpus rather than faked.
+**Stage 2b (next):** the object model — instances, prototypes, property
+behaviors, closures via heap cells, exceptions' jump-chain, call/return
+frame switching, full 245-opcode coverage (built-ins stubbed) — with
+allocation-faithful metering; the original stage-2 acceptance bar
+(bit-exact test262 `language/` dual-run agreement on the covered
+grammar) is 2b's bar, and the 2a grammar graduates into the bit-exact
+corpus as the heap makes its computrons faithful. Meter-check placement
+moves with the frame machinery: per the pin's `xsRun.c`, checks belong
+at the `mxFirstCode` sites (call entry, return-into-a-JS-caller, catch
+resume) and at backward branches; C-XS runs **no** check when
+END/RETURN exits to the C caller, and `fxBeginMetering` scales the
+host's interval `<<16` and resets `meterIndex` — both to be matched
+exactly (stage-2a review findings 1 and 2).
+
 ## Dependencies
 
 | Design | Relationship |
