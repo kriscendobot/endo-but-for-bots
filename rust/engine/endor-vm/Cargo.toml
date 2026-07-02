@@ -1,0 +1,11 @@
+[package]
+name = "endor-vm"
+description = "Safe, index-arena transliteration of the XS interpreter core: value/heap model, slot stack, match-dispatch interpreter, and the 16.16 fixed-point meter. #![forbid(unsafe_code)]."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "endor_vm"
+path = "src/lib.rs"

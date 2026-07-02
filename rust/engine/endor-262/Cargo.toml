@@ -1,0 +1,15 @@
+[package]
+name = "endor-262"
+description = "Dual-run harness: executes each corpus program on endor-vm and on the C-XS oracle, recording four-valued agreement plus computron agreement (design § test262 conformance). #![forbid(unsafe_code)]."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "endor_262"
+path = "src/lib.rs"
+
+[dependencies]
+endor-vm = { path = "../endor-vm" }
+endor-oracle = { path = "../endor-oracle" }

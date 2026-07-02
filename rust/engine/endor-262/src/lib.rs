@@ -1,0 +1,210 @@
+#![forbid(unsafe_code)]
+//! endor-262: the dual-run harness (design § test262 conformance;
+//! requirement 6).
+//!
+//! For each program it executes the source on the C-XS oracle
+//! (`endor-oracle`) to obtain `(bytecode, result, run-only computrons)`
+//! and runs that exact bytecode on `endor-vm`, then records four-valued
+//! agreement plus computron agreement. Matching the oracle's *fail*
+//! vector matters as much as its pass vector: a program endor completes
+//! that C-XS throws on (or vice versa) is a divergence, never a silent
+//! improvement.
+//!
+//! Stage 1 ships a curated corpus under `corpora/` (arithmetic, logic,
+//! control flow); it grows into whole-section runs in later stages.
+
+use endor_vm::{run_program, Halt, RunOutcome};
+
+/// The four-valued completion agreement (design § test262 conformance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agreement {
+    /// Both engines completed normally.
+    BothComplete,
+    /// Both engines aborted (threw / failed to parse).
+    BothAbort,
+    /// endor completed where the oracle aborted.
+    EndorOnlyComplete,
+    /// The oracle completed where endor aborted.
+    OracleOnlyComplete,
+}
+
+/// One program's dual-run record.
+#[derive(Debug, Clone)]
+pub struct DualRun {
+    pub source: String,
+    pub agreement: Agreement,
+    /// Completion-value string agreement (only meaningful when both
+    /// completed).
+    pub result_agrees: bool,
+    pub oracle_result: String,
+    pub endor_result: String,
+    /// Computron agreement (only meaningful when both completed).
+    pub computrons_agree: bool,
+    pub oracle_computrons: u64,
+    pub endor_computrons: u64,
+    /// endor's raw dispatched-opcode count (before the invocation
+    /// baseline), for isolating a metering divergence.
+    pub endor_dispatched: u64,
+    /// Why endor stopped, verbatim, so an unsupported opcode names
+    /// itself.
+    pub endor_halt: Halt,
+    /// The exact bytecode C-XS emitted (for disassembly on divergence).
+    pub bytecode: Vec<u8>,
+}
+
+impl DualRun {
+    /// The acceptance-bar predicate for one program: same completion,
+    /// same result string, same computrons.
+    pub fn is_bit_exact(&self) -> bool {
+        match self.agreement {
+            Agreement::BothComplete => self.result_agrees && self.computrons_agree,
+            Agreement::BothAbort => true,
+            _ => false,
+        }
+    }
+}
+
+/// Run one program on both engines and compare.
+///
+/// Returns `None` only if the oracle machine itself fails to start.
+pub fn dual_run(source: &str) -> Option<DualRun> {
+    let oracle = endor_oracle::run(source)?;
+
+    let endor: RunOutcome = run_program(&oracle.bytecode);
+
+    let agreement = match (oracle.completed, endor.completed) {
+        (true, true) => Agreement::BothComplete,
+        (false, false) => Agreement::BothAbort,
+        (false, true) => Agreement::EndorOnlyComplete,
+        (true, false) => Agreement::OracleOnlyComplete,
+    };
+
+    let result_agrees = oracle.completed && endor.completed && oracle.result == endor.result;
+    let computrons_agree =
+        oracle.completed && endor.completed && oracle.computrons == endor.computrons;
+
+    Some(DualRun {
+        source: source.to_string(),
+        agreement,
+        result_agrees,
+        oracle_result: oracle.result,
+        endor_result: endor.result,
+        computrons_agree,
+        oracle_computrons: oracle.computrons,
+        endor_computrons: endor.computrons,
+        endor_dispatched: endor.dispatched,
+        endor_halt: endor.halt,
+        bytecode: oracle.bytecode,
+    })
+}
+
+/// Parse a corpus file: one program per non-empty, non-`//` line.
+/// Keeping entries to a single line keeps the completion value (the
+/// last expression) unambiguous for the harness.
+pub fn parse_corpus(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// The checked-in stage-1 corpus, embedded so tests and the harness
+/// share one source of truth.
+pub fn stage1_corpus() -> Vec<String> {
+    let mut all = Vec::new();
+    for text in [
+        include_str!("../corpora/arithmetic.js"),
+        include_str!("../corpora/logic.js"),
+        include_str!("../corpora/control-flow.js"),
+    ] {
+        all.extend(parse_corpus(text));
+    }
+    all
+}
+
+/// A summary over a corpus run.
+#[derive(Debug, Default, Clone)]
+pub struct Summary {
+    pub total: usize,
+    pub bit_exact: usize,
+    pub result_divergences: usize,
+    pub computron_divergences: usize,
+    pub completion_divergences: usize,
+    pub unsupported: usize,
+}
+
+impl Summary {
+    pub fn met_bar(&self) -> bool {
+        self.total > 0 && self.bit_exact == self.total
+    }
+}
+
+/// Run a whole corpus and summarize.
+pub fn run_corpus(programs: &[String]) -> (Vec<DualRun>, Summary) {
+    let mut runs = Vec::new();
+    let mut s = Summary::default();
+    for p in programs {
+        if let Some(r) = dual_run(p) {
+            s.total += 1;
+            if r.is_bit_exact() {
+                s.bit_exact += 1;
+            } else {
+                match r.agreement {
+                    Agreement::BothComplete => {
+                        if !r.result_agrees {
+                            s.result_divergences += 1;
+                        }
+                        if !r.computrons_agree {
+                            s.computron_divergences += 1;
+                        }
+                    }
+                    _ => s.completion_divergences += 1,
+                }
+                if matches!(r.endor_halt, Halt::Unsupported(_)) {
+                    s.unsupported += 1;
+                }
+            }
+            runs.push(r);
+        }
+    }
+    (runs, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage1_corpus_is_bit_exact_against_oracle() {
+        let programs = stage1_corpus();
+        assert!(!programs.is_empty(), "corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={})\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source,
+                    r.agreement,
+                    r.oracle_result,
+                    r.endor_result,
+                    r.oracle_computrons,
+                    r.endor_computrons,
+                    r.endor_dispatched,
+                    r.endor_halt,
+                    r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-1 acceptance bar: {}/{} bit-exact (result divergences={}, computron divergences={}, completion divergences={}, unsupported={})",
+            summary.bit_exact,
+            summary.total,
+            summary.result_divergences,
+            summary.computron_divergences,
+            summary.completion_divergences,
+            summary.unsupported,
+        );
+    }
+}

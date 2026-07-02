@@ -1,0 +1,15 @@
+[package]
+name = "endor-fuzz"
+description = "cargo-fuzz targets (design § Fuzzability): target 1 differential source fuzzing, target 2 bytecode decoder. The comparison and generation logic is a plain, testable lib so it builds without a libFuzzer toolchain. #![forbid(unsafe_code)]."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "endor_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+endor-vm = { path = "../endor-vm" }
+endor-oracle = { path = "../endor-oracle" }
