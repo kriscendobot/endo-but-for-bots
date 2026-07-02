@@ -55,8 +55,18 @@ pub enum Kind {
     /// question 4). Payload holds a `ChunkOffset`.
     String = 5,
     /// Reference to a heap instance (slot arena). Payload holds a
-    /// `SlotIndex`. Populated in stage 2.
+    /// `SlotIndex`.
     Reference = 10,
+    /// A not-yet-initialized binding (XS's `XS_UNINITIALIZED_KIND`, the
+    /// "kind < 0" sentinel a `let`/`const`/`this` binding carries before
+    /// its initializer runs; reading it is a TDZ ReferenceError).
+    Uninitialized = 11,
+    /// An environment/reference sentinel produced by `EVAL_REFERENCE`
+    /// and friends and consumed by `GET_VARIABLE`/`SET_VARIABLE`. The
+    /// payload's `Reference` names the environment the variable resolves
+    /// against (the global instance, or `SlotIndex::NULL` for the
+    /// active frame's own scope).
+    EnvReference = 12,
 }
 
 /// The 16-byte value payload (XS's value union arm subset for stage 1).
@@ -107,6 +117,10 @@ impl Slot {
     #[inline]
     pub fn number(n: f64) -> Slot {
         Slot::of(Kind::Number, Payload::Number(n))
+    }
+    #[inline]
+    pub fn uninitialized() -> Slot {
+        Slot::of(Kind::Uninitialized, Payload::None)
     }
     #[inline]
     pub fn of(kind: Kind, value: Payload) -> Slot {

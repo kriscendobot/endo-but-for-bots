@@ -1,14 +1,36 @@
-//! The `match`-dispatch interpreter over the stage-1 opcode subset
-//! (design § Interpreter and dispatch): arithmetic, logic, bitwise,
-//! comparison, unary, branch, and the stack/result opcodes. It
-//! executes the exact bytecode the C-XS compiler emits (captured by the
-//! oracle), so during stages 1 through 4 the byte stream is identical
-//! and any computron divergence has one suspect: the interpreter.
+//! The `match`-dispatch interpreter (design § Interpreter and
+//! dispatch). It executes the exact bytecode the C-XS compiler emits
+//! (captured by the oracle), so during stages 1 through 4 the byte
+//! stream is identical and any divergence has one suspect: the
+//! interpreter.
+//!
+//! Stage 1 covered the pure-expression subset (arithmetic, logic,
+//! bitwise, comparison, unary, branch, stack/result). Stage 2 adds the
+//! program frame and its scope: `RESERVE`/`NEW_LOCAL`/`NEW_TEMPORARY`
+//! scope slots, the `*_LOCAL` accessors, the environment/variable
+//! opcodes (`EVAL_ENVIRONMENT`/`EVAL_REFERENCE`/`GET_VARIABLE`/
+//! `SET_VARIABLE`), and backward-branch control flow (loops) over
+//! compiler-emitted bytecode — the call/frame machinery's scope half.
 //!
 //! Semantics are ported case-by-case from `xs/sources/xsRun.c` at the
 //! `c/moddable` pin: integer fast paths with checked-overflow promotion
 //! to `f64`, XS's `-0` handling on multiply/modulo/minus, ToInt32 on
-//! the bitwise ops, and NaN-aware relational and equality comparison.
+//! the bitwise ops, NaN-aware comparison, and the scope-slot addressing
+//! `mxEnvironment - index`.
+//!
+//! **Metering scope (stage-2 finding).** Computrons are bit-exact for
+//! programs that do not allocate at run time (the stage-1 corpus, pure
+//! expressions): the count is `dispatched + `[`PROGRAM_INVOCATION_COMPUTRONS`].
+//! A program that allocates during the run (a `var` environment, an
+//! object literal, a closure cell) also accrues slot- and
+//! chunk-allocation metering (`XS_SLOT_ALLOCATION_METERING` = 1<<8 per
+//! `fxNewSlot`, 1 per chunk byte) plus a built-in step per property set
+//! — see [`crate::meter`]. Reproducing those bit-exactly requires the
+//! allocation-faithful object heap, which is the remaining stage-2
+//! body; this interpreter computes the correct *results* for the scope/
+//! control-flow subset but does not yet reproduce their computron
+//! counts, so those programs are exercised as *result-agreement* tests,
+//! not added to the bit-exact corpus.
 //!
 //! No JIT, no code generation, no execution-count-dependent behavior
 //! (requirement 4): a straight `match` LLVM lowers to a jump table.
@@ -62,14 +84,47 @@ pub struct RunOutcome {
     pub halt: Halt,
 }
 
-/// One interpreter activation. Stage 1 runs a single top-level program
-/// frame; the slot/chunk arenas are the machine heap (exercised by
-/// string and, later, reference values), and the value stack is XS's
+/// One interpreter activation over a single top-level program frame
+/// (design § Interpreter and dispatch). The value stack is XS's
 /// downward-growing slot stack modeled as a `Vec` whose top is the last
-/// element.
+/// element; the program frame carries its scope slots (`locals`,
+/// declared by `NEW_LOCAL`/`NEW_TEMPORARY` and addressed by the
+/// `*_LOCAL` opcodes' index), the `id -> local` map the environment
+/// opcodes resolve `var` names through, the completion value
+/// (`result`), and the global bindings undeclared names fall back to.
+///
+/// Metering is per dispatched bytecode (§ Metering): the frame and
+/// control-flow opcodes each dispatch once, so running the exact C-XS
+/// bytecode yields the exact C-XS computron count without any separate
+/// per-opcode weight bookkeeping. The program-invocation baseline
+/// ([`PROGRAM_INVOCATION_COMPUTRONS`]) accounts for the program-frame
+/// entry C-XS meters outside the captured bytecode.
+///
+/// Call/return frame *switching* (nested user functions) and the object
+/// model are the next stage-2 work items; opcodes outside the
+/// frame/scope/variable/control-flow/expression subset halt with
+/// [`Halt::Unsupported`] naming themselves, so the differential harness
+/// reports exactly what to implement next rather than diverging
+/// silently.
 pub struct Interp {
     stack: Vec<Slot>,
+    /// The program frame's scope slots. `NEW_LOCAL`/`NEW_TEMPORARY`
+    /// append (XS's `--mxScope`); a `*_LOCAL` opcode's 1-based index `k`
+    /// addresses `locals[k - 1]` (XS's `mxEnvironment - index`).
+    locals: Vec<Slot>,
+    /// `id -> locals index` for the frame's named `var`/`let`/`const`
+    /// bindings, so the environment opcodes resolve a name to its scope
+    /// slot (XS aliases the frame locals through the environment
+    /// instance; this map is the behavioral equivalent).
+    id_map: std::collections::HashMap<u16, usize>,
+    /// Bindings a name resolves to when it is not a frame local: the
+    /// global object's properties, keyed by id.
+    globals: std::collections::HashMap<u16, Slot>,
     result: Slot,
+    /// Whether the frame runs in strict mode (`BEGIN_STRICT*`). Recorded
+    /// for the exception/`this` semantics that observe it; the covered
+    /// subset does not yet branch on it.
+    strict: bool,
     meter: Meter,
     /// The host metering callback, installed by [`Interp::arm_meter`].
     /// `None` is the default un-metered interpreter the differential
@@ -94,12 +149,25 @@ impl Interp {
     pub fn new() -> Interp {
         Interp {
             stack: Vec::with_capacity(64),
+            locals: Vec::new(),
+            id_map: std::collections::HashMap::new(),
+            globals: std::collections::HashMap::new(),
             result: Slot::undefined(),
+            strict: false,
             meter: Meter::new(),
             meter_host: None,
             slots: SlotArena::new(),
             chunks: ChunkArena::new(),
         }
+    }
+
+    /// Seed a global binding by id, so a program that reads an
+    /// undeclared name (`EVAL_REFERENCE`/`GET_VARIABLE` falling through
+    /// to the global object) observes it. Used by
+    /// [`crate::compartment::Compartment::evaluate`] to bind the
+    /// compartment's own globals before running.
+    pub fn define_global_id(&mut self, id: u16, value: Slot) {
+        self.globals.insert(id, value);
     }
 
     /// Arm metering (`fxBeginMetering`): install a check `interval` and
@@ -163,6 +231,19 @@ impl Interp {
                 code[pc + $off] as i8 as i32
             };
         }
+        // Unsigned 1-byte operand (a scope index; XS mxRunU1).
+        macro_rules! u1 {
+            ($off:expr) => {
+                code[pc + $off] as usize
+            };
+        }
+        // 2-byte little-endian ID operand (XS mxRunID == mxRunS2 on the
+        // endor build). Used by the environment/variable opcodes.
+        macro_rules! id {
+            ($off:expr) => {
+                u16::from_le_bytes([code[pc + $off], code[pc + $off + 1]])
+            };
+        }
 
         loop {
             if pc >= len {
@@ -178,13 +259,28 @@ impl Interp {
             self.meter.tick_code();
 
             let size = op.size();
-            // Bounds-check the fixed-size operands before reading.
-            if size > 0 && pc + (size as usize) > len {
+            // The resolved instruction length (fixed size, or the
+            // 1+ID_SIZE / length-prefixed length for the variable
+            // opcodes). ID-operand opcodes have `size == 0`, so they
+            // must advance by `ilen`, never by `size` (a zero-advance
+            // infinite loop).
+            let ilen = match crate::opcode::instruction_len(code, pc) {
+                Some(l) if l > 0 => l,
+                _ => {
+                    return Halt::Decode(format!(
+                        "opcode {} at {} has unresolvable length",
+                        op.name(),
+                        pc
+                    ))
+                }
+            };
+            // Bounds-check the operands before reading.
+            if pc + ilen > len {
                 return Halt::Decode(format!(
                     "opcode {} at {} needs {} bytes, {} left",
                     op.name(),
                     pc,
-                    size,
+                    ilen,
                     len - pc
                 ));
             }
@@ -192,14 +288,130 @@ impl Interp {
             use Opcode::*;
             match op {
                 // ---- program prologue / frame -----------------------
-                XS_CODE_BEGIN_SLOPPY | XS_CODE_BEGIN_STRICT => {
-                    // `this` / strictness setup: no effect on the pure
-                    // expression subset. Operand byte is the frame's
-                    // scope count.
+                XS_CODE_BEGIN_SLOPPY => {
+                    // `this` setup: binds the frame's `this` to the
+                    // realm global for the covered subset. Operand byte
+                    // is the frame's scope count. No observable effect
+                    // until `this`/method calls land.
                     pc += size as usize;
                 }
-                XS_CODE_EVAL_ENVIRONMENT => {
+                XS_CODE_BEGIN_STRICT
+                | XS_CODE_BEGIN_STRICT_BASE
+                | XS_CODE_BEGIN_STRICT_DERIVED
+                | XS_CODE_BEGIN_STRICT_FIELD => {
+                    self.strict = true;
                     pc += size as usize;
+                }
+                // The environment opcodes establish/refer to the frame's
+                // variable environment. `EVAL_ENVIRONMENT` /
+                // `PROGRAM_ENVIRONMENT` build it (a no-op here: the
+                // frame's `locals` + `id_map` are the environment);
+                // `EVAL_REFERENCE` / `PROGRAM_REFERENCE` push the
+                // reference `GET_VARIABLE`/`SET_VARIABLE` resolve a name
+                // against — the frame scope when the id is a declared
+                // local, else the global object.
+                XS_CODE_EVAL_ENVIRONMENT | XS_CODE_PROGRAM_ENVIRONMENT => {
+                    pc += size as usize;
+                }
+                XS_CODE_EVAL_REFERENCE | XS_CODE_PROGRAM_REFERENCE => {
+                    let name = id!(1);
+                    let env = if self.id_map.contains_key(&name) {
+                        // Frame scope: NULL sentinel reference.
+                        Slot::of(Kind::EnvReference, Payload::Reference(crate::value::SlotIndex::NULL))
+                    } else {
+                        // Global object: a distinct non-null sentinel.
+                        Slot::of(Kind::EnvReference, Payload::Reference(crate::value::SlotIndex(0)))
+                    };
+                    self.push(env);
+                    pc += ilen;
+                }
+
+                // ---- scope slots ------------------------------------
+                // XS reserves the scope region (RESERVE) and fills it
+                // downward with NEW_LOCAL/NEW_TEMPORARY (`--mxScope`); a
+                // 1-based scope index `k` addresses the k-th declared
+                // slot. Here the frame's `locals` vector is that region.
+                XS_CODE_RESERVE_1 | XS_CODE_RESERVE_2 => {
+                    // Space is grown lazily as NEW_LOCAL/NEW_TEMPORARY
+                    // append; nothing to pre-allocate.
+                    pc += size as usize;
+                }
+                XS_CODE_NEW_LOCAL => {
+                    let name = id!(1);
+                    self.locals.push(Slot::uninitialized());
+                    self.id_map.insert(name, self.locals.len() - 1);
+                    pc += ilen;
+                }
+                XS_CODE_NEW_TEMPORARY => {
+                    self.locals.push(Slot::undefined());
+                    pc += size as usize;
+                }
+                // Initialize/assign a scope slot from the stack top,
+                // WITHOUT popping (the compiler emits an explicit POP
+                // when the value is not wanted). `PULL_LOCAL` is the
+                // popping variant.
+                XS_CODE_VAR_LOCAL_1 | XS_CODE_LET_LOCAL_1 | XS_CODE_CONST_LOCAL_1 => {
+                    let k = u1!(1);
+                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
+                    self.set_local(k, top);
+                    pc += size as usize;
+                }
+                XS_CODE_SET_LOCAL_1 => {
+                    let k = u1!(1);
+                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
+                    self.set_local(k, top);
+                    pc += size as usize;
+                }
+                XS_CODE_PULL_LOCAL_1 => {
+                    let k = u1!(1);
+                    let v = self.pop();
+                    self.set_local(k, v);
+                    pc += size as usize;
+                }
+                XS_CODE_GET_LOCAL_1 => {
+                    let k = u1!(1);
+                    let v = self.get_local(k);
+                    match v {
+                        Some(s) => self.push(s),
+                        None => return Halt::Throw("get: not initialized yet".into()),
+                    }
+                    pc += size as usize;
+                }
+                XS_CODE_UNWIND_1 => {
+                    let n = u1!(1);
+                    // Discard the n most-recently-declared scope slots
+                    // (XS advances mxScope past them); prune their names.
+                    let keep = self.locals.len().saturating_sub(n);
+                    self.locals.truncate(keep);
+                    self.id_map.retain(|_, &mut idx| idx < keep);
+                    pc += size as usize;
+                }
+
+                // ---- variables (environment-resolved names) ---------
+                XS_CODE_GET_VARIABLE => {
+                    let name = id!(1);
+                    // Consume the environment reference EVAL_REFERENCE
+                    // pushed and resolve the name.
+                    let _envref = self.pop();
+                    let v = self.resolve_get(name);
+                    match v {
+                        Some(s) => self.push(s),
+                        None => {
+                            return Halt::Throw(format!("get {}: undefined variable", name))
+                        }
+                    }
+                    pc += ilen;
+                }
+                XS_CODE_SET_VARIABLE => {
+                    let name = id!(1);
+                    // Stack: [.., envref, value]. Keep the value, drop
+                    // the reference from under it (XS's SET_ALL pops the
+                    // reference and leaves the assigned value).
+                    let value = self.pop();
+                    let _envref = self.pop();
+                    self.resolve_set(name, value);
+                    self.push(value);
+                    pc += ilen;
                 }
 
                 // ---- literals ---------------------------------------
@@ -484,6 +696,63 @@ impl Interp {
                     return Halt::Unsupported(other.name());
                 }
             }
+        }
+    }
+
+    /// Address a 1-based scope index `k` (XS's `mxEnvironment - index`).
+    #[inline]
+    fn local_index(&self, k: usize) -> Option<usize> {
+        if k == 0 || k > self.locals.len() {
+            None
+        } else {
+            Some(k - 1)
+        }
+    }
+
+    /// Read scope slot `k`; `None` if it is still uninitialized (a TDZ
+    /// read) or the index is out of range.
+    fn get_local(&self, k: usize) -> Option<Slot> {
+        let i = self.local_index(k)?;
+        let s = self.locals[i];
+        if s.kind == Kind::Uninitialized {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// Write scope slot `k` from a value (kind + payload), mirroring
+    /// XS's `variable->kind = ...; variable->value = ...`.
+    fn set_local(&mut self, k: usize, v: Slot) {
+        if let Some(i) = self.local_index(k) {
+            self.locals[i].kind = v.kind;
+            self.locals[i].value = v.value;
+        }
+    }
+
+    /// Resolve a name for reading: a frame local when declared (unless
+    /// uninitialized), else a global binding.
+    fn resolve_get(&self, name: u16) -> Option<Slot> {
+        if let Some(&i) = self.id_map.get(&name) {
+            let s = self.locals[i];
+            if s.kind == Kind::Uninitialized {
+                None
+            } else {
+                Some(s)
+            }
+        } else {
+            self.globals.get(&name).copied()
+        }
+    }
+
+    /// Resolve a name for writing: a frame local when declared, else a
+    /// global binding (created if absent, as sloppy assignment does).
+    fn resolve_set(&mut self, name: u16, value: Slot) {
+        if let Some(&i) = self.id_map.get(&name) {
+            self.locals[i].kind = value.kind;
+            self.locals[i].value = value.value;
+        } else {
+            self.globals.insert(name, value);
         }
     }
 

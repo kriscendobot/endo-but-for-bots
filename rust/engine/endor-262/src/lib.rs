@@ -130,6 +130,20 @@ pub fn stage1_corpus() -> Vec<String> {
     all
 }
 
+/// The stage-2 **behavioral** corpus: programs that exercise the
+/// program frame, scope slots, `var` bindings, and backward-branch
+/// control flow (loops) over compiler-emitted bytecode. These run
+/// bit-exactly on *results* but not yet on *computrons*: once a program
+/// allocates at run time (a `var` environment), its computron count
+/// depends on the engine's slot/chunk allocations, which reproducing
+/// bit-exactly requires the allocation-faithful object heap (the
+/// remaining stage-2 body — see `endor_vm::interp` § Metering scope).
+/// So they are asserted for *result agreement*, and are deliberately
+/// **not** in [`stage1_corpus`], which must stay bit-exact.
+pub fn stage2_behavioral_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage2-behavioral.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -257,6 +271,36 @@ mod tests {
         assert_eq!(s.bit_exact, 0, "neither run may count as bit-exact");
         assert_eq!(s.unsupported, 2, "both non-Throw aborts are counted");
         assert!(!s.met_bar());
+    }
+
+    #[test]
+    fn stage2_behavioral_corpus_agrees_on_results() {
+        // The frame/scope/loop interpreter must compute the SAME
+        // completion value as C-XS for every program that exercises
+        // var bindings and backward-branch control flow. (Computron
+        // parity for these awaits the allocation-faithful heap; asserted
+        // separately so the result-correctness of the frame machine is
+        // independently verified.)
+        let programs = stage2_behavioral_corpus();
+        assert!(!programs.is_empty(), "behavioral corpus must be non-empty");
+        let mut agreed = 0usize;
+        for p in &programs {
+            let r = dual_run(p).expect("oracle machine starts");
+            assert!(
+                matches!(r.agreement, Agreement::BothComplete),
+                "both engines complete {:?}: agreement={:?} endor_halt={:?}",
+                p,
+                r.agreement,
+                r.endor_halt,
+            );
+            assert!(
+                r.result_agrees,
+                "result mismatch on {:?}: oracle={:?} endor={:?}",
+                p, r.oracle_result, r.endor_result,
+            );
+            agreed += 1;
+        }
+        assert_eq!(agreed, programs.len(), "all behavioral programs agree on results");
     }
 
     #[test]

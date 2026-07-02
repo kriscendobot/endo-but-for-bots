@@ -38,6 +38,7 @@ typedef struct {
 	txS1 *symbols; /* malloc'd copy of the symbols atom; caller frees */
 	txU4 symbols_size;
 	txU4 computrons; /* meterIndex >> 16 over the run only */
+	txU4 meter_raw; /* raw meterIndex over the run only (diagnostic) */
 	txU4 ok;         /* 1 = completed normally, 0 = threw / parse error */
 	char result[ENDOR_RESULT_MAX]; /* completion value coerced to String() */
 	char error[ENDOR_ERROR_MAX];   /* message when ok == 0 */
@@ -122,6 +123,7 @@ int endor_oracle_run(const char *source, txU4 sourceLen, EndorOracleResult *out)
 			fxRunScript(the, script, mxRealmGlobal(realm), C_NULL,
 				mxRealmClosures(realm)->value.reference, C_NULL, module);
 			out->computrons = the->meterIndex >> 16;
+			out->meter_raw = (txU4)the->meterIndex;
 
 			/* fxRunScript leaves the completion value on the stack top. */
 			result = the->stack;

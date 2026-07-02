@@ -16,10 +16,31 @@
 
 /// `XS_CODE_METERING`: one bytecode dispatch.
 pub const CODE_METERING: u64 = 1 << 16;
-/// `XS_BUILTIN_METERING`: one built-in operation step (used once the
-/// built-ins land in stage 3; the `mxMeterSome(k)` fast-path
-/// annotations become port obligations there).
+/// `XS_BUILTIN_METERING`: one built-in operation step (`mxMeterOne` /
+/// `mxMeterSome(k)`). Stage-2 finding: the property-set path meters one
+/// of these per `SET_VARIABLE`/`SET_PROPERTY`, so it already bites
+/// inside the control-flow subset, not only in stage-3 built-ins.
 pub const BUILTIN_METERING: u64 = 1 << 14;
+/// `XS_SLOT_ALLOCATION_METERING`: added by `fxNewSlot` on **every** slot
+/// allocation during a run (`xsMemory.c`). This is the stage-2 metering
+/// crux: once a program allocates at run time (a `var` environment, an
+/// object literal, a closure cell), its computron count depends on the
+/// exact number of slots the engine allocates, so **computron parity
+/// requires the allocation-faithful object heap**, not just dispatch
+/// counting. A `var` declaration, for instance, meters
+/// `1<<14` (the set's `mxMeterOne`) + `2 * (1<<8)` (a closure cell + a
+/// property slot, per `fxRunEvalEnvironment`) + the property-name chunk
+/// bytes — the "16920 per var" the differential probe measured.
+pub const SLOT_ALLOCATION_METERING: u64 = 1 << 8;
+/// `XS_CHUNK_ALLOCATION_METERING`: added per byte of chunk allocated
+/// (`fxNewChunk`/`fxRenewChunk`), so a string or bytecode allocation
+/// meters its length.
+pub const CHUNK_ALLOCATION_METERING: u64 = 1;
+/// `XS_STRING_METERING` / `XS_BIGINT_METERING`: one code unit of string
+/// concatenation / one BigInt digit step (`xsString.c`, `xsBigInt.c`).
+pub const STRING_METERING: u64 = 1 << 16;
+/// `XS_BIGINT_METERING`.
+pub const BIGINT_METERING: u64 = 1 << 16;
 
 /// Outcome of a metering check at a loop-closing point.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -100,6 +121,22 @@ impl Meter {
     #[inline]
     pub fn tick_builtin_some(&mut self, k: u64) {
         self.index += k * BUILTIN_METERING;
+    }
+
+    /// Meter one slot allocation (`fxNewSlot`'s
+    /// `meterIndex += XS_SLOT_ALLOCATION_METERING`). The faithful object
+    /// heap calls this on every slot it allocates during a run, which is
+    /// what makes stage-2 computrons allocation-dependent.
+    #[inline]
+    pub fn tick_slot_alloc(&mut self) {
+        self.index += SLOT_ALLOCATION_METERING;
+    }
+
+    /// Meter a chunk allocation of `size` bytes (`fxNewChunk`'s
+    /// `meterIndex += size * XS_CHUNK_ALLOCATION_METERING`).
+    #[inline]
+    pub fn tick_chunk_alloc(&mut self, size: u64) {
+        self.index += size * CHUNK_ALLOCATION_METERING;
     }
 
     /// Raw fixed-point index (`the->meterIndex`).

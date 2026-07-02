@@ -86,6 +86,37 @@ fn gen_expr(b: &mut Bytes, depth: u8) -> String {
     }
 }
 
+/// Structure-aware generator for the **stage-2 surface**: a program
+/// with `var` bindings and a backward-branch loop that mutates them,
+/// returning one of the bindings. Every generated program is valid and
+/// terminating (the loop bound is a small literal and the counter only
+/// increments), exercising the frame/scope/variable/loop opcodes the
+/// differential harness compares on results. Computrons are not yet
+/// bit-exact for this surface (run-time allocation metering awaits the
+/// faithful heap), so [`differential_check_result_only`] drives it.
+pub fn gen_statement_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let seed0 = (b.next() % 20) as i32 - 5;
+    let seed1 = (b.next() % 20) as i32 - 5;
+    let bound = 1 + (b.next() % 6) as i32; // 1..=6 iterations
+    let body_op = ["+", "-", "*"][b.choice(3) as usize];
+    let step = 1 + (b.next() % 3) as i32; // keep the counter moving
+    let ret_both = b.choice(2) == 0;
+    // v0 accumulates over the loop; v1 is a second live binding.
+    let mut s = String::new();
+    s.push_str(&format!("var v0 = {}; var v1 = {}; ", seed0, seed1));
+    s.push_str(&format!(
+        "for (var i = 0; i < {}; i = i + {}) {{ v0 = v0 {} i }} ",
+        bound, step, body_op
+    ));
+    if ret_both {
+        s.push_str("v0 + v1");
+    } else {
+        s.push_str("v0");
+    }
+    s
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -163,6 +194,39 @@ pub fn differential_check(source: &str) -> Result<(), Divergence> {
     Ok(())
 }
 
+/// Differential check for the **stage-2 allocating surface**: compares
+/// completion kind and result string, but not computrons, which are not
+/// yet bit-exact while run-time slot/chunk allocation metering awaits
+/// the faithful heap (`endor_vm::interp` § Metering scope). A result or
+/// completion divergence on a valid generated program is still a real
+/// finding — the frame/scope/loop semantics must match C-XS.
+pub fn differential_check_result_only(source: &str) -> Result<(), Divergence> {
+    let oracle = match endor_oracle::run(source) {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let endor = run_program(&oracle.bytecode);
+    if let endor_vm::Halt::Unsupported(_) = endor.halt {
+        return Ok(());
+    }
+    if oracle.completed != endor.completed {
+        return Err(Divergence {
+            source: source.to_string(),
+            detail: format!(
+                "completion: oracle={} endor={} (halt {:?})",
+                oracle.completed, endor.completed, endor.halt
+            ),
+        });
+    }
+    if oracle.completed && oracle.result != endor.result {
+        return Err(Divergence {
+            source: source.to_string(),
+            detail: format!("result: oracle={:?} endor={:?}", oracle.result, endor.result),
+        });
+    }
+    Ok(())
+}
+
 /// Target 2 body: the decoder and interpreter must not panic on
 /// arbitrary bytes. Returns the disassembled length so a caller can
 /// assert liveness; the point is simply that it returns.
@@ -193,6 +257,27 @@ mod tests {
             match differential_check(&prog) {
                 Ok(()) => checked += 1,
                 Err(d) => panic!("differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn generated_statement_programs_agree_on_results() {
+        // The stage-2 generator's var/loop programs must all agree with
+        // C-XS on the completion value (computron parity for this
+        // allocating surface awaits the faithful heap).
+        let mut checked = 0;
+        for seed in 0u32..300 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(6 + (seed % 10)) {
+                buf.push(data[(k as usize) % 4].wrapping_add(k as u8 * 7));
+            }
+            let prog = gen_statement_program(&buf);
+            match differential_check_result_only(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-2 differential divergence: {:?}", d),
             }
         }
         assert!(checked > 0);

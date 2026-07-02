@@ -23,6 +23,7 @@ struct EndorOracleResultRaw {
     symbols: *mut i8,
     symbols_size: u32,
     computrons: u32,
+    meter_raw: u32,
     ok: u32,
     result: [u8; 1024],
     error: [u8; 256],
@@ -36,6 +37,7 @@ impl Default for EndorOracleResultRaw {
             symbols: std::ptr::null_mut(),
             symbols_size: 0,
             computrons: 0,
+            meter_raw: 0,
             ok: 0,
             result: [0u8; 1024],
             error: [0u8; 256],
@@ -71,6 +73,9 @@ pub struct OracleOutcome {
     /// Run-only computrons: `meterIndex >> 16` measured over execution,
     /// with parse metering excluded.
     pub computrons: u64,
+    /// Raw run-only meterIndex (16.16 fixed point), for diagnosing
+    /// fractional (built-in step) metering.
+    pub meter_raw: u32,
 }
 
 /// Compile `source` to XS bytecode and run it on C-XS.
@@ -118,6 +123,7 @@ pub fn run(source: &str) -> Option<OracleOutcome> {
         result: cstr_field(&raw.result),
         error: cstr_field(&raw.error),
         computrons: raw.computrons as u64,
+        meter_raw: raw.meter_raw,
     };
 
     // Safety: frees the heap buffers the shim allocated; we have copied
