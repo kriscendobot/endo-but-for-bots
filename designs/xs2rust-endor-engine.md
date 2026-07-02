@@ -686,6 +686,19 @@ amendment, not a code-review discussion.
    branch and PR, and the oracle harness consumes the existing
    xsnap crate as a path dependency; an incubation directory would
    only defer the integration it exists to prove.
+   *Amended by supervisor ruling, 2026-07-02 (stage-1 review):*
+   the oracle links the C-XS sources directly — reusing xsnap's
+   audited platform layer (`xsnap-platform.{c,h}`) and identical
+   feature defines — rather than through a Cargo path dependency
+   on `xsnap`, because xsnap's `lib.rs` embeds gitignored generated
+   SES bundles absent from a fresh checkout and its `ffi.rs`
+   declares the pre-drift argument-free `fxInitializeSharedCluster`.
+   The recorded `c/moddable` submodule gitlink (`5516726…`, not
+   fetchable upstream) is deliberately **not** bumped by this
+   program: correcting it requires the matching `xsnap` `ffi.rs`
+   arity fix and belongs to a dedicated maintenance change. The
+   oracle's build pin remains `48ee02d8cfe0` per § Ground Truth,
+   with the reproduction procedure in `rust/engine/README.md`.
 10. **Intl is omitted (`intl402` stays out), matching the
     oracle.** Parity with C-XS is the acceptance bar and XS
     deliberately omits Intl. Adding an ICU4X-backed Intl later is
