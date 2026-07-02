@@ -1,18 +1,25 @@
 fn main() {
-    for src in [
-        "1", "1+2", "1+2*3", "10-4", "7%3", "2*3*4",
-        "(1<2)", "(1<2)&&(3>=3)", "1<2?10:20", "-5", "!true",
-        "1&3", "5|2", "6^3", "1<<4", "true", "false", "null", "undefined",
-        "void 0", "1===1", "1!==2", "1.5+2.5",
-    ] {
-        match endor_oracle::run(src) {
+    let progs: Vec<String> = std::env::args().skip(1).collect();
+    let progs = if progs.is_empty() {
+        vec![
+            "(function(x){return x+1})(5)".to_string(),
+            "(function(){return 3})()".to_string(),
+            "(x=>x*2)(21)".to_string(),
+            "((a,b)=>a+b)(2,3)".to_string(),
+        ]
+    } else { progs };
+    for src in progs {
+        match endor_oracle::run(&src) {
             Some(o) => {
+                let dis = endor_vm::disassemble(&o.bytecode);
+                let names: Vec<String> = dis.iter().map(|(_,n)| n.to_string()).collect();
+                println!("SRC {:<32} ok={} result={:?} comp={} nbytes={}",
+                    src, o.completed, o.result, o.computrons, o.bytecode.len());
+                println!("    dis: {}", names.join(" "));
                 let hex: Vec<String> = o.bytecode.iter().map(|b| format!("{:02x}", b)).collect();
-                println!("SRC {:<16} ok={} result={:?} computrons={} nbytes={} sym={}",
-                    src, o.completed, o.result, o.computrons, o.bytecode.len(), o.symbols.len());
-                println!("    bytes: {}", hex.join(" "));
+                println!("    hex: {}", hex.join(" "));
             }
-            None => println!("SRC {:<16} <machine failure>", src),
+            None => println!("SRC {} <fail>", src),
         }
     }
 }
