@@ -12,6 +12,12 @@
 //!
 //! Stage 1 ships a curated corpus under `corpora/` (arithmetic, logic,
 //! control flow); it grows into whole-section runs in later stages.
+//! Those whole-section runs draw from the monorepo's existing
+//! `packages/test262-runner` test262 subset and its `ses-xs-parity`
+//! feature markers -- the same tree that package uses to prove
+//! XS<->Node HardenedJS parity -- rather than a separate pinned
+//! test262 submodule (maintainer directive, PR #600, 2026-07-03;
+//! design section "test262 conformance").
 
 use endor_vm::{run_program, Halt, RunOutcome};
 

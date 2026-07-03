@@ -76,3 +76,12 @@ cargo run -p endor-262 --bin harness          # stage-1 corpus
 cargo run -p endor-262 --bin harness -- '1 + 2 * 3'   # ad-hoc program
 cargo test  --workspace -- --test-threads=1   # includes the bar as a test
 ```
+
+The stage-scoped curated corpora under `endor-262/corpora/` are the
+bootstrap. Per the maintainer directive on PR #600 (2026-07-03), the
+whole-section parity runs that succeed them draw from the monorepo's
+existing `packages/test262-runner` test262 subset and its
+`ses-xs-parity` feature markers — the same tree and convention that
+package already uses to prove XS↔Node HardenedJS parity — rather than a
+separate pinned test262 submodule. See the design's § test262
+conformance (requirement 6).

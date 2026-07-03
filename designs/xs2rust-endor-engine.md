@@ -469,8 +469,34 @@ Coverage bootstraps by section, tracking the stage ladder:
 stage-scoped curated lists (checked into `endor-262/corpora/`)
 grow into whole-section runs, and CI publishes the agreement
 percentage per section so progress toward parity is a monotone,
-visible number. The test262 tree itself is a pinned submodule,
-like `c/moddable`.
+visible number.
+
+**Corpus source: the monorepo's `packages/test262-runner`, not a
+separate pinned submodule** (maintainer directive, 2026-07-03,
+PR #600 review). The repo already carries a curated, pinned
+test262 subset under `packages/test262-runner/test262/` (the tc39
+`test` and `harness` trees plus additional Moddable and Hardened
+JavaScript tests) and a `test262-harness`-driven runner that today
+proves XS↔Node HardenedJS parity by running the tests marked with
+the `ses-xs-parity` feature on both the `xst` (C-XS) and `node`
+hosts against a SES prelude. endor-262 drives its endor↔C-XS
+`(pass-vector, computron)` parity off that **same** tree and the
+**same** `ses-xs-parity` feature markers rather than pinning a
+second, independent test262 submodule. The two parity axes then
+share one corpus and one feature convention: `test262-runner`
+compares XS against Node at the SES surface, and endor-262 adds
+endor against C-XS at the bytecode-and-meter surface, so a single
+maintained test262 subset serves both. This also inherits the
+runner's stated rationale for a checked-in copy over a live
+submodule (stability plus autobuild speed, the same technique V8,
+JSC, and SpiderMonkey use — see `packages/test262-runner/README.md`).
+Reusing the existing tree supersedes the earlier "pinned submodule
+like `c/moddable`" plan. As endor's SES/Compartment surface lands
+(stage 4), the `ses-xs-parity`-tagged tests become directly
+runnable on endor through the runner's host abstraction (a third
+host alongside `xst` and `node`); until then endor-262's curated
+`corpora/` lists are the stage-scoped bootstrap that converges onto
+that shared tree.
 
 ### Fuzzability (requirement 7)
 
