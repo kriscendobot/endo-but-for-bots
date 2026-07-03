@@ -48,6 +48,15 @@ pub struct DualRun {
     pub computrons_agree: bool,
     pub oracle_computrons: u64,
     pub endor_computrons: u64,
+    /// Thrown-value agreement (only meaningful on a shared abort): the
+    /// oracle's `String(exception)` versus endor's `Halt::Throw` string.
+    pub error_agrees: bool,
+    /// The oracle's thrown value coerced to `String()` (valid when the
+    /// oracle aborted).
+    pub oracle_error: String,
+    /// endor's thrown value string, from a `Halt::Throw` halt (empty for
+    /// any other halt).
+    pub endor_error: String,
     /// Raw 16.16 meter indices, for calibrating fractional
     /// (allocation/built-in) metering on a divergence.
     pub oracle_meter_raw: u64,
@@ -75,7 +84,22 @@ impl DualRun {
             // bytecode it cannot model — the oracle "also aborting"
             // (a parse error, a different throw) is not agreement and
             // must never pass silently.
-            Agreement::BothAbort => matches!(self.endor_halt, Halt::Throw(_)),
+            //
+            // Now that 2b models real exceptions, the shared-abort arm is
+            // tightened to the same standard as `BothComplete` (stage-2a
+            // review observation 3): the thrown value must match (the
+            // oracle's `String(exception)` == endor's `Halt::Throw`
+            // string) AND the computrons must match — the uncaught-throw
+            // host-escape path is metered exactly (`interp` §
+            // `THROW_HOST_ESCAPE_METERING`), and the oracle shim now
+            // records the run-only computron count at the throw. A `Throw`
+            // whose value or computrons diverge is a divergence, not a
+            // silent pass.
+            Agreement::BothAbort => {
+                matches!(self.endor_halt, Halt::Throw(_))
+                    && self.error_agrees
+                    && self.oracle_computrons == self.endor_computrons
+            }
             _ => false,
         }
     }
@@ -100,6 +124,20 @@ pub fn dual_run(source: &str) -> Option<DualRun> {
     let computrons_agree =
         oracle.completed && endor.completed && oracle.computrons == endor.computrons;
 
+    // endor's thrown value string comes from a `Halt::Throw`; any other
+    // halt yields no comparable error string.
+    let endor_error = match &endor.halt {
+        Halt::Throw(s) => s.clone(),
+        _ => String::new(),
+    };
+    // The thrown value agrees only on a shared abort where endor threw a
+    // JS-level exception (`Halt::Throw`): compare the oracle's
+    // `String(exception)` against endor's throw string.
+    let error_agrees = !oracle.completed
+        && !endor.completed
+        && matches!(endor.halt, Halt::Throw(_))
+        && oracle.error == endor_error;
+
     Some(DualRun {
         source: source.to_string(),
         agreement,
@@ -109,6 +147,9 @@ pub fn dual_run(source: &str) -> Option<DualRun> {
         computrons_agree,
         oracle_computrons: oracle.computrons,
         endor_computrons: endor.computrons,
+        error_agrees,
+        oracle_error: oracle.error,
+        endor_error,
         oracle_meter_raw: oracle.meter_raw as u64,
         endor_meter_raw: endor.meter_raw,
         endor_dispatched: endor.dispatched,
@@ -193,6 +234,21 @@ pub fn stage2b_closures_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage2b-closures.js"))
 }
 
+/// The stage-2b exception corpus (child 3 of the stage-2b orchestration):
+/// exceptions as XS's jump-buffer chain — try/catch/finally, throw, nested
+/// handlers, throws crossing call frames, throws from loops, and uncaught
+/// propagation to the host boundary. Bit-exact against the oracle on BOTH
+/// axes and both completion arms: a caught throw completes and agrees on
+/// (result, computron); an uncaught throw is a shared abort and agrees on
+/// (thrown-value string, computron) under the tightened
+/// [`DualRun::is_bit_exact`] (observation 3). `catch`/`uncatch`/`throw`/
+/// `exception`/`rethrow` are dispatch-metered (the jump `c_malloc` and
+/// `fxJump` longjmp are unmetered); the uncaught host-escape carries the
+/// measured `endor_vm::interp::THROW_HOST_ESCAPE_METERING` constant.
+pub fn stage2b_exceptions_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage2b-exceptions.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -255,9 +311,16 @@ pub fn run_corpus(programs: &[String]) -> (Vec<DualRun>, Summary) {
 mod tests {
     use super::*;
 
-    // A `DualRun` with the given agreement and endor halt; the other
-    // fields are irrelevant to `is_bit_exact` for aborts.
+    // A `DualRun` with the given agreement and endor halt. For a
+    // `Halt::Throw`, the oracle is modeled as throwing the same value with
+    // the same computrons (the agreeing case), so `is_bit_exact` turns on
+    // the halt kind; a non-`Throw` halt never agrees.
     fn abort_run(agreement: Agreement, endor_halt: Halt) -> DualRun {
+        let endor_error = match &endor_halt {
+            Halt::Throw(s) => s.clone(),
+            _ => String::new(),
+        };
+        let error_agrees = matches!(endor_halt, Halt::Throw(_));
         DualRun {
             source: String::new(),
             agreement,
@@ -267,6 +330,9 @@ mod tests {
             computrons_agree: false,
             oracle_computrons: 0,
             endor_computrons: 0,
+            error_agrees,
+            oracle_error: endor_error.clone(),
+            endor_error,
             oracle_meter_raw: 0,
             endor_meter_raw: 0,
             endor_dispatched: 0,
@@ -296,6 +362,28 @@ mod tests {
             !decode.is_bit_exact(),
             "BothAbort with a Decode halt is not bit-exact"
         );
+    }
+
+    #[test]
+    fn both_abort_throw_requires_error_and_computron_agreement() {
+        // Observation 3: a shared `Throw` abort is bit-exact only when the
+        // thrown value AND the computrons match, exactly like the
+        // `BothComplete` arm — a matching halt kind alone is not enough.
+        let mut r = abort_run(Agreement::BothAbort, Halt::Throw("7".into()));
+        r.oracle_computrons = 6;
+        r.endor_computrons = 6;
+        assert!(r.is_bit_exact(), "matching value + computrons is bit-exact");
+
+        // Divergent thrown value: the oracle threw "8" where endor threw "7".
+        let mut wrong_value = r.clone();
+        wrong_value.oracle_error = "8".into();
+        wrong_value.error_agrees = false;
+        assert!(!wrong_value.is_bit_exact(), "a divergent thrown value is not bit-exact");
+
+        // Divergent computrons on an otherwise-matching throw.
+        let mut wrong_cost = r.clone();
+        wrong_cost.endor_computrons = 7;
+        assert!(!wrong_cost.is_bit_exact(), "a divergent computron count is not bit-exact");
     }
 
     #[test]
@@ -508,6 +596,62 @@ mod tests {
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
+    }
+
+    #[test]
+    fn stage2b_exceptions_corpus_is_bit_exact_against_oracle() {
+        // The child-3 acceptance bar: every exception program — try with no
+        // throw, catch binding the thrown value, try/finally and
+        // try/catch/finally, nested handlers, throws crossing call frames,
+        // throws from inside a loop, throws of heap values, and UNCAUGHT
+        // throws propagating to the host — agrees with C-XS on BOTH the
+        // completion (result for a caught throw, thrown-value string for an
+        // uncaught one) AND the computron count. Caught throws are
+        // dispatch-metered; the uncaught host-escape carries the measured
+        // `THROW_HOST_ESCAPE_METERING`, so the shared-abort arm is bit-exact
+        // under the tightened predicate.
+        let programs = stage2b_exceptions_corpus();
+        assert!(!programs.is_empty(), "stage-2b exception corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?} error oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_error, r.endor_error,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-2b exception bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn uncaught_throw_is_a_bit_exact_shared_abort() {
+        // Behavioural spot-check decoupled from the corpus: an uncaught
+        // throw is a shared abort whose thrown-value string and run-only
+        // computron count both match the oracle (the host-escape metering
+        // and the shim's abort-path computron capture together make the
+        // shared-abort arm bit-exact, not merely "endor also threw").
+        let r = dual_run("throw 7").expect("oracle");
+        assert_eq!(r.agreement, Agreement::BothAbort);
+        assert_eq!(r.endor_error, "7");
+        assert_eq!(r.oracle_error, "7");
+        assert_eq!(r.oracle_computrons, r.endor_computrons, "uncaught-throw computrons agree");
+        assert!(r.is_bit_exact(), "an agreeing uncaught throw is bit-exact");
+
+        // A caught throw completes; its result and computrons agree.
+        let c = dual_run("try { throw 7 } catch (e) { e + 1 }").expect("oracle");
+        assert_eq!(c.agreement, Agreement::BothComplete);
+        assert_eq!(c.endor_result, "8");
+        assert!(c.is_bit_exact());
     }
 
     #[test]

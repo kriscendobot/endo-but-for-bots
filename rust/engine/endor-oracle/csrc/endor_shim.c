@@ -140,6 +140,19 @@ int endor_oracle_run(const char *source, txU4 sourceLen, EndorOracleResult *out)
 		}
 		mxCatch(the) {
 			out->ok = 0;
+			/* Record the run-only computron count reached at the point of
+			 * an uncaught throw, exactly as the normal-completion path
+			 * does. meterIndex was reset to 0 immediately before
+			 * fxRunScript (above) and the longjmp out of the run
+			 * preserves it, so this is the run-phase count when the throw
+			 * originated in execution. (A parse-phase failure — before the
+			 * reset — leaves a parse-metering value here, but such a run
+			 * yields empty/undecodable bytecode on the endor side and so
+			 * is never a bit-exact BothAbort regardless.) This is what lets
+			 * the dual-run harness compare computrons on the abort path,
+			 * not only the completion path (stage-2a review observation 3). */
+			out->computrons = the->meterIndex >> 16;
+			out->meter_raw = (txU4)the->meterIndex;
 			/* mxException holds the thrown value; stringify best-effort. */
 			if (mxException.kind != XS_UNDEFINED_KIND) {
 				mxPush(mxException);

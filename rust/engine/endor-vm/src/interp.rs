@@ -45,6 +45,22 @@ use crate::meter::{Meter, MeterCheck};
 use crate::opcode::Opcode;
 use crate::value::{number_to_ecma_string, to_int32, ChunkArena, Kind, Payload, Slot, SlotArena};
 
+/// The raw 16.16 cost C-XS accrues unwinding an **uncaught** throw across
+/// the host boundary (`fxJump` longjmps into `fxBeginHost`'s `mxTry`). Two
+/// effects combine, both measured against the pin `48ee02d8cfe0`: the
+/// escaping `throw`/`rethrow` opcode is **never metered** (the longjmp
+/// bypasses its `mxBreak`, where the computed-goto dispatch accrues an
+/// opcode's `XS_CODE_METERING`), and the host-boundary teardown accrues a
+/// fixed `1<<15` raw. Verified: an uncaught `throw 7` and `1; throw 7`
+/// each carry exactly `PROGRAM_ENV_SETUP_METERING + 32768` beyond their
+/// pre-throw dispatch metering (raw `443672` and `574744` respectively,
+/// = 6 and 8 metered opcodes plus this remainder). Modeled by
+/// [`crate::meter::Meter::untick_code`] on the escaping opcode plus
+/// accruing this constant. A *caught* throw needs no adjustment: the
+/// `CATCH` resume's `mxBreak` meters the catch target exactly as endor's
+/// dispatch does, so caught exceptions are bit-exact without it.
+pub const THROW_HOST_ESCAPE_METERING: u64 = 1 << 15;
+
 /// The fixed cost, in computrons, of the top-level program invocation
 /// that precedes the captured program bytecode. C-XS dispatches the
 /// program-as-function through its call machinery before the first
@@ -299,6 +315,20 @@ pub struct Interp {
     /// [`FuncInfo`] carries the closure environment closure opcodes resolve
     /// against. `NULL` in the program frame.
     cur_func: crate::value::SlotIndex,
+    /// The pending thrown value (XS's `mxException`). `THROW` sets it and
+    /// unwinds to the innermost jump; `EXCEPTION` moves it to the stack
+    /// (binding the catch parameter) and clears it back to `undefined`;
+    /// `RETHROW` re-unwinds with it. Default `undefined`.
+    exception: Slot,
+    /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
+    /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
+    /// unwind to the top entry, restoring the value stack, scope, and call
+    /// frames it recorded, then resume at its target. An empty chain means
+    /// the throw escapes every JS handler and propagates to the host
+    /// boundary as [`Halt::Throw`] — the JS/host flag reduced to a
+    /// structural predicate (every `self.jumps` entry is a JS jump,
+    /// XS's `jump->flag = 1`; the host is the absence of a jump).
+    jumps: Vec<CatchJump>,
 }
 
 /// A suspended activation: the caller's scope and resume point, saved by
@@ -316,6 +346,24 @@ struct CallerState {
     cur_func: crate::value::SlotIndex,
     /// The caller's code cursor to resume at (just past its `run`).
     ret_pc: usize,
+}
+
+/// One entry of the exception jump-buffer chain (XS's `txJump`, pushed by
+/// `CATCH`). It records exactly what XS's `c_setjmp` restore restores when
+/// a throw longjmps here: where to resume (`target_pc`, XS's `jump->code`),
+/// the value-stack cut (`stack_len`, XS's `jump->stack`), the scope cut
+/// (`locals_len`/`id_map`, XS's `jump->scope`/environment), and the call
+/// depth to unwind to (`call_depth`, XS's `jump->frame` — a throw that
+/// crosses called functions pops their activations back to the frame that
+/// established the catch). `flag` mirrors XS's `jump->flag = 1` (a JS
+/// jump); every endor jump is JS, and the host boundary is the empty chain.
+struct CatchJump {
+    target_pc: usize,
+    stack_len: usize,
+    locals_len: usize,
+    id_map: std::collections::HashMap<u16, usize>,
+    call_depth: usize,
+    flag: u8,
 }
 
 impl Default for Interp {
@@ -350,6 +398,8 @@ impl Interp {
             args: Vec::new(),
             this_val: Slot::undefined(),
             cur_func: crate::value::SlotIndex::NULL,
+            exception: Slot::undefined(),
+            jumps: Vec::new(),
         }
     }
 
@@ -1292,10 +1342,98 @@ impl Interp {
                     return Halt::Return;
                 }
 
-                // ---- explicit throw (stage-1 shape) -----------------
+                // ---- exceptions: the jump-buffer chain --------------
+                // `catch L` (`XS_CODE_CATCH_*`, xsRun.c:1365): establish a
+                // handler. Push a jump recording the resume target
+                // (`pc + size + offset`), the value-stack/scope cuts, and
+                // the call depth — the state a throw longjmps back to.
+                // Execution continues into the try body (no branch). The
+                // `c_malloc(txJump)` is not a slot allocation, so — like
+                // XS — `catch` meters only its dispatch.
+                XS_CODE_CATCH_1 | XS_CODE_CATCH_2 | XS_CODE_CATCH_4 => {
+                    let off = match op {
+                        XS_CODE_CATCH_1 => s1!(1),
+                        XS_CODE_CATCH_2 => i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32,
+                        _ => i32::from_le_bytes([
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
+                            code[pc + 4],
+                        ]),
+                    };
+                    let target = (pc as isize + size as isize + off as isize) as usize;
+                    self.jumps.push(CatchJump {
+                        target_pc: target,
+                        stack_len: self.stack.len(),
+                        locals_len: self.locals.len(),
+                        id_map: self.id_map.clone(),
+                        call_depth: self.call_stack.len(),
+                        flag: 1,
+                    });
+                    pc += size as usize;
+                }
+                // `uncatch` (`XS_CODE_UNCATCH`, xsRun.c:1440): the try body
+                // completed normally; pop the handler off the chain.
+                XS_CODE_UNCATCH => {
+                    self.jumps.pop();
+                    pc += size as usize;
+                }
+                // `exception` (`XS_CODE_EXCEPTION`, xsRun.c:1359): push the
+                // pending thrown value onto the stack (the catch clause
+                // binds it) and clear `mxException` back to `undefined`.
+                XS_CODE_EXCEPTION => {
+                    let ex = self.exception;
+                    self.push(ex);
+                    self.exception = Slot::undefined();
+                    pc += size as usize;
+                }
+                // `throw` (`XS_CODE_THROW`, xsRun.c:1409): `mxException =
+                // *mxStack` (peek), then `fxJump` — unwind to the innermost
+                // handler, restoring its recorded state and resuming at its
+                // target (a `mxFirstCode` meter check fires on resume). With
+                // no handler the throw escapes to the host: `Halt::Throw`.
                 XS_CODE_THROW => {
-                    let v = self.pop();
-                    return Halt::Throw(slot_to_ecma_string(&v));
+                    let v = *self.stack.last().unwrap_or(&Slot::undefined());
+                    self.exception = v;
+                    match self.unwind_to_jump() {
+                        Some(target) => {
+                            pc = target;
+                            if self.check_meter() == MeterCheck::Abort {
+                                return Halt::MeterAbort;
+                            }
+                        }
+                        None => {
+                            self.meter_host_escape();
+                            return Halt::Throw(slot_to_ecma_string(&v));
+                        }
+                    }
+                }
+                // `rethrow` (`XS_CODE_RETHROW`, xsRun.c:1405): re-`fxJump`
+                // with the current `mxException` (a finally re-raising a
+                // saved throw). Same unwind as `throw`, but the value is
+                // already in `mxException` rather than on the stack.
+                XS_CODE_RETHROW => {
+                    let v = self.exception;
+                    match self.unwind_to_jump() {
+                        Some(target) => {
+                            pc = target;
+                            if self.check_meter() == MeterCheck::Abort {
+                                return Halt::MeterAbort;
+                            }
+                        }
+                        None => {
+                            self.meter_host_escape();
+                            return Halt::Throw(slot_to_ecma_string(&v));
+                        }
+                    }
+                }
+                // `throw_status` (`XS_CODE_THROW_STATUS`, xsRun.c:1423):
+                // throw only when the frame's status carries `XS_THROW_STATUS`
+                // (a for-in/for-of/optional-chaining status check). The
+                // covered grammar never sets a throw status, so this always
+                // falls through; it is dispatched (metered) and advances.
+                XS_CODE_THROW_STATUS => {
+                    pc += size as usize;
                 }
 
                 other => {
@@ -1421,6 +1559,43 @@ impl Interp {
         self.this_val = caller.this_val;
         self.cur_func = caller.cur_func;
         caller.ret_pc
+    }
+
+    /// `fxJump`: unwind to the innermost jump-buffer entry (XS's
+    /// `the->firstJump`), restoring exactly what the `c_setjmp` restore in
+    /// `CATCH` restores — the call frames back to the establishing frame,
+    /// then that frame's value-stack and scope cuts — and returning the
+    /// target pc to resume at. Returns `None` when the chain is empty (the
+    /// throw escapes every JS handler and reaches the host boundary), so
+    /// the caller yields `Halt::Throw`.
+    fn unwind_to_jump(&mut self) -> Option<usize> {
+        let jump = self.jumps.pop()?;
+        // Pop any callee activations opened since the catch was
+        // established (a throw crossing called functions), restoring the
+        // establishing frame's saved activation each time (XS restores
+        // `mxFrame`). Discard the callee results — the throw abandons them.
+        while self.call_stack.len() > jump.call_depth {
+            let _ = self.leave_call();
+        }
+        // Restore the establishing frame's value-stack and scope cuts
+        // (XS's `mxStack = jump->stack; mxScope = jump->scope`) and the
+        // exact environment name map at catch time.
+        self.stack.truncate(jump.stack_len);
+        self.locals.truncate(jump.locals_len);
+        self.id_map = jump.id_map;
+        let _ = jump.flag; // every endor jump is a JS jump (flag == 1)
+        Some(jump.target_pc)
+    }
+
+    /// Adjust the meter for an uncaught throw escaping to the host: the
+    /// escaping opcode's dispatch metering (added at the top of the loop)
+    /// is removed — C-XS never meters it, its `mxBreak` bypassed by the
+    /// longjmp — and the fixed host-boundary constant
+    /// [`THROW_HOST_ESCAPE_METERING`] is accrued instead.
+    #[inline]
+    fn meter_host_escape(&mut self) {
+        self.meter.untick_code();
+        self.meter.tick_raw(THROW_HOST_ESCAPE_METERING);
     }
 
     /// Read a `*_CLOSURE_*`/`retrieve`/`store` opcode's 1-based scope index
@@ -2106,6 +2281,44 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "2", "the shared closure cell mutates across the two f() calls");
         assert_eq!(out.computrons, 87, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn caught_throw_runs_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `try { throw 7 } catch (e) { e }`
+        // (captured from the oracle), run oracle-free: `catch` pushes a
+        // jump, `throw` unwinds to it restoring the stack/scope cuts,
+        // `exception` binds the thrown 7 into `e`, and the completion is
+        // `7` with the C-XS computron count `38` — a standing lock on the
+        // jump-chain semantics and dispatch-only exception metering.
+        let code: [u8; 59] = [
+            0x0b, 0x00, 0x4b, 0x9e, 0x04, 0x8b, 0x8b, 0x8b, 0x72, 0x00, 0xb5, 0x02, 0x92, 0x29,
+            0x08, 0xe0, 0xbb, 0x72, 0x07, 0xd7, 0x16, 0x11, 0xdf, 0x29, 0x14, 0xe0, 0xbb, 0x86,
+            0x01, 0x00, 0x4f, 0x7a, 0x04, 0x92, 0x5c, 0x04, 0xbb, 0xe2, 0x01, 0x72, 0x02, 0xb5,
+            0x02, 0x92, 0xdf, 0x4f, 0xb5, 0x01, 0x92, 0x5c, 0x02, 0x22, 0x03, 0x5c, 0x01, 0xd7,
+            0xe2, 0x03, 0xa9,
+        ];
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "7", "the catch binds and returns the thrown value");
+        assert_eq!(out.computrons, 38, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn uncaught_throw_escapes_to_host_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `throw 7` (captured from the oracle),
+        // run oracle-free: with no handler on the jump chain the throw
+        // escapes to the host as `Halt::Throw("7")`, and the computron
+        // count is C-XS's `6` — the escaping opcode is un-metered and the
+        // host-boundary constant `THROW_HOST_ESCAPE_METERING` is accrued
+        // (`begin`, `eval_environment`, `integer` = 3 metered opcodes plus
+        // the 3-dispatch invocation baseline, the escaping `throw` dropped).
+        let code: [u8; 7] = [0x0b, 0x00, 0x4b, 0x72, 0x07, 0xd7, 0xa9];
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Throw("7".into()), "no handler ⇒ escape to host");
+        assert!(!out.completed);
+        assert_eq!(out.computrons, 6, "bit-exact host-escape computrons vs C-XS");
     }
 
     #[test]

@@ -111,6 +111,17 @@ impl Meter {
         self.index += CODE_METERING;
     }
 
+    /// Undo one bytecode dispatch's metering (`meterIndex -=
+    /// XS_CODE_METERING`). Used on the uncaught-throw host-escape path: the
+    /// escaping `throw`/`rethrow` opcode's `mxBreak` is bypassed by the
+    /// `fxJump` longjmp into the host, so C-XS never meters it, whereas
+    /// endor's dispatch loop pre-meters every opcode. See
+    /// [`crate::interp::THROW_HOST_ESCAPE_METERING`].
+    #[inline]
+    pub fn untick_code(&mut self) {
+        self.index -= CODE_METERING;
+    }
+
     /// Add `n` bytecode-equivalent units in one step (the explicit
     /// `meterIndex += k * XS_CODE_METERING` sites, e.g. the computed
     /// element-access path).
