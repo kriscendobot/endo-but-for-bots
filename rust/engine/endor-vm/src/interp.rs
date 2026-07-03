@@ -4952,13 +4952,22 @@ impl Interp {
                             // The seed-finding scan (one iteration for a dense
                             // array — the first/last present element).
                             self.meter.tick_raw(ARRAY_REDUCE_INIT_SCAN_METERING);
-                            self.arrays[&inst].items[&i]
+                            match self.arrays[&inst].items.get(&i) {
+                                Some(s) => *s,
+                                None => return Err(Halt::Unsupported("reduce:concurrent-mutation")),
+                            }
                         }
                         None => return Err(Halt::Unsupported("reduce:empty-no-initial")),
                     }
                 };
                 for i in it {
-                    let item = self.arrays[&inst].items[&i];
+                    // A prior callback may have mutated the receiver (e.g. the
+                    // test262 `delete arr[i]` pattern); a vanished snapshotted
+                    // index self-names rather than panicking on a missing key.
+                    let item = match self.arrays[&inst].items.get(&i) {
+                        Some(s) => *s,
+                        None => return Err(Halt::Unsupported("reduce:concurrent-mutation")),
+                    };
                     self.meter.tick_raw(ARRAY_REDUCE_PER_ELEM_METERING);
                     let cb_args = [acc, item, Slot::integer(i as i32), this];
                     acc = self.run_callback(code, callback, Slot::undefined(), &cb_args)?;
