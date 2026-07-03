@@ -183,7 +183,23 @@ copy-constructor iterable argument (`new Map([[k,v]])`), a WeakMap/WeakSet
 primitive key (a TypeError in XS), mid-iteration structural mutation, and the
 ES2025 Set combinators (`union`/`intersection`/…) — each self-names
 `Halt::Unsupported` rather than resolve to a wrong value or a computron
-divergence. The stage-3 built-ins reach
+divergence. The stage-3b **binary-data** child (3/9) binds `ArrayBuffer` as an
+intrinsic whose per-instance backing store lives in a side table like the exotic
+collections: `new ArrayBuffer(byteLength)` allocates the zero-filled
+`fxNewChunk(byteLength)` store (metered at XS's 8-byte-aligned adjusted size) over
+a constant native frame (`ARRAY_BUFFER_CTOR_FRAME_METERING` — six built-in steps +
+the three `fxNewSlot`s of `fxNewArrayBufferInstance`), and the `byteLength`
+accessor getter reads the stored `bufferInfo.length` metering nothing beyond its
+`GET_PROPERTY` dispatch — both bit-exact (result AND computron) against the pin.
+The `built-ins/ArrayBuffer` dual-run section agrees with **zero divergence**:
+`built-ins/ArrayBuffer total=80 covered=3 divergent=0 skipped=77`. The deferred
+ArrayBuffer paths are honest **named skips**: `slice` and `isView` (the species
+constructor and the not-yet-landed TypedArray/DataView view kinds), `resize`/
+`transfer`/`concat` and the resizable (`maxByteLength`) construct, a
+negative/oversized/non-integer byteLength (each a RangeError), and the
+`ArrayBuffer(n)` call without `new` (a TypeError) — each self-names
+`Halt::Unsupported` rather than ship a wrong value or a computron divergence; the
+TypedArray family and DataView are sibling stage-3b children. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic

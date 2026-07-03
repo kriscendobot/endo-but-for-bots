@@ -346,6 +346,16 @@ pub fn stage3_bigint_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-bigint.js"))
 }
 
+/// The stage-3b (binary-data) curated corpus, child 3/9: the ArrayBuffer
+/// surface per the pin — `new ArrayBuffer(byteLength)` (the constant native
+/// frame plus the 8-byte-aligned `fxNewChunk(byteLength)` backing store, all
+/// zero-filled) and the `byteLength` accessor getter (which meters nothing
+/// beyond its `GET_PROPERTY` dispatch) — bit-exact (completion value AND
+/// computron count) against the C-XS oracle.
+pub fn stage3b_binary_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3b-binary.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -979,6 +989,38 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3b bigint bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3b_binary_corpus_is_bit_exact_against_oracle() {
+        // The stage-3b binary-data acceptance bar (child 3/9): every
+        // ArrayBuffer program — construct over a byteLength, the byteLength
+        // accessor getter, the zero-fill, and buffers as first-class objects
+        // — agrees with C-XS on BOTH the completion value AND the computron
+        // count. The construct cost is a constant native frame
+        // (`ARRAY_BUFFER_CTOR_FRAME_METERING`) plus the 8-byte-aligned
+        // `fxNewChunk(byteLength)` backing store; the getter meters nothing
+        // beyond its dispatch.
+        let programs = stage3b_binary_corpus();
+        assert!(!programs.is_empty(), "stage-3b binary corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3b binary bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

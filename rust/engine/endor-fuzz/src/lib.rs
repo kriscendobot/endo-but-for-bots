@@ -868,6 +868,48 @@ pub fn gen_stage3_bigint_program(data: &[u8]) -> String {
     }
 }
 
+/// Stage-3b binary-data grammar (child 3/9): the ArrayBuffer construct +
+/// `byteLength` accessor surface that is **bit-exact** (result AND
+/// computron) against C-XS. Every arm builds `new ArrayBuffer(n)` over a
+/// spread of byte lengths (so the 8-byte chunk-alignment boundary is
+/// crossed) and reads `.byteLength`, exercising the constant native frame
+/// plus the `fxNewChunk(n)` backing store. Rides the full symbol-linking
+/// differential check (the `ArrayBuffer` global and the `byteLength` name
+/// are program symbols).
+pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    // A byte length that reaches both sides of an 8-byte alignment boundary.
+    let len = |b: &mut Bytes| -> u32 {
+        match b.choice(4) {
+            0 => (b.next() % 8) as u32,
+            1 => (b.next() % 64) as u32,
+            2 => (b.next() as u32) + 1,
+            _ => ((b.next() as u32) % 512) + 256,
+        }
+    };
+    match b.choice(5) {
+        // Construct and read the byteLength directly.
+        0 => format!("new ArrayBuffer({}).byteLength", len(&mut b)),
+        // A missing argument defaults the byteLength to 0.
+        1 => "new ArrayBuffer().byteLength".to_string(),
+        // Bind to a variable, then read the byteLength back.
+        2 => {
+            let n = len(&mut b);
+            format!("var a = new ArrayBuffer({}); a.byteLength", n)
+        }
+        // typeof an ArrayBuffer instance ("object").
+        3 => format!("typeof new ArrayBuffer({})", len(&mut b)),
+        // Two independent buffers; sum their byte lengths.
+        _ => {
+            let (m, n) = (len(&mut b), len(&mut b));
+            format!(
+                "var p = new ArrayBuffer({}); var q = new ArrayBuffer({}); p.byteLength + q.byteLength",
+                m, n
+            )
+        }
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -1487,6 +1529,45 @@ mod tests {
         assert!(saw_neg, "negation never generated");
         assert!(saw_mul, "multiplication never generated");
         assert!(saw_cmp, "comparison never generated");
+    }
+
+    #[test]
+    fn generated_stage3b_binary_programs_agree_bit_exact() {
+        // The stage-3b binary-data grammar — `new ArrayBuffer(n)` over a
+        // spread of byte lengths (crossing the 8-byte chunk-alignment
+        // boundary) and the `byteLength` accessor — bit-exact (result AND
+        // computron) vs C-XS. Rides the symbol-linking differential check
+        // (the `ArrayBuffer` global and `byteLength` are program symbols).
+        let mut checked = 0;
+        let mut saw_typeof = false;
+        let mut saw_var = false;
+        let mut saw_sum = false;
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(29))
+                        .wrapping_add((seed as u8).wrapping_mul(4)),
+                );
+            }
+            let prog = gen_stage3b_binary_program(&buf);
+            distinct.insert(prog.clone());
+            saw_typeof |= prog.contains("typeof");
+            saw_var |= prog.contains("var a =");
+            saw_sum |= prog.contains('+');
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3b binary differential divergence on {:?}: {:?}", prog, d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "binary sweep too uniform: {} distinct", distinct.len());
+        assert!(saw_typeof, "typeof arm never generated");
+        assert!(saw_var, "var-binding arm never generated");
+        assert!(saw_sum, "two-buffer sum arm never generated");
     }
 
     #[test]

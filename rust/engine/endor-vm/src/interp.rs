@@ -439,6 +439,23 @@ pub const ARRAY_CTOR_BASE_METERING: u64 = 98816;
 /// argument).
 pub const ARRAY_ISARRAY_METERING: u64 = 0;
 
+/// The constant raw 16.16 cost of a `new ArrayBuffer(n)` construct beyond
+/// the byteLength-dependent backing-store chunk: the native host frame,
+/// `fxArgToSafeByteLength`, `fxGetPrototypeFromConstructor`, and
+/// `fxNewArrayBufferInstance` (`fxNewObjectInstance` + the two internal
+/// `fxNewSlot`s — the `XS_ARRAY_BUFFER_KIND` and `XS_BUFFER_INFO_KIND`
+/// slots). Calibrated raw-exact against the pin `48ee02d8cfe0` via the
+/// completed-call raw-gap, independent of `n` (the `fxNewChunk(n)` backing
+/// store is metered separately by [`crate::meter::Meter::tick_chunk_new`]).
+/// 99072 = six built-in steps (`6 << 14`) + three `fxNewSlot`s (`3 << 8` —
+/// the object instance plus the two internal slots).
+pub const ARRAY_BUFFER_CTOR_FRAME_METERING: u64 = 99072;
+/// The raw 16.16 cost of the `ArrayBuffer.prototype.byteLength` accessor
+/// getter (`fx_ArrayBuffer_prototype_get_byteLength`) beyond the
+/// `GET_PROPERTY` dispatch: measured against the pin (the getter reads the
+/// stored `bufferInfo.length` and meters nothing itself).
+pub const ARRAY_BUFFER_BYTE_LENGTH_GET_METERING: u64 = 0;
+
 /// The raw 16.16 cost of `Array.prototype.values()`/`keys()`/`entries()`
 /// beyond its dispatch: the native host frame plus `fxNewIteratorInstance`
 /// (the iterator instance + the reused `{value, done}` result object + the
@@ -1019,6 +1036,22 @@ pub enum NativeMethod {
     /// entry and shrink the address table back toward `mxTableMinLength`,
     /// returning `undefined`. WeakMap/WeakSet have no `clear`.
     CollClear,
+    /// `ArrayBuffer.prototype.slice(begin, end)`
+    /// (`fx_ArrayBuffer_prototype_slice`): a fresh ArrayBuffer holding the
+    /// `[begin, end)` byte range (relative-index clamped like
+    /// `Array.prototype.slice`), copied out of the receiver's backing store.
+    ArrayBufferSlice,
+    /// `ArrayBuffer.prototype.resize` — recognized-but-unimplemented (a
+    /// resizable buffer is an honest named skip this stage does not model).
+    ArrayBufferResize,
+    /// `ArrayBuffer.prototype.transfer` — recognized-but-unimplemented.
+    ArrayBufferTransfer,
+    /// `ArrayBuffer.prototype.concat` (XS extension) —
+    /// recognized-but-unimplemented.
+    ArrayBufferConcat,
+    /// `ArrayBuffer.isView(arg)` (`fx_ArrayBuffer_isView`): `true` iff the
+    /// argument is a TypedArray or DataView view, else `false`.
+    ArrayBufferIsView,
 }
 
 impl Default for FuncInfo {
@@ -1074,6 +1107,25 @@ struct CollectionData {
     kind: CollKind,
     entries: Vec<(Slot, Slot)>,
     table_length: u32,
+}
+
+/// An `ArrayBuffer` instance's internal state (XS's `XS_ARRAY_BUFFER_KIND`
+/// + `XS_BUFFER_INFO_KIND` internal slots: the backing-store address and
+/// the byte length). Kept in the [`Interp::array_buffers`] side table like
+/// [`CollectionData`]; the backing bytes live in the chunk arena at
+/// `data`, relocated by the slide-compactor. `length` is the buffer's
+/// `byteLength` (`bufferInfo.length`). Resizable buffers (a non-negative
+/// `maxByteLength`) are an honest named skip this stage does not model, so
+/// there is no `max_length` field yet.
+#[derive(Copy, Clone, Debug)]
+struct ArrayBufferData {
+    /// The chunk-arena offset of the zero-filled backing store. Read by the
+    /// view surfaces (TypedArray element access, DataView get/set, and
+    /// `ArrayBuffer.prototype.slice`) landing in the sibling stage-3b
+    /// children; the ArrayBuffer surface itself only exposes `length`.
+    #[allow(dead_code)]
+    data: crate::value::ChunkOffset,
+    length: u32,
 }
 
 /// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
@@ -1136,6 +1188,10 @@ pub enum Native {
     Set,
     WeakMap,
     WeakSet,
+    /// `ArrayBuffer` — the raw byte-buffer constructor (`xsDataView.c`
+    /// `fx_ArrayBuffer`). Its per-instance backing store lives in the
+    /// [`Interp::array_buffers`] side table.
+    ArrayBuffer,
 }
 
 impl Native {
@@ -1162,6 +1218,7 @@ impl Native {
             Native::Set => "Set",
             Native::WeakMap => "WeakMap",
             Native::WeakSet => "WeakSet",
+            Native::ArrayBuffer => "ArrayBuffer",
         }
     }
 
@@ -1190,6 +1247,7 @@ impl Native {
             ("Set", Native::Set),
             ("WeakMap", Native::WeakMap),
             ("WeakSet", Native::WeakSet),
+            ("ArrayBuffer", Native::ArrayBuffer),
         ]
     }
 }
@@ -1458,6 +1516,18 @@ pub struct Interp {
     set_proto: crate::value::SlotIndex,
     weakmap_proto: crate::value::SlotIndex,
     weakset_proto: crate::value::SlotIndex,
+    /// Per-instance `ArrayBuffer` backing store (XS's `XS_ARRAY_BUFFER_KIND`
+    /// internal slot). Keyed by the buffer instance's slot, like
+    /// [`Self::collections`]. See [`ArrayBufferData`].
+    array_buffers: std::collections::HashMap<crate::value::SlotIndex, ArrayBufferData>,
+    /// The realm's `%ArrayBuffer.prototype%` (a boot object), so a
+    /// `new ArrayBuffer()` instance chains to it and its methods resolve.
+    arraybuffer_proto: crate::value::SlotIndex,
+    /// The program-local symbol id of `byteLength`, resolved at
+    /// [`Self::link_intrinsics`] (XS's `mxID(_byteLength)`), so a
+    /// `buffer.byteLength` get routes to the buffer byte-length accessor.
+    /// `None` when the program never references `byteLength`.
+    byte_length_id: Option<u16>,
     /// The program-local symbol id of `size`, resolved at
     /// [`Self::link_intrinsics`] (XS's `mxID(_size)`), so a `map.size`/
     /// `set.size` get routes to the collection size accessor. `None` when the
@@ -1636,6 +1706,9 @@ impl Interp {
             set_proto: crate::value::SlotIndex::NULL,
             weakmap_proto: crate::value::SlotIndex::NULL,
             weakset_proto: crate::value::SlotIndex::NULL,
+            array_buffers: std::collections::HashMap::new(),
+            arraybuffer_proto: crate::value::SlotIndex::NULL,
+            byte_length_id: None,
             size_id: None,
             length_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
@@ -1714,6 +1787,11 @@ impl Interp {
                 Native::Map | Native::Set | Native::WeakMap | Native::WeakSet => {
                     self.slots.alloc(Slot::instance(object_proto))
                 }
+                // `%ArrayBuffer.prototype%`: a plain boot object chaining to
+                // %Object.prototype%, carrying the `byteLength` accessor and
+                // the `slice` method bound below. The per-instance backing
+                // store lives in the `array_buffers` side table.
+                Native::ArrayBuffer => self.slots.alloc(Slot::instance(object_proto)),
             };
             self.ctor_prototype.insert(f, proto);
         }
@@ -1856,6 +1934,32 @@ impl Interp {
                 let mf = self.alloc_method(m);
                 self.proto_methods.push((proto, m_name, mf));
             }
+        }
+        // `%ArrayBuffer.prototype%`: the `slice` method (a dense fast path)
+        // plus the recognized-but-unimplemented methods bound so a reference
+        // is an honest NAMED skip (`Halt::Unsupported`) rather than a
+        // completion divergence. `byteLength` is an accessor getter routed
+        // through `byte_length_id` in `GET_PROPERTY`, not a bound method.
+        self.arraybuffer_proto = self
+            .intrinsics
+            .get("ArrayBuffer")
+            .and_then(|&c| self.ctor_prototype.get(&c).copied())
+            .unwrap_or(crate::value::SlotIndex::NULL);
+        for (name, m) in [
+            ("slice", NativeMethod::ArrayBufferSlice),
+            // Recognized-but-unimplemented (honest named skips).
+            ("resize", NativeMethod::ArrayBufferResize),
+            ("transfer", NativeMethod::ArrayBufferTransfer),
+            ("concat", NativeMethod::ArrayBufferConcat),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((self.arraybuffer_proto, name, mf));
+        }
+        // `ArrayBuffer.isView` — a static bound as an own property of the
+        // `ArrayBuffer` constructor instance (not the prototype).
+        if let Some(&ab_ctor) = self.intrinsics.get("ArrayBuffer") {
+            let is_view = self.alloc_method(NativeMethod::ArrayBufferIsView);
+            self.proto_methods.push((ab_ctor, "isView", is_view));
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -2230,6 +2334,7 @@ impl Interp {
         self.value_id = id_of("value");
         self.done_id = id_of("done");
         self.size_id = id_of("size");
+        self.byte_length_id = id_of("byteLength");
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -3090,6 +3195,16 @@ impl Interp {
                             // the size slot. WeakMap/WeakSet have no `size`.
                             self.meter.tick_raw(COLLECTION_SIZE_GET_METERING);
                             Slot::integer(self.collections[&inst].entries.len() as i32)
+                        }
+                        Payload::Reference(inst)
+                            if Some(id) == self.byte_length_id
+                                && self.array_buffers.contains_key(&inst) =>
+                        {
+                            // `buffer.byteLength`: the ArrayBuffer byte-length
+                            // accessor getter
+                            // (`fx_ArrayBuffer_prototype_get_byteLength`).
+                            self.meter.tick_raw(ARRAY_BUFFER_BYTE_LENGTH_GET_METERING);
+                            Slot::integer(self.array_buffers[&inst].length as i32)
                         }
                         Payload::Reference(inst) => self.instance_get(inst, id),
                         // A primitive string boxes to `%String.prototype%`
@@ -4759,6 +4874,56 @@ impl Interp {
                 );
                 Slot::of(Kind::Reference, Payload::Reference(inst))
             }
+            // `new ArrayBuffer(byteLength)` (`fx_ArrayBuffer` +
+            // `fxNewArrayBufferInstance`): a fresh zero-filled buffer. The
+            // instance is `fxNewObjectInstance` + two internal `fxNewSlot`s
+            // (the `XS_ARRAY_BUFFER_KIND` address slot and the
+            // `XS_BUFFER_INFO_KIND` length slot), folded with the native host
+            // frame into [`ARRAY_BUFFER_CTOR_FRAME_METERING`]; the backing
+            // store is a single `fxNewChunk(byteLength)`. A resizable buffer
+            // (a reference second argument carrying `maxByteLength`), a
+            // negative/oversized/non-integer byteLength (each a RangeError),
+            // and the `ArrayBuffer(n)` call without `new` (a TypeError) are
+            // honest named skips — their abort metering is a later increment.
+            Native::ArrayBuffer if has_target => {
+                if argc >= 2 && arg(1).kind == Kind::Reference {
+                    return Err(Halt::Unsupported("native-call:ArrayBuffer:resizable"));
+                }
+                let a = arg(0);
+                let byte_length: u32 = match a.kind {
+                    Kind::Undefined if argc == 0 => 0,
+                    Kind::Undefined => 0,
+                    Kind::Integer => match a.value {
+                        Payload::Integer(i) if i >= 0 => i as u32,
+                        _ => return Err(Halt::Unsupported("native-call:ArrayBuffer:bad-length")),
+                    },
+                    Kind::Number => match a.value {
+                        Payload::Number(n) => {
+                            let t = n.trunc();
+                            if t.is_nan() {
+                                0
+                            } else if t < 0.0 || t > 0x7FFF_FFFF as f64 {
+                                return Err(Halt::Unsupported(
+                                    "native-call:ArrayBuffer:bad-length",
+                                ));
+                            } else {
+                                t as u32
+                            }
+                        }
+                        _ => return Err(Halt::Unsupported("native-call:ArrayBuffer:bad-length")),
+                    },
+                    // A boolean/string/etc. byteLength needs the general
+                    // ToNumber (with its own coercion metering) — a later
+                    // increment; honest skip.
+                    _ => return Err(Halt::Unsupported("native-call:ArrayBuffer:coerce-length")),
+                };
+                self.meter.tick_raw(ARRAY_BUFFER_CTOR_FRAME_METERING);
+                self.meter.tick_chunk_new(byte_length as u64);
+                let data = self.chunks.alloc(&vec![0u8; byte_length as usize]);
+                let inst = self.slots.alloc(Slot::instance(self.arraybuffer_proto));
+                self.array_buffers.insert(inst, ArrayBufferData { data, length: byte_length });
+                Slot::of(Kind::Reference, Payload::Reference(inst))
+            }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -6407,6 +6572,37 @@ impl Interp {
                 self.collection_table_resize(inst);
                 Slot::undefined()
             }
+            // `ArrayBuffer.prototype.slice(begin, end)` builds its result by
+            // invoking the species constructor (`this.constructor`,
+            // `fxToSpeciesConstructor`, `mxNew`/`mxRunCount`) — a
+            // symbol-keyed corner whose full protocol metering is a later
+            // increment; honest named skip.
+            NativeMethod::ArrayBufferSlice => {
+                if self.array_buffer_ref(this).is_none() {
+                    return Err(Halt::Unsupported("array-buffer-slice:non-buffer"));
+                }
+                return Err(Halt::Unsupported("array-buffer-slice:species-constructor"));
+            }
+            // `ArrayBuffer.prototype.resize`/`transfer`/`concat`:
+            // recognized-but-unimplemented (resizable/transfer/concat are a
+            // later increment). Honest named skips.
+            NativeMethod::ArrayBufferResize => {
+                return Err(Halt::Unsupported("array-buffer-resize:unsupported"))
+            }
+            NativeMethod::ArrayBufferTransfer => {
+                return Err(Halt::Unsupported("array-buffer-transfer:unsupported"))
+            }
+            NativeMethod::ArrayBufferConcat => {
+                return Err(Halt::Unsupported("array-buffer-concat:unsupported"))
+            }
+            // `ArrayBuffer.isView(arg)` (`fx_ArrayBuffer_isView`): `true` iff
+            // the argument is a TypedArray or DataView view. Neither view kind
+            // is modeled yet, so it is an honest named skip until the views
+            // land (a `false`-only answer with no view to test against would
+            // be an uncalibrated meter).
+            NativeMethod::ArrayBufferIsView => {
+                return Err(Halt::Unsupported("array-buffer-isview:no-views-yet"))
+            }
         };
         self.stack.truncate(base);
         self.push(result);
@@ -7969,6 +8165,16 @@ impl Interp {
         }
     }
 
+    /// The ArrayBuffer instance a receiver names (XS's
+    /// `fxCheckArrayBufferInstance`), or `None` when the receiver is not an
+    /// ArrayBuffer.
+    fn array_buffer_ref(&self, this: Slot) -> Option<crate::value::SlotIndex> {
+        match this.value {
+            Payload::Reference(r) if self.array_buffers.contains_key(&r) => Some(r),
+            _ => None,
+        }
+    }
+
     /// `fxCheckMapKey`: normalize a collection key so `-0` is stored/compared
     /// as `+0` (every other value is unchanged; SameValueZero already unifies
     /// `NaN`).
@@ -9322,6 +9528,7 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::Set => "native-call:Set",
         Native::WeakMap => "native-call:WeakMap",
         Native::WeakSet => "native-call:WeakSet",
+        Native::ArrayBuffer => "native-call:ArrayBuffer",
     }
 }
 
