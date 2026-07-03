@@ -95,3 +95,52 @@ var o={}; var s=new WeakSet(); s.add(o); s.add(o); s.has(o)
 var o={}; var s=new WeakSet(); s.add(o); s.delete(o)
 var o={}; var s=new WeakSet(); s.add(o); s.delete(o); s.has(o)
 var a={}; var b={}; var s=new WeakSet(); s.add(a); s.has(b)
+
+// === Stage-3b: keyed-collection iteration (child 1/9 remainder) ===
+// The iteration protocol built on the stage-3 array iterators: Map/Set
+// entries/keys/values, forEach, and for-of / spread. Bit-exact (completion
+// value AND computron count) against the pin 48ee02d8cfe0. The iterator
+// creation cluster, the per-entries-yield pair construction, and the forEach
+// per-entry call frame are each modeled to the exact allocation/frame cost.
+
+// --- Map.prototype.forEach (fx_Map_prototype_forEach: (value, key, map)) ---
+var m=new Map(); m.set(1,2); var r=0; m.forEach(function(v,k){r+=v;}); r
+var m=new Map(); m.set(1,10); m.set(2,20); m.set(3,30); var r=0; m.forEach(function(v){r+=v;}); r
+var m=new Map(); m.set("a",1); m.set("b",2); var ks=""; m.forEach(function(v,k){ks+=k;}); ks
+var m=new Map(); m.set(1,2); var self=0; m.forEach(function(v,k,mm){self=(mm===m)?1:0;}); self
+var m=new Map(); var r=0; m.forEach(function(v){r+=v;}); r
+var m=new Map(); m.set(1,5); var t={n:100}; var got=0; m.forEach(function(v){got=this.n;},t); got
+
+// --- Set.prototype.forEach (fx_Set_prototype_forEach: (value, value, set)) ---
+var s=new Set(); s.add(1); var r=0; s.forEach(function(v){r+=v;}); r
+var s=new Set(); s.add(1); s.add(2); s.add(3); var r=0; s.forEach(function(v){r+=v;}); r
+var s=new Set(); s.add(4); var same=0; s.forEach(function(v,k){same=(v===k)?1:0;}); same
+var s=new Set(); s.add(2); var self=0; s.forEach(function(v,k,ss){self=(ss===s)?1:0;}); self
+
+// --- Map keys / values / entries iterators (fxNewMapIteratorInstance) ---
+var m=new Map(); m.set(1,2); var it=m.keys(); it.next().value
+var m=new Map(); m.set(1,2); var it=m.values(); it.next().value
+var m=new Map(); m.set(1,2); var it=m.entries(); it.next().value[0]
+var m=new Map(); m.set(1,2); var it=m.entries(); it.next().value[1]
+var m=new Map(); m.set(7,8); var it=m.keys(); it.next(); it.next().done
+var m=new Map(); m.set(1,2); m.set(3,4); var it=m.values(); it.next(); it.next().value
+var m=new Map(); m.set(1,2); m.set(3,4); m.set(5,6); var it=m.keys(); var t=0; var r=it.next(); while(!r.done){t+=r.value; r=it.next();} t
+
+// --- Set values / keys (Set.keys === Set.values) / entries iterators ---
+var s=new Set(); s.add(9); var it=s.values(); it.next().value
+var s=new Set(); s.add(9); var it=s.keys(); it.next().value
+var s=new Set(); s.add(5); var it=s.entries(); it.next().value[0]
+var s=new Set(); s.add(5); var it=s.entries(); it.next().value[1]
+var s=new Set(); s.add(1); s.add(2); var it=s.values(); it.next(); it.next().done
+
+// --- for-of over Map (Symbol.iterator = entries) and Set (= values) ---
+var s=new Set(); s.add(1); s.add(2); s.add(3); var t=0; for(var x of s){t+=x;} t
+var m=new Map(); m.set(1,10); m.set(2,20); var t=0; for(var e of m){t+=e[1];} t
+var m=new Map(); m.set(1,10); m.set(2,20); var t=0; for(var e of m){t+=e[0];} t
+var s=new Set(); for(var i=0;i<10;i++){s.add(i);} var t=0; for(var x of s){t+=x;} t
+
+// --- spread over Map and Set ([...coll]) ---
+var s=new Set(); s.add(5); s.add(6); var a=[...s]; a[1]
+var s=new Set(); s.add(5); s.add(6); var a=[...s]; a.length
+var m=new Map(); m.set(1,2); var a=[...m]; a[0][0]
+var m=new Map(); m.set(1,2); var a=[...m]; a[0][1]

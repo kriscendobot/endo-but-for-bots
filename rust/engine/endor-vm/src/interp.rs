@@ -577,6 +577,35 @@ pub const COLLECTION_SIZE_GET_METERING: u64 = 0;
 /// XS's `mxTableMinLength`: the initial (and minimum) Map/Set hash-table
 /// address-array length. The table grows/shrinks by powers of two around it.
 pub const MAP_MIN_TABLE_LENGTH: u32 = 1;
+/// The native host-frame residual of `Map.prototype.forEach`
+/// (`fx_Map_prototype_forEach`) BEYOND its dispatch and the per-entry callback
+/// machinery: the frame, `fxCheckMapInstance`, `fxArgToCallback`, and the
+/// `mxPushList` setup/teardown. Calibrated raw-exact against the pin
+/// `48ee02d8cfe0`. The Set form ([`SET_FOREACH_FRAME_METERING`]) is 8 raw
+/// units less (Map walks a key→value slot pair per entry; Set a single slot).
+pub const MAP_FOREACH_FRAME_METERING: u64 = 32776;
+/// The native host-frame residual of `Set.prototype.forEach`
+/// (`fx_Set_prototype_forEach`). See [`MAP_FOREACH_FRAME_METERING`].
+pub const SET_FOREACH_FRAME_METERING: u64 = 32768;
+/// The per-entry residual `forEach` charges for one live entry BEYOND the
+/// callback body the nested dispatch meters: the `mxPushSlot`s, `mxCall`, and
+/// `mxRunCount(3)` frame the C loop builds around each call (`2 << 16`).
+/// Calibrated raw-exact against the pin (identical for Map and Set).
+pub const COLLECTION_FOREACH_PER_ENTRY_METERING: u64 = 2 << 16;
+/// The raw 16.16 cost of building a Map/Set Iterator
+/// (`fxNewMapIteratorInstance`/`fxNewSetIteratorInstance` → the shared
+/// `fxNewIteratorInstance`): the two host objects (iterator instance + reused
+/// `{value, done}` result), the result's `value`/`done` properties, the three
+/// internal iterator slots (id/iterable/index), the list slot, and the kind
+/// integer slot. Calibrated computron-exact against the pin `48ee02d8cfe0`.
+pub const COLLECTION_ITERATOR_CREATE_METERING: u64 = 67584;
+/// The per-yield residual an ENTRIES-kind `%MapIteratorPrototype%.next()` /
+/// `%SetIteratorPrototype%.next()` charges to build its `[k, v]` pair
+/// (`fxConstructArrayEntry` → `fxNewArrayInstance`) BEYOND the two-element
+/// pair chunk (modeled explicitly). A keys/values `next` allocates nothing and
+/// carries no residual (its base host-frame cost is folded into the dispatch,
+/// measured zero against the pin). Calibrated computron-exact against the pin.
+pub const COLLECTION_ITERATOR_ENTRY_METERING: u64 = 2 << 14;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -945,6 +974,21 @@ pub enum NativeMethod {
     SetHas,
     /// `Set.prototype.delete(v)` / `WeakSet.prototype.delete(v)`.
     SetDelete,
+    /// `Map.prototype.forEach(cb[, thisArg])` / `Set.prototype.forEach(...)`
+    /// (`fx_Map_prototype_forEach` / `fx_Set_prototype_forEach`): call
+    /// `cb(value, key, coll)` for each live entry in insertion order (a Set
+    /// passes `value` for both the value AND the key). The second re-entrant
+    /// collection method; the handler branches on the receiver's kind. WeakMap/
+    /// WeakSet have no `forEach`.
+    CollForEach,
+    /// `Map.prototype.entries()`/`keys()`/`values()` and
+    /// `Set.prototype.entries()`/`values()`/`keys()` (Set's `keys` IS
+    /// `values`): construct a Map/Set Iterator over the receiver with the given
+    /// iteration kind (0 keys, 1 values, 2 entries). Set's kind-2 entry is
+    /// `[value, value]`.
+    CollEntries,
+    CollKeys,
+    CollValues,
 }
 
 impl Default for FuncInfo {
@@ -1747,11 +1791,20 @@ impl Interp {
                     ("get", NativeMethod::MapGet),
                     ("has", NativeMethod::MapHas),
                     ("delete", NativeMethod::MapDelete),
+                    ("forEach", NativeMethod::CollForEach),
+                    ("entries", NativeMethod::CollEntries),
+                    ("keys", NativeMethod::CollKeys),
+                    ("values", NativeMethod::CollValues),
                 ],
                 1 => &[
                     ("add", NativeMethod::SetAdd),
                     ("has", NativeMethod::SetHas),
                     ("delete", NativeMethod::SetDelete),
+                    ("forEach", NativeMethod::CollForEach),
+                    ("entries", NativeMethod::CollEntries),
+                    // Set's `keys` IS `values` (both iterate the values).
+                    ("keys", NativeMethod::CollValues),
+                    ("values", NativeMethod::CollValues),
                 ],
                 2 => &[
                     ("set", NativeMethod::MapSet),
@@ -2870,6 +2923,23 @@ impl Interp {
                             let bytes = self.str_content(off).to_vec();
                             self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
                             let it = self.make_string_iterator(bytes);
+                            self.push(it);
+                        }
+                        Payload::Reference(i) if self.collections.contains_key(&i) => {
+                            // `for (x of map|set)` — the collection's
+                            // `Symbol.iterator` (Map: `entries` kind 7; Set:
+                            // `values` kind 6). WeakMap/WeakSet are not
+                            // iterable (TypeError in XS): self-name. The
+                            // `fxGetIterator` get + call dispatch is metered
+                            // identically to the array case; the iterator
+                            // creation is metered inside the builder.
+                            let it_kind = match self.collections[&i].kind {
+                                CollKind::Map => 7u8,
+                                CollKind::Set => 6u8,
+                                _ => return Halt::Unsupported("for_of:weak-collection"),
+                            };
+                            self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
+                            let it = self.make_collection_iterator(i, it_kind);
                             self.push(it);
                         }
                         _ => return Halt::Unsupported(op.name()),
@@ -6197,6 +6267,30 @@ impl Interp {
             | NativeMethod::SetAdd
             | NativeMethod::SetHas
             | NativeMethod::SetDelete => self.call_collection(m, this, base, argc)?,
+            // `Map`/`Set` `forEach` — re-entrant (drives a user callback per
+            // live entry); needs the code buffer for the nested dispatch.
+            NativeMethod::CollForEach => {
+                self.call_collection_foreach(this, base, argc, code)?
+            }
+            // `entries`/`keys`/`values` → a Map/Set Iterator over the receiver.
+            NativeMethod::CollEntries | NativeMethod::CollKeys | NativeMethod::CollValues => {
+                let inst = match self.collection_ref(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("collection-iterator:non-collection")),
+                };
+                // WeakMap/WeakSet have no iterator methods (never bound); a Map/
+                // Set kind maps entries→2, keys→0, values→1.
+                match self.collections[&inst].kind {
+                    CollKind::Map | CollKind::Set => {}
+                    _ => return Err(Halt::Unsupported("collection-iterator:weak")),
+                }
+                let iter_kind = match m {
+                    NativeMethod::CollKeys => 5u8,
+                    NativeMethod::CollValues => 6u8,
+                    _ => 7u8,
+                };
+                self.make_collection_iterator(inst, iter_kind)
+            }
         };
         self.stack.truncate(base);
         self.push(result);
@@ -7275,6 +7369,155 @@ impl Interp {
         Slot::of(Kind::Reference, Payload::Reference(iter))
     }
 
+    /// Build a Map/Set Iterator over the collection `inst`
+    /// (`fxNewMapIteratorInstance`/`fxNewSetIteratorInstance` → the shared
+    /// `fxNewIteratorInstance`): allocate the iterator instance and its reused
+    /// `{value, done}` result, recording an [`IterState`] whose `iterable` is
+    /// the collection slot and `index` cursors its live entry list. `kind` is
+    /// 5 = keys, 6 = values, 7 = entries. The iterator chains to
+    /// `%Array Iterator.prototype%` in endor's model (its `next` dispatches to
+    /// the same [`NativeMethod::ArrayIteratorNext`], which branches on kind to
+    /// [`Self::collection_iterator_next`]). Meters the creation cluster
+    /// ([`COLLECTION_ITERATOR_CREATE_METERING`]).
+    fn make_collection_iterator(&mut self, inst: crate::value::SlotIndex, kind: u8) -> Slot {
+        self.meter.tick_raw(COLLECTION_ITERATOR_CREATE_METERING);
+        let result = self.slots.alloc(Slot::instance(self.object_proto));
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::undefined());
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(false));
+        }
+        let iter = self.slots.alloc(Slot::instance(self.array_iterator_proto));
+        self.iterators.insert(
+            iter,
+            IterState {
+                iterable: inst,
+                index: 0,
+                kind,
+                result,
+                done: false,
+                enum_keys: Vec::new(),
+                str_bytes: Vec::new(),
+            },
+        );
+        Slot::of(Kind::Reference, Payload::Reference(iter))
+    }
+
+    /// `fx_MapIterator_prototype_next` / `fx_SetIterator_prototype_next`: yield
+    /// the collection's next live entry in insertion order, mutating and
+    /// returning the reused result object. `kind` is 5 = keys (the entry key),
+    /// 6 = values (the entry value; a Set stores its value as the key half, so
+    /// a Set's kind-6 yields the key), 7 = entries (a fresh `[k, v]` pair; a
+    /// Set yields `[v, v]`). Meters the per-`next()` base plus, for an entries
+    /// yield, the two-element pair array's chunk. Entries are addressed by
+    /// index into the live [`CollectionData::entries`] Vec (XS walks the linked
+    /// list, skipping deleted `XS_DONT_ENUM` tombstones; the covered grammar
+    /// does not mutate mid-iteration).
+    fn collection_iterator_next(&mut self, iter: crate::value::SlotIndex) -> Slot {
+        let st = self.iterators[&iter].clone();
+        let result = st.result;
+        let len = self
+            .collections
+            .get(&st.iterable)
+            .map(|c| c.entries.len() as u32)
+            .unwrap_or(0);
+        let (new_value, new_done, next_index): (Slot, bool, u32) = if st.done || st.index >= len {
+            (Slot::undefined(), true, st.index)
+        } else {
+            // A keys/values yield carries no residual; an entries yield charges
+            // the pair-construction frame ([`COLLECTION_ITERATOR_ENTRY_METERING`])
+            // plus the two-element pair chunk (below).
+            if st.kind == 7 {
+                self.meter.tick_raw(COLLECTION_ITERATOR_ENTRY_METERING);
+            }
+            let (k, v) = self.collections[&st.iterable].entries[st.index as usize];
+            let is_set = matches!(self.collections[&st.iterable].kind, CollKind::Set);
+            let value = match st.kind {
+                5 => k, // keys
+                // values: a Map yields the value half; a Set stores its value
+                // in the key half, so it yields the key.
+                6 if is_set => k,
+                6 => v,
+                _ => {
+                    // entries: `[key, value]` (a Set yields `[value, value]`).
+                    let (a, b) = if is_set { (k, k) } else { (k, v) };
+                    let pair = self.new_array();
+                    let arr = self.arrays.get_mut(&pair).unwrap();
+                    arr.length = 2;
+                    arr.items.insert(0, Slot::of(a.kind, a.value));
+                    arr.items.insert(1, Slot::of(b.kind, b.value));
+                    self.meter.tick_raw(self.array_chunk_size_metering(2));
+                    Slot::of(Kind::Reference, Payload::Reference(pair))
+                }
+            };
+            (value, false, st.index + 1)
+        };
+        if let Some(s) = self.iterators.get_mut(&iter) {
+            s.index = next_index;
+            s.done = new_done;
+        }
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::of(new_value.kind, new_value.value));
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(new_done));
+        }
+        Slot::of(Kind::Reference, Payload::Reference(result))
+    }
+
+    /// `fx_Map_prototype_forEach` / `fx_Set_prototype_forEach`: call the
+    /// callback for each live entry in insertion order. Map passes
+    /// `(value, key, coll)`; Set passes `(value, value, coll)`. Meters the
+    /// native frame ([`COLLECTION_FOREACH_FRAME_METERING`]) plus, per entry,
+    /// the call-frame residual ([`COLLECTION_FOREACH_PER_ENTRY_METERING`]) over
+    /// the callback body the nested dispatch meters. WeakMap/WeakSet self-name
+    /// (no `forEach`). A non-user callback self-names via [`Self::run_callback`].
+    fn call_collection_foreach(
+        &mut self,
+        this: Slot,
+        base: usize,
+        argc: usize,
+        code: &[u8],
+    ) -> Result<Slot, Halt> {
+        let _ = argc;
+        let inst = match self.collection_ref(this) {
+            Some(i) => i,
+            None => return Err(Halt::Unsupported("collection-forEach:non-collection")),
+        };
+        let is_set = match self.collections[&inst].kind {
+            CollKind::Map => false,
+            CollKind::Set => true,
+            _ => return Err(Halt::Unsupported("collection-forEach:weak")),
+        };
+        let callback = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+        self.meter.tick_raw(if is_set {
+            SET_FOREACH_FRAME_METERING
+        } else {
+            MAP_FOREACH_FRAME_METERING
+        });
+        // Index into the live entry list (XS walks the linked list resiliently;
+        // the covered grammar does not mutate mid-iteration).
+        let mut i = 0u32;
+        loop {
+            let entry = self.collections.get(&inst).and_then(|c| c.entries.get(i as usize).copied());
+            let (k, v) = match entry {
+                Some(kv) => kv,
+                None => break,
+            };
+            self.meter.tick_raw(COLLECTION_FOREACH_PER_ENTRY_METERING);
+            // Map: cb(value, key, coll). Set: cb(value, value, coll) — the
+            // value is stored in the key half.
+            let cb_val = if is_set { k } else { v };
+            let cb_key = k;
+            let cb_args = [cb_val, cb_key, this];
+            self.run_callback(code, callback, this_arg, &cb_args)?;
+            i += 1;
+        }
+        Ok(Slot::undefined())
+    }
+
     /// `fx_String_prototype_iterator_next`: decode the next code point at the
     /// byte offset `index`, yield it as a fresh one-character string, and
     /// advance `index` past its bytes. BMP code points only (a single UTF-8
@@ -7425,6 +7668,9 @@ impl Interp {
         }
         if self.iterators[&iter].kind == 4 {
             return self.string_iterator_next(iter);
+        }
+        if self.iterators[&iter].kind >= 5 {
+            return Ok(self.collection_iterator_next(iter));
         }
         let st = self.iterators[&iter].clone();
         let result = st.result;
