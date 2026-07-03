@@ -144,3 +144,14 @@ var s=new Set(); s.add(5); s.add(6); var a=[...s]; a[1]
 var s=new Set(); s.add(5); s.add(6); var a=[...s]; a.length
 var m=new Map(); m.set(1,2); var a=[...m]; a[0][0]
 var m=new Map(); m.set(1,2); var a=[...m]; a[0][1]
+
+// --- Map.prototype.clear / Set.prototype.clear (fxClearEntries) ---
+var m=new Map(); m.set(1,2); m.clear(); m.size
+var m=new Map(); m.set(1,2); m.set(3,4); m.clear(); m.has(1)
+var m=new Map(); for(var i=0;i<8;i++){m.set(i,i);} m.clear(); m.size
+var m=new Map(); m.clear(); m.size
+var m=new Map(); m.set(1,2); m.set(3,4); m.clear(); m.set(5,6); m.get(5)
+var s=new Set(); s.add(1); s.add(2); s.clear(); s.size
+var s=new Set(); s.add(1); s.clear(); s.has(1)
+var s=new Set(); for(var i=0;i<16;i++){s.add(i);} s.clear(); s.size
+var s=new Set(); for(var i=0;i<20;i++){s.add(i);} s.clear(); var t=0; for(var x of s){t=t+1;} t

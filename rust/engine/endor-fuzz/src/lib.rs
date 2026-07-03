@@ -729,7 +729,17 @@ pub fn gen_stage3_collections_program(data: &[u8]) -> String {
             build.push_str(&format!(" c.set({},{});", i, small_int(&mut b)));
         }
     }
-    match b.choice(5) {
+    match b.choice(6) {
+        // clear then observe the (zero) size, optionally re-adding one entry.
+        5 => {
+            if b.choice(2) == 0 {
+                format!("{} c.clear(); c.size", build)
+            } else if is_set {
+                format!("{} c.clear(); c.add(9); c.size", build)
+            } else {
+                format!("{} c.clear(); c.set(9,9); c.get(9)", build)
+            }
+        }
         // forEach: accumulate the values with an overflow-safe operator.
         0 => {
             let op = small_op(&mut b);

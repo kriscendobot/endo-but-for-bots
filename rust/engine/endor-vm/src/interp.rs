@@ -599,6 +599,12 @@ pub const COLLECTION_FOREACH_PER_ENTRY_METERING: u64 = 2 << 16;
 /// internal iterator slots (id/iterable/index), the list slot, and the kind
 /// integer slot. Calibrated computron-exact against the pin `48ee02d8cfe0`.
 pub const COLLECTION_ITERATOR_CREATE_METERING: u64 = 67584;
+/// The native host-frame residual of `Map.prototype.clear` /
+/// `Set.prototype.clear` (`fxClearEntries`) BEYOND its dispatch and the
+/// `fxResizeEntries` shrink chunk (modeled separately): the frame,
+/// `fxCheckMap/SetInstance`, the entry tombstone walk, and `fxPurgeEntries`.
+/// Calibrated computron-exact against the pin `48ee02d8cfe0`.
+pub const COLLECTION_CLEAR_FRAME_METERING: u64 = 0;
 /// The per-yield residual an ENTRIES-kind `%MapIteratorPrototype%.next()` /
 /// `%SetIteratorPrototype%.next()` charges to build its `[k, v]` pair
 /// (`fxConstructArrayEntry` → `fxNewArrayInstance`) BEYOND the two-element
@@ -989,6 +995,11 @@ pub enum NativeMethod {
     CollEntries,
     CollKeys,
     CollValues,
+    /// `Map.prototype.clear()` / `Set.prototype.clear()`
+    /// (`fx_Map_prototype_clear` / the Set form → `fxClearEntries`): drop every
+    /// entry and shrink the address table back toward `mxTableMinLength`,
+    /// returning `undefined`. WeakMap/WeakSet have no `clear`.
+    CollClear,
 }
 
 impl Default for FuncInfo {
@@ -1795,6 +1806,7 @@ impl Interp {
                     ("entries", NativeMethod::CollEntries),
                     ("keys", NativeMethod::CollKeys),
                     ("values", NativeMethod::CollValues),
+                    ("clear", NativeMethod::CollClear),
                 ],
                 1 => &[
                     ("add", NativeMethod::SetAdd),
@@ -1805,6 +1817,7 @@ impl Interp {
                     // Set's `keys` IS `values` (both iterate the values).
                     ("keys", NativeMethod::CollValues),
                     ("values", NativeMethod::CollValues),
+                    ("clear", NativeMethod::CollClear),
                 ],
                 2 => &[
                     ("set", NativeMethod::MapSet),
@@ -6290,6 +6303,25 @@ impl Interp {
                     _ => 7u8,
                 };
                 self.make_collection_iterator(inst, iter_kind)
+            }
+            // `Map`/`Set` `clear` (`fxClearEntries`): drop all entries and
+            // shrink the table back toward its minimum length.
+            NativeMethod::CollClear => {
+                let inst = match self.collection_ref(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("collection-clear:non-collection")),
+                };
+                match self.collections[&inst].kind {
+                    CollKind::Map | CollKind::Set => {}
+                    _ => return Err(Halt::Unsupported("collection-clear:weak")),
+                }
+                self.meter.tick_raw(COLLECTION_CLEAR_FRAME_METERING);
+                self.collections.get_mut(&inst).unwrap().entries.clear();
+                // `fxResizeEntries` with size 0 shrinks the address chunk back
+                // toward `mxTableMinLength`, charging the rehash chunk if the
+                // length changes (modeled by [`Self::collection_table_resize`]).
+                self.collection_table_resize(inst);
+                Slot::undefined()
             }
         };
         self.stack.truncate(base);

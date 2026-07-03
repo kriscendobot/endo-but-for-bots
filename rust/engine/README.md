@@ -168,16 +168,18 @@ callback body the nested dispatch meters; a Map's native frame is 8 raw units
 over a Set's — Map walks a key→value slot pair per entry, Set a single slot). The
 four collection dual-run sections agree bit-exactly with **zero divergence**,
 every skip named:
-`built-ins/Map total=144 covered=22 divergent=0 skipped=122`,
-`built-ins/Set total=188 covered=34 divergent=0 skipped=154`,
+`built-ins/Map total=144 covered=25 divergent=0 skipped=119`,
+`built-ins/Set total=188 covered=37 divergent=0 skipped=151`,
 `built-ins/WeakMap total=88 covered=11 divergent=0 skipped=77`,
 `built-ins/WeakSet total=75 covered=9 divergent=0 skipped=66`
 (and `MapIteratorPrototype`/`SetIteratorPrototype` `divergent=0`, covered=0 —
 their tests exercise `Symbol.toStringTag` / direct-prototype corners endor
-honestly skips). The deferred collection paths are honest **named skips**: the
-copy-constructor iterable argument (`new Map([[k,v]])`), `clear`, a WeakMap/
-WeakSet primitive key (a TypeError in XS), mid-iteration structural mutation, and
-the ES2025 Set combinators (`union`/`intersection`/…) — each self-names
+honestly skips). The stage-3b remainder also lands `clear` (`fxClearEntries`: drop every entry
+and shrink the address table back toward `mxTableMinLength`), computron-exact.
+The deferred collection paths are honest **named skips**: the
+copy-constructor iterable argument (`new Map([[k,v]])`), a WeakMap/WeakSet
+primitive key (a TypeError in XS), mid-iteration structural mutation, and the
+ES2025 Set combinators (`union`/`intersection`/…) — each self-names
 `Halt::Unsupported` rather than resolve to a wrong value or a computron
 divergence. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
