@@ -158,3 +158,19 @@ Number(5)
 Number(true)
 Number(null)
 String('hi')
+
+// Native prototype-method dispatch (resolved up the prototype chain, called
+// with the receiver as `this`): Object.prototype toString/valueOf/
+// hasOwnProperty, Function.prototype.toString, Error.prototype.toString, and
+// the wrapper valueOf/toString.
+({}).toString()
+({a:1}).valueOf()
+({a:1}).hasOwnProperty('a')
+(function(){}).toString()
+function named1(){}; named1.toString()
+(new Error('m')).toString()
+(new TypeError('t')).toString()
+(new Boolean(1)).valueOf()
+(new Boolean(1)).toString()
+(new Number(5)).toString()
+(new String('hi')).toString()

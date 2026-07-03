@@ -180,6 +180,15 @@ pub const FUNCTION_LOCAL_METERING: u64 = 280;
 /// entry at `begin`, in [`Interp::run_constructor`].
 pub const CONSTRUCTOR_HOST_FRAME_METERING: u64 = 2 << 16;
 
+/// Per-method raw 16.16 costs for the native prototype methods, measured
+/// against the pin `48ee02d8cfe0` via the differential raw-gap. Each is the
+/// method's cost beyond its call dispatch; the result-string chunk (for the
+/// `toString` family) is metered separately at its `fxNewChunk`.
+pub const METHOD_OBJECT_TOSTRING_METERING: u64 = 49216;
+pub const METHOD_FUNCTION_TOSTRING_METERING: u64 = 131176;
+pub const METHOD_ERROR_TOSTRING_METERING: u64 = 98360;
+pub const METHOD_HAS_OWN_PROPERTY_METERING: u64 = 1 << 16;
+
 /// The raw 16.16 cost the `instanceof` operator accrues beyond its own
 /// dispatch for the `Symbol.hasInstance` host-frame call itself
 /// (`fxRunInstanceOf` → `fxOrdinaryHasInstance`), measured against the pin
@@ -246,6 +255,31 @@ struct FuncInfo {
     /// entering a bytecode frame, and the completion renders as
     /// `function ["name"] (){[native code]}`. `None` for a user function.
     native: Option<Native>,
+    /// For a native **prototype method** (`Object.prototype.toString`,
+    /// `Function.prototype.toString`, `Error.prototype.toString`, the wrapper
+    /// `valueOf`/`toString`, …): dispatched with the call's receiver as
+    /// `this`. `None` for a constructor or a user function.
+    method: Option<NativeMethod>,
+    /// The function's own name (for `Function.prototype.toString`), an empty
+    /// string for an anonymous function.
+    name: String,
+}
+
+/// A native prototype method endor models (dispatched with the receiver as
+/// `this`). These compute a value from the receiver with no re-entry into
+/// user code — the `call`/`apply`/`bind` re-entrant methods are separate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeMethod {
+    ObjectToString,
+    ObjectHasOwnProperty,
+    ObjectValueOf,
+    ObjectIsPrototypeOf,
+    FunctionToString,
+    ErrorToString,
+    /// A primitive wrapper's `valueOf` (returns the wrapped primitive).
+    WrapperValueOf,
+    /// A primitive wrapper's `toString` (stringifies the wrapped primitive).
+    WrapperToString,
 }
 
 impl Default for FuncInfo {
@@ -255,6 +289,8 @@ impl Default for FuncInfo {
             body_len: 0,
             closures: crate::value::SlotIndex::NULL,
             native: None,
+            method: None,
+            name: String::new(),
         }
     }
 }
@@ -527,6 +563,10 @@ pub struct Interp {
     /// prototype objects carry no data properties — so this is invisible to
     /// the existing corpora; only the prototype *identity* chain is new.
     object_proto: crate::value::SlotIndex,
+    /// The realm's `%Function.prototype%`: the prototype of every function
+    /// instance (native and user), so `f.toString`/`f.call`/… resolve up the
+    /// chain. A boot object.
+    function_proto: crate::value::SlotIndex,
     /// Each constructor instance's `.prototype` object, by slot (XS's
     /// `constructor.prototype`): the intrinsics' prototypes (wired at boot)
     /// and every user function's default prototype (wired at
@@ -535,6 +575,18 @@ pub struct Interp {
     /// object — so `(new F()) instanceof F` and `err instanceof TypeError`
     /// are prototype-chain identity checks (`fxOrdinaryHasInstance`).
     ctor_prototype: std::collections::HashMap<crate::value::SlotIndex, crate::value::SlotIndex>,
+    /// Native prototype methods to bind at link time: `(prototype instance,
+    /// method name, method function)`. Populated once at boot; a method is
+    /// installed as an own property of its prototype only when the program
+    /// references its name (so it relinks to the program-local symbol id and
+    /// stays invisible to programs that never mention it).
+    proto_methods: Vec<(crate::value::SlotIndex, &'static str, crate::value::SlotIndex)>,
+    /// Native prototype **data** properties to bind at link time: `(prototype,
+    /// property name, string value)`. Used for the inherited Error prototype
+    /// `name`/`message` (so `err.name` resolves up the chain and
+    /// `err.hasOwnProperty('name')` is correctly `false`, matching XS). Bound
+    /// only when the program references the name; unmetered.
+    proto_data: Vec<(crate::value::SlotIndex, &'static str, String)>,
     /// The program's symbol `name → id` table, built at
     /// [`Self::link_intrinsics`] from the decoded symbols atom (the inverse
     /// of the id→name vector). A native built-in that must set a
@@ -544,6 +596,10 @@ pub struct Interp {
     /// against, exactly as the intrinsic constructors relink by name. A name
     /// the program never references has no id (and no read of it occurs).
     symbol_ids: std::collections::HashMap<String, u16>,
+    /// The program's symbol names indexed by `id - 1` (the decoded symbols
+    /// atom, verbatim), so a function definition can recover its own name
+    /// string for `Function.prototype.toString`.
+    symbol_names: Vec<String>,
     /// Per-instance Error metadata (name + message), keyed by the error
     /// instance's slot index. An Error object's completion/abort value
     /// stringifies as `name` (no/empty message) or `name: message` — XS's
@@ -669,8 +725,12 @@ impl Interp {
             frame_slots: 0,
             intrinsics: std::collections::HashMap::new(),
             object_proto: crate::value::SlotIndex::NULL,
+            function_proto: crate::value::SlotIndex::NULL,
             ctor_prototype: std::collections::HashMap::new(),
+            proto_methods: Vec::new(),
+            proto_data: Vec::new(),
             symbol_ids: std::collections::HashMap::new(),
+            symbol_names: Vec::new(),
             error_data: std::collections::HashMap::new(),
             wrapper_data: std::collections::HashMap::new(),
             jumps: Vec::new(),
@@ -693,6 +753,7 @@ impl Interp {
         let object_proto = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
         self.object_proto = object_proto;
         let func_proto = self.slots.alloc(Slot::instance(object_proto));
+        self.function_proto = func_proto;
         // Each Error type's `.prototype`: the base `%Error.prototype%` chains
         // to %Object.prototype%; each subtype's prototype chains to
         // %Error.prototype% (so `TypeError` `instanceof Error`).
@@ -730,6 +791,108 @@ impl Interp {
             };
             self.ctor_prototype.insert(f, proto);
         }
+        // Native prototype methods (bound to their prototype at link time,
+        // only when the program references the method name). %Object.prototype%
+        // carries toString/valueOf/hasOwnProperty/isPrototypeOf; each Error
+        // prototype an `Error.prototype.toString`; each wrapper prototype a
+        // `valueOf`/`toString` over the wrapped primitive; %Function.prototype%
+        // a `toString`.
+        let obj_methods = [
+            ("toString", NativeMethod::ObjectToString),
+            ("valueOf", NativeMethod::ObjectValueOf),
+            ("hasOwnProperty", NativeMethod::ObjectHasOwnProperty),
+            ("isPrototypeOf", NativeMethod::ObjectIsPrototypeOf),
+        ];
+        for (name, m) in obj_methods {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((object_proto, name, mf));
+        }
+        let fp_tostring = self.alloc_method(NativeMethod::FunctionToString);
+        self.proto_methods.push((func_proto, "toString", fp_tostring));
+        // Every Error prototype (base + each subtype) gets `toString`.
+        let error_protos: Vec<crate::value::SlotIndex> = {
+            let mut v = vec![error_proto];
+            for &(_, native) in Native::intrinsics() {
+                if matches!(
+                    native,
+                    Native::EvalError
+                        | Native::RangeError
+                        | Native::ReferenceError
+                        | Native::SyntaxError
+                        | Native::TypeError
+                        | Native::URIError
+                        | Native::AggregateError
+                ) {
+                    if let Some(&c) = self.intrinsics.get(native.display_name()) {
+                        if let Some(p) = self.prototype_of(c) {
+                            v.push(p);
+                        }
+                    }
+                }
+            }
+            v
+        };
+        for p in error_protos {
+            let mf = self.alloc_method(NativeMethod::ErrorToString);
+            self.proto_methods.push((p, "toString", mf));
+        }
+        // The inherited Error prototype `name` (per type) and `message` (""
+        // on `%Error.prototype%`, inherited by subtypes). Placing `name` on
+        // the prototype — not the instance — is what makes `err.name` resolve
+        // up the chain while `err.hasOwnProperty('name')` is `false`, as XS.
+        self.proto_data.push((error_proto, "name", "Error".to_string()));
+        self.proto_data.push((error_proto, "message", String::new()));
+        for &(_, native) in Native::intrinsics() {
+            if matches!(
+                native,
+                Native::EvalError
+                    | Native::RangeError
+                    | Native::ReferenceError
+                    | Native::SyntaxError
+                    | Native::TypeError
+                    | Native::URIError
+                    | Native::AggregateError
+            ) {
+                if let Some(&c) = self.intrinsics.get(native.display_name()) {
+                    if let Some(p) = self.prototype_of(c) {
+                        self.proto_data
+                            .push((p, "name", native.display_name().to_string()));
+                    }
+                }
+            }
+        }
+        // The wrapper prototypes carry valueOf + toString over the primitive.
+        for native in [Native::Boolean, Native::Number, Native::String] {
+            if let Some(&c) = self.intrinsics.get(native.display_name()) {
+                if let Some(p) = self.prototype_of(c) {
+                    let v = self.alloc_method(NativeMethod::WrapperValueOf);
+                    self.proto_methods.push((p, "valueOf", v));
+                    let t = self.alloc_method(NativeMethod::WrapperToString);
+                    self.proto_methods.push((p, "toString", t));
+                }
+            }
+        }
+    }
+
+    /// Allocate a native prototype-method function instance (chained to
+    /// %Function.prototype% is unnecessary for these — they are only ever
+    /// dispatched, never re-inspected) registered in [`Self::functions`].
+    fn alloc_method(&mut self, m: NativeMethod) -> crate::value::SlotIndex {
+        let f = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        self.functions.insert(
+            f,
+            FuncInfo {
+                method: Some(m),
+                ..FuncInfo::default()
+            },
+        );
+        f
+    }
+
+    /// The native-method identity of a function instance, if it is one.
+    #[inline]
+    fn method_of(&self, f: crate::value::SlotIndex) -> Option<NativeMethod> {
+        self.functions.get(&f).and_then(|fi| fi.method)
     }
 
     /// The `.prototype` object of a constructor instance, if it is one.
@@ -774,6 +937,7 @@ impl Interp {
     /// `var`/sloppy-global) or to miss. Unmetered: these globals pre-exist
     /// the guest run exactly as XS's do, so no allocation is charged.
     pub fn link_intrinsics(&mut self, names: &[String]) {
+        self.symbol_names = names.to_vec();
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -798,6 +962,29 @@ impl Interp {
                 self.create_global_property(id, (v.kind, v.value));
             }
         }
+        // Install the native prototype methods whose names this program
+        // references, as own properties of their prototype (unmetered — an
+        // inherited intrinsic method, present before the guest runs).
+        let methods = std::mem::take(&mut self.proto_methods);
+        for &(proto, mname, mfunc) in &methods {
+            if let Some(&mid) = self.symbol_ids.get(mname) {
+                self.set_own_unmetered(
+                    proto,
+                    mid,
+                    Slot::of(Kind::Reference, Payload::Reference(mfunc)),
+                );
+            }
+        }
+        self.proto_methods = methods;
+        // Inherited prototype data (Error `name`/`message`).
+        let data = std::mem::take(&mut self.proto_data);
+        for (proto, pname, value) in &data {
+            if let Some(&pid) = self.symbol_ids.get(*pname) {
+                let off = self.chunks.alloc(value.as_bytes());
+                self.set_own_unmetered(*proto, pid, Slot::of(Kind::String, Payload::String(off)));
+            }
+        }
+        self.proto_data = data;
     }
 
     /// The native identity of a function instance, if it is an intrinsic.
@@ -1522,17 +1709,31 @@ impl Interp {
                         .and_then(|b| self.stack.get(b))
                         .map(|s| s.kind == Kind::Uninitialized)
                         .unwrap_or(false);
-                    let callee = base_opt.and_then(|base| {
+                    let func_ref = base_opt.and_then(|base| {
                         match self.stack.get(base + 1).map(|s| s.value) {
-                            Some(Payload::Reference(f)) => self.native_of(f).map(|n| (n, base)),
+                            Some(Payload::Reference(f)) => Some((f, base)),
                             _ => None,
                         }
                     });
+                    let callee = func_ref.and_then(|(f, base)| self.native_of(f).map(|n| (n, base)));
+                    let method = func_ref.and_then(|(f, base)| self.method_of(f).map(|m| (m, base)));
                     if let Some((native, base)) = callee {
-                        // A native (intrinsic) callee, called or constructed.
+                        // A native (intrinsic) constructor callee.
                         match self.call_native(native, base, argc, has_target) {
                             Ok(()) => {
                                 // Return into the JS caller: `END_ALL` checks.
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = ret_pc;
+                            }
+                            Err(h) => return h,
+                        }
+                    } else if let Some((m, base)) = method {
+                        // A native prototype method: the call's receiver is
+                        // `this` (stack[base]); its arguments follow.
+                        match self.call_native_method(m, base, argc) {
+                            Ok(()) => {
                                 if self.check_meter() == MeterCheck::Abort {
                                     return Halt::MeterAbort;
                                 }
@@ -2475,8 +2676,25 @@ impl Interp {
         if name != crate::value::XS_NO_ID {
             self.meter.tick_builtin_some(2);
         }
-        let f = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
-        self.functions.insert(f, FuncInfo::default());
+        let f = self.slots.alloc(Slot::instance(self.function_proto));
+        // Recover the function's own name (for `Function.prototype.toString`):
+        // a real name id indexes the program's symbol names; `XS_NO_ID` is
+        // anonymous.
+        let fname = if name != crate::value::XS_NO_ID {
+            self.symbol_names
+                .get(name as usize - 1)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.functions.insert(
+            f,
+            FuncInfo {
+                name: fname,
+                ..FuncInfo::default()
+            },
+        );
         // `fxDefaultFunctionPrototype`: a `constructor_function` gets a default
         // `.prototype` object (chaining to %Object.prototype%) that a later
         // `new f()` uses as the instance prototype and `instanceof` tests
@@ -2763,18 +2981,17 @@ impl Interp {
                 message: message.clone(),
             },
         );
-        // Own `name`/`message` properties for guest reads, relinked to the
-        // program's symbol ids (only when the program references them). Set
-        // unmetered: `name` is XS's inherited prototype value, and the own
-        // `message` slot cost is already folded into the measured constants.
-        if let Some(&nid) = self.symbol_ids.get("name") {
-            let off = self.chunks.alloc(name.as_bytes());
-            self.set_own_unmetered(inst, nid, Slot::of(Kind::String, Payload::String(off)));
-        }
-        if let Some(&mid) = self.symbol_ids.get("message") {
-            let text = message.unwrap_or_default();
-            let off = self.chunks.alloc(text.as_bytes());
-            self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
+        // An own `message` property only when a message argument was given
+        // (XS): a no-argument error inherits `message == ""` from the
+        // prototype. `name` is always inherited from the prototype, never own
+        // — so `err.hasOwnProperty('name')` is `false`, matching XS. Both are
+        // set unmetered (the own message slot cost is folded into the
+        // measured construct constants).
+        if let Some(text) = message {
+            if let Some(&mid) = self.symbol_ids.get("message") {
+                let off = self.chunks.alloc(text.as_bytes());
+                self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
+            }
         }
         Slot::of(Kind::Reference, Payload::Reference(inst))
     }
@@ -2813,6 +3030,116 @@ impl Interp {
             let idx = self.slots.alloc(prop);
             self.slots.get_mut(inst).next = idx;
         }
+    }
+
+    /// Dispatch a native prototype **method** call (`obj.toString()`,
+    /// `obj.hasOwnProperty(k)`, `wrapper.valueOf()`, …). The value stack holds
+    /// the call frame `[THIS, FUNCTION, RESULT, FRAME]` from `base`; `THIS` is
+    /// the receiver. Computes the result from the receiver (no re-entry into
+    /// user code), meters the method's steps, collapses the region to the
+    /// result, and pushes it. A method whose receiver shape endor cannot model
+    /// self-names (an honest skip).
+    fn call_native_method(&mut self, m: NativeMethod, base: usize, argc: usize) -> Result<(), Halt> {
+        let this = self.stack.get(base).copied().unwrap_or_else(Slot::undefined);
+        let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        let _ = argc;
+        let result: Slot = match m {
+            // `Object.prototype.valueOf`: returns the receiver unchanged.
+            NativeMethod::ObjectValueOf => this,
+            // `<wrapper>.valueOf`: the wrapped primitive.
+            NativeMethod::WrapperValueOf => match this.value {
+                Payload::Reference(r) => self.wrapper_data.get(&r).copied().unwrap_or(this),
+                _ => this,
+            },
+            // `Object.prototype.toString`: `[object Object]` for an ordinary
+            // object (the exotic tags — Array/Error/… — are XS overrides or a
+            // later increment). Allocates the result string chunk.
+            NativeMethod::ObjectToString => {
+                self.meter.tick_raw(METHOD_OBJECT_TOSTRING_METERING);
+                self.meter.tick_chunk_new(b"[object Object]".len() as u64);
+                let off = self.chunks.alloc(b"[object Object]");
+                Slot::of(Kind::String, Payload::String(off))
+            }
+            // `Function.prototype.toString`: XS renders any function as
+            // `function ["name"] (){[native code]}`.
+            NativeMethod::FunctionToString => {
+                let name = match this.value {
+                    Payload::Reference(r) => self
+                        .functions
+                        .get(&r)
+                        .map(|fi| fi.name.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                self.meter.tick_raw(METHOD_FUNCTION_TOSTRING_METERING);
+                let s = format!("function [\"{}\"] (){{[native code]}}", name);
+                self.meter.tick_chunk_new(s.len() as u64);
+                let off = self.chunks.alloc(s.as_bytes());
+                Slot::of(Kind::String, Payload::String(off))
+            }
+            // `Error.prototype.toString`: `name` / `name: message`.
+            NativeMethod::ErrorToString => {
+                let s = self.render(&this);
+                self.meter.tick_raw(METHOD_ERROR_TOSTRING_METERING);
+                self.meter.tick_chunk_new(s.len() as u64);
+                let off = self.chunks.alloc(s.as_bytes());
+                Slot::of(Kind::String, Payload::String(off))
+            }
+            // `<wrapper>.toString`: stringify the wrapped primitive with the
+            // same per-type ToString metering the `String(v)` call uses (a
+            // number renders through `fxNumberToString` — one built-in step
+            // plus its chunk; a boolean/string is interned/identity, no cost).
+            NativeMethod::WrapperToString => {
+                let prim = match this.value {
+                    Payload::Reference(r) => self.wrapper_data.get(&r).copied(),
+                    _ => None,
+                }
+                .unwrap_or(this);
+                let bytes = self.to_string_bytes_metered(prim);
+                let off = self.chunks.alloc(&bytes);
+                Slot::of(Kind::String, Payload::String(off))
+            }
+            // `Object.prototype.hasOwnProperty(k)`: is `k` an OWN property.
+            // A key that is not a program symbol cannot be an own property
+            // (own keys are interned symbol ids) ⇒ `false` — safe, unlike
+            // `in`, because this never consults the prototype chain.
+            NativeMethod::ObjectHasOwnProperty => {
+                // Only a key that is already a program symbol is answered:
+                // find it among the receiver's OWN properties (never the
+                // prototype chain), bit-exact. A string-literal key that is
+                // not a program symbol self-names — endor's per-program symbol
+                // table cannot tell a genuinely-absent key from a
+                // native-created own property under a global id (an error's
+                // `message`), nor whether interning it costs `fxNewName`.
+                let (o, id) = match (this.value, arg0.value) {
+                    (Payload::Reference(o), Payload::String(off)) => {
+                        let key = String::from_utf8_lossy(self.str_content(off)).into_owned();
+                        match self.symbol_ids.get(&key) {
+                            Some(&id) => (o, id),
+                            None => return Err(Halt::Unsupported("hasOwnProperty:non-symbol-key")),
+                        }
+                    }
+                    _ => return Err(Halt::Unsupported("hasOwnProperty:non-string-key")),
+                };
+                self.meter.tick_raw(METHOD_HAS_OWN_PROPERTY_METERING);
+                Slot::boolean(self.find_property(o, id).is_some())
+            }
+            // `Object.prototype.isPrototypeOf(v)`: is the receiver in `v`'s
+            // prototype chain.
+            NativeMethod::ObjectIsPrototypeOf => {
+                let r = match (this.value, arg0.value) {
+                    (Payload::Reference(proto), Payload::Reference(o)) => {
+                        self.prototype_chain_has(o, proto)
+                    }
+                    _ => false,
+                };
+                self.meter.tick_raw(METHOD_HAS_OWN_PROPERTY_METERING);
+                Slot::boolean(r)
+            }
+        };
+        self.stack.truncate(base);
+        self.push(result);
+        Ok(())
     }
 
     /// Leave a user-function call (`XS_CODE_END`): restore the caller's
@@ -3129,13 +3456,21 @@ impl Interp {
     /// absent — the covered grammar has a null prototype, so there is no
     /// prototype walk yet).
     fn instance_get(&self, inst: crate::value::SlotIndex, id: u16) -> Slot {
-        match self.find_property(inst, id) {
-            Some(p) => {
+        // Walk the prototype chain (XS's `mxBehaviorGetProperty`): own first,
+        // then each prototype, to the root. Metering is unchanged — a chain
+        // walk meters no built-in step, exactly as an own read. The prototype
+        // objects carry data only for names the program references (the
+        // linked intrinsic methods), so this stays invisible to reads of
+        // ordinary objects with no matching inherited property.
+        let mut cur = inst;
+        while !cur.is_null() {
+            if let Some(p) = self.find_property(cur, id) {
                 let s = self.slots.get(p);
-                Slot::of(s.kind, s.value)
+                return Slot::of(s.kind, s.value);
             }
-            None => Slot::undefined(),
+            cur = self.instance_prototype(cur);
         }
+        Slot::undefined()
     }
 
     /// Read a `*_LOCAL_*` opcode's 1-based scope-index operand: a `u8` for
@@ -4028,6 +4363,26 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "5", "new F(5).x reads the constructed property");
         assert_eq!(out.computrons, 43, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn object_prototype_method_dispatch_meters_bit_exact() {
+        // The exact C-XS bytecode for `({a:1}).hasOwnProperty('a')` (captured
+        // from the oracle): `.hasOwnProperty` resolves up the prototype chain
+        // to %Object.prototype%'s native method, which is dispatched with the
+        // object as receiver and answers `true` at C-XS's 21 computrons.
+        let code: [u8; 33] = [
+            0x0b, 0x00, 0x4b, 0x9e, 0x01, 0x8b, 0x90, 0xb5, 0x01, 0x5c, 0x01, 0x72, 0x01, 0x89,
+            0x01, 0x00, 0x72, 0x00, 0xe2, 0x01, 0x42, 0x60, 0x02, 0x00, 0x28, 0xc9, 0x02, 0x61,
+            0x00, 0xab, 0x01, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["a".to_string(), "hasOwnProperty".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "true");
+        assert_eq!(out.computrons, 21, "bit-exact computrons vs C-XS");
     }
 
     #[test]
