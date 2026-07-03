@@ -145,6 +145,15 @@ var a=[3]; a.unshift(1,2); a
 var a=[]; a.unshift(9); a
 var a=[1,2,3]; a.unshift(0); a
 var a=[5]; a.unshift(1,2,3); a.length
+var a=[1,2]; a.concat([3,4])
+var a=[1,2]; a.concat(3)
+var a=[1]; a.concat([2],[3])
+var a=[]; a.concat([1,2])
+var a=[1,2]; a.concat()
+var a=[1]; a.concat(2,3)
+var a=[1,2,3]; a.concat([4,5],6)
+var a=[1]; a.concat([2,3],[4],5,6)
+var a=[1,2]; a.concat([3,4]).length
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()

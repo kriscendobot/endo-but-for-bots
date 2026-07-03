@@ -288,7 +288,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(15) {
+    match b.choice(16) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -343,7 +343,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
         // shift the first element off, observe the removed value.
         13 => format!("var a={}; a.shift(); a", lit),
         // unshift one or two elements, observe the result.
-        _ => {
+        14 => {
             if b.choice(2) == 0 {
                 format!("var a={}; a.unshift({}); a", lit, small_int(&mut b))
             } else {
@@ -355,6 +355,22 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
                 )
             }
         }
+        // concat an array and/or a value, observe the result.
+        _ => match b.choice(3) {
+            0 => format!(
+                "var a={}; a.concat([{},{}]); a",
+                lit,
+                small_int(&mut b),
+                small_int(&mut b)
+            ),
+            1 => format!("var a={}; a.concat({}); a", lit, small_int(&mut b)),
+            _ => format!(
+                "var a={}; a.concat([{}],{}); a",
+                lit,
+                small_int(&mut b),
+                small_int(&mut b)
+            ),
+        },
     }
 }
 

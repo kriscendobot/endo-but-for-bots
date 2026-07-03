@@ -330,6 +330,18 @@ pub const ARRAY_REVERSE_PER_SWAP_METERING: u64 = 8 << 16;
 /// and closing `mxMeterSome(2)`. Measured against the pin as `2 << 14`. (shift
 /// needs no such residual — its `mxMeterSome(2+3+3+4)` fully accounts for it.)
 pub const ARRAY_UNSHIFT_FRAME_METERING: u64 = 2 << 14;
+/// `Array.prototype.concat` frame cost + the `Symbol.isConcatSpreadable`
+/// check per reference operand + the per-spread-element read and per-appended-
+/// value residual (beyond the per-element/per-value key slot and `mxMeterSome`,
+/// the result chunk, and the closing `mxMeterSome(3)`). Calibrated against the
+/// pin by solving the linear system over a spread of operand shapes.
+pub const ARRAY_CONCAT_FRAME_METERING: u64 = 311808;
+pub const ARRAY_CONCAT_CHECK_METERING: u64 = 196608;
+/// Extra raw per spread element (its `mxGetIndex`/`fxHasIndex` read), over the
+/// key slot + `mxMeterSome(2)`.
+pub const ARRAY_CONCAT_SPREAD_EXTRA_METERING: u64 = 98304;
+/// Extra raw per appended non-array value, over the key slot + `mxMeterSome(4)`.
+pub const ARRAY_CONCAT_PRIM_EXTRA_METERING: u64 = 2 << 14;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -4183,11 +4195,85 @@ impl Interp {
                 self.meter.tick_builtin_some(3);
                 Slot::of(Kind::Reference, Payload::Reference(result))
             }
-            // `Array.prototype.concat(...args)` — the spreadable-argument
-            // handling (Symbol.isConcatSpreadable, per-arg `mxMeterSome`) is a
-            // later increment; honest skip.
+            // `Array.prototype.concat(...args)` — dense fast path. A new array
+            // of the receiver's elements followed by each argument: an array
+            // argument (concat-spreadable) contributes its elements, any other
+            // value is appended as one element. Dense receivers/array-args only
+            // (a hole self-names — the uninitialized-slot accounting is a later
+            // increment). Metering models `fxNewInstance` (the list) + a
+            // Symbol.isConcatSpreadable check per reference operand + a key slot
+            // and `mxMeterSome(2)` per spread element + a key slot and
+            // `mxMeterSome(4)` per appended value + the result chunk +
+            // `mxMeterSome(3)`, plus a frame constant.
             NativeMethod::ArrayConcat => {
-                return Err(Halt::Unsupported("concat:metering"));
+                let recv = match this.value {
+                    Payload::Reference(i) if self.arrays.contains_key(&i) => i,
+                    _ => return Err(Halt::Unsupported("concat:non-array-receiver")),
+                };
+                // Collect the operands: the receiver, then each argument.
+                let mut operands: Vec<Slot> = vec![this];
+                for i in 0..argc {
+                    operands.push(
+                        self.stack
+                            .get(base + 4 + i)
+                            .copied()
+                            .unwrap_or_else(Slot::undefined),
+                    );
+                }
+                self.meter.tick_raw(ARRAY_CONCAT_FRAME_METERING);
+                self.meter.tick_slot_alloc(); // `fxNewInstance` (the list)
+                let result = self.new_array_unmetered();
+                let mut out: Vec<Slot> = Vec::new();
+                for op in operands {
+                    // Every reference operand runs the `Symbol.isConcatSpreadable`
+                    // check.
+                    let is_array = matches!(op.value, Payload::Reference(r) if self.arrays.contains_key(&r));
+                    if let Payload::Reference(_) = op.value {
+                        self.meter.tick_raw(ARRAY_CONCAT_CHECK_METERING);
+                    }
+                    if is_array {
+                        let r = match op.value {
+                            Payload::Reference(r) => r,
+                            _ => unreachable!(),
+                        };
+                        // Dense array only (a hole needs the uninitialized-slot
+                        // path).
+                        let (len, dense) = {
+                            let a = &self.arrays[&r];
+                            (a.length, a.items.len() as u32 == a.length)
+                        };
+                        if !dense {
+                            return Err(Halt::Unsupported("concat:sparse-arg"));
+                        }
+                        for i in 0..len {
+                            let s = self.arrays[&r].items.get(&i).copied().unwrap_or_else(Slot::undefined);
+                            self.meter.tick_slot_alloc();
+                            self.meter.tick_builtin_some(2);
+                            self.meter.tick_raw(ARRAY_CONCAT_SPREAD_EXTRA_METERING);
+                            out.push(Slot::of(s.kind, s.value));
+                        }
+                    } else {
+                        // A non-array value is appended as a single element.
+                        self.meter.tick_slot_alloc();
+                        self.meter.tick_builtin_some(4);
+                        self.meter.tick_raw(ARRAY_CONCAT_PRIM_EXTRA_METERING);
+                        out.push(op);
+                    }
+                }
+                let total = out.len() as u32;
+                if total > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(total));
+                }
+                {
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, s) in out.into_iter().enumerate() {
+                        a.items.insert(i as u32, s);
+                    }
+                    a.length = total;
+                }
+                self.meter.tick_builtin_some(3);
+                let _ = recv;
+                Slot::of(Kind::Reference, Payload::Reference(result))
             }
             // `Array.prototype.at(index)` — dense fast path. Relative index
             // (negative counts from the end); the element there, or
