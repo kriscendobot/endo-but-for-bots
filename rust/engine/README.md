@@ -93,10 +93,13 @@ first-class values, `Boolean`/`Object` native calls, the value globals
 `undefined`/`NaN`/`Infinity`, and `new` constructor calls; stage-3 arrays —
 the Array exotic object: literals with holes, computed index get/set over the
 item chunk, the `length` accessor get/set, the dense `Array.prototype` methods
-`push`/`pop`/`shift`/`unshift`/`indexOf`/`lastIndexOf`/`includes`/`fill`/
-`slice`/`join`/`at`/`reverse`/`concat`/`copyWithin`/`with`, the `Array(...)`
-constructor + `Array.isArray`, the `values`/`keys`/`entries` array iterators,
-and the iteration protocol — `for-of`, `for-in`, and array spread `[...arr]`),
+— the non-callback `push`/`pop`/`shift`/`unshift`/`indexOf`/`lastIndexOf`/
+`includes`/`fill`/`slice`/`join`/`at`/`reverse`/`concat`/`copyWithin`/`with`
+and the re-entrant callback methods `forEach`/`map`/`filter`/`some`/`every`/
+`find`/`findIndex`/`findLast`/`findLastIndex`/`reduce`/`reduceRight` (driven
+through a re-entrant `run_callback` substrate) — the `Array(...)` constructor +
+`Array.isArray`, the `values`/`keys`/`entries` array iterators, and the
+iteration protocol — `for-of`, `for-in`, and array spread `[...arr]`),
 all bit-exact
 (result AND computron) against the oracle. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
