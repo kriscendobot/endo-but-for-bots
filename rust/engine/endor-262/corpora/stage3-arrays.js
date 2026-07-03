@@ -112,6 +112,14 @@ var a=[5,6,7,8,9]; a.slice(2)
 var a=[1,2,3]; a.slice(-1)
 var a=[1,2,3]; a.slice(1).length
 var a=[1,2,3]; a.slice(1)[0]
+var a=[1,2,3]; a.join()
+var a=[1,2,3,4]; a.join()
+var a=[7]; a.join()
+var a=[]; a.join()
+var a=["x","y"]; a.join()
+var a=[10,20,30]; a.join()
+var a=[1,2,3]; a.join("-")
+var a=[1,2,3]; a.join("--")
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()

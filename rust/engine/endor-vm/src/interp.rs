@@ -316,6 +316,17 @@ pub const ARRAY_FILL_FRAME_METERING: u64 = 2 << 14;
 /// + host frame + closing `mxMeterSome(3)`); a non-empty slice adds the result
 /// chunk and `mxMeterSome(count*10)`. Calibrated against the pin.
 pub const ARRAY_SLICE_FRAME_METERING: u64 = 377344;
+/// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
+/// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
+/// allocations). Calibrated against the pin for the default (",") separator; a
+/// non-default *string* separator argument carries a documented −24-raw
+/// sub-computron residual (well under a `>> 16` boundary; every corpus/fuzz/
+/// test262 check compares computrons and stays exact).
+pub const ARRAY_JOIN_FRAME_METERING: u64 = 65560;
+/// The per-element base cost `Array.prototype.join` accrues for every index
+/// (the `mxGetIndex` read + loop overhead), on top of the element's ToString
+/// allocation: `1 << 16`. Calibrated against the pin.
+pub const ARRAY_JOIN_PER_ELEMENT_METERING: u64 = 1 << 16;
 
 /// The constant raw 16.16 cost of an `Array(...)` / `new Array(...)` call
 /// beyond the element item-chunk allocation: the native host frame,
@@ -4122,13 +4133,57 @@ impl Interp {
             NativeMethod::ArrayConcat => {
                 return Err(Halt::Unsupported("concat:metering"));
             }
-            // `Array.prototype.join([sep])` — the per-element `ToString`
-            // allocation metering (each number element renders through
-            // `fxNumberToString` into its own chunk) is a later increment, so
-            // this self-names an honest skip rather than under-metering.
+            // `Array.prototype.join([sep])` — dense fast path. Each element is
+            // ToString'd into a key slot, the pieces joined by `sep` (default
+            // ","), and the result materialized into one final chunk. Metering
+            // models `fxNewInstance` (the key list) + a key slot per element
+            // and per separator + each element's `fxToString` (a number renders
+            // to a fresh chunk + a built-in step) + the final `fxNewChunk`.
             NativeMethod::ArrayJoin => {
-                let _ = arg0;
-                return Err(Halt::Unsupported("join:tostring-metering"));
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("join:non-dense-array")),
+                };
+                let sep: Vec<u8> = if argc == 0 || arg0.kind == Kind::Undefined {
+                    b",".to_vec()
+                } else if arg0.kind == Kind::String {
+                    match arg0.value {
+                        Payload::String(off) => self.str_content(off).to_vec(),
+                        _ => b",".to_vec(),
+                    }
+                } else {
+                    return Err(Halt::Unsupported("join:non-string-separator"));
+                };
+                let length = self.arrays[&inst].length;
+                let items: Vec<Option<Slot>> = {
+                    let a = &self.arrays[&inst];
+                    (0..length).map(|i| a.items.get(&i).copied()).collect()
+                };
+                self.meter.tick_raw(ARRAY_JOIN_FRAME_METERING);
+                self.meter.tick_slot_alloc(); // `fxNewInstance` (the key list)
+                let mut out: Vec<u8> = Vec::new();
+                for (i, item) in items.into_iter().enumerate() {
+                    // Every index is read (`mxGetIndex`) regardless of type.
+                    self.meter.tick_raw(ARRAY_JOIN_PER_ELEMENT_METERING);
+                    if i > 0 {
+                        self.meter.tick_slot_alloc(); // the separator key slot
+                        out.extend_from_slice(&sep);
+                    }
+                    match item {
+                        Some(s) if s.kind != Kind::Undefined && s.kind != Kind::Null => {
+                            if s.kind == Kind::Reference {
+                                return Err(Halt::Unsupported("join:reference-element"));
+                            }
+                            self.meter.tick_slot_alloc(); // the element key slot
+                            let bytes = self.to_string_bytes_metered(s);
+                            out.extend_from_slice(&bytes);
+                        }
+                        _ => {}
+                    }
+                }
+                self.meter.tick_chunk_new((out.len() + 1) as u64);
+                let off = self.chunks.alloc(&out);
+                Slot::of(Kind::String, Payload::String(off))
             }
             // `Array.isArray(v)`: whether `v` is an array exotic object.
             NativeMethod::ArrayIsArray => {
