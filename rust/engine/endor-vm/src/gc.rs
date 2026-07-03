@@ -202,6 +202,51 @@ mod tests {
     }
 
     #[test]
+    fn traces_an_instance_property_chain() {
+        // The stage-2b object-heap shape: an instance whose `next` chains
+        // Property slots, one holding a Reference to a second instance.
+        // Everything reachable from the root instance survives; a
+        // detached instance + property are swept.
+        let mut h = Heap::new();
+        let inner = h.slots.alloc(Slot::instance(SlotIndex::NULL));
+        // root instance -> prop "a" (Reference to inner) -> prop "b" (=7)
+        let pa = h.slots.alloc(Slot::property(1, Payload::Reference(inner)));
+        // fix up the property kind (property() defaults to Property kind
+        // with a Reference payload, which is what we want here).
+        assert_eq!(h.slots.get(pa).kind, Kind::Property);
+        let pb = h.slots.alloc(Slot::property(2, Payload::Integer(7)));
+        h.slots.get_mut(pa).next = pb;
+        let root = h.slots.alloc(Slot::instance(SlotIndex::NULL));
+        h.slots.get_mut(root).next = pa;
+        // Detached garbage: an unreachable instance with a property.
+        let dead_inst = h.slots.alloc(Slot::instance(SlotIndex::NULL));
+        let dead_prop = h.slots.alloc(Slot::property(9, Payload::Integer(0)));
+        h.slots.get_mut(dead_inst).next = dead_prop;
+
+        let stats = h.collect(&[root]);
+        assert_eq!(stats.slots_reclaimed, 2, "the detached instance + its property are swept");
+        assert!(h.slots.is_marked(inner), "Reference-held instance kept");
+        assert!(h.slots.is_marked(pa) && h.slots.is_marked(pb), "the property chain is kept");
+        assert!(!h.slots.is_marked(dead_inst) && !h.slots.is_marked(dead_prop));
+        // The chain is intact after the collection.
+        assert_eq!(h.slots.get(root).next, pa);
+        assert_eq!(h.slots.get(pa).next, pb);
+    }
+
+    #[test]
+    fn traces_instance_prototype_edge() {
+        // An instance's prototype (its payload Reference) is a GC edge:
+        // a prototype-only-reachable instance survives.
+        let mut h = Heap::new();
+        let proto = h.slots.alloc(Slot::instance(SlotIndex::NULL));
+        let obj = h.slots.alloc(Slot::instance(proto));
+        let _garbage = h.slots.alloc(Slot::instance(SlotIndex::NULL));
+        let stats = h.collect(&[obj]);
+        assert_eq!(stats.slots_reclaimed, 1, "only the unrelated instance is swept");
+        assert!(h.slots.is_marked(proto), "the prototype is kept through the instance edge");
+    }
+
+    #[test]
     fn empty_root_set_reclaims_everything() {
         let mut h = Heap::new();
         h.slots.alloc(Slot::integer(1));

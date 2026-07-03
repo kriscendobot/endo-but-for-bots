@@ -146,7 +146,14 @@ pub fn stage1_corpus() -> Vec<String> {
 /// per var" the differential probe measured in 2a is now reproduced.
 /// They **graduate** into the bit-exact bar alongside [`stage1_corpus`].
 pub fn stage2_corpus() -> Vec<String> {
-    parse_corpus(include_str!("../corpora/stage2-behavioral.js"))
+    let mut all = Vec::new();
+    for text in [
+        include_str!("../corpora/stage2-behavioral.js"),
+        include_str!("../corpora/stage2-objects.js"),
+    ] {
+        all.extend(parse_corpus(text));
+    }
+    all
 }
 
 /// A summary over a corpus run.

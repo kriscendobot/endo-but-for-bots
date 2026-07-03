@@ -70,15 +70,19 @@ pub const PROGRAM_INVOCATION_COMPUTRONS: u64 = 3;
 pub const PROGRAM_ENV_SETUP_METERING: u64 = 17688;
 
 /// The raw 16.16 cost C-XS accrues materializing one new own property on
-/// the global object (`mxBehaviorSetProperty` creating a property:
+/// an object (`mxBehaviorSetProperty`/`fxRunDefine` creating a property:
 /// `fxNewSlot` for the property slot plus the property-table growth and
 /// interned-key `fxNewSlot`/`fxNewChunk`). Measured against the pin as
 /// 536 = one modeled property-slot allocation
-/// ([`crate::meter::SLOT_ALLOCATION_METERING`], 1<<8 = 256) plus
-/// [`GLOBAL_PROPERTY_CREATE_REMAINDER`]. Accrued where the property is
-/// first created: at `EVAL_ENVIRONMENT` for a hoisted `var`, or at the
-/// first `SET_VARIABLE` to an undeclared (sloppy-created) global.
-pub const GLOBAL_PROPERTY_CREATE_REMAINDER: u64 = 280;
+/// ([`crate::meter::SLOT_ALLOCATION_METERING`], 1<<8 = 256) plus this
+/// [`PROPERTY_CREATE_REMAINDER`]. Accrued wherever a new own property is
+/// created — a hoisted `var` or sloppy global at `EVAL_ENVIRONMENT` /
+/// `SET_VARIABLE`, an object-literal member at `NEW_PROPERTY`, or a
+/// dynamic assignment at `SET_PROPERTY`. Verified per-site against the
+/// oracle's raw meter (a `SET_PROPERTY` that creates costs exactly 536;
+/// one that overwrites costs nothing; a `NEW_PROPERTY` costs 536 plus one
+/// built-in step for `fxRunDefine`).
+pub const PROPERTY_CREATE_REMAINDER: u64 = 280;
 
 /// Why a run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,15 +257,22 @@ impl Interp {
     /// `var`, or a sloppy assignment creating a global), metering the
     /// allocation exactly where `fxNewSlot`/`fxNewChunk` run:
     /// [`crate::meter::SLOT_ALLOCATION_METERING`] for the property slot
-    /// plus the measured [`GLOBAL_PROPERTY_CREATE_REMAINDER`] (the
-    /// property-table growth and interned-key allocation not yet modeled
-    /// as individual slots) — 536 raw total against the pin. Initialized
-    /// undefined; a following `SET_VARIABLE` assigns and meters its own
-    /// built-in step.
+    /// plus the measured [`PROPERTY_CREATE_REMAINDER`] (the property-table
+    /// growth and interned-key allocation not yet modeled as individual
+    /// slots) — 536 raw total against the pin. Initialized undefined; a
+    /// following `SET_VARIABLE` assigns and meters its own built-in step.
     fn materialize_global_property(&mut self, id: u16) -> crate::value::SlotIndex {
-        self.meter.tick_slot_alloc();
-        self.meter.tick_raw(GLOBAL_PROPERTY_CREATE_REMAINDER);
+        self.tick_property_create();
         self.create_global_property(id, (Kind::Undefined, Payload::None))
+    }
+
+    /// Meter one new own-property allocation: the property `fxNewSlot`
+    /// ([`crate::meter::SLOT_ALLOCATION_METERING`]) plus the measured
+    /// [`PROPERTY_CREATE_REMAINDER`], 536 raw total against the pin.
+    #[inline]
+    fn tick_property_create(&mut self) {
+        self.meter.tick_slot_alloc();
+        self.meter.tick_raw(PROPERTY_CREATE_REMAINDER);
     }
 
     /// Arm metering (`fxBeginMetering`): install a check `interval` — a
@@ -454,8 +465,18 @@ impl Interp {
                     // branch runs). Materialize each declared name's
                     // global property here — that is where XS allocates
                     // it — metering the allocation faithfully. The frame
-                    // scope slot still holds the working value.
+                    // property slots hold the working value from here on.
                     self.hoist_vars_to_global();
+                    // `fxRunEvalEnvironment` ends `the->scope = top + 1`,
+                    // resetting the scope region: the hoisted vars now live
+                    // in the global object, and their scope slots are freed
+                    // and reused (a following `RESERVE`/`NEW_TEMPORARY`
+                    // reuses scope index 1 — this is why an object-literal
+                    // temporary and a hoisted var can both address `#1`).
+                    // Reads/writes of a top-level var resolve to its global
+                    // property from here (`resolve_get`/`resolve_set`).
+                    self.locals.clear();
+                    self.id_map.clear();
                     pc += size as usize;
                 }
                 XS_CODE_EVAL_REFERENCE | XS_CODE_PROGRAM_REFERENCE => {
@@ -571,6 +592,66 @@ impl Interp {
                     // pre-existed or was just created.
                     self.meter.tick_builtin();
                     self.push(value);
+                    pc += ilen;
+                }
+
+                // ---- objects and properties -------------------------
+                // `fxNewObject`: push a reference to a fresh instance.
+                XS_CODE_OBJECT => {
+                    let inst = self.new_object();
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(inst)));
+                    pc += size as usize;
+                }
+                // Define a new own property (object-literal member).
+                // Stack: [.., objectRef, value]; consumes both. Encoded
+                // as 5 bytes — opcode + 2-byte id + a 2-byte inline flag
+                // operand the compiler emits (`fxRunDefine`'s attributes),
+                // which `gxCodeSizes` marks as an ID opcode (3) but whose
+                // handler advances two further bytes (`xsRun.c` NEW_PROPERTY),
+                // so the flag pair is NOT a separate dispatched opcode.
+                XS_CODE_NEW_PROPERTY => {
+                    if pc + 5 > len {
+                        return Halt::Decode(format!("new_property at {} needs 5 bytes", pc));
+                    }
+                    let id = id!(1);
+                    let value = self.pop();
+                    let obj = self.pop();
+                    if let Payload::Reference(inst) = obj.value {
+                        // `fxRunDefine` creating a data property: one
+                        // built-in step plus the property-slot allocation.
+                        self.instance_put(inst, id, value);
+                        self.meter.tick_builtin();
+                    }
+                    pc += 5;
+                }
+                // `o.k = v`. Stack: [.., objectRef, value] → [.., value].
+                // Unlike `SET_VARIABLE`, the handler runs no `fxRunHas`
+                // pre-check, so an overwrite meters nothing and a create
+                // meters only the property allocation (536) — verified
+                // against the pin's raw meter.
+                XS_CODE_SET_PROPERTY => {
+                    let id = id!(1);
+                    let value = self.pop();
+                    let obj = self.pop();
+                    if let Payload::Reference(inst) = obj.value {
+                        self.instance_put(inst, id, value);
+                    }
+                    self.push(value);
+                    pc += ilen;
+                }
+                // `o.k`. Stack: [.., objectRef] → [.., value]. The handler
+                // calls `mxBehaviorGetProperty` directly (no `mxGetID`
+                // wrapper), so — like `GET_VARIABLE` — a property read
+                // meters no built-in step (verified against the pin: a
+                // repeated `o.a;` adds only its dispatch computrons).
+                XS_CODE_GET_PROPERTY => {
+                    let id = id!(1);
+                    let obj = self.pop();
+                    let v = match obj.value {
+                        Payload::Reference(inst) => self.instance_get(inst, id),
+                        _ => Slot::undefined(),
+                    };
+                    self.push(v);
                     pc += ilen;
                 }
 
@@ -864,6 +945,73 @@ impl Interp {
                     return Halt::Unsupported(other.name());
                 }
             }
+        }
+    }
+
+    /// Allocate a fresh object instance on the slot heap (`fxNewObject`)
+    /// and return its index. Prototype is null for now (the intrinsic
+    /// `%Object.prototype%` wiring lands with the intrinsics seam; the
+    /// covered grammar only reads/writes own properties). Meters the
+    /// `fxNewObject` cost measured against the pin: one built-in step
+    /// (`mxMeterOne`) plus one property-slot `fxNewSlot`
+    /// ([`crate::meter::SLOT_ALLOCATION_METERING`]) — 16640 raw total.
+    fn new_object(&mut self) -> crate::value::SlotIndex {
+        self.meter.tick_builtin();
+        self.meter.tick_slot_alloc();
+        self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL))
+    }
+
+    /// Find an own property slot of `inst` by key `id`, walking its
+    /// `next`-linked property list. Every slot in the list is a property
+    /// (XS's property slots hold the value directly, keyed by `id`), so
+    /// the match is by `id` alone — a property slot's `kind` is the
+    /// value's kind, not a separate marker.
+    fn find_property(&self, inst: crate::value::SlotIndex, id: u16) -> Option<crate::value::SlotIndex> {
+        let mut cur = self.slots.get(inst).next;
+        while !cur.is_null() {
+            let s = self.slots.get(cur);
+            if s.id == id {
+                return Some(cur);
+            }
+            cur = s.next;
+        }
+        None
+    }
+
+    /// Define/set an own property `id = value` on instance `inst`,
+    /// creating the property slot (metered `fxNewSlot`) when absent.
+    /// Returns `true` if a new property was created. The property slot
+    /// holds the value directly (its `kind`/`value` are the value's),
+    /// with `id` the key and `next` the following property.
+    fn instance_put(&mut self, inst: crate::value::SlotIndex, id: u16, value: Slot) -> bool {
+        if let Some(p) = self.find_property(inst, id) {
+            let s = self.slots.get_mut(p);
+            s.kind = value.kind;
+            s.value = value.value;
+            false
+        } else {
+            self.tick_property_create(); // fxNewSlot + property-table growth (536)
+            let head = self.slots.get(inst).next;
+            let mut prop = value;
+            prop.id = id;
+            prop.flag = 0;
+            prop.next = head;
+            let idx = self.slots.alloc(prop);
+            self.slots.get_mut(inst).next = idx;
+            true
+        }
+    }
+
+    /// Read own property `id` of instance `inst` (or `undefined` when
+    /// absent — the covered grammar has a null prototype, so there is no
+    /// prototype walk yet).
+    fn instance_get(&self, inst: crate::value::SlotIndex, id: u16) -> Slot {
+        match self.find_property(inst, id) {
+            Some(p) => {
+                let s = self.slots.get(p);
+                Slot::of(s.kind, s.value)
+            }
+            None => Slot::undefined(),
         }
     }
 
