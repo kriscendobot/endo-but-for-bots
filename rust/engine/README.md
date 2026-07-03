@@ -81,12 +81,21 @@ cargo test  --workspace -- --test-threads=1   # includes the bar as a test
 # walk, so `expressions`/`statements` in separate processes bound the RSS.
 cargo run -p endor-262 --bin test262-language -- expressions
 cargo run -p endor-262 --bin test262-language -- statements/for
+# The stage-3 built-ins sections run through the same binary:
+cargo run -p endor-262 --bin test262-language -- built-ins/Boolean
 ```
 
 The stage-scoped curated corpora under `endor-262/corpora/` are the
 bootstrap (stage-1 arithmetic/logic/control-flow; stage-2 var/loop/object;
-stage-2b functions/closures/exceptions), all bit-exact (result AND
-computron) against the oracle. Per the maintainer directive on PR #600
+stage-2b functions/closures/exceptions; stage-3 language string values +
+numeric/chaining opcodes, and fundamentals — the intrinsic constructors as
+first-class values, `Boolean`/`Object` native calls, the value globals
+`undefined`/`NaN`/`Infinity`, and `new` constructor calls), all bit-exact
+(result AND computron) against the oracle. The stage-3 built-ins reach
+endor's intrinsics by name: the oracle's `symbols` atom (decoded by
+`endor-vm::symbols`) carries the C-XS compiler's program-local id→name
+table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic
+under the id that program assigned it (`endor_vm::run_program_with_symbols`). Per the maintainer directive on PR #600
 (2026-07-03), the whole-section parity runs that succeed them draw from the
 monorepo's existing `packages/test262-runner` test262 subset — the same
 tree and convention that package already uses to prove XS↔Node HardenedJS
