@@ -518,6 +518,19 @@ pub const MATH_FRAME_METERING: u64 = 0;
 /// calibrates against the pin `48ee02d8cfe0` to zero over the `RUN` opcode.
 pub const NUMBER_FRAME_METERING: u64 = 0;
 
+/// The `JSON.stringify` setup residual: `fxStringifyJSON` mallocs an unmetered
+/// 1 KiB working buffer but also allocates a metered holder object
+/// (`fxNewObjectInstance` + `fxNextSlotProperty`) and runs the host frame — a
+/// fixed `82432` raw 16.16 units, independent of the value, measured against
+/// the pin `48ee02d8cfe0` (the `JSON.stringify(undefined)` no-output gap).
+pub const JSON_STRINGIFY_SETUP_METERING: u64 = 82432;
+/// The extra residual a `JSON.stringify` of a **produced** top-level primitive
+/// accrues over the setup (the `fxStringifyJSONName` + value-append path):
+/// a fixed `16384` (`1 << 14`), independent of the primitive's spelling (the
+/// result chunk is metered separately). Structured (object/array) values carry
+/// per-node allocation costs not modeled this stage — they self-name.
+pub const JSON_STRINGIFY_SCALAR_METERING: u64 = 1 << 14;
+
 /// The raw 16.16 native-host-frame cost of a `String.prototype` method call,
 /// beyond the modeled `mxMeterSome` steps and the result chunk. Like the
 /// `Math.*` frame it calibrates against the pin `48ee02d8cfe0` to zero over
@@ -874,6 +887,14 @@ pub enum NativeMethod {
     /// `fxToNumber` then the `fpclassify` test. No chunk.
     GlobalIsNaN,
     GlobalIsFinite,
+    /// `JSON.stringify(value)` (`fx_JSON_stringify`): serialize `value` over
+    /// XS's traversal order. The stringifier's working buffer is C-malloc'd
+    /// (unmetered); only the final `fxNewChunk(offset)` meters. The
+    /// no-replacer / no-space subset is modeled; a replacer, a space argument,
+    /// a `toJSON` method, or a wrapper/BigInt value self-names an honest skip.
+    JsonStringify,
+    /// `JSON.parse(text)` (`fx_JSON_parse`): parse `text` to a value.
+    JsonParse,
 }
 
 impl Default for FuncInfo {
@@ -1692,6 +1713,24 @@ impl Interp {
         self.create_math();
         self.create_string_proto();
         self.create_number_globals();
+        self.create_json();
+    }
+
+    /// Build the `JSON` namespace object (XS's `mxJSONObject`, `xsJSON.c`): a
+    /// boot object carrying `parse`/`stringify`, bound into the global object
+    /// under the program-local `JSON` id at link time. Not a function, so
+    /// `typeof JSON === "object"`.
+    fn create_json(&mut self) {
+        let object_proto = self.object_proto;
+        let json = self.slots.alloc(Slot::instance(object_proto));
+        self.intrinsics.insert("JSON", json);
+        for (name, m) in [
+            ("stringify", NativeMethod::JsonStringify),
+            ("parse", NativeMethod::JsonParse),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((json, name, mf));
+        }
     }
 
     /// Register the `Number` statics + `Number.prototype.toString` and the
@@ -5893,6 +5932,9 @@ impl Interp {
             | NativeMethod::GlobalParseFloat
             | NativeMethod::GlobalIsNaN
             | NativeMethod::GlobalIsFinite => self.call_number(m, this, base, argc)?,
+            NativeMethod::JsonStringify | NativeMethod::JsonParse => {
+                self.call_json(m, base, argc)?
+            }
         };
         self.stack.truncate(base);
         self.push(result);
@@ -6269,6 +6311,188 @@ impl Interp {
             _ => return Err(Halt::Unsupported("number:unmodeled")),
         };
         Ok(result)
+    }
+
+    /// Dispatch `JSON.stringify` / `JSON.parse`. The stringifier's working
+    /// buffer is unmetered (C-malloc'd in XS); only the final result chunk
+    /// meters. `parse` allocates the parsed strings' chunks.
+    fn call_json(&mut self, m: NativeMethod, base: usize, argc: usize) -> Result<Slot, Halt> {
+        let arg0 = if argc > 0 {
+            self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined)
+        } else {
+            Slot::undefined()
+        };
+        match m {
+            NativeMethod::JsonStringify => {
+                // A replacer/space argument (2nd/3rd) changes the output and
+                // the traversal; endor models the no-replacer / no-space subset
+                // and self-names the rest.
+                let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                let arg2 = self.stack.get(base + 6).copied().unwrap_or_else(Slot::undefined);
+                if (argc > 1 && arg1.kind != Kind::Undefined && arg1.kind != Kind::Null)
+                    || (argc > 2 && arg2.kind != Kind::Undefined && arg2.kind != Kind::Null)
+                {
+                    return Err(Halt::Unsupported("JSON.stringify:replacer-or-space"));
+                }
+                // A structured (object/array) value carries per-node allocation
+                // costs (the keys instance, per-key strings, the recursive
+                // property frames) not yet modeled to a clean constant — it
+                // self-names an honest skip rather than a computron divergence.
+                // A top-level primitive is bit-exact.
+                if arg0.kind == Kind::Reference {
+                    return Err(Halt::Unsupported("JSON.stringify:structured-metering"));
+                }
+                self.meter.tick_raw(JSON_STRINGIFY_SETUP_METERING);
+                let mut visited: Vec<crate::value::SlotIndex> = Vec::new();
+                match self.json_serialize(arg0, &mut visited)? {
+                    Some(bytes) => {
+                        self.meter.tick_raw(JSON_STRINGIFY_SCALAR_METERING);
+                        Ok(self.new_string_metered(&bytes))
+                    }
+                    // A value that serializes to nothing (undefined / symbol)
+                    // yields `undefined`, with no chunk (setup metered only).
+                    None => Ok(Slot::undefined()),
+                }
+            }
+            NativeMethod::JsonParse => {
+                let _ = arg0;
+                Err(Halt::Unsupported("JSON.parse:unmodeled"))
+            }
+            _ => Err(Halt::Unsupported("json:unmodeled")),
+        }
+    }
+
+    /// `SerializeJSONProperty` (`fxStringifyJSONProperty`, no replacer/space):
+    /// the JSON text of `value`, or `None` when it serializes to nothing
+    /// (undefined / callable / symbol). Builds into a plain byte buffer with no
+    /// metering — XS's working buffer is an unmetered C-malloc, and only the
+    /// final result chunk (charged by the caller) meters.
+    fn json_serialize(
+        &mut self,
+        value: Slot,
+        visited: &mut Vec<crate::value::SlotIndex>,
+    ) -> Result<Option<Vec<u8>>, Halt> {
+        match value.kind {
+            Kind::Null => Ok(Some(b"null".to_vec())),
+            Kind::Undefined => Ok(None),
+            Kind::Boolean => Ok(Some(
+                if matches!(value.value, Payload::Boolean(true)) {
+                    b"true".to_vec()
+                } else {
+                    b"false".to_vec()
+                },
+            )),
+            Kind::Integer => match value.value {
+                Payload::Integer(i) => Ok(Some(i.to_string().into_bytes())),
+                _ => Ok(None),
+            },
+            Kind::Number => match value.value {
+                Payload::Number(n) => Ok(Some(if n.is_finite() {
+                    number_to_ecma_string(n).into_bytes()
+                } else {
+                    b"null".to_vec()
+                })),
+                _ => Ok(None),
+            },
+            Kind::String => match value.value {
+                Payload::String(off) => {
+                    let content = self.str_content(off).to_vec();
+                    Ok(Some(json_escape_string(&content)))
+                }
+                _ => Ok(None),
+            },
+            Kind::Reference => {
+                let inst = match value.value {
+                    Payload::Reference(r) => r,
+                    _ => return Ok(None),
+                };
+                // A callable value serializes to nothing.
+                if self.functions.contains_key(&inst) {
+                    return Ok(None);
+                }
+                // A boxed wrapper (Number/String/Boolean object) unwraps to its
+                // primitive in XS — not modeled here; self-name.
+                if self.wrapper_data.contains_key(&inst) {
+                    return Err(Halt::Unsupported("JSON.stringify:wrapper-object"));
+                }
+                // A `toJSON` method would redirect the value; self-name if the
+                // object carries one.
+                if let Some(&tid) = self.symbol_ids.get("toJSON") {
+                    if self.find_property(inst, tid).is_some() {
+                        return Err(Halt::Unsupported("JSON.stringify:toJSON"));
+                    }
+                }
+                if visited.contains(&inst) {
+                    return Err(Halt::Throw("TypeError: cyclic value".to_string()));
+                }
+                visited.push(inst);
+                let out = if let Some(a) = self.arrays.get(&inst).cloned() {
+                    let mut buf = vec![b'['];
+                    for i in 0..a.length {
+                        if i > 0 {
+                            buf.push(b',');
+                        }
+                        let elem = a
+                            .items
+                            .get(&i)
+                            .map(|s| Slot::of(s.kind, s.value))
+                            .unwrap_or_else(Slot::undefined);
+                        // A hole / undefined / callable element serializes as
+                        // `null` in array context.
+                        match self.json_serialize(elem, visited)? {
+                            Some(b) => buf.extend_from_slice(&b),
+                            None => buf.extend_from_slice(b"null"),
+                        }
+                    }
+                    buf.push(b']');
+                    buf
+                } else {
+                    // An ordinary object: its own enumerable string-named
+                    // properties in insertion order, skipping values that
+                    // serialize to nothing.
+                    let keys = self.object_own_string_keys(inst);
+                    let mut buf = vec![b'{'];
+                    let mut first = true;
+                    for (id, key) in keys {
+                        let v = self.instance_get(inst, id);
+                        if let Some(vb) = self.json_serialize(v, visited)? {
+                            if !first {
+                                buf.push(b',');
+                            }
+                            first = false;
+                            buf.extend_from_slice(&json_escape_string(key.as_bytes()));
+                            buf.push(b':');
+                            buf.extend_from_slice(&vb);
+                        }
+                    }
+                    buf.push(b'}');
+                    buf
+                };
+                visited.pop();
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// An object's own **string-named** enumerable properties in insertion
+    /// order, as `(id, name)` — the `mxBehaviorOwnKeys(XS_EACH_NAME_FLAG)`
+    /// subset JSON serializes. Array-index keys and non-program symbols are
+    /// excluded (JSON keys are string names).
+    fn object_own_string_keys(&self, inst: crate::value::SlotIndex) -> Vec<(u16, String)> {
+        let mut names: Vec<(u16, String)> = Vec::new();
+        let mut p = self.slots.get(inst).next;
+        while !p.is_null() {
+            let s = self.slots.get(p);
+            if s.id != crate::value::XS_NO_ID {
+                if let Some(name) = self.symbol_names.get((s.id - 1) as usize) {
+                    names.push((s.id, name.clone()));
+                }
+            }
+            p = s.next;
+        }
+        names.reverse();
+        names
     }
 
     /// The CESU-8 content bytes of a string receiver (NUL-stripped), for a
@@ -8171,6 +8395,35 @@ fn decode_code_point(content: &[u8], off: usize) -> u32 {
             | (((content[off + 2] & 0x3F) as u32) << 6)
             | (content[off + 3] & 0x3F) as u32
     }
+}
+
+/// `fxStringifyJSONString` (`xsJSON.c`): the JSON-escaped, double-quoted form
+/// of a CESU-8 string. Control characters below 0x20 map to the short escapes
+/// (`\b\t\n\f\r`) or `\uXXXX`; `"` and `\` are backslash-escaped; a lone
+/// surrogate becomes `\uXXXX`; every other code point is copied verbatim (its
+/// raw UTF-8 bytes).
+fn json_escape_string(content: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'"'];
+    let starts = string_unit_starts(content);
+    for (k, &start) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(content.len());
+        let cp = decode_code_point(content, start);
+        match cp {
+            8 => out.extend_from_slice(b"\\b"),
+            9 => out.extend_from_slice(b"\\t"),
+            10 => out.extend_from_slice(b"\\n"),
+            12 => out.extend_from_slice(b"\\f"),
+            13 => out.extend_from_slice(b"\\r"),
+            0x22 => out.extend_from_slice(b"\\\""),
+            0x5C => out.extend_from_slice(b"\\\\"),
+            c if c < 0x20 || (0xD800..=0xDFFF).contains(&c) => {
+                out.extend_from_slice(format!("\\u{:04x}", c).as_bytes());
+            }
+            _ => out.extend_from_slice(&content[start..end]),
+        }
+    }
+    out.push(b'"');
+    out
 }
 
 /// Whether `b` is an ASCII byte XS's `fxSkipSpaces` treats as whitespace
