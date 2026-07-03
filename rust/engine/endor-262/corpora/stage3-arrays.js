@@ -240,3 +240,10 @@ var a=[1,2,3,4]; a.with(0,9)[0]
 var a=[5]; a.with(0,9)[0]
 var a=[1,2,3]; a.with(-1,9)[2]
 var a=[1,2,3,4,5]; a.with(2,0); a
+var s=0; [1,2,3].forEach(function(x){s=s+x}); s
+var s=0; [10,20].forEach(function(x){s=s+x}); s
+var s=0; [].forEach(function(x){s=s+x}); s
+var s=0; [5].forEach(function(x){s=s+x}); s
+var s=0; [1,2,3].forEach(function(x,i){s=s+i}); s
+var p=1; [2,3,4].forEach(function(x){p=p*x}); p
+var s=0; [1,2,3,4,5].forEach(function(x){s=s+x}); s

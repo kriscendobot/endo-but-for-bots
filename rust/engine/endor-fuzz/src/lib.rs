@@ -496,6 +496,36 @@ pub fn gen_stage3_for_in_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for the **re-entrant `Array.prototype.forEach`** —
+/// the callback-taking method driven bit-exactly by `run_callback`. Builds a
+/// dense array and a `forEach` whose callback accumulates over an outer
+/// closed-over variable (`+`/`-`/`*`, overflow-safe), observing the result.
+/// Rides the full symbol-linking differential check.
+pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let n = (b.next() % 5) as usize; // 0..=4 dense elements
+    let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
+    let lit = format!("[{}]", elems.join(","));
+    match b.choice(3) {
+        // accumulate the elements with an overflow-safe operator.
+        0 => {
+            let op = ["+", "-", "*"][b.choice(3) as usize];
+            let seed = small_int(&mut b);
+            format!(
+                "var s={}; {}.forEach(function(x){{s=s{}x}}); s",
+                seed, lit, op
+            )
+        }
+        // sum the indices.
+        1 => format!(
+            "var s=0; {}.forEach(function(x,i){{s=s+i}}); s",
+            lit
+        ),
+        // count the elements.
+        _ => format!("var n=0; {}.forEach(function(x){{n=n+1}}); n", lit),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -912,6 +942,47 @@ mod tests {
         }
         assert!(checked > 0);
         assert!(distinct.len() > 20, "spread sweep too uniform: {} distinct", distinct.len());
+    }
+
+    #[test]
+    fn generated_stage3_reentrant_programs_agree_bit_exact() {
+        // forEach drives a user callback per element through run_callback; the
+        // callback body's opcodes are metered by the nested dispatch and the
+        // per-element fxCallThisItem overhead is a calibrated constant, so the
+        // whole thing is bit-exact (result AND computron). Sweep a spread of
+        // seeds over the three callback shapes and a range of lengths.
+        let mut checked = 0;
+        let mut shapes = [false; 3];
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(23))
+                        .wrapping_add((seed as u8).wrapping_mul(2)),
+                );
+            }
+            let prog = gen_stage3_reentrant_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains("s=s+i") {
+                shapes[1] = true;
+            } else if prog.contains("n=n+1") {
+                shapes[2] = true;
+            } else {
+                shapes[0] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 re-entrant differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "re-entrant sweep too uniform: {} distinct", distinct.len());
+        for (i, s) in shapes.iter().enumerate() {
+            assert!(*s, "re-entrant shape {} never generated", i);
+        }
     }
 
     #[test]

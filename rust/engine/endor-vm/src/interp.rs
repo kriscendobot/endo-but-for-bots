@@ -350,6 +350,11 @@ pub const ARRAY_COPYWITHIN_FRAME_METERING: u64 = 98304;
 /// pin.
 pub const ARRAY_WITH_FRAME_METERING: u64 = 66048;
 pub const ARRAY_WITH_PER_ELEM_METERING: u64 = 10 << 14;
+/// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
+/// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
+/// callback body's own metering. Calibrated against the pin.
+pub const ARRAY_FOREACH_FRAME_METERING: u64 = 8;
+pub const ARRAY_FOREACH_PER_ELEM_METERING: u64 = 13 << 14;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -545,6 +550,11 @@ pub enum NativeMethod {
     /// array copying the receiver with `index` replaced by `value` (negative
     /// index counts from the end; out-of-range is a RangeError).
     ArrayWith,
+    /// `Array.prototype.forEach(callback[, thisArg])`
+    /// (`fx_Array_prototype_forEach`): call `callback(item, index, array)` for
+    /// each present element; returns `undefined`. The first re-entrant method
+    /// (drives a user callback per element via [`Interp::run_callback`]).
+    ArrayForEach,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1186,6 +1196,7 @@ impl Interp {
             ("unshift", NativeMethod::ArrayUnshift),
             ("copyWithin", NativeMethod::ArrayCopyWithin),
             ("with", NativeMethod::ArrayWith),
+            ("forEach", NativeMethod::ArrayForEach),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -1704,8 +1715,21 @@ impl Interp {
     }
 
     fn dispatch(&mut self, code: &[u8]) -> Halt {
+        // The top-level program: start at pc 0, return to the host (C
+        // boundary) when the call stack fully unwinds (depth 0).
+        self.dispatch_at(code, 0, 0)
+    }
+
+    /// The interpreter dispatch loop, runnable from any `start_pc` and stopping
+    /// when an `END` pops the call stack back to `return_depth` (the top-level
+    /// program uses `0`/`0`). A native method drives a callback by entering its
+    /// frame and calling this with the callback's `body_start` and the caller's
+    /// current call depth, so the callback runs to its own `END` and returns
+    /// control here — the re-entrant substrate the callback-taking
+    /// `Array.prototype` methods (`forEach`/`map`/…) need.
+    fn dispatch_at(&mut self, code: &[u8], start_pc: usize, return_depth: usize) -> Halt {
         let len = code.len();
-        let mut pc: usize = 0;
+        let mut pc: usize = start_pc;
 
         // Operand readers (little-endian; XS mxRunS1/S2/S4 on our LE
         // target). `off` is relative to `pc`.
@@ -2392,8 +2416,11 @@ impl Interp {
                         }
                     } else if let Some((m, base)) = method {
                         // A native prototype method: the call's receiver is
-                        // `this` (stack[base]); its arguments follow.
-                        match self.call_native_method(m, base, argc) {
+                        // `this` (stack[base]); its arguments follow. `code` is
+                        // threaded through so a callback-taking method
+                        // (`forEach`/`map`/…) can drive the callback via
+                        // `run_callback`.
+                        match self.call_native_method(m, base, argc, code) {
                             Ok(()) => {
                                 if self.check_meter() == MeterCheck::Abort {
                                     return Halt::MeterAbort;
@@ -3188,9 +3215,26 @@ impl Interp {
                 | XS_CODE_END_ARROW
                 | XS_CODE_END_BASE
                 | XS_CODE_END_DERIVED => {
-                    if self.call_stack.is_empty() {
-                        // A function as the top activation returning to C:
-                        // no meter check (exit-to-host END).
+                    if self.call_stack.len() == return_depth {
+                        // The frame this dispatch was entered to run has
+                        // returned: hand control back to the caller (the C/host
+                        // boundary for the top-level program at depth 0, or the
+                        // native method driving a callback via `run_callback`).
+                        // Construct/`this` return still applies; leave the
+                        // result on the value stack for the caller to read.
+                        let ret = if self.cur_target && self.result.kind != Kind::Reference {
+                            self.this_val
+                        } else {
+                            self.result
+                        };
+                        if return_depth != 0 {
+                            // A callback frame: pop the activation and push its
+                            // result, exactly as a normal `END` does, so
+                            // `run_callback` can read it and the caller's
+                            // activation is restored.
+                            let _ = self.leave_call();
+                            self.push(ret);
+                        }
                         return Halt::Return;
                     }
                     // Construct return (XS's `END` with `mxFrameHasTarget`):
@@ -3459,6 +3503,51 @@ impl Interp {
         self.cur_func = func;
         self.cur_target = has_target;
         Ok(body_start)
+    }
+
+    /// Synchronously invoke a user-function callback `func` with receiver
+    /// `this` and `args`, running its body to `END` and returning its
+    /// completion value — the re-entrant substrate the callback-taking
+    /// `Array.prototype` methods use (XS's `fxRunCount` per element). It sets
+    /// up the callee frame on the shared value stack, enters it, and runs a
+    /// nested [`Self::dispatch_at`] that stops when the callback's frame
+    /// returns to the current call depth; the caller's activation is restored
+    /// exactly as an ordinary return does. A non-user-function callback (a
+    /// native, or a non-callable) self-names an honest skip. Propagates a
+    /// callback throw / meter abort to the caller.
+    fn run_callback(
+        &mut self,
+        code: &[u8],
+        func: Slot,
+        this: Slot,
+        args: &[Slot],
+    ) -> Result<Slot, Halt> {
+        // Only a user (bytecode) function is driven here; a native callback or
+        // a non-callable is out of the modeled subset.
+        match func.value {
+            Payload::Reference(f)
+                if self.functions.contains_key(&f)
+                    && self.functions[&f].native.is_none()
+                    && self.functions[&f].method.is_none() => {}
+            _ => return Err(Halt::Unsupported("callback:non-user-function")),
+        }
+        let argc = args.len();
+        // Push the callee frame geometry [THIS, FUNCTION, RESULT, FRAME] + args.
+        self.push(this);
+        self.push(func);
+        self.push(Slot::undefined());
+        self.push(Slot::of(Kind::Uninitialized, Payload::None));
+        for a in args {
+            self.push(*a);
+        }
+        let body_start = self.enter_call(argc, 0, false)?;
+        // After `enter_call` the callee frame's `CallerState` is on the call
+        // stack; run until its `END` pops the stack back to this depth.
+        let return_depth = self.call_stack.len();
+        match self.dispatch_at(code, body_start, return_depth) {
+            Halt::Return => Ok(self.pop()),
+            other => Err(other),
+        }
     }
 
     /// Dispatch a plain (non-`new`) call to an intrinsic native function.
@@ -3869,7 +3958,14 @@ impl Interp {
     /// user code), meters the method's steps, collapses the region to the
     /// result, and pushes it. A method whose receiver shape endor cannot model
     /// self-names (an honest skip).
-    fn call_native_method(&mut self, m: NativeMethod, base: usize, argc: usize) -> Result<(), Halt> {
+    fn call_native_method(
+        &mut self,
+        m: NativeMethod,
+        base: usize,
+        argc: usize,
+        code: &[u8],
+    ) -> Result<(), Halt> {
+        let _ = code; // used by the callback-taking methods (run_callback)
         let this = self.stack.get(base).copied().unwrap_or_else(Slot::undefined);
         let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
         let _ = argc;
@@ -4483,6 +4579,35 @@ impl Interp {
                     a.length = length;
                 }
                 Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.forEach(callback[, thisArg])` — dense fast path.
+            // Call `callback(item, index, array)` for each present element (via
+            // the re-entrant [`Self::run_callback`]); returns `undefined`. The
+            // callback body's own opcodes are metered by the nested dispatch;
+            // this adds the per-element `fxCallThisItem` overhead
+            // (`mxGetIndex` + the call frame setup) and the frame constant.
+            NativeMethod::ArrayForEach => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("forEach:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self
+                    .stack
+                    .get(base + 4 + 1)
+                    .copied()
+                    .unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_FOREACH_FRAME_METERING);
+                for i in 0..length {
+                    let item = self.arrays[&inst].items.get(&i).copied();
+                    if let Some(item) = item {
+                        self.meter.tick_raw(ARRAY_FOREACH_PER_ELEM_METERING);
+                        let cb_args = [item, Slot::integer(i as i32), this];
+                        self.run_callback(code, callback, this_arg, &cb_args)?;
+                    }
+                }
+                Slot::undefined()
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default
