@@ -104,6 +104,14 @@ var a=[1,2,3,4]; a.fill(0); a
 var a=[1,2,3]; a.fill(9,1); a
 var a=[1,2,3,4]; a.fill(7,1,3); a
 var a=[1,2,3]; a.fill(5); a.length
+var a=[1,2,3]; a.slice(1)
+var a=[1,2,3,4]; a.slice(1,3)
+var a=[1,2,3]; a.slice()
+var a=[1,2,3]; a.slice(0,0)
+var a=[5,6,7,8,9]; a.slice(2)
+var a=[1,2,3]; a.slice(-1)
+var a=[1,2,3]; a.slice(1).length
+var a=[1,2,3]; a.slice(1)[0]
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()

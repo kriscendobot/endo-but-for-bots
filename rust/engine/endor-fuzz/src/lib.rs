@@ -288,7 +288,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(9) {
+    match b.choice(10) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -311,13 +311,23 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
         // lastIndexOf a value that may or may not be present.
         7 => format!("var a={}; a.lastIndexOf({})", lit, small_int(&mut b)),
         // fill a (possibly bounded) range, observe the result.
-        _ => {
+        8 => {
             let v = small_int(&mut b);
             if b.choice(2) == 0 {
                 format!("var a={}; a.fill({}); a", lit, v)
             } else {
                 let s = (b.next() as usize) % (n + 1);
                 format!("var a={}; a.fill({},{}); a", lit, v, s)
+            }
+        }
+        // slice a range into a new array.
+        _ => {
+            let s = (b.next() as usize) % (n + 1);
+            if b.choice(2) == 0 {
+                format!("var a={}; a.slice({}); a", lit, s)
+            } else {
+                let e = s + (b.next() as usize) % (n + 1 - s.min(n));
+                format!("var a={}; a.slice({},{}); a", lit, s, e)
             }
         }
     }

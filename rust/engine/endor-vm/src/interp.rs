@@ -312,6 +312,10 @@ pub const ARRAY_LASTINDEXOF_PER_STEP: u64 = 5 << 14;
 /// `Array.prototype.fill` frame cost (the full-fill chunk realloc and the
 /// per-element `mxMeterSome(5)` are metered separately). Calibrated.
 pub const ARRAY_FILL_FRAME_METERING: u64 = 2 << 14;
+/// `Array.prototype.slice` frame cost (the result array's `fxCreateArraySpecies`
+/// + host frame + closing `mxMeterSome(3)`); a non-empty slice adds the result
+/// chunk and `mxMeterSome(count*10)`. Calibrated against the pin.
+pub const ARRAY_SLICE_FRAME_METERING: u64 = 377344;
 
 /// The constant raw 16.16 cost of an `Array(...)` / `new Array(...)` call
 /// beyond the element item-chunk allocation: the native host frame,
@@ -470,6 +474,14 @@ pub enum NativeMethod {
     /// (`fx_Array_prototype_reverse`): reverse the elements in place, returning
     /// the array.
     ArrayReverse,
+    /// `Array.prototype.slice([start[, end]])` — dense fast path
+    /// (`fx_Array_prototype_slice`): a new array with the elements of
+    /// `[start, end)`.
+    ArraySlice,
+    /// `Array.prototype.concat(...args)` — dense fast path
+    /// (`fx_Array_prototype_concat`): a new array of the receiver's elements
+    /// followed by each argument (spreading array arguments).
+    ArrayConcat,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1101,6 +1113,8 @@ impl Interp {
             ("lastIndexOf", NativeMethod::ArrayLastIndexOf),
             ("fill", NativeMethod::ArrayFill),
             ("reverse", NativeMethod::ArrayReverse),
+            ("slice", NativeMethod::ArraySlice),
+            ("concat", NativeMethod::ArrayConcat),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4069,6 +4083,45 @@ impl Interp {
             NativeMethod::ArrayReverse => {
                 return Err(Halt::Unsupported("reverse:at-metering"));
             }
+            // `Array.prototype.slice([start[, end]])` — dense fast path. A new
+            // array with the elements of `[start, end)`. Metering: a frame
+            // constant, plus (when the slice is non-empty) the result chunk
+            // and `mxMeterSome(count*10)`, plus a closing `mxMeterSome(3)`.
+            NativeMethod::ArraySlice => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("slice:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                let start = self.arg_to_index(base, 0, 0, length);
+                let end = self.arg_to_index(base, 1, length, length);
+                let count = end.saturating_sub(start);
+                self.meter.tick_raw(ARRAY_SLICE_FRAME_METERING);
+                let result = self.new_array_unmetered();
+                if count > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(count));
+                    self.meter.tick_builtin_some((count as u64) * 10);
+                    let items: Vec<(u32, Slot)> = {
+                        let a = &self.arrays[&inst];
+                        (0..count)
+                            .filter_map(|i| a.items.get(&(start + i)).map(|s| (i, *s)))
+                            .collect()
+                    };
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, s) in items {
+                        a.items.insert(i, Slot::of(s.kind, s.value));
+                    }
+                    a.length = count;
+                }
+                self.meter.tick_builtin_some(3);
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.concat(...args)` — the spreadable-argument
+            // handling (Symbol.isConcatSpreadable, per-arg `mxMeterSome`) is a
+            // later increment; honest skip.
+            NativeMethod::ArrayConcat => {
+                return Err(Halt::Unsupported("concat:metering"));
+            }
             // `Array.prototype.join([sep])` — the per-element `ToString`
             // allocation metering (each number element renders through
             // `fxNumberToString` into its own chunk) is a later increment, so
@@ -4670,6 +4723,15 @@ impl Interp {
     /// array-behavior slot allocations).
     fn new_array(&mut self) -> crate::value::SlotIndex {
         self.meter.tick_raw(ARRAY_CREATE_METERING);
+        let inst = self.slots.alloc(Slot::instance(self.array_proto));
+        self.arrays.insert(inst, ArrayData::default());
+        inst
+    }
+
+    /// Allocate an empty array instance **without** charging the standalone
+    /// `ARRAY_CREATE_METERING` — for callers (e.g. `slice`) whose own frame
+    /// constant already folds in the result-array construction cost.
+    fn new_array_unmetered(&mut self) -> crate::value::SlotIndex {
         let inst = self.slots.alloc(Slot::instance(self.array_proto));
         self.arrays.insert(inst, ArrayData::default());
         inst
