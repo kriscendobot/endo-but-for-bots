@@ -511,6 +511,26 @@ pub const ENUMERATOR_NEXT_METERING: u64 = (2 << 14) + 256;
 /// `abs`/`max`/`sqrt`/`floor`/… on the pin).
 pub const MATH_FRAME_METERING: u64 = 0;
 
+/// The raw 16.16 native-host-frame cost of a `String.prototype` method call,
+/// beyond the modeled `mxMeterSome` steps and the result chunk. Like the
+/// `Math.*` frame it calibrates against the pin `48ee02d8cfe0` to zero over
+/// the `RUN` opcode endor already meters — the `xsString.c` bodies charge
+/// only their explicit `mxMeterSome` and `fxNewChunk`, which endor models
+/// directly.
+pub const STRING_METHOD_FRAME_METERING: u64 = 0;
+
+/// The measured native residual carried by every `String.prototype` method
+/// whose body calls `mxMeterSome` (`startsWith`/`endsWith`/`includes`/`concat`/
+/// `toLowerCase`/`toUpperCase`/`repeat`/`trim`/`trimStart`/`trimEnd`): a fixed
+/// `33280` raw 16.16 units (`2 << 14` + `2 << 8`) beyond the explicit
+/// `mxMeterSome` steps and the result chunk, independent of the string
+/// lengths. The chunk-only / number-returning methods that call **no**
+/// `mxMeterSome` (`slice`/`substring`/`charAt`/`at`/`charCodeAt`/`codePointAt`/
+/// `str[i]`) carry **zero** residual. Calibrated against the pin
+/// `48ee02d8cfe0` (raw-exact, so the `>> 16` computron count never drifts by a
+/// sub-computron rounding).
+pub const STRING_METERSOME_FRAME_METERING: u64 = (2 << 14) + (2 << 8);
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -765,6 +785,65 @@ pub enum NativeMethod {
     ArrayIteratorNext,
     /// A `Math.*` static (`xsMath.c`), dispatched ignoring the receiver.
     Math(MathId),
+    /// `String.prototype.charCodeAt(pos)` (`fx_String_prototype_charCodeAt`):
+    /// the UTF-16 code unit at `pos`, or `NaN` when out of range. No
+    /// `mxMeterSome`; the result is a number (no chunk).
+    StringCharCodeAt,
+    /// `String.prototype.codePointAt(pos)` (`fx_String_prototype_codePointAt`):
+    /// the code point at `pos`, or `undefined` out of range.
+    StringCodePointAt,
+    /// `String.prototype.charAt(pos)` (`fx_String_prototype_charAt`): the
+    /// one-character string at `pos` (empty string out of range). Allocates
+    /// the result chunk.
+    StringCharAt,
+    /// `String.prototype.at(index)` (`fx_String_prototype_at`): the character
+    /// at `index` (negative counts from the end), `undefined` out of range.
+    StringAt,
+    /// `String.prototype.slice([start[,end]])` (`fx_String_prototype_slice`):
+    /// the substring `[start,end)` with negative offsets from the end.
+    StringSlice,
+    /// `String.prototype.substring([start[,end]])`
+    /// (`fx_String_prototype_substring`): the substring between the clamped,
+    /// swapped-if-needed offsets.
+    StringSubstring,
+    /// `String.prototype.indexOf(search[,from])`
+    /// (`fx_String_prototype_indexOf`): the first index of `search` at or after
+    /// `from`, or `-1`. Meters one `mxMeterSome` per non-continuation scanned
+    /// byte.
+    StringIndexOf,
+    /// `String.prototype.lastIndexOf(search[,from])`
+    /// (`fx_String_prototype_lastIndexOf`): the last index of `search`, or `-1`.
+    StringLastIndexOf,
+    /// `String.prototype.includes(search[,from])`
+    /// (`fx_String_prototype_includes`): whether `search` occurs.
+    StringIncludes,
+    /// `String.prototype.startsWith(search[,from])`
+    /// (`fx_String_prototype_startsWith`).
+    StringStartsWith,
+    /// `String.prototype.endsWith(search[,end])`
+    /// (`fx_String_prototype_endsWith`).
+    StringEndsWith,
+    /// `String.prototype.concat(...args)` (`fx_String_prototype_concat`):
+    /// the receiver followed by each stringified argument; `mxMeterSome(argc)`
+    /// plus the result chunk.
+    StringConcat,
+    /// `String.prototype.toLowerCase()` / `toUpperCase()`
+    /// (`fx_String_prototype_toCase`): case mapping over the code points;
+    /// `mxMeterSome(count)` plus the result chunk. ASCII-only fast path — a
+    /// non-ASCII code point self-names an honest skip (full Unicode case
+    /// folding is not modeled this stage).
+    StringToLowerCase,
+    StringToUpperCase,
+    /// `String.prototype.repeat(count)` (`fx_String_prototype_repeat`): the
+    /// receiver repeated `count` times; `mxMeterSome(count)` plus the result
+    /// chunk. A negative/`Infinity` count is a RangeError.
+    StringRepeat,
+    /// `String.prototype.trim()`/`trimStart()`/`trimEnd()`
+    /// (`fx_String_prototype_trim*`): the receiver with ASCII/Unicode
+    /// whitespace stripped. ASCII-whitespace fast path.
+    StringTrim,
+    StringTrimStart,
+    StringTrimEnd,
 }
 
 impl Default for FuncInfo {
@@ -1167,6 +1246,15 @@ pub struct Interp {
     /// the program-local `Math` id at [`Self::link_intrinsics`]. Not a
     /// function, so `typeof Math === "object"`.
     math_object: crate::value::SlotIndex,
+    /// The realm's `%String.prototype%` (a boot object). A **primitive**
+    /// string's property/method access boxes to it (XS's `fxCoerceToString`
+    /// / `mxStringAccessor` path): `"abc".charCodeAt`/`.slice`/… resolve up
+    /// this chain. Held here so a `GET_PROPERTY` on a `Kind::String` receiver
+    /// routes here without materializing a wrapper object.
+    string_proto: crate::value::SlotIndex,
+    /// The realm's `%Number.prototype%` (a boot object) — the box target for a
+    /// primitive number's method access (`(42).toString(2)`, …).
+    number_proto: crate::value::SlotIndex,
     /// Native prototype/namespace **numeric** data properties to bind at link
     /// time: `(owner instance, property name, value)`. Used for `Math.PI` &co.
     /// (the `Math` constants) and `Number.MAX_VALUE` &co.; bound only when the
@@ -1311,6 +1399,8 @@ impl Interp {
             length_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
             math_object: crate::value::SlotIndex::NULL,
+            string_proto: crate::value::SlotIndex::NULL,
+            number_proto: crate::value::SlotIndex::NULL,
             proto_value_data: Vec::new(),
             iterators: std::collections::HashMap::new(),
             value_id: None,
@@ -1557,6 +1647,11 @@ impl Interp {
         for native in [Native::Boolean, Native::Number, Native::String] {
             if let Some(&c) = self.intrinsics.get(native.display_name()) {
                 if let Some(p) = self.prototype_of(c) {
+                    if native == Native::String {
+                        self.string_proto = p;
+                    } else if native == Native::Number {
+                        self.number_proto = p;
+                    }
                     let v = self.alloc_method(NativeMethod::WrapperValueOf);
                     self.proto_methods.push((p, "valueOf", v));
                     let t = self.alloc_method(NativeMethod::WrapperToString);
@@ -1565,6 +1660,42 @@ impl Interp {
             }
         }
         self.create_math();
+        self.create_string_proto();
+    }
+
+    /// Register the modeled `String.prototype` methods (`xsString.c`) on
+    /// `%String.prototype%`, bound at link time only for the names the program
+    /// references. A primitive string's method access boxes to this prototype
+    /// (see the `GET_PROPERTY` primitive-string route).
+    fn create_string_proto(&mut self) {
+        let p = self.string_proto;
+        if p.is_null() {
+            return;
+        }
+        use NativeMethod::*;
+        for (name, m) in [
+            ("charCodeAt", StringCharCodeAt),
+            ("codePointAt", StringCodePointAt),
+            ("charAt", StringCharAt),
+            ("at", StringAt),
+            ("slice", StringSlice),
+            ("substring", StringSubstring),
+            ("indexOf", StringIndexOf),
+            ("lastIndexOf", StringLastIndexOf),
+            ("includes", StringIncludes),
+            ("startsWith", StringStartsWith),
+            ("endsWith", StringEndsWith),
+            ("concat", StringConcat),
+            ("toLowerCase", StringToLowerCase),
+            ("toUpperCase", StringToUpperCase),
+            ("repeat", StringRepeat),
+            ("trim", StringTrim),
+            ("trimStart", StringTrimStart),
+            ("trimEnd", StringTrimEnd),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((p, name, mf));
+        }
     }
 
     /// Build the `Math` namespace object (XS's `mxMathObject`, `xsMath.c`):
@@ -2528,6 +2659,11 @@ impl Interp {
                             Slot::integer(self.arrays[&inst].length as i32)
                         }
                         Payload::Reference(inst) => self.instance_get(inst, id),
+                        // A primitive string boxes to `%String.prototype%`
+                        // (XS's `fxCoerceToString`/string behavior): `.length`
+                        // is the UTF-16 code-unit count; any other name
+                        // resolves the inherited method up the prototype chain.
+                        Payload::String(off) => self.string_property_get(off, id),
                         _ => Slot::undefined(),
                     };
                     self.push(v);
@@ -5630,6 +5766,24 @@ impl Interp {
                 self.array_iterator_next(iter)?
             }
             NativeMethod::Math(id) => self.call_math(id, base, argc)?,
+            NativeMethod::StringCharCodeAt
+            | NativeMethod::StringCodePointAt
+            | NativeMethod::StringCharAt
+            | NativeMethod::StringAt
+            | NativeMethod::StringSlice
+            | NativeMethod::StringSubstring
+            | NativeMethod::StringIndexOf
+            | NativeMethod::StringLastIndexOf
+            | NativeMethod::StringIncludes
+            | NativeMethod::StringStartsWith
+            | NativeMethod::StringEndsWith
+            | NativeMethod::StringConcat
+            | NativeMethod::StringToLowerCase
+            | NativeMethod::StringToUpperCase
+            | NativeMethod::StringRepeat
+            | NativeMethod::StringTrim
+            | NativeMethod::StringTrimStart
+            | NativeMethod::StringTrimEnd => self.call_string(m, this, base, argc)?,
         };
         self.stack.truncate(base);
         self.push(result);
@@ -5865,6 +6019,357 @@ impl Interp {
             None => Slot::number(acc),
         })
     }
+
+    /// The CESU-8 content bytes of a string receiver (NUL-stripped), for a
+    /// primitive string or a boxed `String` wrapper. `None` for any other
+    /// receiver (an honest named skip — `String.prototype` methods on a
+    /// non-string `this` are not modeled this stage).
+    fn string_receiver_bytes(&self, this: Slot) -> Option<Vec<u8>> {
+        match this.value {
+            Payload::String(off) => Some(self.str_content(off).to_vec()),
+            Payload::Reference(r) => match self.wrapper_data.get(&r).map(|s| s.value) {
+                Some(Payload::String(off)) => Some(self.str_content(off).to_vec()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Allocate a fresh String slot from CESU-8 `bytes`, metering the
+    /// `fxNewChunk(len + 1)` XS charges for the result string (payload + the
+    /// trailing NUL). An empty result reuses the interned empty string (no
+    /// chunk), exactly as XS returns `mxEmptyString`.
+    fn new_string_metered(&mut self, bytes: &[u8]) -> Slot {
+        if bytes.is_empty() {
+            // XS's `mxEmptyString` — an interned "", no fxNewChunk.
+            let off = self.chunks.alloc(b"\x00");
+            return Slot::of(Kind::String, Payload::String(off));
+        }
+        self.meter.tick_chunk_new((bytes.len() + 1) as u64);
+        let mut buf = bytes.to_vec();
+        buf.push(0);
+        let off = self.chunks.alloc(&buf);
+        Slot::of(Kind::String, Payload::String(off))
+    }
+
+    /// Dispatch a `String.prototype` method (`xsString.c`) over the primitive
+    /// receiver's CESU-8 bytes. BMP + CESU-8 surrogate content is handled by
+    /// the code-unit boundary walk ([`string_unit_starts`]); a position/search
+    /// argument that is not a number/string endor can coerce self-names an
+    /// honest skip. Meters exactly the pin's `mxMeterSome` + `fxNewChunk`,
+    /// plus the (zero) native frame.
+    fn call_string(
+        &mut self,
+        m: NativeMethod,
+        this: Slot,
+        base: usize,
+        argc: usize,
+    ) -> Result<Slot, Halt> {
+        let content = match self.string_receiver_bytes(this) {
+            Some(c) => c,
+            None => return Err(Halt::Unsupported("string-method:non-string-receiver")),
+        };
+        let starts = string_unit_starts(&content);
+        let ulen = starts.len() as i64; // UTF-16 code-unit length
+        let byte_of = |unit: i64| -> usize {
+            if unit <= 0 {
+                0
+            } else if unit >= ulen {
+                content.len()
+            } else {
+                starts[unit as usize]
+            }
+        };
+        let argn = |i: usize| -> Option<Slot> {
+            if i < argc {
+                Some(self.stack.get(base + 4 + i).copied().unwrap_or_else(Slot::undefined))
+            } else {
+                None
+            }
+        };
+        // ToInteger/ToNumber over a numeric operand only (a string/reference
+        // position argument self-names — endor does not model string→number
+        // coercion in these built-ins).
+        let to_num = |s: Slot| -> Result<f64, Halt> {
+            match s.kind {
+                Kind::String | Kind::Reference | Kind::Symbol => {
+                    Err(Halt::Unsupported("string-method:non-numeric-argument"))
+                }
+                _ => Ok(to_number(&s)),
+            }
+        };
+        self.meter.tick_raw(STRING_METHOD_FRAME_METERING);
+        use NativeMethod::*;
+        let result = match m {
+            // charCodeAt(pos): the UTF-16 code unit at `pos`, else NaN. No
+            // chunk, no mxMeterSome.
+            StringCharCodeAt => {
+                let pos = match argn(0) {
+                    Some(s) if s.kind != Kind::Undefined => {
+                        let n = to_num(s)?;
+                        if n < 0.0 {
+                            return Ok(Slot::number(f64::NAN));
+                        }
+                        n as i64
+                    }
+                    _ => 0,
+                };
+                if pos < ulen {
+                    let cp = decode_code_point(&content, starts[pos as usize]);
+                    Slot::integer(cp as i32)
+                } else {
+                    Slot::number(f64::NAN)
+                }
+            }
+            // codePointAt(pos): the code point at `pos` (combining a surrogate
+            // pair into an astral scalar), else undefined.
+            StringCodePointAt => {
+                let pos = match argn(0) {
+                    Some(s) if s.kind != Kind::Undefined => {
+                        let n = to_num(s)?;
+                        if n.is_nan() {
+                            0
+                        } else {
+                            n as i64
+                        }
+                    }
+                    _ => 0,
+                };
+                if pos >= 0 && pos < ulen {
+                    let hi = decode_code_point(&content, starts[pos as usize]);
+                    let cp = if (0xD800..=0xDBFF).contains(&hi) && pos + 1 < ulen {
+                        let lo = decode_code_point(&content, starts[(pos + 1) as usize]);
+                        if (0xDC00..=0xDFFF).contains(&lo) {
+                            0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                        } else {
+                            hi
+                        }
+                    } else {
+                        hi
+                    };
+                    Slot::integer(cp as i32)
+                } else {
+                    Slot::undefined()
+                }
+            }
+            // charAt(pos): the one-unit string at `pos`, else "". A negative
+            // `pos` fails to the empty string (XS's `goto fail`).
+            StringCharAt => {
+                let pos = match argn(0) {
+                    Some(s) if s.kind != Kind::Undefined => {
+                        let n = to_num(s)?;
+                        n.trunc() as i64
+                    }
+                    _ => 0,
+                };
+                if pos < 0 || pos >= ulen {
+                    self.new_string_metered(b"")
+                } else {
+                    let a = starts[pos as usize];
+                    let b = byte_of(pos + 1);
+                    self.new_string_metered(&content[a..b])
+                }
+            }
+            // at(index): the one-unit string at `index` (negative from the
+            // end), else undefined.
+            StringAt => {
+                let idx = match argn(0) {
+                    Some(s) => {
+                        let n = to_num(s)?.trunc();
+                        if n.is_nan() {
+                            0
+                        } else {
+                            n as i64
+                        }
+                    }
+                    None => 0,
+                };
+                let idx = if idx < 0 { idx + ulen } else { idx };
+                if idx < 0 || idx >= ulen {
+                    Slot::undefined()
+                } else {
+                    let a = starts[idx as usize];
+                    let b = byte_of(idx + 1);
+                    self.new_string_metered(&content[a..b])
+                }
+            }
+            // slice([start[,end]]): the substring `[start,end)` with negative
+            // offsets counted from the end.
+            StringSlice => {
+                let start = arg_to_index(argn(0), 0, ulen, &to_num)?;
+                let end = arg_to_index(argn(1), ulen, ulen, &to_num)?;
+                if start < end {
+                    self.new_string_metered(&content[byte_of(start)..byte_of(end)])
+                } else {
+                    self.new_string_metered(b"")
+                }
+            }
+            // substring([start[,end]]): clamp both to `[0,len]`, swap if
+            // start>end.
+            StringSubstring => {
+                let mut start = arg_to_position(argn(0), 0, ulen, &to_num)?;
+                let mut stop = arg_to_position(argn(1), ulen, ulen, &to_num)?;
+                if start > stop {
+                    std::mem::swap(&mut start, &mut stop);
+                }
+                if start < stop {
+                    self.new_string_metered(&content[byte_of(start)..byte_of(stop)])
+                } else {
+                    self.new_string_metered(b"")
+                }
+            }
+            // concat(...args): the receiver followed by each stringified
+            // argument; mxMeterSome(argc) + the result chunk. A non-string
+            // argument self-names (ToString of a non-string is not modeled).
+            StringConcat => {
+                let mut out = content.clone();
+                for i in 0..argc {
+                    let a = argn(i).unwrap();
+                    match a.value {
+                        Payload::String(off) => out.extend_from_slice(self.str_content(off)),
+                        _ => return Err(Halt::Unsupported("concat:non-string-argument")),
+                    }
+                }
+                self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                self.meter.tick_builtin_some(argc as u64);
+                self.new_string_metered(&out)
+            }
+            // repeat(count): the receiver repeated `count` times; a negative or
+            // over-large count is a RangeError. mxMeterSome(count) + chunk.
+            StringRepeat => {
+                // A negative/over-large count throws a RangeError; endor does
+                // not model that throw's metering this stage, so it self-names
+                // an honest skip rather than a completion divergence.
+                let count = match argn(0) {
+                    Some(s) if s.kind != Kind::Undefined => {
+                        if let Payload::Integer(v) = s.value {
+                            if v < 0 {
+                                return Err(Halt::Unsupported("repeat:range-error"));
+                            }
+                            v as i64
+                        } else {
+                            let n = to_num(s)?.trunc();
+                            if n.is_nan() {
+                                0
+                            } else if n < 0.0 || n > 0x7FFFFFFF as f64 {
+                                return Err(Halt::Unsupported("repeat:range-error"));
+                            } else {
+                                n as i64
+                            }
+                        }
+                    }
+                    _ => 0,
+                };
+                self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                self.meter.tick_builtin_some(count as u64);
+                let mut out = Vec::with_capacity(content.len() * count as usize);
+                for _ in 0..count {
+                    out.extend_from_slice(&content);
+                }
+                self.new_string_metered(&out)
+            }
+            // startsWith / endsWith: mxMeterSome(searchUnitLen), then a byte
+            // compare (no per-byte meter). A regexp/non-string search arg
+            // self-names.
+            StringStartsWith | StringEndsWith => {
+                let sub = match argn(0).map(|s| s.value) {
+                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    _ => return Err(Halt::Unsupported("startsWith/endsWith:non-string-search")),
+                };
+                let sub_units = string_unit_starts(&sub).len() as u64;
+                let is_start = m == StringStartsWith;
+                // The position argument (unit), clamped to [0, ulen].
+                let pos = if is_start {
+                    arg_to_position(argn(1), 0, ulen, &to_num)?
+                } else {
+                    arg_to_position(argn(1), ulen, ulen, &to_num)?
+                };
+                let boff = byte_of(pos);
+                let matches = if is_start {
+                    content.len() >= boff + sub.len() && content[boff..boff + sub.len()] == sub[..]
+                } else {
+                    boff >= sub.len() && content[boff - sub.len()..boff] == sub[..]
+                };
+                self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                self.meter.tick_builtin_some(sub_units);
+                Slot::boolean(matches)
+            }
+            // includes(search[,from]): whether `search` occurs. Charges the
+            // fixed search-argument residual; its `includes_aux` scan does NOT
+            // meter the per-byte compares (measured against the pin — a
+            // distinct host-frame shape from `indexOf`), so the search runs
+            // unmetered.
+            StringIncludes => {
+                let sub = match argn(0).map(|s| s.value) {
+                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    _ => return Err(Halt::Unsupported("includes:non-string-search")),
+                };
+                let from = arg_to_position(argn(1), 0, ulen, &to_num)?;
+                self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                let bfrom = byte_of(from).min(content.len());
+                let hay = &content[bfrom..];
+                let found = sub.is_empty()
+                    || (sub.len() <= hay.len() && hay.windows(sub.len()).any(|w| w == &sub[..]));
+                Slot::boolean(found)
+            }
+            // indexOf / lastIndexOf: the pin's inner compare loop meters a
+            // per-matched-byte count endor does not yet reproduce for
+            // multi-character searches (the single-character/not-found cases
+            // agree, but a partial-then-full match over-counts). Rather than
+            // ship a computron divergence, these self-name an honest skip until
+            // the scan-metering shape is calibrated.
+            StringIndexOf | StringLastIndexOf => {
+                return Err(Halt::Unsupported("indexOf/lastIndexOf:scan-metering"))
+            }
+            // toLowerCase / toUpperCase: ASCII case mapping. mxMeterSome(count)
+            // over the code units + the result chunk. A non-ASCII code point
+            // self-names (full Unicode case folding is not modeled).
+            StringToLowerCase | StringToUpperCase => {
+                if content.iter().any(|&b| b >= 0x80) {
+                    return Err(Halt::Unsupported("toCase:non-ascii"));
+                }
+                let up = m == StringToUpperCase;
+                let out: Vec<u8> = content
+                    .iter()
+                    .map(|&b| if up { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() })
+                    .collect();
+                self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                self.meter.tick_builtin_some(ulen as u64);
+                self.new_string_metered(&out)
+            }
+            // trim / trimStart / trimEnd: strip ASCII whitespace. The pin
+            // meters mxMeterSome(leading byte count) and/or mxMeterSome(kept
+            // length), then allocates the result chunk. Non-ASCII content
+            // self-names (its whitespace decode is not modeled).
+            StringTrim | StringTrimStart | StringTrimEnd => {
+                if content.iter().any(|&b| b >= 0x80) {
+                    return Err(Halt::Unsupported("trim:non-ascii"));
+                }
+                let is_ws = |b: u8| matches!(b, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20);
+                let trim_start = m != StringTrimEnd;
+                let trim_end = m != StringTrimStart;
+                self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                let mut lo = 0usize;
+                if trim_start {
+                    while lo < content.len() && is_ws(content[lo]) {
+                        lo += 1;
+                    }
+                    self.meter.tick_builtin_some(lo as u64);
+                }
+                let mut hi = content.len();
+                if trim_end {
+                    while hi > lo && is_ws(content[hi - 1]) {
+                        hi -= 1;
+                    }
+                    self.meter.tick_builtin_some((hi - lo) as u64);
+                }
+                self.new_string_metered(&content[lo..hi])
+            }
+            _ => return Err(Halt::Unsupported("string-method:unmodeled")),
+        };
+        Ok(result)
+    }
+
 
     /// Build an Array Iterator over `arr` with the given `kind` (0 values, 1
     /// keys, 2 entries): `fxNewIteratorInstance` — allocate the iterator
@@ -6633,13 +7138,21 @@ impl Interp {
     /// reads the (own-or-inherited) property. Meters no built-in step, like
     /// `GET_PROPERTY`.
     fn property_at_get(&mut self, obj: Slot, key: Slot) -> Result<Slot, Halt> {
-        let inst = match obj.value {
-            Payload::Reference(i) => i,
-            _ => return Ok(Slot::undefined()),
-        };
         let (id, index) = match key.value {
             Payload::At(id, index) => (id, index),
             _ => return Err(Halt::Unsupported("get_property_at")),
+        };
+        // A primitive string indexed by number yields its one-unit character;
+        // a named key boxes to `%String.prototype%` (methods / `.length`).
+        if let Payload::String(off) = obj.value {
+            if id == crate::value::XS_NO_ID {
+                return Ok(self.string_index_get(off, index));
+            }
+            return Ok(self.string_property_get(off, id));
+        }
+        let inst = match obj.value {
+            Payload::Reference(i) => i,
+            _ => return Ok(Slot::undefined()),
         };
         if id == crate::value::XS_NO_ID {
             // An index key.
@@ -6888,6 +7401,37 @@ impl Interp {
             cur = s.next;
         }
         true
+    }
+
+    /// Read a **named** property `id` of a primitive string (XS's string
+    /// behavior boxing to `%String.prototype%`): `.length` is the UTF-16
+    /// code-unit count (an unmetered accessor, like `arr.length`); any other
+    /// name resolves the inherited method up the `%String.prototype%` chain.
+    fn string_property_get(&self, off: crate::value::ChunkOffset, id: u16) -> Slot {
+        if Some(id) == self.length_id {
+            let units = string_unit_starts(self.str_content(off)).len();
+            return Slot::integer(units as i32);
+        }
+        if self.string_proto.is_null() {
+            return Slot::undefined();
+        }
+        self.instance_get(self.string_proto, id)
+    }
+
+    /// Read a computed index of a primitive string (`str[i]`): the one-unit
+    /// string at UTF-16 index `index`, or `undefined` past the end. Allocates
+    /// the one-character result chunk (`fxStringGetProperty` → `fxNewChunk`),
+    /// metered via [`Interp::new_string_metered`].
+    fn string_index_get(&mut self, off: crate::value::ChunkOffset, index: u32) -> Slot {
+        let content = self.str_content(off).to_vec();
+        let starts = string_unit_starts(&content);
+        if (index as usize) < starts.len() {
+            let a = starts[index as usize];
+            let b = starts.get(index as usize + 1).copied().unwrap_or(content.len());
+            self.new_string_metered(&content[a..b])
+        } else {
+            Slot::undefined()
+        }
     }
 
     /// Read own property `id` of instance `inst` (or `undefined` when
@@ -7343,6 +7887,97 @@ fn to_boolean(s: &Slot) -> bool {
 }
 
 // ToNumber (ECMAScript 7.1.4) for stage-1 value kinds.
+/// The byte offsets of each UTF-16 code unit in CESU-8 `content` — the
+/// non-continuation bytes (`(b & 0xC0) != 0x80`), exactly what
+/// `fxUnicodeLength` counts. For BMP each unit is a 1–3 byte UTF-8 sequence;
+/// a CESU-8 surrogate half also begins with a lead byte, so an astral pair
+/// yields two units, matching the UTF-16 code-unit semantics.
+fn string_unit_starts(content: &[u8]) -> Vec<usize> {
+    content
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| (b & 0xC0) != 0x80)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Decode the Unicode scalar (or lone surrogate, for a CESU-8 surrogate half)
+/// of the UTF-8 sequence at byte offset `off` — `fxUTF8Decode` / the
+/// `charCodeAt` unit value.
+fn decode_code_point(content: &[u8], off: usize) -> u32 {
+    let b0 = content[off];
+    if b0 < 0x80 {
+        b0 as u32
+    } else if b0 < 0xE0 {
+        (((b0 & 0x1F) as u32) << 6) | (content[off + 1] & 0x3F) as u32
+    } else if b0 < 0xF0 {
+        (((b0 & 0x0F) as u32) << 12)
+            | (((content[off + 1] & 0x3F) as u32) << 6)
+            | (content[off + 2] & 0x3F) as u32
+    } else {
+        (((b0 & 0x07) as u32) << 18)
+            | (((content[off + 1] & 0x3F) as u32) << 12)
+            | (((content[off + 2] & 0x3F) as u32) << 6)
+            | (content[off + 3] & 0x3F) as u32
+    }
+}
+
+/// `fxArgToIndex` (`xsArray.c`, used by `String.prototype.slice`): a relative
+/// index — `undefined` yields `default`; otherwise `trunc(ToNumber)` with a
+/// negative value counted from `len` (clamped to 0) and a value past `len`
+/// clamped to `len`.
+fn arg_to_index<F: Fn(Slot) -> Result<f64, Halt>>(
+    arg: Option<Slot>,
+    default: i64,
+    len: i64,
+    to_num: &F,
+) -> Result<i64, Halt> {
+    match arg {
+        Some(s) if s.kind != Kind::Undefined => {
+            let mut i = to_num(s)?.trunc();
+            if i.is_nan() {
+                i = 0.0;
+            }
+            let mut i = i as i64;
+            if i < 0 {
+                i += len;
+                if i < 0 {
+                    i = 0;
+                }
+            } else if i > len {
+                i = len;
+            }
+            Ok(i)
+        }
+        _ => Ok(default),
+    }
+}
+
+/// `fxArgToPosition` (`xsString.c`, used by `substring`/`indexOf`-from/
+/// `startsWith`/`endsWith`): an absolute position — `undefined` yields
+/// `default`; otherwise `trunc(ToNumber)` (NaN→0) clamped to `[0, len]`.
+fn arg_to_position<F: Fn(Slot) -> Result<f64, Halt>>(
+    arg: Option<Slot>,
+    default: i64,
+    len: i64,
+    to_num: &F,
+) -> Result<i64, Halt> {
+    match arg {
+        Some(s) if s.kind != Kind::Undefined => {
+            let i = to_num(s)?.trunc();
+            let i = if i.is_nan() { 0.0 } else { i };
+            Ok(if i < 0.0 {
+                0
+            } else if i > len as f64 {
+                len
+            } else {
+                i as i64
+            })
+        }
+        _ => Ok(default),
+    }
+}
+
 /// `fx_Math_toInteger` (`xsMath.c`): fold a number result to an INTEGER-kind
 /// slot when it is an exact `txInteger` (32-bit) value and not negative zero,
 /// exactly as `round`/`sign`/`trunc` do before returning. Otherwise the
