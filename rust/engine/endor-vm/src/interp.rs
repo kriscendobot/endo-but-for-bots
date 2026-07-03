@@ -482,6 +482,26 @@ pub const TYPED_ARRAY_LENGTH_GET_METERING: u64 = 0;
 /// exotic index behavior (`fxTypedArrayGetter`/`fxTypedArraySetter` →
 /// `mxMeterOne`) beyond the index-property dispatch: one built-in step.
 pub const TYPED_ARRAY_ELEMENT_METERING: u64 = 1 << 14;
+/// The raw 16.16 cost of `ArrayBuffer.isView(v)` beyond its dispatch,
+/// calibrated raw against the pin.
+pub const ARRAY_BUFFER_ISVIEW_METERING: u64 = 0;
+/// The constant raw 16.16 cost of a `new DataView(buffer[, offset[, len]])`
+/// construct: the native host frame, `fxArgToByteLength`, the bounds checks,
+/// `fxGetPrototypeFromConstructor`, and `fxNewDataViewInstance` (the object
+/// instance + two internal `fxNewSlot`s — the view slot and the buffer-ref
+/// slot). No backing store is allocated (the view shares the argument
+/// buffer). Calibrated raw-exact against the pin `48ee02d8cfe0` (99080).
+pub const DATA_VIEW_CTOR_FRAME_METERING: u64 = 99080;
+/// The raw 16.16 cost of a single `DataView.prototype.get<Type>` beyond the
+/// method dispatch: the getter's `mxMeterOne` (one built-in step). Calibrated
+/// raw-exact against the pin.
+pub const DATA_VIEW_GET_METERING: u64 = 1 << 14;
+/// The raw 16.16 cost of a single `DataView.prototype.set<Type>` beyond the
+/// method dispatch: three built-in steps — the value coercer
+/// (`fxToInteger`/`fxToUnsigned`/`fxToNumber`, two steps, constant across the
+/// element types) plus the setter's `mxMeterOne`. Calibrated raw-exact
+/// against the pin `48ee02d8cfe0`.
+pub const DATA_VIEW_SET_METERING: u64 = 3 << 14;
 
 /// The raw 16.16 cost of `Array.prototype.values()`/`keys()`/`entries()`
 /// beyond its dispatch: the native host frame plus `fxNewIteratorInstance`
@@ -1079,6 +1099,15 @@ pub enum NativeMethod {
     /// `ArrayBuffer.isView(arg)` (`fx_ArrayBuffer_isView`): `true` iff the
     /// argument is a TypedArray or DataView view, else `false`.
     ArrayBufferIsView,
+    /// `DataView.prototype.get<Type>(byteOffset[, littleEndian])`
+    /// (`fx_DataView_prototype_get`): read an element of the type indexed by
+    /// the payload (into [`TYPED_ARRAY_TYPES`]) at the byte offset, honoring
+    /// the endianness (default big-endian). One `mxMeterOne` per read.
+    DataViewGet(u8),
+    /// `DataView.prototype.set<Type>(byteOffset, value[, littleEndian])`
+    /// (`fx_DataView_prototype_set`): coerce and write an element of the type
+    /// indexed by the payload. One `mxMeterOne` per write.
+    DataViewSet(u8),
 }
 
 impl Default for FuncInfo {
@@ -1198,6 +1227,17 @@ struct TypedArrayData {
     length: u32,
 }
 
+/// A `DataView` instance's internal state (XS's `XS_DATA_VIEW_KIND` view
+/// slot + buffer reference). Kept in the [`Interp::data_views`] side table.
+/// `buffer` names the backing `ArrayBuffer`; `offset` is the `byteOffset`;
+/// `size` is the view's `byteLength` in bytes.
+#[derive(Copy, Clone, Debug)]
+struct DataViewData {
+    buffer: crate::value::SlotIndex,
+    offset: u32,
+    size: u32,
+}
+
 /// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
 /// keys, 2 = entries) `iterable` is the array and `index` the cursor. For a
 /// **for-in enumerator** (`kind` = 3) `enum_keys` is the pre-collected list of
@@ -1267,6 +1307,10 @@ pub enum Native {
     /// [`TYPED_ARRAY_TYPES`] (the element type). Its per-instance view state
     /// lives in the [`Interp::typed_arrays`] side table.
     TypedArray(u8),
+    /// `DataView` — the endian-aware buffer view constructor (`xsDataView.c`
+    /// `fx_DataView`). Its per-instance view state lives in the
+    /// [`Interp::data_views`] side table.
+    DataView,
 }
 
 impl Native {
@@ -1295,6 +1339,7 @@ impl Native {
             Native::WeakSet => "WeakSet",
             Native::ArrayBuffer => "ArrayBuffer",
             Native::TypedArray(i) => TYPED_ARRAY_TYPES[i as usize].name,
+            Native::DataView => "DataView",
         }
     }
 
@@ -1330,6 +1375,7 @@ impl Native {
         for (i, t) in TYPED_ARRAY_TYPES.iter().enumerate() {
             v.push((t.name, Native::TypedArray(i as u8)));
         }
+        v.push(("DataView", Native::DataView));
         v
     }
 }
@@ -1621,6 +1667,14 @@ pub struct Interp {
     /// the program never references the name.
     byte_offset_id: Option<u16>,
     buffer_id: Option<u16>,
+    /// Per-instance `DataView` view state (XS's `XS_DATA_VIEW_KIND` internal
+    /// slot + buffer reference). Keyed by the view instance's slot. See
+    /// [`DataViewData`].
+    data_views: std::collections::HashMap<crate::value::SlotIndex, DataViewData>,
+    /// The realm's `%DataView.prototype%` (a boot object), so a
+    /// `new DataView()` instance chains to it and its `get*`/`set*` methods
+    /// resolve.
+    dataview_proto: crate::value::SlotIndex,
     /// The program-local symbol id of `size`, resolved at
     /// [`Self::link_intrinsics`] (XS's `mxID(_size)`), so a `map.size`/
     /// `set.size` get routes to the collection size accessor. `None` when the
@@ -1805,6 +1859,8 @@ impl Interp {
             typed_arrays: std::collections::HashMap::new(),
             byte_offset_id: None,
             buffer_id: None,
+            data_views: std::collections::HashMap::new(),
+            dataview_proto: crate::value::SlotIndex::NULL,
             size_id: None,
             length_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
@@ -1898,6 +1954,12 @@ impl Interp {
                 // per-instance view state lives in the `typed_arrays` side
                 // table.
                 Native::TypedArray(_) => self.slots.alloc(Slot::instance(object_proto)),
+                // `%DataView.prototype%`: a plain boot object chaining to
+                // %Object.prototype%, carrying the `get*`/`set*` methods and
+                // the `byteLength`/`byteOffset`/`buffer` accessors (the latter
+                // special-cased by id). The per-instance view state lives in
+                // the `data_views` side table.
+                Native::DataView => self.slots.alloc(Slot::instance(object_proto)),
             };
             self.ctor_prototype.insert(f, proto);
         }
@@ -2066,6 +2128,40 @@ impl Interp {
         if let Some(&ab_ctor) = self.intrinsics.get("ArrayBuffer") {
             let is_view = self.alloc_method(NativeMethod::ArrayBufferIsView);
             self.proto_methods.push((ab_ctor, "isView", is_view));
+        }
+        // `%DataView.prototype%`: the endian-aware `get<Type>`/`set<Type>`
+        // methods (each dispatching to the shared `fx_DataView_prototype_get`/
+        // `_set` over the element type indexed into `TYPED_ARRAY_TYPES`). The
+        // `byteLength`/`byteOffset`/`buffer` accessors are special-cased by id
+        // in `GET_PROPERTY`. The BigInt64/BigUint64 get/set are bound so a
+        // reference is an honest NAMED skip (BigInt coercion is a later
+        // increment).
+        self.dataview_proto = self
+            .intrinsics
+            .get("DataView")
+            .and_then(|&c| self.ctor_prototype.get(&c).copied())
+            .unwrap_or(crate::value::SlotIndex::NULL);
+        // (get-method name, set-method name, element-type index into
+        // TYPED_ARRAY_TYPES). Static names — no per-boot allocation. The
+        // BigInt64/BigUint64 get/set are bound so a reference is an honest
+        // NAMED skip (their BigInt coercion is a later increment).
+        let dv_methods: &[(&'static str, &'static str, u8)] = &[
+            ("getInt8", "setInt8", 4),
+            ("getUint8", "setUint8", 7),
+            ("getInt16", "setInt16", 5),
+            ("getUint16", "setUint16", 8),
+            ("getInt32", "setInt32", 6),
+            ("getUint32", "setUint32", 9),
+            ("getFloat32", "setFloat32", 2),
+            ("getFloat64", "setFloat64", 3),
+            ("getBigInt64", "setBigInt64", 0),
+            ("getBigUint64", "setBigUint64", 1),
+        ];
+        for &(gname, sname, kind) in dv_methods {
+            let getter = self.alloc_method(NativeMethod::DataViewGet(kind));
+            let setter = self.alloc_method(NativeMethod::DataViewSet(kind));
+            self.proto_methods.push((self.dataview_proto, gname, getter));
+            self.proto_methods.push((self.dataview_proto, sname, setter));
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -3334,6 +3430,26 @@ impl Interp {
                             } else if Some(id) == self.buffer_id {
                                 self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
                                 Slot::of(Kind::Reference, Payload::Reference(ta.buffer))
+                            } else {
+                                self.instance_get(inst, id)
+                            }
+                        }
+                        Payload::Reference(inst) if self.data_views.contains_key(&inst) => {
+                            // The DataView view accessors
+                            // (`fx_DataView_prototype_*_get`): `byteLength`,
+                            // `byteOffset`, and `buffer`. A non-accessor name
+                            // resolves up the prototype chain (the get*/set*
+                            // methods).
+                            let dv = self.data_views[&inst];
+                            if Some(id) == self.byte_length_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::integer(dv.size as i32)
+                            } else if Some(id) == self.byte_offset_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::integer(dv.offset as i32)
+                            } else if Some(id) == self.buffer_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::of(Kind::Reference, Payload::Reference(dv.buffer))
                             } else {
                                 self.instance_get(inst, id)
                             }
@@ -5166,6 +5282,50 @@ impl Interp {
                     }
                 }
             }
+            // `new DataView(buffer[, byteOffset[, byteLength]])` (`fx_DataView`
+            // + `fxNewDataViewInstance`): a view over an existing ArrayBuffer.
+            // The instance is `fxNewObjectInstance` + two internal `fxNewSlot`s
+            // (the `XS_DATA_VIEW_KIND` view slot + the buffer-ref slot), folded
+            // with the native host frame into
+            // [`DATA_VIEW_CTOR_FRAME_METERING`]; no backing store is allocated
+            // (the view shares the argument buffer). A non-ArrayBuffer first
+            // argument (a TypeError), and a resizable-buffer corner, self-name.
+            Native::DataView if has_target => {
+                let a = arg(0);
+                let buf = match a.value {
+                    Payload::Reference(r) if self.array_buffers.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("native-call:DataView:non-buffer")),
+                };
+                let buf_len = self.array_buffers[&buf].length;
+                let offset = match self.arg_to_byte_length(base, 1, 0) {
+                    Some(o) => o,
+                    None => return Err(Halt::Unsupported("native-call:DataView:coerce-offset")),
+                };
+                if offset > buf_len {
+                    return Err(Halt::Unsupported("native-call:DataView:bad-offset"));
+                }
+                let size: u32;
+                if argc >= 3 && arg(2).kind != Kind::Undefined {
+                    let s = match self.arg_to_byte_length(base, 2, 0) {
+                        Some(s) => s,
+                        None => return Err(Halt::Unsupported("native-call:DataView:coerce-length")),
+                    };
+                    let end = match offset.checked_add(s) {
+                        Some(e) => e,
+                        None => return Err(Halt::Unsupported("native-call:DataView:bad-length")),
+                    };
+                    if buf_len < end {
+                        return Err(Halt::Unsupported("native-call:DataView:bad-length"));
+                    }
+                    size = s;
+                } else {
+                    size = buf_len - offset;
+                }
+                self.meter.tick_raw(DATA_VIEW_CTOR_FRAME_METERING);
+                let inst = self.slots.alloc(Slot::instance(self.dataview_proto));
+                self.data_views.insert(inst, DataViewData { buffer: buf, offset, size });
+                Slot::of(Kind::Reference, Payload::Reference(inst))
+            }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -6838,12 +6998,70 @@ impl Interp {
                 return Err(Halt::Unsupported("array-buffer-concat:unsupported"))
             }
             // `ArrayBuffer.isView(arg)` (`fx_ArrayBuffer_isView`): `true` iff
-            // the argument is a TypedArray or DataView view. Neither view kind
-            // is modeled yet, so it is an honest named skip until the views
-            // land (a `false`-only answer with no view to test against would
-            // be an uncalibrated meter).
+            // the argument is a TypedArray or DataView view, else `false`. The
+            // host-frame residual is calibrated raw against the pin.
             NativeMethod::ArrayBufferIsView => {
-                return Err(Halt::Unsupported("array-buffer-isview:no-views-yet"))
+                self.meter.tick_raw(ARRAY_BUFFER_ISVIEW_METERING);
+                let is_view = match arg0.value {
+                    Payload::Reference(r) => {
+                        self.typed_arrays.contains_key(&r) || self.data_views.contains_key(&r)
+                    }
+                    _ => false,
+                };
+                Slot::boolean(is_view)
+            }
+            // `DataView.prototype.get<Type>(byteOffset[, littleEndian])`
+            // (`fx_DataView_prototype_get`): read an element at `byteOffset`
+            // honoring endianness (default big-endian). One `mxMeterOne`.
+            NativeMethod::DataViewGet(kind) => {
+                let inst = match this.value {
+                    Payload::Reference(r) if self.data_views.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("data-view-get:non-dataview")),
+                };
+                if kind <= 1 {
+                    return Err(Halt::Unsupported("data-view-get:bigint"));
+                }
+                let dv = self.data_views[&inst];
+                let delta = TYPED_ARRAY_TYPES[kind as usize].size as u32;
+                let offset = match self.arg_to_byte_length(base, 0, 0) {
+                    Some(o) => o,
+                    None => return Err(Halt::Unsupported("data-view-get:coerce-offset")),
+                };
+                // `(size < delta) || ((size - delta) < offset)` → RangeError.
+                if dv.size < delta || (dv.size - delta) < offset {
+                    return Err(Halt::Unsupported("data-view-get:out-of-range"));
+                }
+                let little = self.arg_is_truthy(base, 1);
+                let abs = dv.offset + offset;
+                self.meter.tick_raw(DATA_VIEW_GET_METERING);
+                self.data_view_read(dv.buffer, abs, kind, little)?
+            }
+            // `DataView.prototype.set<Type>(byteOffset, value[, littleEndian])`
+            // (`fx_DataView_prototype_set`): coerce + write. One `mxMeterOne`.
+            NativeMethod::DataViewSet(kind) => {
+                let inst = match this.value {
+                    Payload::Reference(r) if self.data_views.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("data-view-set:non-dataview")),
+                };
+                if kind <= 1 {
+                    return Err(Halt::Unsupported("data-view-set:bigint"));
+                }
+                let dv = self.data_views[&inst];
+                let delta = TYPED_ARRAY_TYPES[kind as usize].size as u32;
+                let offset = match self.arg_to_byte_length(base, 0, 0) {
+                    Some(o) => o,
+                    None => return Err(Halt::Unsupported("data-view-set:coerce-offset")),
+                };
+                let value = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                if dv.size < delta || (dv.size - delta) < offset {
+                    return Err(Halt::Unsupported("data-view-set:out-of-range"));
+                }
+                // The littleEndian flag is argument 2 for set.
+                let little = self.arg_is_truthy(base, 2);
+                let abs = dv.offset + offset;
+                self.data_view_write(dv.buffer, abs, kind, value, little)?;
+                self.meter.tick_raw(DATA_VIEW_SET_METERING);
+                Slot::undefined()
             }
         };
         self.stack.truncate(base);
@@ -8425,43 +8643,13 @@ impl Interp {
     /// (its BigInt read is a later increment). Reads the little-endian
     /// element the oracle target (x86-64, `EndianNative == little`) stores.
     fn typed_array_element_get(&self, ta: TypedArrayData, index: u32) -> Option<Slot> {
-        let ty = TYPED_ARRAY_TYPES[ta.kind as usize];
-        let size = ty.size as usize;
+        let size = TYPED_ARRAY_TYPES[ta.kind as usize].size as usize;
         let buf = self.array_buffers[&ta.buffer];
         let base = ta.offset as usize + index as usize * size;
         let bytes = self.chunks.payload(buf.data);
-        let b = &bytes[base..base + size];
-        Some(match ta.kind {
-            // BigInt64 / BigUint64: BigInt read is a later increment.
-            0 | 1 => return None,
-            // Float32
-            2 => Slot::number(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            // Float64
-            3 => Slot::number(f64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])),
-            // Int8
-            4 => Slot::integer(b[0] as i8 as i32),
-            // Int16
-            5 => Slot::integer(i16::from_le_bytes([b[0], b[1]]) as i32),
-            // Int32
-            6 => Slot::integer(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            // Uint8 / Uint8Clamped
-            7 | 10 => Slot::integer(b[0] as i32),
-            // Uint16
-            8 => Slot::integer(u16::from_le_bytes([b[0], b[1]]) as i32),
-            // Uint32: an integer completion when it fits int32, else a number
-            // (XS's `fxUint32Getter`).
-            9 => {
-                let u = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                if u <= 0x7FFF_FFFF {
-                    Slot::integer(u as i32)
-                } else {
-                    Slot::number(u as f64)
-                }
-            }
-            _ => return None,
-        })
+        // TypedArray element storage is native-endian; the oracle target
+        // (x86-64) is little-endian.
+        decode_element_le(ta.kind, &bytes[base..base + size])
     }
 
     /// Coerce `value` to this element type and write TypedArray element
@@ -8478,70 +8666,93 @@ impl Interp {
         index: u32,
         value: Slot,
     ) -> Result<(), Halt> {
-        // The numeric value to coerce (a primitive). An object self-names.
-        let n: f64 = match value.kind {
-            Kind::Integer => match value.value {
-                Payload::Integer(i) => i as f64,
-                _ => return Err(Halt::Unsupported("typed-array-set:value")),
-            },
-            Kind::Number => match value.value {
-                Payload::Number(v) => v,
-                _ => return Err(Halt::Unsupported("typed-array-set:value")),
-            },
-            Kind::Boolean => match value.value {
-                Payload::Boolean(bv) => {
-                    if bv {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                _ => return Err(Halt::Unsupported("typed-array-set:value")),
-            },
-            Kind::Undefined => f64::NAN,
-            // A reference (object) needs ToPrimitive; a BigInt view needs
-            // BigInt coercion — honest skips.
-            _ => return Err(Halt::Unsupported("typed-array-set:coerce")),
-        };
-        let ty = TYPED_ARRAY_TYPES[ta.kind as usize];
-        let size = ty.size as usize;
+        let n = self
+            .element_value_to_number(value)
+            .ok_or(Halt::Unsupported("typed-array-set:coerce"))?;
+        let size = TYPED_ARRAY_TYPES[ta.kind as usize].size as usize;
         let buf = self.array_buffers[&ta.buffer];
         let base = ta.offset as usize + index as usize * size;
-        // ToInteger: truncate toward zero, NaN → 0 (the int/uint coercions).
-        let to_int = |x: f64| -> f64 {
-            if x.is_nan() {
-                0.0
-            } else {
-                x.trunc()
-            }
-        };
-        let dst = self.chunks.slice_mut(buf.data, base + size);
-        let out = &mut dst[base..base + size];
-        match ta.kind {
-            0 | 1 => return Err(Halt::Unsupported("typed-array-set:bigint")),
-            // Float32
-            2 => out.copy_from_slice(&(n as f32).to_le_bytes()),
-            // Float64
-            3 => out.copy_from_slice(&n.to_le_bytes()),
-            // Int8 / Uint8 (ToInteger/ToUint then truncate to one byte).
-            4 | 7 => out[0] = to_int(n) as i64 as u8,
-            // Int16 / Uint16
-            5 | 8 => out.copy_from_slice(&((to_int(n) as i64 as u16).to_le_bytes())),
-            // Int32 / Uint32
-            6 | 9 => out.copy_from_slice(&((to_int(n) as i64 as u32).to_le_bytes())),
-            // Uint8Clamped (ToNumber, clamp to [0,255], round half-to-even).
-            10 => {
-                let v = if n.is_nan() || n <= 0.0 {
-                    0.0
-                } else if n >= 255.0 {
-                    255.0
-                } else {
-                    round_half_even(n)
-                };
-                out[0] = v as u8;
-            }
-            _ => return Err(Halt::Unsupported("typed-array-set:kind")),
+        let le = encode_element_le(ta.kind, n)
+            .ok_or(Halt::Unsupported("typed-array-set:bigint"))?;
+        let out = self.chunks.slice_mut(buf.data, base + size);
+        out[base..base + size].copy_from_slice(&le);
+        Ok(())
+    }
+
+    /// Coerce a primitive element write value to the `f64` the element
+    /// encoders take (a number/integer identity, a boolean 0/1, `undefined`
+    /// → NaN). An object value (needing `ToPrimitive`/`valueOf`) or a BigInt
+    /// returns `None`, so the caller self-names an honest skip.
+    fn element_value_to_number(&self, value: Slot) -> Option<f64> {
+        match value.kind {
+            Kind::Integer => match value.value {
+                Payload::Integer(i) => Some(i as f64),
+                _ => None,
+            },
+            Kind::Number => match value.value {
+                Payload::Number(v) => Some(v),
+                _ => None,
+            },
+            Kind::Boolean => match value.value {
+                Payload::Boolean(bv) => Some(if bv { 1.0 } else { 0.0 }),
+                _ => None,
+            },
+            Kind::Undefined => Some(f64::NAN),
+            _ => None,
         }
+    }
+
+    /// Whether call argument `argi` (at `stack[base + 4 + argi]`) is truthy
+    /// (XS's `fxToBoolean`) — the DataView `littleEndian` flag.
+    fn arg_is_truthy(&self, base: usize, argi: usize) -> bool {
+        let a = self.stack.get(base + 4 + argi).copied().unwrap_or_else(Slot::undefined);
+        self.truthy(&a)
+    }
+
+    /// Read a DataView element of type `kind` at absolute byte offset `abs`
+    /// in `buffer`'s backing store, honoring `little` endianness (XS's
+    /// per-type getter with the `endian` argument). A big-endian read
+    /// reverses the element bytes before the little-endian decode. A BigInt
+    /// element self-names.
+    fn data_view_read(
+        &self,
+        buffer: crate::value::SlotIndex,
+        abs: u32,
+        kind: u8,
+        little: bool,
+    ) -> Result<Slot, Halt> {
+        let size = TYPED_ARRAY_TYPES[kind as usize].size as usize;
+        let buf = self.array_buffers[&buffer];
+        let bytes = self.chunks.payload(buf.data);
+        let mut b = bytes[abs as usize..abs as usize + size].to_vec();
+        if !little {
+            b.reverse();
+        }
+        decode_element_le(kind, &b).ok_or(Halt::Unsupported("data-view-get:bigint"))
+    }
+
+    /// Coerce `value` and write a DataView element of type `kind` at
+    /// absolute byte offset `abs`, honoring `little` endianness. A
+    /// big-endian write reverses the little-endian element bytes.
+    fn data_view_write(
+        &mut self,
+        buffer: crate::value::SlotIndex,
+        abs: u32,
+        kind: u8,
+        value: Slot,
+        little: bool,
+    ) -> Result<(), Halt> {
+        let n = self
+            .element_value_to_number(value)
+            .ok_or(Halt::Unsupported("data-view-set:coerce"))?;
+        let mut le = encode_element_le(kind, n).ok_or(Halt::Unsupported("data-view-set:bigint"))?;
+        if !little {
+            le.reverse();
+        }
+        let size = le.len();
+        let buf = self.array_buffers[&buffer];
+        let out = self.chunks.slice_mut(buf.data, abs as usize + size);
+        out[abs as usize..abs as usize + size].copy_from_slice(&le);
         Ok(())
     }
 
@@ -9952,6 +10163,85 @@ fn value_global(name: &str) -> Option<Slot> {
     }
 }
 
+/// Decode a numeric element of type `kind` (an index into
+/// [`TYPED_ARRAY_TYPES`]) from its little-endian bytes `b` (length == the
+/// element size) to a number/integer completion. `None` for a BigInt
+/// element (kind 0/1), whose BigInt decode is a later increment. The
+/// `Uint32` result is an integer completion when it fits int32, else a
+/// number (XS's `fxUint32Getter`).
+fn decode_element_le(kind: u8, b: &[u8]) -> Option<Slot> {
+    Some(match kind {
+        0 | 1 => return None,
+        // Float32
+        2 => Slot::number(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        // Float64
+        3 => Slot::number(f64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ])),
+        // Int8
+        4 => Slot::integer(b[0] as i8 as i32),
+        // Int16
+        5 => Slot::integer(i16::from_le_bytes([b[0], b[1]]) as i32),
+        // Int32
+        6 => Slot::integer(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        // Uint8 / Uint8Clamped
+        7 | 10 => Slot::integer(b[0] as i32),
+        // Uint16
+        8 => Slot::integer(u16::from_le_bytes([b[0], b[1]]) as i32),
+        // Uint32
+        9 => {
+            let u = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if u <= 0x7FFF_FFFF {
+                Slot::integer(u as i32)
+            } else {
+                Slot::number(u as f64)
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Encode the number `n` as a numeric element of type `kind` to
+/// little-endian bytes, applying the per-type coercion the XS setter does
+/// (ToInteger truncation + width wrap for the int/uint types, ToNumber +
+/// clamp/round for `Uint8ClampedArray`, IEEE for the floats). `None` for a
+/// BigInt element (kind 0/1).
+fn encode_element_le(kind: u8, n: f64) -> Option<Vec<u8>> {
+    // ToInteger: truncate toward zero, NaN → 0.
+    let to_int = |x: f64| -> f64 {
+        if x.is_nan() {
+            0.0
+        } else {
+            x.trunc()
+        }
+    };
+    Some(match kind {
+        0 | 1 => return None,
+        // Float32
+        2 => (n as f32).to_le_bytes().to_vec(),
+        // Float64
+        3 => n.to_le_bytes().to_vec(),
+        // Int8 / Uint8
+        4 | 7 => vec![to_int(n) as i64 as u8],
+        // Int16 / Uint16
+        5 | 8 => (to_int(n) as i64 as u16).to_le_bytes().to_vec(),
+        // Int32 / Uint32
+        6 | 9 => (to_int(n) as i64 as u32).to_le_bytes().to_vec(),
+        // Uint8Clamped (ToNumber, clamp to [0,255], round half-to-even).
+        10 => {
+            let v = if n.is_nan() || n <= 0.0 {
+                0.0
+            } else if n >= 255.0 {
+                255.0
+            } else {
+                round_half_even(n)
+            };
+            vec![v as u8]
+        }
+        _ => return None,
+    })
+}
+
 /// Round to the nearest integer, ties to even (C's `c_nearbyint` under the
 /// default rounding mode) — the `Uint8ClampedArray` setter's rounding.
 fn round_half_even(x: f64) -> f64 {
@@ -9995,6 +10285,7 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::WeakSet => "native-call:WeakSet",
         Native::ArrayBuffer => "native-call:ArrayBuffer",
         Native::TypedArray(_) => "native-call:TypedArray",
+        Native::DataView => "native-call:DataView",
     }
 }
 

@@ -80,3 +80,38 @@ var b7 = new ArrayBuffer(8); var v7 = new Uint8Array(b7); v7.buffer === b7
 
 // Fill a small typed array in a loop (the metering hot path).
 var g = new Uint8Array(4); var i = 0; while (i < 4) { g[i] = i * 2; i = i + 1; } g[0] + g[1] + g[2] + g[3]
+
+// ArrayBuffer.isView over a view, a buffer, and a primitive.
+ArrayBuffer.isView(new Uint8Array(4))
+ArrayBuffer.isView(new ArrayBuffer(4))
+ArrayBuffer.isView(42)
+
+// --- DataView: construct over a buffer + endian-aware get/set.
+
+// Construct + byteLength/byteOffset/buffer accessors.
+var dvb = new ArrayBuffer(8); new DataView(dvb).byteLength
+var dvb2 = new ArrayBuffer(8); new DataView(dvb2, 2).byteOffset
+var dvb3 = new ArrayBuffer(8); new DataView(dvb3, 2, 4).byteLength
+var dvb4 = new ArrayBuffer(8); var dv4 = new DataView(dvb4); dv4.buffer === dvb4
+
+// get/set per type; big-endian (default) round-trips.
+var d1 = new DataView(new ArrayBuffer(8)); d1.setInt8(0, 100); d1.getInt8(0)
+var d2 = new DataView(new ArrayBuffer(8)); d2.setUint8(0, 200); d2.getUint8(0)
+var d3 = new DataView(new ArrayBuffer(8)); d3.setInt16(0, 12345); d3.getInt16(0)
+var d4 = new DataView(new ArrayBuffer(8)); d4.setUint16(0, 60000); d4.getUint16(0)
+var d5 = new DataView(new ArrayBuffer(8)); d5.setInt32(0, 1000000); d5.getInt32(0)
+var d6 = new DataView(new ArrayBuffer(8)); d6.setUint32(0, 4000000000); d6.getUint32(0)
+var d7 = new DataView(new ArrayBuffer(8)); d7.setFloat32(0, 1.5); d7.getFloat32(0)
+var d8 = new DataView(new ArrayBuffer(8)); d8.setFloat64(0, 3.141592653589793); d8.getFloat64(0)
+
+// Endianness: little-endian round-trip, and a cross-endian read.
+var e1 = new DataView(new ArrayBuffer(8)); e1.setInt16(0, 256, true); e1.getInt16(0, true)
+var e2 = new DataView(new ArrayBuffer(8)); e2.setInt16(0, 256); e2.getInt16(0, true)
+var e3 = new DataView(new ArrayBuffer(8)); e3.setUint32(0, 1, true); e3.getUint32(0)
+
+// A big-endian write is observable byte-for-byte through a Uint8Array view.
+var cb = new ArrayBuffer(4); var cv = new DataView(cb); cv.setInt32(0, 66051); new Uint8Array(cb)[0]
+var cb2 = new ArrayBuffer(4); var cv2 = new DataView(cb2); cv2.setInt32(0, 66051, true); new Uint8Array(cb2)[0]
+
+// A write at a nonzero offset reads back at that offset.
+var f1 = new DataView(new ArrayBuffer(8)); f1.setInt32(4, 777); f1.getInt32(4)

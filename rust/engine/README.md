@@ -192,14 +192,14 @@ the three `fxNewSlot`s of `fxNewArrayBufferInstance`), and the `byteLength`
 accessor getter reads the stored `bufferInfo.length` metering nothing beyond its
 `GET_PROPERTY` dispatch — both bit-exact (result AND computron) against the pin.
 The `built-ins/ArrayBuffer` dual-run section agrees with **zero divergence**:
-`built-ins/ArrayBuffer total=80 covered=3 divergent=0 skipped=77`. The deferred
-ArrayBuffer paths are honest **named skips**: `slice` and `isView` (the species
-constructor and the not-yet-landed TypedArray/DataView view kinds), `resize`/
-`transfer`/`concat` and the resizable (`maxByteLength`) construct, a
-negative/oversized/non-integer byteLength (each a RangeError), and the
-`ArrayBuffer(n)` call without `new` (a TypeError) — each self-names
-`Halt::Unsupported` rather than ship a wrong value or a computron divergence; the
-DataView view is a sibling stage-3b child. The same child binds the
+`built-ins/ArrayBuffer total=80 covered=11 divergent=0 skipped=69` (with the views
+landed, `ArrayBuffer.isView` is modeled too — `true` for a TypedArray/DataView,
+`false` otherwise). The deferred ArrayBuffer paths are honest **named skips**:
+`slice` (the species constructor), `resize`/`transfer`/`concat` and the resizable
+(`maxByteLength`) construct, a negative/oversized/non-integer byteLength (each a
+RangeError), and the `ArrayBuffer(n)` call without `new` (a TypeError) — each
+self-names `Halt::Unsupported` rather than ship a wrong value or a computron
+divergence. The same child binds the
 **TypedArray family** — the eleven concrete constructors (`Uint8Array`/`Int8Array`/
 `Uint8ClampedArray`/`Int16Array`/`Uint16Array`/`Int32Array`/`Uint32Array`/
 `Float32Array`/`Float64Array` plus the `BigInt64Array`/`BigUint64Array` shells) as
@@ -217,7 +217,7 @@ in-bounds access, `undefined`/silent-no-op out of bounds) are bit-exact, includi
 the per-type coercions: Int/Uint wrap-around, `Uint8ClampedArray` clamp-and-round
 (ties to even), the `Uint32` integer-vs-number completion split, and the IEEE
 float encodings. The dual-run sections agree with **zero divergence**:
-`built-ins/ArrayBuffer total=80 covered=3 divergent=0 skipped=77`,
+`built-ins/ArrayBuffer total=80 covered=11 divergent=0 skipped=69`,
 `built-ins/TypedArray total=1054 covered=0 divergent=0 skipped=1054` (its tests
 drive the abstract `%TypedArray%` helpers and methods endor honestly skips),
 `built-ins/TypedArrayConstructors/{Uint8Array,Int32Array} covered=1 divergent=0`.
@@ -225,7 +225,22 @@ The deferred TypedArray paths are honest **named skips**: the from-iterable /
 from-array-like / source-TypedArray copy constructors, the BigInt-element
 read/write (BigInt coercion is a later increment), an object element value (needing
 `ToPrimitive`), the prototype methods (`set`/`subarray`/`fill`/`map`/… and the
-statics `from`/`of`), and the resizable/species corners. The stage-3 built-ins reach
+statics `from`/`of`), and the resizable/species corners. The same child binds
+**`DataView`** — the endian-aware buffer view — with its view state (buffer
+reference + `byteOffset`/`size`) in a `data_views` side table. The construct
+`new DataView(buffer[, byteOffset[, byteLength]])` (a view sharing the argument
+buffer's store, no allocation) plus the `byteLength`/`byteOffset`/`buffer`
+accessors and the full `get<Type>`/`set<Type>` method family (`Int8`/`Uint8`/
+`Int16`/`Uint16`/`Int32`/`Uint32`/`Float32`/`Float64`) are bit-exact, honoring the
+**endianness argument** (default big-endian; a big-endian access reverses the
+element bytes around the shared little-endian codec the TypedArray path uses) and
+the same per-type coercions. The metering splits the get (one `mxMeterOne`) from
+the set (three built-in steps — the value coercer's two plus the setter's
+`mxMeterOne`, constant across the element types). `built-ins/DataView total=455
+covered=62 divergent=0 skipped=393`. The deferred DataView paths are honest named
+skips: the `getBigInt64`/`setBigInt64`/`getBigUint64`/`setBigUint64` (BigInt
+coercion), an object value needing `ToPrimitive`, and the resizable-buffer corner.
+The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic

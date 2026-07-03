@@ -896,7 +896,12 @@ pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
     ];
     let ta = |b: &mut Bytes| -> &'static str { TA[(b.next() as usize) % TA.len()] };
     let count = |b: &mut Bytes| -> u32 { 1 + (b.next() as u32 % 6) };
-    match b.choice(9) {
+    // DataView element type methods paired with their byte width.
+    const DV: &[(&str, u32)] = &[
+        ("Int8", 1), ("Uint8", 1), ("Int16", 2), ("Uint16", 2),
+        ("Int32", 4), ("Uint32", 4), ("Float32", 4), ("Float64", 8),
+    ];
+    match b.choice(11) {
         // Construct and read the byteLength directly.
         0 => format!("new ArrayBuffer({}).byteLength", len(&mut b)),
         // A missing argument defaults the byteLength to 0.
@@ -944,7 +949,7 @@ pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
             )
         }
         // Fill a small typed array in a loop and sum it (the metering hot path).
-        _ => {
+        8 => {
             let n = count(&mut b);
             format!(
                 "var a = new {}({}); var i = 0; while (i < {}) {{ a[i] = i; i = i + 1; }} a[0]",
@@ -952,6 +957,30 @@ pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
                 n,
                 n
             )
+        }
+        // DataView construct + endian-aware set/get round-trip.
+        9 => {
+            let (suffix, width) = DV[(b.next() as usize) % DV.len()];
+            let cap = 8u32;
+            let off = (b.next() as u32) % (cap - width + 1);
+            let le = if b.choice(2) == 0 { "" } else { ", true" };
+            let val = (b.next() as i32) - 128;
+            format!(
+                "var d = new DataView(new ArrayBuffer({})); d.set{}({}, {}{}); d.get{}({}{})",
+                cap, suffix, off, val, le, suffix, off, le
+            )
+        }
+        // DataView accessors / isView.
+        _ => {
+            let cap = 4 + 4 * ((b.next() as u32) % 4);
+            match b.choice(3) {
+                0 => format!("new DataView(new ArrayBuffer({})).byteLength", cap),
+                1 => {
+                    let off = (b.next() as u32) % (cap + 1);
+                    format!("new DataView(new ArrayBuffer({}), {}).byteOffset", cap, off)
+                }
+                _ => format!("ArrayBuffer.isView(new DataView(new ArrayBuffer({})))", cap),
+            }
         }
     }
 }
@@ -1589,6 +1618,7 @@ mod tests {
         let mut saw_typed = false;
         let mut saw_element = false;
         let mut saw_loop = false;
+        let mut saw_dataview = false;
         let mut distinct = std::collections::BTreeSet::new();
         for seed in 0u32..1200 {
             let data = seed.to_le_bytes();
@@ -1606,6 +1636,7 @@ mod tests {
             saw_typed |= prog.contains("Array(");
             saw_element |= prog.contains("] =");
             saw_loop |= prog.contains("while");
+            saw_dataview |= prog.contains("DataView");
             match differential_check_with_symbols(&prog) {
                 Ok(()) => checked += 1,
                 Err(d) => panic!("stage-3b binary differential divergence on {:?}: {:?}", prog, d),
@@ -1617,6 +1648,7 @@ mod tests {
         assert!(saw_typed, "TypedArray arm never generated");
         assert!(saw_element, "element write/read arm never generated");
         assert!(saw_loop, "fill-loop arm never generated");
+        assert!(saw_dataview, "DataView arm never generated");
     }
 
     #[test]
