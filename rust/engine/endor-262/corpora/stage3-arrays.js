@@ -91,6 +91,25 @@ var a=[]; a.indexOf(1)
 var a=[10,20,30]; a.indexOf(20)
 var a=["x","y","z"]; a.indexOf("z")
 
+// --- Array constructor + statics (fx_Array; call and construct forms) ---
+Array()
+Array(0)
+Array(3)
+Array(5)
+Array(1,2)
+Array(1,2,3)
+new Array()
+new Array(3)
+new Array(1,2,3)
+Array(1,2,3)[1]
+var a=Array(1,2,3); a.push(4); a
+var a=Array(2,4,6); a.length
+Array.isArray([1,2])
+Array.isArray([])
+Array.isArray(5)
+Array.isArray("x")
+Array.isArray(Array(3))
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

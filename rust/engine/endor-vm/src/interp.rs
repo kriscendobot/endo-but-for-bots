@@ -303,6 +303,21 @@ pub const ARRAY_POP_FRAME_METERING: u64 = 0;
 pub const ARRAY_METHOD_INDEXOF_FRAME_METERING: u64 = 2 << 14;
 pub const ARRAY_INDEXOF_PER_STEP: u64 = 5 << 14;
 
+/// The constant raw 16.16 cost of an `Array(...)` / `new Array(...)` call
+/// beyond the element item-chunk allocation: the native host frame,
+/// `fxGetPrototypeFromConstructor`, and `fxNewArrayInstance`. Measured
+/// against the pin `48ee02d8cfe0` as the constant raw-gap of `Array()` /
+/// `Array(n)` / `new Array()` (no chunk), independent of the length; the
+/// element forms add exactly one `array_chunk_size_metering(count)` on top.
+/// (98816 = six built-in steps + the two `fxNewArrayInstance` slots; the
+/// raw-gap the differential harness reports for a completed call, not the
+/// larger figure a *halted* endor showed before the call was modeled.)
+pub const ARRAY_CTOR_BASE_METERING: u64 = 98816;
+/// The raw 16.16 cost of `Array.isArray(v)` beyond its dispatch: **zero**
+/// (measured against the pin — the completed-call raw-gap, independent of the
+/// argument).
+pub const ARRAY_ISARRAY_METERING: u64 = 0;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -381,6 +396,9 @@ pub enum NativeMethod {
     /// (`fx_Array_prototype_join`): the elements stringified and joined by
     /// `sep` (default `","`), holes/`undefined`/`null` contributing empty.
     ArrayJoin,
+    /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
+    /// is an array exotic object.
+    ArrayIsArray,
 }
 
 impl Default for FuncInfo {
@@ -959,6 +977,12 @@ impl Interp {
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
+        }
+        // `Array.isArray` — a static bound as an own property of the `Array`
+        // constructor instance (not the prototype).
+        if let Some(&array_ctor) = self.intrinsics.get("Array") {
+            let mf = self.alloc_method(NativeMethod::ArrayIsArray);
+            self.proto_methods.push((array_ctor, "isArray", mf));
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -3295,6 +3319,52 @@ impl Interp {
                 self.meter.tick_raw(SYMBOL_CREATE_METERING);
                 Slot::of(Kind::Symbol, Payload::Reference(d))
             }
+            // `Array(...)` / `new Array(...)` (`fx_Array`): both forms build the
+            // same array. A single number argument is the length (a holey
+            // array of that length); a single non-number, or two-or-more
+            // arguments, are the elements. Metering measured against the pin
+            // `48ee02d8cfe0`: a constant constructor base ([`ARRAY_CTOR_BASE_METERING`],
+            // covering the native host frame, `fxGetPrototypeFromConstructor`,
+            // and `fxNewArrayInstance`) plus, for the element forms, one
+            // item-chunk allocation of `count` slots (a single `fxSetIndexSize`,
+            // not per-item growth).
+            Native::Array => {
+                self.meter.tick_raw(ARRAY_CTOR_BASE_METERING);
+                let inst = self.slots.alloc(Slot::instance(self.array_proto));
+                let mut data = ArrayData::default();
+                if argc == 1 {
+                    let a = arg(0);
+                    match a.kind {
+                        Kind::Integer | Kind::Number => match self.checked_array_length(a) {
+                            Some(n) => data.length = n,
+                            // A non-length number (`Array(2.5)`, `Array(-1)`)
+                            // is a `RangeError` in XS — its abort value and
+                            // metering are a later increment; honest skip.
+                            None => return Err(Halt::Unsupported("native-call:Array:bad-length")),
+                        },
+                        _ => {
+                            self.meter.tick_raw(self.array_chunk_size_metering(1));
+                            let mut v = a;
+                            v.id = 0;
+                            v.next = crate::value::SlotIndex::NULL;
+                            data.items.insert(0, v);
+                            data.length = 1;
+                        }
+                    }
+                } else if argc >= 2 {
+                    self.meter
+                        .tick_raw(self.array_chunk_size_metering(argc as u32));
+                    for i in 0..argc {
+                        let mut v = arg(i);
+                        v.id = 0;
+                        v.next = crate::value::SlotIndex::NULL;
+                        data.items.insert(i as u32, v);
+                    }
+                    data.length = argc as u32;
+                }
+                self.arrays.insert(inst, data);
+                Slot::of(Kind::Reference, Payload::Reference(inst))
+            }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -3720,6 +3790,15 @@ impl Interp {
             NativeMethod::ArrayJoin => {
                 let _ = arg0;
                 return Err(Halt::Unsupported("join:tostring-metering"));
+            }
+            // `Array.isArray(v)`: whether `v` is an array exotic object.
+            NativeMethod::ArrayIsArray => {
+                self.meter.tick_raw(ARRAY_ISARRAY_METERING);
+                let r = match arg0.value {
+                    Payload::Reference(r) => self.arrays.contains_key(&r),
+                    _ => false,
+                };
+                Slot::boolean(r)
             }
         };
         self.stack.truncate(base);
@@ -4246,6 +4325,19 @@ impl Interp {
             Payload::Integer(i) if i >= 0 => i as u32,
             Payload::Number(n) if n >= 0.0 && n.fract() == 0.0 && n <= 4294967295.0 => n as u32,
             _ => 0,
+        }
+    }
+
+    /// A valid array length (`fxCheckArrayLength`): a non-negative integer in
+    /// `[0, 2^32-1]`. Returns `None` for a fractional or out-of-range number
+    /// (XS throws a `RangeError` there — out of the covered set).
+    fn checked_array_length(&self, value: Slot) -> Option<u32> {
+        match value.value {
+            Payload::Integer(i) if i >= 0 => Some(i as u32),
+            Payload::Number(n) if n >= 0.0 && n.fract() == 0.0 && n <= 4294967295.0 => {
+                Some(n as u32)
+            }
+            _ => None,
         }
     }
 
