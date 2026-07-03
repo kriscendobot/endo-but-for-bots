@@ -316,6 +316,10 @@ pub const ARRAY_FILL_FRAME_METERING: u64 = 2 << 14;
 /// + host frame + closing `mxMeterSome(3)`); a non-empty slice adds the result
 /// chunk and `mxMeterSome(count*10)`. Calibrated against the pin.
 pub const ARRAY_SLICE_FRAME_METERING: u64 = 377344;
+/// `Array.prototype.at` frame cost + the in-range element read (`mxGetAt`).
+/// Calibrated against the pin.
+pub const ARRAY_AT_FRAME_METERING: u64 = 0;
+pub const ARRAY_AT_READ_METERING: u64 = 98304;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -493,6 +497,9 @@ pub enum NativeMethod {
     /// (`fx_Array_prototype_concat`): a new array of the receiver's elements
     /// followed by each argument (spreading array arguments).
     ArrayConcat,
+    /// `Array.prototype.at(index)` — dense fast path (`fx_Array_prototype_at`):
+    /// the element at `index` (negative counts from the end), or `undefined`.
+    ArrayAt,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1129,6 +1136,7 @@ impl Interp {
             ("reverse", NativeMethod::ArrayReverse),
             ("slice", NativeMethod::ArraySlice),
             ("concat", NativeMethod::ArrayConcat),
+            ("at", NativeMethod::ArrayAt),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4137,6 +4145,34 @@ impl Interp {
             // later increment; honest skip.
             NativeMethod::ArrayConcat => {
                 return Err(Halt::Unsupported("concat:metering"));
+            }
+            // `Array.prototype.at(index)` — dense fast path. Relative index
+            // (negative counts from the end); the element there, or
+            // `undefined`. Metering: a frame constant, plus (when in range) the
+            // element read (`mxGetAt`).
+            NativeMethod::ArrayAt => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("at:non-dense-array")),
+                };
+                self.meter.tick_raw(ARRAY_AT_FRAME_METERING);
+                let length = self.arrays[&inst].length as i64;
+                let raw = match numeric_of(&arg0) {
+                    Some(n) if !n.is_nan() => n.trunc() as i64,
+                    _ => 0,
+                };
+                let idx = if raw < 0 { length + raw } else { raw };
+                let result = if idx >= 0 && idx < length {
+                    self.meter.tick_raw(ARRAY_AT_READ_METERING);
+                    self.arrays
+                        .get(&inst)
+                        .and_then(|a| a.items.get(&(idx as u32)).copied())
+                        .map(|s| Slot::of(s.kind, s.value))
+                        .unwrap_or_else(Slot::undefined)
+                } else {
+                    Slot::undefined()
+                };
+                result
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default

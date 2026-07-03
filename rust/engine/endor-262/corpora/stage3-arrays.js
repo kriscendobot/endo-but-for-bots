@@ -120,6 +120,13 @@ var a=["x","y"]; a.join()
 var a=[10,20,30]; a.join()
 var a=[1,2,3]; a.join("-")
 var a=[1,2,3]; a.join("--")
+var a=[1,2,3]; a.at(0)
+var a=[1,2,3]; a.at(1)
+var a=[1,2,3]; a.at(-1)
+var a=[1,2,3]; a.at(5)
+var a=[1,2,3]; a.at(-5)
+var a=[5,6,7,8]; a.at(2)
+var a=[5,6,7,8]; a.at(-2)
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()
