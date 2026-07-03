@@ -5443,11 +5443,14 @@ impl Interp {
                 };
                 Slot::boolean(r)
             }
-            // `Array.of(...items)` (`fx_Array_of`): its per-element metering
-            // (a first-element chunk-transition outlier plus a residual over
-            // `mxMeterSome(4)`) does not calibrate to a clean per-element
-            // constant, so this self-names an honest skip rather than shipping
-            // a divergent meter (a "within reach" stretch static).
+            // `Array.of(...items)` (`fx_Array_of`): its per-element metering has
+            // a first-element chunk-transition outlier (~2<<14 over the steady
+            // per-element step) plus a steady ~1<<14 per-element residual over
+            // the C's `mxMeterSome(4)` that traces to the variadic static-call
+            // argument marshalling / `fxCreateArray`+`fxSetIndexSize` interaction
+            // rather than the documented body meter. It does not reduce to a
+            // faithful constant this stage, so this self-names an honest skip
+            // rather than shipping a fitted (unfaithful) meter.
             NativeMethod::ArrayOf => {
                 let _ = base;
                 return Err(Halt::Unsupported("Array.of:metering"));
