@@ -488,6 +488,27 @@ pub fn gen_stage3_for_of_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for **`for-of` over a string** — the string
+/// iterator yields each code point as a one-character string. Builds a bounded
+/// ASCII string (BMP, single-byte code points — astral/surrogate content self-
+/// names an honest skip, so it is excluded here) and a concatenation/count
+/// loop over it. Rides the full symbol-linking differential check.
+pub fn gen_stage3_string_for_of_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let n = (b.next() % 6) as usize; // 0..=5 characters
+    // Draw from a fixed ASCII alphabet so every char is a single UTF-8 byte.
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    let s: String = (0..n).map(|_| ALPHA[(b.next() as usize) % ALPHA.len()] as char).collect();
+    match b.choice(3) {
+        // Forward concatenation (reconstructs the string).
+        0 => format!("var r=\"\"; for (var c of \"{}\") r=r+c; r", s),
+        // Reverse concatenation.
+        1 => format!("var r=\"\"; for (var c of \"{}\") r=c+r; r", s),
+        // A count of the code points.
+        _ => format!("var n=0; for (var c of \"{}\") n=n+1; n", s),
+    }
+}
+
 /// Structure-aware generator for **array spread** (`[...arr]`) — which
 /// desugars to the for-of iterator loop appending each element. Emits a single
 /// spread of a dense literal, optionally with leading/trailing plain elements,
@@ -987,6 +1008,46 @@ mod tests {
         assert!(distinct.len() > 20, "for-of sweep too uniform: {} distinct", distinct.len());
         for (i, s) in shapes.iter().enumerate() {
             assert!(*s, "for-of shape {} never generated", i);
+        }
+    }
+
+    #[test]
+    fn generated_stage3_string_for_of_programs_agree_bit_exact() {
+        // for-of over a string drives fxGetIterator + the string iterator's
+        // per-code-point next() (a fresh one-char result string per step), all
+        // metered faithfully over an ASCII (single-byte BMP) alphabet, so it
+        // rides the full result+computron differential.
+        let mut checked = 0;
+        let mut shapes = [false; 3];
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(13))
+                        .wrapping_add((seed as u8).wrapping_mul(6)),
+                );
+            }
+            let prog = gen_stage3_string_for_of_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains("n=n+1") {
+                shapes[1] = true;
+            } else if prog.contains("r=c+r") {
+                shapes[2] = true;
+            } else {
+                shapes[0] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 string for-of differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "string for-of sweep too uniform: {} distinct", distinct.len());
+        for (i, s) in shapes.iter().enumerate() {
+            assert!(*s, "string for-of shape {} never generated", i);
         }
     }
 

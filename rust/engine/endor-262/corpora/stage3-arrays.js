@@ -313,3 +313,11 @@ var a=[1,2,3,4,5]; a.splice(2)
 [7].toString()
 ["a","b","c"].toString()
 [].toString()
+var s="";for(var c of "abc"){s=s+c};s
+var s="";for(var c of "hello"){s=c+s};s
+var n=0;for(var c of "abcd"){n=n+1};n
+var s="";for(var c of ""){s=s+c};s
+[..."abc"].length
+[..."abc"].join("-")
+[..."hi","!"].join()
+var a=[];for(var c of "pq"){a.push(c)};a.join("-")

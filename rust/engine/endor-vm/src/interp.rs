@@ -464,6 +464,17 @@ pub const ARRAY_ITERATOR_ELEMENT_READ: u64 = 2 << 14;
 /// [`Interp::make_array_iterator`]) — a constant `2 << 16`, independent of the
 /// iterable's length.
 pub const FOR_OF_GET_ITERATOR_METERING: u64 = 2 << 16;
+/// The raw 16.16 cost of creating a String Iterator (`fx_String_prototype_
+/// iterator` → `fxNewIteratorInstance`), analogous to
+/// [`ARRAY_ITERATOR_CREATE_METERING`] but chaining to
+/// `%StringIteratorPrototype%`. Calibrated against the pin.
+pub const STRING_ITERATOR_CREATE_METERING: u64 = 100872;
+/// The base raw 16.16 cost of `%StringIteratorPrototype%.next()` that yields a
+/// character, beyond the result-string chunk it allocates (`fxNewChunk`, metered
+/// separately via [`Interp::meter`] `tick_chunk_new`): the host frame, the
+/// `mxStringByteDecode`, and the result-object mutation. Calibrated against the
+/// pin.
+pub const STRING_ITERATOR_NEXT_METERING: u64 = 0;
 /// The raw 16.16 cost of building a for-in enumerator (`XS_CODE_FOR_IN` →
 /// `mxEnumeratorFunction` → `fx_Enumerator`): the enumerator + result objects,
 /// the own-keys collection, and the host frame — a fixed cluster independent
@@ -735,6 +746,10 @@ struct IterState {
     result: crate::value::SlotIndex,
     done: bool,
     enum_keys: Vec<(u16, u32)>,
+    /// For a string iterator (`kind == 4`): the CESU-8 bytes being iterated,
+    /// with `index` a BYTE offset into them (an array/enumerator leaves this
+    /// empty and drives `index`/`enum_keys` instead).
+    str_bytes: Vec<u8>,
 }
 
 /// An Error instance's stringification data (XS's `Error.prototype.toString`
@@ -2249,13 +2264,24 @@ impl Interp {
                 // against the pin.
                 XS_CODE_FOR_OF => {
                     let iterable = self.pop();
-                    let arr = match iterable.value {
-                        Payload::Reference(i) if self.arrays.contains_key(&i) => i,
+                    match iterable.value {
+                        Payload::Reference(i) if self.arrays.contains_key(&i) => {
+                            self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
+                            let it = self.make_array_iterator(i, 0);
+                            self.push(it);
+                        }
+                        Payload::String(off) if iterable.kind == Kind::String => {
+                            // `for (x of str)` — the string iterator yields each
+                            // code point. The `fxGetIterator` get + call dispatch
+                            // is metered identically to the array case; the
+                            // iterator creation is metered inside the builder.
+                            let bytes = self.str_content(off).to_vec();
+                            self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
+                            let it = self.make_string_iterator(bytes);
+                            self.push(it);
+                        }
                         _ => return Halt::Unsupported(op.name()),
-                    };
-                    self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
-                    let it = self.make_array_iterator(arr, 0);
-                    self.push(it);
+                    }
                     pc += size as usize;
                 }
                 // `for_in` (`XS_CODE_FOR_IN`): call the enumerator function on
@@ -5479,9 +5505,101 @@ impl Interp {
                 result,
                 done: false,
                 enum_keys: Vec::new(),
+                str_bytes: Vec::new(),
             },
         );
         Slot::of(Kind::Reference, Payload::Reference(iter))
+    }
+
+    /// Build a String Iterator over the CESU-8 `bytes` (`fx_String_prototype_
+    /// iterator` → `fxNewIteratorInstance`): allocate the iterator instance and
+    /// its reused `{value, done}` result, recording a kind-4 [`IterState`] whose
+    /// `index` is a BYTE offset into `bytes`. Meters the creation cluster
+    /// ([`STRING_ITERATOR_CREATE_METERING`]). The iterator chains to
+    /// `%Array Iterator.prototype%` in endor's model (its `next` dispatches to
+    /// the same [`NativeMethod::ArrayIteratorNext`], which branches on kind).
+    fn make_string_iterator(&mut self, bytes: Vec<u8>) -> Slot {
+        self.meter.tick_raw(STRING_ITERATOR_CREATE_METERING);
+        let result = self.slots.alloc(Slot::instance(self.object_proto));
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::undefined());
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(false));
+        }
+        let iter = self.slots.alloc(Slot::instance(self.array_iterator_proto));
+        self.iterators.insert(
+            iter,
+            IterState {
+                iterable: crate::value::SlotIndex::NULL,
+                index: 0,
+                kind: 4,
+                result,
+                done: false,
+                enum_keys: Vec::new(),
+                str_bytes: bytes,
+            },
+        );
+        Slot::of(Kind::Reference, Payload::Reference(iter))
+    }
+
+    /// `fx_String_prototype_iterator_next`: decode the next code point at the
+    /// byte offset `index`, yield it as a fresh one-character string, and
+    /// advance `index` past its bytes. BMP code points only (a single UTF-8
+    /// sequence); an astral/surrogate sequence self-names an honest skip (its
+    /// CESU-8 surrogate-pair recombination is a later increment). Meters the
+    /// per-`next()` base plus the yielded string's chunk allocation.
+    fn string_iterator_next(&mut self, iter: crate::value::SlotIndex) -> Result<Slot, Halt> {
+        let st = self.iterators[&iter].clone();
+        let result = st.result;
+        let (new_value, new_done, next_index): (Slot, bool, u32) = if st.done
+            || (st.index as usize) >= st.str_bytes.len()
+        {
+            (Slot::undefined(), true, st.index)
+        } else {
+            let i = st.index as usize;
+            let b0 = st.str_bytes[i];
+            // UTF-8 sequence length from the lead byte.
+            let seq_len = if b0 < 0x80 {
+                1
+            } else if b0 >= 0xC0 && b0 < 0xE0 {
+                2
+            } else if b0 >= 0xE0 && b0 < 0xF0 {
+                3
+            } else {
+                // A 4-byte (astral) lead, or a CESU-8 surrogate half we do not
+                // recombine yet — self-name rather than mis-yield.
+                return Err(Halt::Unsupported("string-iterator:astral-or-surrogate"));
+            };
+            if i + seq_len > st.str_bytes.len() {
+                return Err(Halt::Unsupported("string-iterator:truncated-sequence"));
+            }
+            let seq = &st.str_bytes[i..i + seq_len];
+            // A 3-byte sequence encoding a surrogate (0xED 0xA0..0xBF ..) is a
+            // CESU-8 astral half; defer it honestly.
+            if seq_len == 3 && seq[0] == 0xED && seq[1] >= 0xA0 {
+                return Err(Halt::Unsupported("string-iterator:astral-or-surrogate"));
+            }
+            self.meter.tick_raw(STRING_ITERATOR_NEXT_METERING);
+            self.meter.tick_chunk_new((seq_len + 1) as u64);
+            let off = self.chunks.alloc(seq);
+            (
+                Slot::of(Kind::String, Payload::String(off)),
+                false,
+                st.index + seq_len as u32,
+            )
+        };
+        if let Some(s) = self.iterators.get_mut(&iter) {
+            s.index = next_index;
+            s.done = new_done;
+        }
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::of(new_value.kind, new_value.value));
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(new_done));
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(result)))
     }
 
     /// Build a for-in enumerator over `obj` (XS's `fx_Enumerator`): collect the
@@ -5514,6 +5632,7 @@ impl Interp {
                 result,
                 done: false,
                 enum_keys: keys,
+                str_bytes: Vec::new(),
             },
         );
         Slot::of(Kind::Reference, Payload::Reference(iter))
@@ -5571,6 +5690,9 @@ impl Interp {
     fn array_iterator_next(&mut self, iter: crate::value::SlotIndex) -> Result<Slot, Halt> {
         if self.iterators[&iter].kind == 3 {
             return Ok(self.enumerator_next(iter));
+        }
+        if self.iterators[&iter].kind == 4 {
+            return self.string_iterator_next(iter);
         }
         let st = self.iterators[&iter].clone();
         let result = st.result;
