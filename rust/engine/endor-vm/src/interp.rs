@@ -511,6 +511,13 @@ pub const ENUMERATOR_NEXT_METERING: u64 = (2 << 14) + 256;
 /// `abs`/`max`/`sqrt`/`floor`/… on the pin).
 pub const MATH_FRAME_METERING: u64 = 0;
 
+/// The native-host-frame cost of a `Number` static / numeric global call
+/// (`isFinite`/`isInteger`/`isNaN`/`isSafeInteger`/`parseInt`/`parseFloat`/
+/// `isNaN`/`isFinite`), beyond the `Number.prototype.toString` result chunk.
+/// Like `Math.*`, the `xsNumber.c` bodies carry no `mxMeterSome`, so the frame
+/// calibrates against the pin `48ee02d8cfe0` to zero over the `RUN` opcode.
+pub const NUMBER_FRAME_METERING: u64 = 0;
+
 /// The raw 16.16 native-host-frame cost of a `String.prototype` method call,
 /// beyond the modeled `mxMeterSome` steps and the result chunk. Like the
 /// `Math.*` frame it calibrates against the pin `48ee02d8cfe0` to zero over
@@ -844,6 +851,29 @@ pub enum NativeMethod {
     StringTrim,
     StringTrimStart,
     StringTrimEnd,
+    /// `Number.isFinite`/`isInteger`/`isNaN`/`isSafeInteger` (`xsNumber.c`) —
+    /// statics on the `Number` constructor that inspect the argument's slot
+    /// **kind** directly (no coercion): an integer is always finite/integer/
+    /// safe and never NaN; a number defers to its `fpclassify`.
+    NumberIsFinite,
+    NumberIsInteger,
+    NumberIsNaN,
+    NumberIsSafeInteger,
+    /// `Number.prototype.toString([radix])` (`fx_Number_prototype_toString`):
+    /// radix-10 renders through `fxNumberToString` (the `Number::toString`
+    /// spelling); a radix in `[2,36]` runs XS's digit conversion. Allocates
+    /// the result chunk.
+    NumberToString,
+    /// The global `parseInt(string[,radix])` (`fx_parseInt`): the integer
+    /// prefix parse. No `mxMeterSome`, no chunk.
+    GlobalParseInt,
+    /// The global `parseFloat(string)` (`fx_parseFloat`): the float prefix
+    /// parse (`fxStringToNumber` with `whole = 0`). No chunk.
+    GlobalParseFloat,
+    /// The global `isNaN(x)` / `isFinite(x)` (`fx_isNaN`/`fx_isFinite`):
+    /// `fxToNumber` then the `fpclassify` test. No chunk.
+    GlobalIsNaN,
+    GlobalIsFinite,
 }
 
 impl Default for FuncInfo {
@@ -1661,6 +1691,59 @@ impl Interp {
         }
         self.create_math();
         self.create_string_proto();
+        self.create_number_globals();
+    }
+
+    /// Register the `Number` statics + `Number.prototype.toString` and the
+    /// numeric global functions (`parseInt`/`parseFloat`/`isNaN`/`isFinite`),
+    /// each bound at link time only for the names the program references.
+    fn create_number_globals(&mut self) {
+        // `Number.isFinite`/`isInteger`/`isNaN`/`isSafeInteger` — statics on
+        // the constructor instance; the numeric constants — its data props.
+        if let Some(&ctor) = self.intrinsics.get("Number") {
+            for (name, m) in [
+                ("isFinite", NativeMethod::NumberIsFinite),
+                ("isInteger", NativeMethod::NumberIsInteger),
+                ("isNaN", NativeMethod::NumberIsNaN),
+                ("isSafeInteger", NativeMethod::NumberIsSafeInteger),
+            ] {
+                let mf = self.alloc_method(m);
+                self.proto_methods.push((ctor, name, mf));
+            }
+            for (name, v) in [
+                ("EPSILON", f64::EPSILON),
+                ("MAX_SAFE_INTEGER", 9007199254740991.0),
+                ("MAX_VALUE", f64::MAX),
+                ("MIN_SAFE_INTEGER", -9007199254740991.0),
+                // The smallest positive value — the denormal 5e-324
+                // (`Number.MIN_VALUE`), not the smallest *normal*
+                // (`f64::MIN_POSITIVE`).
+                ("MIN_VALUE", f64::from_bits(1)),
+                ("NaN", f64::NAN),
+                ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+                ("POSITIVE_INFINITY", f64::INFINITY),
+            ] {
+                self.proto_value_data.push((ctor, name, Slot::number(v)));
+            }
+        }
+        // `Number.prototype.toString` (radix-aware) overrides the wrapper's
+        // plain `toString` on `%Number.prototype%`; a later push wins the
+        // link-time set, so this must follow the wrapper registration.
+        if !self.number_proto.is_null() {
+            let mf = self.alloc_method(NativeMethod::NumberToString);
+            self.proto_methods.push((self.number_proto, "toString", mf));
+        }
+        // The numeric global functions, bound into the global object by name
+        // (a native function instance, so `typeof parseInt === "function"`).
+        for (name, m) in [
+            ("parseInt", NativeMethod::GlobalParseInt),
+            ("parseFloat", NativeMethod::GlobalParseFloat),
+            ("isNaN", NativeMethod::GlobalIsNaN),
+            ("isFinite", NativeMethod::GlobalIsFinite),
+        ] {
+            let mf = self.alloc_method(m);
+            self.intrinsics.insert(name, mf);
+        }
     }
 
     /// Register the modeled `String.prototype` methods (`xsString.c`) on
@@ -2664,6 +2747,13 @@ impl Interp {
                         // is the UTF-16 code-unit count; any other name
                         // resolves the inherited method up the prototype chain.
                         Payload::String(off) => self.string_property_get(off, id),
+                        // A primitive number boxes to `%Number.prototype%`
+                        // (`(42).toString(2)`): resolve the inherited method.
+                        Payload::Integer(_) | Payload::Number(_)
+                            if !self.number_proto.is_null() =>
+                        {
+                            self.instance_get(self.number_proto, id)
+                        }
                         _ => Slot::undefined(),
                     };
                     self.push(v);
@@ -4054,10 +4144,11 @@ impl Interp {
                 self.build_wrapper(Native::Boolean, prim)
             }
             // `Number(v)` / `new Number(v)`: the primitive number is
-            // ToNumber(v). endor handles the numeric fast path (identity) and
-            // the primitive `boolean`/`null`/`undefined` coercions — all
-            // metering-neutral; a string needs the number parser (a later
-            // increment) and self-names. `new` wraps the primitive.
+            // ToNumber(v). endor handles the numeric fast path (identity), the
+            // primitive `boolean`/`null`/`undefined` coercions, and a string
+            // (the `fxStringToNumber` whole-string parse) — all
+            // metering-neutral (no chunk); an object argument needs
+            // ToPrimitive and self-names. `new` wraps the primitive.
             Native::Number => {
                 let a = arg(0);
                 let prim = match a.kind {
@@ -4065,6 +4156,15 @@ impl Interp {
                     Kind::Boolean | Kind::Null | Kind::Undefined if argc >= 1 => {
                         Slot::number(to_number(&a))
                     }
+                    Kind::String if argc >= 1 => match a.value {
+                        Payload::String(off) => {
+                            let bytes = self.str_content(off).to_vec();
+                            // `fx_Number` folds the ToNumber result to integer
+                            // kind (`fx_Math_toInteger`) in the non-target case.
+                            math_to_integer(string_to_number(&bytes, true))
+                        }
+                        _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
+                    },
                     _ if argc == 0 => Slot::integer(0),
                     _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
                 };
@@ -5784,6 +5884,15 @@ impl Interp {
             | NativeMethod::StringTrim
             | NativeMethod::StringTrimStart
             | NativeMethod::StringTrimEnd => self.call_string(m, this, base, argc)?,
+            NativeMethod::NumberIsFinite
+            | NativeMethod::NumberIsInteger
+            | NativeMethod::NumberIsNaN
+            | NativeMethod::NumberIsSafeInteger
+            | NativeMethod::NumberToString
+            | NativeMethod::GlobalParseInt
+            | NativeMethod::GlobalParseFloat
+            | NativeMethod::GlobalIsNaN
+            | NativeMethod::GlobalIsFinite => self.call_number(m, this, base, argc)?,
         };
         self.stack.truncate(base);
         self.push(result);
@@ -6018,6 +6127,148 @@ impl Interp {
             Some(v) => Slot::integer(v),
             None => Slot::number(acc),
         })
+    }
+
+    /// Dispatch a `Number` static / `Number.prototype.toString` / numeric
+    /// global (`parseInt`/`parseFloat`/`isNaN`/`isFinite`). The `xsNumber.c`
+    /// bodies carry no `mxMeterSome`; `toString` allocates its result chunk,
+    /// the rest return a number/boolean (no chunk). A NaN result is the
+    /// canonical `f64::NAN`.
+    fn call_number(
+        &mut self,
+        m: NativeMethod,
+        this: Slot,
+        base: usize,
+        argc: usize,
+    ) -> Result<Slot, Halt> {
+        let arg0 = if argc > 0 {
+            Some(self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined))
+        } else {
+            None
+        };
+        use NativeMethod::*;
+        // The kind-inspecting predicates (no coercion).
+        let predicate = |s: Option<Slot>, kind: NativeMethod| -> bool {
+            let s = match s {
+                Some(s) => s,
+                None => return false,
+            };
+            match s.kind {
+                Kind::Integer => !matches!(kind, NumberIsNaN),
+                Kind::Number => {
+                    let n = to_number(&s);
+                    match kind {
+                        NumberIsNaN => n.is_nan(),
+                        NumberIsFinite => n.is_finite(),
+                        NumberIsInteger => n.is_finite() && n.trunc() == n,
+                        NumberIsSafeInteger => {
+                            n.is_finite()
+                                && n.trunc() == n
+                                && (-9007199254740991.0..=9007199254740991.0).contains(&n)
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        };
+        self.meter.tick_raw(NUMBER_FRAME_METERING);
+        let result = match m {
+            NumberIsFinite | NumberIsInteger | NumberIsNaN | NumberIsSafeInteger => {
+                Slot::boolean(predicate(arg0, m))
+            }
+            // Number.prototype.toString([radix]) — radix 10 renders through the
+            // metered `fxNumberToString`; a radix in [2,36] runs the digit
+            // conversion (integer values only this stage; a fractional value or
+            // out-of-range radix self-names).
+            NumberToString => {
+                let prim = match this.value {
+                    Payload::Integer(_) | Payload::Number(_) => this,
+                    Payload::Reference(r) => match self.wrapper_data.get(&r).copied() {
+                        Some(s) if matches!(s.value, Payload::Integer(_) | Payload::Number(_)) => s,
+                        _ => return Err(Halt::Unsupported("Number.toString:non-number-receiver")),
+                    },
+                    _ => return Err(Halt::Unsupported("Number.toString:non-number-receiver")),
+                };
+                let radix = match arg0 {
+                    Some(s) if s.kind != Kind::Undefined => {
+                        let r = to_number(&s).trunc();
+                        if !(2.0..=36.0).contains(&r) {
+                            return Err(Halt::Unsupported("Number.toString:radix-range"));
+                        }
+                        r as u32
+                    }
+                    _ => 10,
+                };
+                if radix == 10 {
+                    // `fx_Number_prototype_toString` routes radix-10 through
+                    // `fxToString`/`fxNumberToString`, which carries the same
+                    // fixed 33280-raw host residual as the `mxMeterSome`-path
+                    // built-ins (measured against the pin) beyond the metered
+                    // `fxNumberToString` step + result chunk.
+                    self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
+                    let bytes = self.to_string_bytes_metered(prim);
+                    let off = self.chunks.alloc(&bytes);
+                    Slot::of(Kind::String, Payload::String(off))
+                } else {
+                    return Err(Halt::Unsupported("Number.toString:non-decimal-radix"));
+                }
+            }
+            // parseInt(string[,radix]) — the integer prefix parse. A non-string
+            // argument would route through a metered `fxToString`; endor models
+            // the string-argument case exactly and self-names the rest.
+            GlobalParseInt => {
+                let bytes = match arg0.map(|s| s.value) {
+                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    None => return Ok(Slot::number(f64::NAN)),
+                    _ => return Err(Halt::Unsupported("parseInt:non-string-argument")),
+                };
+                let radix = match self.stack.get(base + 5).copied() {
+                    Some(s) if argc > 1 && s.kind != Kind::Undefined => {
+                        let r = to_number(&s).trunc();
+                        if r != 0.0 && !(2.0..=36.0).contains(&r) {
+                            return Ok(Slot::number(f64::NAN));
+                        }
+                        r as i32
+                    }
+                    _ => 0,
+                };
+                parse_int(&bytes, radix)
+            }
+            // parseFloat(string) — the float prefix parse (fxStringToNumber,
+            // whole = 0). String argument only.
+            GlobalParseFloat => {
+                let bytes = match arg0.map(|s| s.value) {
+                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    None => return Ok(Slot::number(f64::NAN)),
+                    _ => return Err(Halt::Unsupported("parseFloat:non-string-argument")),
+                };
+                Slot::number(string_to_number(&bytes, false))
+            }
+            // isNaN(x)/isFinite(x) — ToNumber then the fpclassify test. A
+            // string routes through the whole-string parse; a numeric operand
+            // is identity; a non-numeric non-string self-names (its ToNumber
+            // may allocate/throw).
+            GlobalIsNaN | GlobalIsFinite => {
+                let n = match arg0 {
+                    None => f64::NAN,
+                    Some(s) => match s.kind {
+                        Kind::Integer | Kind::Number => to_number(&s),
+                        Kind::String => match s.value {
+                            Payload::String(off) => {
+                                string_to_number(&self.str_content(off).to_vec(), true)
+                            }
+                            _ => f64::NAN,
+                        },
+                        Kind::Boolean | Kind::Null | Kind::Undefined => to_number(&s),
+                        _ => return Err(Halt::Unsupported("isNaN/isFinite:uncoercible")),
+                    },
+                };
+                Slot::boolean(if m == GlobalIsNaN { n.is_nan() } else { n.is_finite() })
+            }
+            _ => return Err(Halt::Unsupported("number:unmodeled")),
+        };
+        Ok(result)
     }
 
     /// The CESU-8 content bytes of a string receiver (NUL-stripped), for a
@@ -7920,6 +8171,202 @@ fn decode_code_point(content: &[u8], off: usize) -> u32 {
             | (((content[off + 2] & 0x3F) as u32) << 6)
             | (content[off + 3] & 0x3F) as u32
     }
+}
+
+/// Whether `b` is an ASCII byte XS's `fxSkipSpaces` treats as whitespace
+/// (the ECMAScript WhiteSpace + LineTerminator set, ASCII subset).
+fn is_ecma_ws(b: u8) -> bool {
+    matches!(b, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20)
+}
+
+/// `fx_parseInt` (`xsNumber.c`): the integer prefix parse over the CESU-8
+/// bytes — skip leading whitespace, an optional sign, an optional `0x`/`0X`
+/// (radix 16) prefix, then digits valid in `radix` (default 10). Returns an
+/// INTEGER-kind slot when the result fits `i32`, else a NUMBER-kind slot; an
+/// empty digit run is `NaN`. No `mxMeterSome`, no chunk.
+fn parse_int(bytes: &[u8], mut radix: i32) -> Slot {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n && is_ecma_ws(bytes[i]) {
+        i += 1;
+    }
+    let mut sign = 1.0f64;
+    match bytes.get(i) {
+        Some(b'+') => i += 1,
+        Some(b'-') => {
+            i += 1;
+            sign = -1.0;
+        }
+        _ => {}
+    }
+    if bytes.get(i) == Some(&b'0') && matches!(bytes.get(i + 1), Some(b'x') | Some(b'X')) {
+        if radix == 0 || radix == 16 {
+            radix = 16;
+            i += 2;
+        }
+    }
+    if radix == 0 {
+        radix = 10;
+    }
+    let start = i;
+    let mut result = 0.0f64;
+    while i < n {
+        let c = bytes[i];
+        let digit = if c.is_ascii_digit() {
+            (c - b'0') as i32
+        } else if c.is_ascii_lowercase() {
+            10 + (c - b'a') as i32
+        } else if c.is_ascii_uppercase() {
+            10 + (c - b'A') as i32
+        } else {
+            break;
+        };
+        if digit >= radix {
+            break;
+        }
+        result = result * radix as f64 + digit as f64;
+        i += 1;
+    }
+    if i == start {
+        return Slot::number(f64::NAN);
+    }
+    result *= sign;
+    let ir = result as i32;
+    if ir as f64 == result {
+        Slot::integer(ir)
+    } else {
+        Slot::number(result)
+    }
+}
+
+/// `fxStringToNumber` (`xsdtoa.c`): coerce a CESU-8 string to a number.
+/// `whole` = the `Number(...)`/`fxToNumber`/`isNaN`/`isFinite` mode (leading
+/// AND trailing whitespace allowed, empty ⇒ `0`, `0b`/`0o`/`0x` integer
+/// prefixes, trailing garbage ⇒ `NaN`); `!whole` = the `parseFloat` prefix
+/// mode (leading whitespace, then the longest valid float prefix, empty ⇒
+/// `NaN`). Uses Rust's IEEE-correct `f64` parse for the decimal body (the
+/// `strtod2` equivalent).
+fn string_to_number(bytes: &[u8], whole: bool) -> f64 {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n && is_ecma_ws(bytes[i]) {
+        i += 1;
+    }
+    if whole {
+        // Trim trailing whitespace; the body must consume the rest exactly.
+        let mut end = n;
+        while end > i && is_ecma_ws(bytes[end - 1]) {
+            end -= 1;
+        }
+        let body = &bytes[i..end];
+        if body.is_empty() {
+            return 0.0;
+        }
+        // 0b / 0o / 0x integer literals (no sign).
+        if body.len() >= 2 && body[0] == b'0' {
+            let (r, digits): (u32, &[u8]) = match body[1] {
+                b'b' | b'B' => (2, &body[2..]),
+                b'o' | b'O' => (8, &body[2..]),
+                b'x' | b'X' => (16, &body[2..]),
+                _ => (0, &body[..]),
+            };
+            if r != 0 {
+                if digits.is_empty() {
+                    return f64::NAN;
+                }
+                let mut acc = 0.0f64;
+                for &c in digits {
+                    let d = match (c as char).to_digit(r) {
+                        Some(d) => d as f64,
+                        None => return f64::NAN,
+                    };
+                    acc = acc * r as f64 + d;
+                }
+                return acc;
+            }
+        }
+        parse_decimal_body(body)
+    } else {
+        // parseFloat: the longest valid float prefix from `i`.
+        let body = &bytes[i..];
+        let len = float_prefix_len(body);
+        if len == 0 {
+            return f64::NAN;
+        }
+        parse_decimal_body(&body[..len])
+    }
+}
+
+/// Parse a fully-delimited ECMAScript `StrDecimalLiteral` body (already
+/// whitespace-trimmed) to `f64`, returning `NaN` on any invalid character —
+/// notably rejecting the `inf`/`nan` spellings Rust's parser would otherwise
+/// accept (only the exact `Infinity` word, handled here, is valid).
+fn parse_decimal_body(body: &[u8]) -> f64 {
+    // `Infinity` with an optional sign.
+    let (sign, rest): (f64, &[u8]) = match body.first() {
+        Some(b'+') => (1.0, &body[1..]),
+        Some(b'-') => (-1.0, &body[1..]),
+        _ => (1.0, body),
+    };
+    if rest == b"Infinity" {
+        return sign * f64::INFINITY;
+    }
+    // Reject any character outside the decimal grammar (so `inf`/`nan`/hex
+    // letters do not sneak through Rust's permissive parser).
+    if body.is_empty()
+        || body
+            .iter()
+            .any(|&c| !matches!(c, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return f64::NAN;
+    }
+    match std::str::from_utf8(body).ok().and_then(|s| s.parse::<f64>().ok()) {
+        Some(v) => v,
+        None => f64::NAN,
+    }
+}
+
+/// The byte length of the longest `parseFloat` float prefix of `body`
+/// (optional sign, then `Infinity` or a decimal with optional fraction and
+/// exponent); `0` when no valid prefix begins here.
+fn float_prefix_len(body: &[u8]) -> usize {
+    let n = body.len();
+    let mut i = 0;
+    if matches!(body.first(), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    if body[i.min(n)..].starts_with(b"Infinity") {
+        return i + b"Infinity".len();
+    }
+    let mut digits = 0;
+    while i < n && body[i].is_ascii_digit() {
+        i += 1;
+        digits += 1;
+    }
+    if i < n && body[i] == b'.' {
+        i += 1;
+        while i < n && body[i].is_ascii_digit() {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0;
+    }
+    // Optional exponent — only if followed by (sign?) at least one digit.
+    if i < n && (body[i] == b'e' || body[i] == b'E') {
+        let mut j = i + 1;
+        if j < n && matches!(body[j], b'+' | b'-') {
+            j += 1;
+        }
+        if j < n && body[j].is_ascii_digit() {
+            while j < n && body[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    i
 }
 
 /// `fxArgToIndex` (`xsArray.c`, used by `String.prototype.slice`): a relative
