@@ -112,7 +112,42 @@ resolve to `undefined` and throw — so a reference is a NAMED skip, never a
 completion divergence or a wrong value. The stage's built-ins/Array dual-run
 reflects this: `total=2625 covered=403 divergent=0 skipped=2222` (every skip
 named), and the iteration protocol grows `statements/for-in` to `covered=19`
-and `statements/for-of` to `covered=79`, both `divergent=0`. The stage-3 built-ins reach
+and `statements/for-of` to `covered=79`, both `divergent=0`. The stage-3
+**text-math-json** child adds `String.prototype` over the CESU-8 chunk (a
+primitive string boxes to `%String.prototype%`: `.length` is the UTF-16
+code-unit count, `str[i]` the one-unit character; `charCodeAt`/`codePointAt`/
+`charAt`/`at`/`slice`/`substring`/`concat`/`repeat`/`toLowerCase`/`toUpperCase`/
+`trim`/`trimStart`/`trimEnd`/`startsWith`/`endsWith`/`includes`), the `Number`
+statics/predicates/`toString`(radix 10)/`Number(...)` coercion, the numeric
+globals `parseInt`/`parseFloat`/`isNaN`/`isFinite`, the whole `Math` namespace
+(every function, **canonical `f64::NAN`** for the consensus-critical
+determinism, the pin's exact libm choices, and the `±0`/integer-fold corners),
+and `JSON.stringify` over a top-level primitive. Metering is calibrated
+raw-exact against the pin: `Math`/`Number`/`parseInt`/`parseFloat` carry a zero
+native residual over the `RUN` opcode (their `xs*.c` bodies charge no
+`mxMeterSome`); a chunk-only String method (`slice`/`charAt`/…) carries zero,
+while an `mxMeterSome`-calling String method (`concat`/`repeat`/`toCase`/`trim`/
+`startsWith`/`endsWith`/`includes`) and `Number.prototype.toString`(10) carry a
+measured `33280`-raw host residual; `JSON.stringify` of a primitive carries the
+`82432`-setup + `16384`-produced residuals over the final result chunk (its
+working buffer is an unmetered C-malloc). The four built-ins dual-run sections
+agree bit-exactly with **zero divergence**, every skip named:
+`built-ins/Math total=275 covered=151 divergent=0 skipped=124`,
+`built-ins/Number total=281 covered=59 divergent=0 skipped=222`,
+`built-ins/String total=1111 covered=115 divergent=0 skipped=996`,
+`built-ins/JSON total=138 covered=2 divergent=0 skipped=136` (before this child
+all four were ~0 covered — the constructors bound as values but no methods).
+The deferred paths are honest **named skips**, never faked: `indexOf`/
+`lastIndexOf`'s inner-loop scan metering (single-character and not-found agree;
+a multi-character partial-then-full match over-counts), `Number.prototype.
+toString` at a non-decimal radix, non-ASCII case/trim and astral offset math, a
+String method result consumed *directly* (without an intervening variable) as a
+receiver/argument (an extra temporary-lifetime residual), and — the largest
+remaining work — **`JSON.parse`** and **structured `JSON.stringify`** (the
+object/array serializer is implemented and its RESULT is correct, but the
+per-node allocation metering — the keys instance, per-key strings, and
+recursive property frames — is not yet modeled to a clean constant, so it
+self-names rather than ship a computron divergence). The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic

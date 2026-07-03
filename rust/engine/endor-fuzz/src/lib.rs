@@ -509,6 +509,89 @@ pub fn gen_stage3_string_for_of_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for the **stage-3 text-math-json** surface: the
+/// `Math` statics, `String.prototype` methods over the CESU-8 chunk, the
+/// `Number` predicates, `parseInt`/`parseFloat`/`isNaN`, and `JSON.stringify`
+/// of a primitive — every emitted program bit-exact (result AND computron)
+/// against the pin. Only the raw-clean subset is drawn (numeric `Math` args,
+/// ASCII strings so case/`.length`/index math stays byte==unit, string search/
+/// parse arguments, non-negative small `repeat` counts, decimal `toString`),
+/// so the arm rides the full symbol-linking differential check. Rides
+/// [`differential_check_with_symbols`] (the built-ins relink by name).
+pub fn gen_stage3_text_math_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    // A short ASCII string literal (single-UTF-8-byte code units).
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    let mk_str = |b: &mut Bytes| -> String {
+        let n = (b.next() % 5) as usize; // 0..=4 characters
+        (0..n).map(|_| ALPHA[(b.next() as usize) % ALPHA.len()] as char).collect()
+    };
+    match b.choice(5) {
+        // Math statics — algebraically-exact / correctly-rounded functions
+        // over small numeric literals (canonical NaN never leaks here).
+        0 => {
+            let x = (b.next() % 40) as i32 - 20; // -20..=19
+            match b.choice(8) {
+                0 => format!("Math.abs({})", x),
+                1 => format!("Math.sign({})", x),
+                2 => format!("Math.floor({}.5)", x),
+                3 => format!("Math.ceil({}.5)", x),
+                4 => format!("Math.round({}.5)", x),
+                5 => format!("Math.trunc({}.5)", x),
+                6 => format!("Math.sqrt({})", x.abs()),
+                _ => format!("Math.max({}, {})", x, (b.next() % 40) as i32 - 20),
+            }
+        }
+        // String.prototype methods over an ASCII literal.
+        1 => {
+            let s = mk_str(&mut b);
+            let len = s.chars().count() as i32;
+            let i = if len > 0 { (b.next() as i32) % len } else { 0 };
+            match b.choice(9) {
+                0 => format!("\"{}\".length", s),
+                1 => format!("\"{}\".toUpperCase()", s),
+                2 => format!("\"{}\".toLowerCase()", s),
+                3 => format!("\"{}\".charCodeAt({})", s, i),
+                4 => format!("\"{}\".charAt({})", s, i),
+                5 => format!("\"{}\".slice({})", s, i),
+                6 => format!("\"{}\".concat(\"{}\")", s, mk_str(&mut b)),
+                7 => format!("\"{}\".repeat({})", s, b.next() % 4),
+                _ => format!("\"{}\".includes(\"{}\")", s, mk_str(&mut b)),
+            }
+        }
+        // Number predicates / parseInt / parseFloat / isNaN.
+        2 => {
+            let x = (b.next() % 40) as i32 - 20;
+            match b.choice(6) {
+                0 => format!("Number.isInteger({})", x),
+                1 => format!("Number.isFinite({})", x),
+                2 => format!("Number.isNaN({})", x),
+                3 => format!("parseInt(\"{}\")", x),
+                4 => format!("parseFloat(\"{}.5\")", x),
+                _ => format!("isNaN({})", x),
+            }
+        }
+        // JSON.stringify of a primitive.
+        3 => {
+            let s = mk_str(&mut b);
+            match b.choice(3) {
+                0 => format!("JSON.stringify({})", (b.next() % 40) as i32 - 20),
+                1 => format!("JSON.stringify(\"{}\")", s),
+                _ => "JSON.stringify(true)".to_string(),
+            }
+        }
+        // A small chain: a String method feeding a Number predicate / concat.
+        _ => {
+            let s = mk_str(&mut b);
+            match b.choice(3) {
+                0 => format!("Number.isInteger(parseInt(\"{}7\"))", s.len()),
+                1 => format!("var t=\"{}\"; t.concat(t)", s),
+                _ => format!("Math.max(Math.abs(-{}), {})", b.next() % 10, b.next() % 10),
+            }
+        }
+    }
+}
+
 /// Structure-aware generator for **array spread** (`[...arr]`) — which
 /// desugars to the for-of iterator loop appending each element. Emits a single
 /// spread of a dense literal, optionally with leading/trailing plain elements,
@@ -1049,6 +1132,48 @@ mod tests {
         for (i, s) in shapes.iter().enumerate() {
             assert!(*s, "string for-of shape {} never generated", i);
         }
+    }
+
+    #[test]
+    fn generated_stage3_text_math_programs_agree_bit_exact() {
+        // The stage-3 text-math-json surface (Math statics, String.prototype,
+        // Number predicates, parseInt/parseFloat/isNaN, JSON.stringify of a
+        // primitive) is bit-exact (result AND computron); sweep a spread of
+        // seeds across all five shapes and assert zero divergence.
+        let mut checked = 0;
+        // Coverage flags for the built-in families the arm must reach.
+        let (mut math, mut string, mut number, mut json) = (false, false, false, false);
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(11))
+                        .wrapping_add((seed as u8).wrapping_mul(7)),
+                );
+            }
+            let prog = gen_stage3_text_math_program(&buf);
+            distinct.insert(prog.clone());
+            math |= prog.contains("Math.");
+            string |= prog.contains(".toUpperCase")
+                || prog.contains(".toLowerCase")
+                || prog.contains(".charCodeAt")
+                || prog.contains(".slice")
+                || prog.contains(".concat")
+                || prog.contains(".includes")
+                || prog.contains(".length");
+            number |= prog.contains("Number.") || prog.contains("parseInt") || prog.contains("parseFloat") || prog.contains("isNaN");
+            json |= prog.contains("JSON.");
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 text-math-json differential divergence on {:?}: {:?}", prog, d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 40, "text-math-json sweep too uniform: {} distinct", distinct.len());
+        assert!(math && string && number && json, "families reached: math={} string={} number={} json={}", math, string, number, json);
     }
 
     #[test]
