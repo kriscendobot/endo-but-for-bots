@@ -34,9 +34,17 @@ fn main() {
             r.oracle_result,
             mark,
         );
+        if std::env::var("ENDOR_SHOW_RAW").is_ok() {
+            println!("    raw oracle={} endor={} gap={}",
+                r.oracle_meter_raw, r.endor_meter_raw,
+                r.oracle_meter_raw as i64 - r.endor_meter_raw as i64);
+        }
         if !r.is_bit_exact() {
             println!("    oracle_result={:?} endor_result={:?} endor_dispatched={} halt={:?}",
                 r.oracle_result, r.endor_result, r.endor_dispatched, r.endor_halt);
+            println!("    oracle_raw={} endor_raw={} raw_gap={}",
+                r.oracle_meter_raw, r.endor_meter_raw,
+                r.oracle_meter_raw as i64 - r.endor_meter_raw as i64);
             println!("    bytecode={:02x?}", r.bytecode);
         }
     }

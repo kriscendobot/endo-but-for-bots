@@ -48,6 +48,10 @@ pub struct DualRun {
     pub computrons_agree: bool,
     pub oracle_computrons: u64,
     pub endor_computrons: u64,
+    /// Raw 16.16 meter indices, for calibrating fractional
+    /// (allocation/built-in) metering on a divergence.
+    pub oracle_meter_raw: u64,
+    pub endor_meter_raw: u64,
     /// endor's raw dispatched-opcode count (before the invocation
     /// baseline), for isolating a metering divergence.
     pub endor_dispatched: u64,
@@ -105,6 +109,8 @@ pub fn dual_run(source: &str) -> Option<DualRun> {
         computrons_agree,
         oracle_computrons: oracle.computrons,
         endor_computrons: endor.computrons,
+        oracle_meter_raw: oracle.meter_raw as u64,
+        endor_meter_raw: endor.meter_raw,
         endor_dispatched: endor.dispatched,
         endor_halt: endor.halt,
         bytecode: oracle.bytecode,
@@ -154,6 +160,23 @@ pub fn stage2_corpus() -> Vec<String> {
         all.extend(parse_corpus(text));
     }
     all
+}
+
+/// The stage-2b user-function corpus (child 2 of the stage-2b
+/// orchestration): user functions end to end — definition
+/// (`constructor_function`/`function` + `code` + `function_environment`),
+/// `call`/`run` frame switching with `argument` binding, `end` popping
+/// into the calling frame — over closures-free calls, recursion, nested
+/// calls, multiple arguments, local variables, and functions called from
+/// loops. Bit-exact (result AND computron) against the oracle: the call
+/// machinery is stack-based (dispatch-metered), and the definition
+/// allocations are metered at their faithful C-XS sites
+/// (`endor_vm::interp` § the `FUNCTION_*` metering constants). The
+/// meter-check placement matches C-XS's `mxFirstCode` sites (call entry,
+/// return-into-a-JS-caller) with **no** check when the program exits to
+/// the C caller (`return`).
+pub fn stage2b_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage2b-functions.js"))
 }
 
 /// A summary over a corpus run.
@@ -230,6 +253,8 @@ mod tests {
             computrons_agree: false,
             oracle_computrons: 0,
             endor_computrons: 0,
+            oracle_meter_raw: 0,
+            endor_meter_raw: 0,
             endor_dispatched: 0,
             endor_halt,
             bytecode: Vec::new(),
@@ -310,6 +335,129 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-2 bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    // Arm a fresh endor interpreter on the oracle's bytecode for `src`,
+    // recording every computron value the meter host is consulted at and
+    // whether the run was allowed to complete (`allow`) or refused at the
+    // `refuse_at`-th consultation (1-based; 0 = never refuse). Returns
+    // `(halt, completed, consulted_computrons)`.
+    fn metered_run(
+        src: &str,
+        interval: u64,
+        refuse_at: usize,
+    ) -> (endor_vm::Halt, bool, Vec<u64>) {
+        use endor_vm::Interp;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let oracle = endor_oracle::run(src).expect("oracle machine");
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_cb = Rc::clone(&seen);
+        let mut interp = Interp::new();
+        interp.arm_meter(
+            interval,
+            Box::new(move |computrons| {
+                let mut s = seen_cb.borrow_mut();
+                s.push(computrons);
+                refuse_at == 0 || s.len() < refuse_at
+            }),
+        );
+        let out = interp.run(&oracle.bytecode);
+        let consulted = seen.borrow().clone();
+        (out.halt, out.completed, consulted)
+    }
+
+    #[test]
+    fn no_meter_check_when_program_returns_to_c() {
+        // A straight-line program (no backward branch, no call) has no
+        // loop-closing point, so C-XS never checks the meter — its `return`
+        // exits to the C caller unconditionally. An endor armed to refuse
+        // immediately therefore still *completes*: the host is never
+        // consulted, proving the exit-to-C `return` carries no
+        // `mxFirstCode` check (stage-2a review finding 1).
+        let (halt, completed, consulted) = metered_run("1 + 2 * 3", 1, 1);
+        assert_eq!(halt, endor_vm::Halt::Return, "must complete: no check point");
+        assert!(completed);
+        assert!(consulted.is_empty(), "the exit-to-C return must not check the meter");
+    }
+
+    #[test]
+    fn meter_checks_fire_at_call_entry_and_return_into_js() {
+        // A single user-function call has exactly two `mxFirstCode` check
+        // points: call entry (`run` installing the callee frame) and the
+        // callee's `end` returning into the JS program frame. The
+        // program's own final `return` (exit to C) does not check. So a
+        // permissive armed run is consulted exactly twice and completes.
+        let (halt, completed, consulted) =
+            metered_run("(function(){return 1})()", 1, 0);
+        assert_eq!(halt, endor_vm::Halt::Return);
+        assert!(completed);
+        assert_eq!(
+            consulted.len(),
+            2,
+            "call entry + return-into-JS check; the exit-to-C return does not check (got {:?})",
+            consulted,
+        );
+    }
+
+    #[test]
+    fn armed_meter_aborts_at_call_entry_not_at_program_exit() {
+        // Refusing at the first consultation (the call-entry `mxFirstCode`)
+        // aborts the crank there — before the callee body's completion is
+        // observed — rather than letting the program run to its exit-to-C
+        // `return`. This is the abort-point determinism the check-placement
+        // fix exists to guarantee.
+        let (halt, completed, consulted) =
+            metered_run("(function(){return 1})()", 1, 1);
+        assert_eq!(halt, endor_vm::Halt::MeterAbort, "must abort at the call-entry check");
+        assert!(!completed, "the call must not complete once refused at entry");
+        assert_eq!(consulted.len(), 1, "aborts on the first (call-entry) consultation");
+    }
+
+    #[test]
+    fn armed_meter_aborts_at_backward_branch_in_a_loop() {
+        // A loop's backward branch is a check point (as in stage 2a); a
+        // function body containing a loop still aborts there under an armed
+        // meter, never at the function's `end` exit or the program
+        // `return`.
+        let src = "var i=0; while(i<1000000){i=i+1} i";
+        let (halt, completed, _consulted) = metered_run(src, 1, 3);
+        assert_eq!(halt, endor_vm::Halt::MeterAbort, "the backward branch must abort");
+        assert!(!completed);
+    }
+
+    #[test]
+    fn stage2b_functions_corpus_is_bit_exact_against_oracle() {
+        // The child-2 acceptance bar: every user-function program — IIFEs,
+        // multi-argument calls, local variables, functions stored in vars,
+        // named declarations, nested calls, and recursion (fib/fac/sum) —
+        // must agree with C-XS on BOTH the completion value AND the
+        // computron count. Results follow from the frame machinery
+        // (`call`/`run`/`argument`/`end`); computrons follow from
+        // dispatch-metered stack frames plus the faithful definition-site
+        // allocation metering, with the meter check at C-XS's `mxFirstCode`
+        // sites (call entry, return-into-JS) and none at the exit-to-C
+        // `return`.
+        let programs = stage2b_corpus();
+        assert!(!programs.is_empty(), "stage-2b corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-2b bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

@@ -15,6 +15,12 @@
 //! arena handles and are filled in as later stages land the object
 //! model and GC.
 
+/// XS's `XS_NO_ID` (`xs.h`): the sentinel key id meaning "no name". A
+/// `constructor_function`/`function` opcode carries it as the name operand
+/// for an anonymous function; a real (inferred or declared) name is any
+/// other id.
+pub const XS_NO_ID: u16 = 0;
+
 /// Handle into the slot arena. `u32::MAX` is the null sentinel
 /// (XS's `C_NULL`), never a live index.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

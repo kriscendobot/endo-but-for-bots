@@ -84,6 +84,80 @@ pub const PROGRAM_ENV_SETUP_METERING: u64 = 17688;
 /// built-in step for `fxRunDefine`).
 pub const PROPERTY_CREATE_REMAINDER: u64 = 280;
 
+/// The raw 16.16 cost C-XS accrues in `constructor_function`
+/// (`fxNewFunctionInstance` + `fxDefaultFunctionPrototype`): the function
+/// instance and its internal CODE/HOME slots, its `length`/`name`
+/// properties, and the default `.prototype` object with its `constructor`
+/// back-reference — a fixed cluster of `fxNewSlot` allocations plus the
+/// built-in steps `fxDefaultFunctionPrototype` runs, independent of the
+/// function's body or arity (the body chunk is metered separately at
+/// `code`, and the arity-dependent scope slots at the body's
+/// `new_local`s). Measured against the pin `48ee02d8cfe0`: a bare
+/// `(function(){})()` — whose only unmodeled cost is this cluster plus the
+/// 5-byte body chunk — carries exactly [`FUNCTION_DEFINE_METERING`] + 5
+/// beyond the program baseline, the per-opcode dispatch metering, and the
+/// modeled `new_property`. The nested `(function(){return
+/// (function(){return 1})()})()` carries exactly twice this (its raw gap
+/// with the constant zeroed was 135670 = 2 × 67835), confirming it as a
+/// clean per-definition constant. Verified per-site against the oracle's
+/// raw meter. Plain `XS_CODE_FUNCTION` (no default prototype) is a
+/// distinct, smaller cluster carried by a later increment. (The
+/// body-chunk allocation is *not* part of this constant — it is metered
+/// faithfully at `code` via [`crate::meter::Meter::tick_chunk_new`], so a
+/// function's arity/body length moves its computrons the way C-XS's does.)
+pub const FUNCTION_DEFINE_METERING: u64 = 67816;
+
+/// The raw 16.16 cost C-XS accrues in `function_environment`
+/// (`fxNewEnvironmentInstance`): the closure environment instance the
+/// function captures its defining scope through. Accrued once per
+/// `function_environment` opcode, at the definition site. Measured
+/// against the pin; verified per-site.
+pub const FUNCTION_ENVIRONMENT_METERING: u64 = 0;
+
+/// Body-scope allocation metering per declared parameter/local inside a
+/// function frame. Each declared parameter/local (`new_local`) of a
+/// function carries a fixed definition-time allocation cost — a scope-cell
+/// `fxNewSlot` (256) plus a small aligned chunk (24 = the `fxNewChunk`
+/// header/alignment of a ≤8-byte block), 280 raw total, measured against
+/// the pin. It is a **definition-time** cost (present even when the
+/// function is never called and constant across calls/recursion depth, so
+/// it does not accumulate per invocation), accrued at `code` in proportion
+/// to the count of `new_local` opcodes in the function's immediate body.
+/// (A residual ≤8 raw per definition from body-chunk alignment on some
+/// arities stays below one computron and does not perturb the bit-exact
+/// bar.)
+pub const FUNCTION_LOCAL_METERING: u64 = 280;
+
+/// Metadata for a user function instance created by
+/// `constructor_function`/`function`: the byte range of its body in the
+/// program's code buffer (set by the following `code` opcode) and the
+/// closure environment it captured (set by `function_environment`). Kept
+/// in a side table keyed by the function's slot index so the function
+/// object stays a real arena instance whose own properties (`.prototype`,
+/// `.length`, `.name`, and user-defined) are real arena slots the GC
+/// traces, while the non-value-slot body/closure metadata rides alongside.
+#[derive(Clone, Debug)]
+struct FuncInfo {
+    /// Start offset of the function body in the program code buffer (the
+    /// byte just past the `code` opcode's operand — where `begin_*` sits).
+    body_start: usize,
+    /// Length of the body chunk (the `code` opcode's operand).
+    body_len: usize,
+    /// The captured closure environment (a frame-cell owner), or `NULL`
+    /// until `function_environment` runs / for a non-capturing function.
+    closures: crate::value::SlotIndex,
+}
+
+impl Default for FuncInfo {
+    fn default() -> Self {
+        FuncInfo {
+            body_start: 0,
+            body_len: 0,
+            closures: crate::value::SlotIndex::NULL,
+        }
+    }
+}
+
 /// Why a run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Halt {
@@ -116,6 +190,10 @@ pub struct RunOutcome {
     /// Raw dispatched-opcode count, before the invocation baseline
     /// (useful for isolating a metering divergence).
     pub dispatched: u64,
+    /// Raw 16.16 fixed-point meter index (`the->meterIndex`), for
+    /// diagnosing fractional (allocation/built-in) metering during
+    /// calibration.
+    pub meter_raw: u64,
     /// Why the run stopped.
     pub halt: Halt,
 }
@@ -194,6 +272,50 @@ pub struct Interp {
     /// computron count, which now also folds in the program overhead and
     /// the allocation metering.
     n_dispatched: u64,
+    /// Side table of user-function metadata (body range + captured
+    /// closures), keyed by the function instance's slot index. See
+    /// [`FuncInfo`].
+    functions: std::collections::HashMap<crate::value::SlotIndex, FuncInfo>,
+    /// The saved caller states of the active call chain (design §
+    /// Interpreter and dispatch: "frames are stack slots ... fixed offsets
+    /// for result/function/this"). The top-level program is the base
+    /// activation whose scope lives in the flat `locals`/`id_map`/`result`
+    /// fields; each user-function `run` saves the current activation here
+    /// and installs the callee's, and each `end` restores the top of this
+    /// stack. Empty ⇒ the program frame is active (its `end`-equivalent is
+    /// `return`, which exits to the C caller). XS keeps these frames inline
+    /// on the slot stack; endor keeps the scope state per-activation here
+    /// and the value stack shared, preserving the observable frame
+    /// geometry (arguments below the frame, `result`/`function`/`this` at
+    /// fixed offsets) that `run`/`argument`/`end` read.
+    call_stack: Vec<CallerState>,
+    /// The active frame's positional arguments (`mxFrameArgv`), read by
+    /// `XS_CODE_ARGUMENT`. Empty in the program frame.
+    args: Vec<Slot>,
+    /// The active frame's `this` (`mxFrameThis`). Bound by `begin_*`;
+    /// the covered subset does not yet branch on it.
+    this_val: Slot,
+    /// The active frame's function instance (`mxFrameFunction`), whose
+    /// [`FuncInfo`] carries the closure environment closure opcodes resolve
+    /// against. `NULL` in the program frame.
+    cur_func: crate::value::SlotIndex,
+}
+
+/// A suspended activation: the caller's scope and resume point, saved by
+/// `run` and restored by `end` (XS's `mxFrame->value.frame.{code,scope}`
+/// plus the environment the frame aliases). The value stack is shared and
+/// not saved here; `end` resets it to the frame boundary and pushes the
+/// callee's result, matching XS's `mxStack = mxFrameEnd; *mxStack = *slot`.
+struct CallerState {
+    locals: Vec<Slot>,
+    id_map: std::collections::HashMap<u16, usize>,
+    result: Slot,
+    strict: bool,
+    args: Vec<Slot>,
+    this_val: Slot,
+    cur_func: crate::value::SlotIndex,
+    /// The caller's code cursor to resume at (just past its `run`).
+    ret_pc: usize,
 }
 
 impl Default for Interp {
@@ -223,6 +345,11 @@ impl Interp {
             slots,
             chunks: ChunkArena::new(),
             n_dispatched: 0,
+            functions: std::collections::HashMap::new(),
+            call_stack: Vec::new(),
+            args: Vec::new(),
+            this_val: Slot::undefined(),
+            cur_func: crate::value::SlotIndex::NULL,
         }
     }
 
@@ -361,6 +488,7 @@ impl Interp {
             // `meterIndex >> 16`, directly comparable with the oracle.
             computrons: self.meter.computrons(),
             dispatched: self.n_dispatched,
+            meter_raw: self.meter.raw(),
             halt,
         }
     }
@@ -435,11 +563,19 @@ impl Interp {
             match op {
                 // ---- program prologue / frame -----------------------
                 XS_CODE_BEGIN_SLOPPY => {
-                    // `this` setup: binds the frame's `this` to the
-                    // realm global for the covered subset. Operand byte
-                    // is the frame's scope count. No observable effect
-                    // until `this`/method calls land.
-                    self.tick_program_overhead();
+                    // `this` setup (`XS_CODE_BEGIN_SLOPPY` in `xsRun.c`):
+                    // an `undefined`/`null` `this` in a sloppy frame binds
+                    // to the realm global. The program-frame + eval-env
+                    // setup overhead C-XS meters outside the captured
+                    // bytecode is a property of the *program* invocation
+                    // (`fxRunProgram`), so it accrues only on the top-level
+                    // program's `begin` — a function frame's `begin` (a
+                    // stack-based `run` set it up, dispatch-only) does not.
+                    if self.call_stack.is_empty() {
+                        self.tick_program_overhead();
+                    } else {
+                        self.bind_this_sloppy();
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_BEGIN_STRICT
@@ -447,7 +583,9 @@ impl Interp {
                 | XS_CODE_BEGIN_STRICT_DERIVED
                 | XS_CODE_BEGIN_STRICT_FIELD => {
                     self.strict = true;
-                    self.tick_program_overhead();
+                    if self.call_stack.is_empty() {
+                        self.tick_program_overhead();
+                    }
                     pc += size as usize;
                 }
                 // The environment opcodes establish/refer to the frame's
@@ -554,7 +692,13 @@ impl Interp {
                 }
 
                 // ---- variables (environment-resolved names) ---------
-                XS_CODE_GET_VARIABLE => {
+                // `get_this_variable` shares `get_variable`'s handler in
+                // `xsRun.c` (a fused case): it resolves the name against the
+                // top-of-stack environment reference and replaces it with
+                // the value, which for a plain call is exactly a variable
+                // read (the frame's `this` was pushed separately as
+                // `undefined` before the reference).
+                XS_CODE_GET_VARIABLE | XS_CODE_GET_THIS_VARIABLE => {
                     let name = id!(1);
                     // Consume the environment reference EVAL_REFERENCE
                     // pushed and resolve the name.
@@ -653,6 +797,125 @@ impl Interp {
                     };
                     self.push(v);
                     pc += ilen;
+                }
+
+                // ---- user functions: definition ---------------------
+                // `constructor_function` / `function` (`fxNewFunctionInstance`):
+                // push a fresh callable instance. `constructor_function`
+                // additionally runs `fxDefaultFunctionPrototype` (the
+                // `.prototype`/`constructor` pair); both allocation clusters
+                // are the measured [`FUNCTION_DEFINE_METERING`]. The body
+                // range and closures are filled in by the following `code`
+                // and `function_environment` opcodes.
+                XS_CODE_CONSTRUCTOR_FUNCTION | XS_CODE_FUNCTION => {
+                    let name = id!(1);
+                    let f = self.new_function(name);
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
+                    pc += ilen;
+                }
+                // `code N` (`XS_CODE_CODE_*`): `fxNewChunk(N)` copies the N
+                // body bytes into a chunk (metered per byte) and records the
+                // body address on the top-of-stack function; execution skips
+                // past the body (it runs only when the function is called).
+                XS_CODE_CODE_1 | XS_CODE_CODE_2 | XS_CODE_CODE_4 => {
+                    let n = match op {
+                        XS_CODE_CODE_1 => code[pc + 1] as usize,
+                        XS_CODE_CODE_2 => {
+                            u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize
+                        }
+                        _ => u32::from_le_bytes([
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
+                            code[pc + 4],
+                        ]) as usize,
+                    };
+                    let body_start = pc + size as usize;
+                    // `fxNewChunk(N)` meters the header+alignment-adjusted
+                    // body size, not N (see `Meter::tick_chunk_new`).
+                    self.meter.tick_chunk_new(n as u64);
+                    // The function's declared parameters/locals each carry a
+                    // fixed definition-time allocation cost
+                    // ([`FUNCTION_LOCAL_METERING`]); count the `new_local`
+                    // opcodes in this body (skipping nested function bodies)
+                    // and accrue it here, where C-XS incurs it at
+                    // definition rather than per call.
+                    let locals = count_new_locals(code, body_start, n);
+                    self.meter
+                        .tick_raw(FUNCTION_LOCAL_METERING * locals as u64);
+                    if let Payload::Reference(f) = self.stack.last().map(|s| s.value).unwrap_or(Payload::None) {
+                        let info = self.functions.entry(f).or_default();
+                        info.body_start = body_start;
+                        info.body_len = n;
+                    }
+                    pc = body_start + n;
+                }
+                // `function_environment` (`fxNewEnvironmentInstance`): the
+                // function captures its defining scope through a fresh
+                // closure environment instance. Pushes an `undefined` (XS's
+                // scratch slot) that the following `pop` discards; the
+                // function is one below the top.
+                XS_CODE_FUNCTION_ENVIRONMENT => {
+                    let env = self.new_environment();
+                    let below = self.stack.len().checked_sub(1).map(|i| self.stack[i].value);
+                    if let Some(Payload::Reference(f)) = below {
+                        self.functions.entry(f).or_default().closures = env;
+                    }
+                    self.push(Slot::undefined());
+                    pc += size as usize;
+                }
+
+                // ---- user functions: call --------------------------
+                // `call` (`XS_CODE_CALL`): reserve the RESULT (undefined)
+                // and FRAME (marker) slots above the already-pushed
+                // FUNCTION and THIS. No heap allocation — the frame lives on
+                // the value stack (metered by dispatch only).
+                XS_CODE_CALL => {
+                    self.push(Slot::undefined()); // RESULT
+                    self.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
+                    pc += size as usize;
+                }
+                // `run`/`run_N` (`XS_CODE_RUN*`): invoke the function with N
+                // arguments. Stack below the N args is
+                // `[THIS, FUNCTION, RESULT, FRAME]` (XS's frame geometry:
+                // args below the frame, `result`/`function`/`this` at fixed
+                // offsets). Enter the callee's body frame; the call-entry
+                // `mxFirstCode` meter check fires here.
+                XS_CODE_RUN | XS_CODE_RUN_1 | XS_CODE_RUN_2 | XS_CODE_RUN_4 => {
+                    let argc = match op {
+                        XS_CODE_RUN => self.pop_run_count(),
+                        XS_CODE_RUN_1 => code[pc + 1] as usize,
+                        XS_CODE_RUN_2 => {
+                            u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize
+                        }
+                        _ => u32::from_le_bytes([
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
+                            code[pc + 4],
+                        ]) as usize,
+                    };
+                    let ret_pc = pc + size as usize;
+                    match self.enter_call(argc, ret_pc) {
+                        Ok(body_start) => {
+                            // Call entry: `mxFirstCode()` runs a meter check
+                            // before the callee's first opcode.
+                            if self.check_meter() == MeterCheck::Abort {
+                                return Halt::MeterAbort;
+                            }
+                            pc = body_start;
+                        }
+                        Err(h) => return h,
+                    }
+                }
+                // `argument i` (`XS_CODE_ARGUMENT`): push the frame's i-th
+                // positional argument (`mxFrameArgv(i)`), or `undefined`
+                // when fewer were passed.
+                XS_CODE_ARGUMENT => {
+                    let i = u1!(1);
+                    let v = self.args.get(i).copied().unwrap_or_else(Slot::undefined);
+                    self.push(v);
+                    pc += size as usize;
                 }
 
                 // ---- literals ---------------------------------------
@@ -918,20 +1181,42 @@ impl Interp {
                     self.push(r);
                     pc += size as usize;
                 }
-                XS_CODE_RETURN | XS_CODE_END => {
-                    // The top-level program frame's caller is the C caller
-                    // (the eval harness). Per the pin's `xsRun.c`
-                    // (1080-1092 RETURN; 1069-1078 END), C-XS runs **no**
-                    // meter check when the frame exits to a C caller — the
-                    // END path checks (via `mxFirstCode`) only when
-                    // resuming a *JS* caller, and RETURN never checks.
-                    // Checking here would let an armed endor abort a crank
-                    // C-XS completes — the abort-point-determinism fault
-                    // this program exists to prevent (stage-2a review
-                    // finding 1). The check therefore lives at the
-                    // `mxFirstCode` sites (call entry, return-into-JS,
-                    // catch resume) that arrive with the call/return frame
-                    // machinery (child 2), not at the exit-to-host END.
+                // `end` (`XS_CODE_END`, xsRun.c:1049): a function body's
+                // terminator. Pop the callee frame, reset the value stack to
+                // the frame boundary, push the callee's result into the
+                // caller, and resume the caller. C-XS runs `mxFirstCode()`
+                // (a meter check) **only when the caller is a JS frame**;
+                // when the popped frame's caller is the C boundary (an empty
+                // call stack here), it returns to C with **no** check. The
+                // top-level program never reaches `end` (it ends in
+                // `return`), so a JS caller always exists when `end` runs in
+                // the covered grammar — but the guard is explicit so the
+                // abort-point semantics are exact (stage-2a review finding
+                // 1).
+                XS_CODE_END
+                | XS_CODE_END_ARROW
+                | XS_CODE_END_BASE
+                | XS_CODE_END_DERIVED => {
+                    if self.call_stack.is_empty() {
+                        // A function as the top activation returning to C:
+                        // no meter check (exit-to-host END).
+                        return Halt::Return;
+                    }
+                    let ret = self.result;
+                    let resume = self.leave_call();
+                    self.push(ret);
+                    pc = resume;
+                    // Returning into a JS caller: `mxFirstCode()` checks.
+                    if self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                }
+                // `return` (`XS_CODE_RETURN`, xsRun.c:1080): the top-level
+                // program's terminator. C-XS always returns to the C caller
+                // here with **no** meter check. Only the program frame emits
+                // it (a `return x` inside a function compiles to
+                // `set_result; end`), so this is the exit-to-host boundary.
+                XS_CODE_RETURN => {
                     return Halt::Return;
                 }
 
@@ -945,6 +1230,126 @@ impl Interp {
                     return Halt::Unsupported(other.name());
                 }
             }
+        }
+    }
+
+    /// Allocate a fresh user-function instance (`fxNewFunctionInstance` +
+    /// `fxDefaultFunctionPrototype`, driven by `constructor_function`).
+    /// The instance is a real arena object; its body range and closures are
+    /// recorded in [`Self::functions`] by the following `code` /
+    /// `function_environment` opcodes. Meters the measured allocation
+    /// cluster [`FUNCTION_DEFINE_METERING`].
+    fn new_function(&mut self, name: u16) -> crate::value::SlotIndex {
+        self.meter.tick_raw(FUNCTION_DEFINE_METERING);
+        // `fxNewFunctionInstance` runs `fxRenameFunction`; naming the
+        // instance with a real id (an inferred `var f = function(){}` or a
+        // `function g(){}` declaration — anything but `XS_NO_ID` = 0)
+        // costs two additional built-in steps (`mxMeterOne`) over the
+        // anonymous case folded into [`FUNCTION_DEFINE_METERING`]. Measured
+        // against the pin as exactly `2 * XS_BUILTIN_METERING` = 32768 raw,
+        // independent of the name's length (the name symbol's string chunk
+        // is interned at parse time, outside the run-only meter).
+        if name != crate::value::XS_NO_ID {
+            self.meter.tick_builtin_some(2);
+        }
+        let f = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        self.functions.insert(f, FuncInfo::default());
+        f
+    }
+
+    /// Allocate a closure environment instance (`fxNewEnvironmentInstance`,
+    /// driven by `function_environment`). Meters
+    /// [`FUNCTION_ENVIRONMENT_METERING`]. The environment is a real arena
+    /// instance so its captured cells are GC-traced.
+    fn new_environment(&mut self) -> crate::value::SlotIndex {
+        self.meter.tick_raw(FUNCTION_ENVIRONMENT_METERING);
+        self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL))
+    }
+
+    /// `XS_CODE_RUN`'s inline argument count (pushed as an integer just
+    /// below the frame). The variadic `run` reads it off the stack.
+    fn pop_run_count(&mut self) -> usize {
+        match self.pop().value {
+            Payload::Integer(i) if i >= 0 => i as usize,
+            _ => 0,
+        }
+    }
+
+    /// Enter a user-function call with `argc` arguments (`XS_CODE_RUN_ALL`).
+    /// The value stack below the `argc` args holds the frame geometry
+    /// `[THIS, FUNCTION, RESULT, FRAME]`; read the function and `this`,
+    /// collect the arguments, unwind those `4 + argc` slots, save the
+    /// caller's activation, and install the callee's fresh scope. Returns
+    /// the callee body's start pc, or `Halt::Throw` when the callee is not a
+    /// known user function (the covered grammar only calls functions it
+    /// defined).
+    fn enter_call(&mut self, argc: usize, ret_pc: usize) -> Result<usize, Halt> {
+        let len = self.stack.len();
+        if len < argc + 4 {
+            return Err(Halt::Throw("call: stack underflow".into()));
+        }
+        let base = len - argc - 4; // index of THIS
+        let func_slot = self.stack[base + 1];
+        // Collect arguments (arg0 is the deepest of the argc; XS's
+        // `mxFrameArgv(i) = mxFrame - 1 - i`).
+        let args: Vec<Slot> = self.stack[base + 4..base + 4 + argc].to_vec();
+        let func = match func_slot.value {
+            Payload::Reference(f) if self.functions.contains_key(&f) => f,
+            _ => return Err(Halt::Throw("call: not a function".into())),
+        };
+        let body_start = self.functions[&func].body_start;
+        let this_val = self.stack[base];
+        // Unwind the frame region (THIS..last arg).
+        self.stack.truncate(base);
+        // Save the caller's activation and install the callee's.
+        self.call_stack.push(CallerState {
+            locals: std::mem::take(&mut self.locals),
+            id_map: std::mem::take(&mut self.id_map),
+            result: self.result,
+            strict: self.strict,
+            args: std::mem::take(&mut self.args),
+            this_val: self.this_val,
+            cur_func: self.cur_func,
+            ret_pc,
+        });
+        self.result = Slot::undefined();
+        self.strict = false;
+        self.args = args;
+        self.this_val = this_val;
+        self.cur_func = func;
+        Ok(body_start)
+    }
+
+    /// Leave a user-function call (`XS_CODE_END`): restore the caller's
+    /// saved activation and return the pc to resume the caller at. The
+    /// callee's result has already been captured by the caller of this
+    /// method (which pushes it onto the shared value stack, matching XS's
+    /// `mxStack = mxFrameEnd; *mxStack = *result`).
+    fn leave_call(&mut self) -> usize {
+        let caller = self
+            .call_stack
+            .pop()
+            .expect("leave_call with empty call stack");
+        self.locals = caller.locals;
+        self.id_map = caller.id_map;
+        self.result = caller.result;
+        self.strict = caller.strict;
+        self.args = caller.args;
+        self.this_val = caller.this_val;
+        self.cur_func = caller.cur_func;
+        caller.ret_pc
+    }
+
+    /// `XS_CODE_BEGIN_SLOPPY`'s `this` binding: an `undefined`/`null` `this`
+    /// in a sloppy function frame binds to the realm global. Recorded for
+    /// the `this`/method semantics that observe it; the covered call
+    /// grammar (plain calls) passes `undefined`.
+    fn bind_this_sloppy(&mut self) {
+        if matches!(self.this_val.kind, Kind::Undefined | Kind::Null) {
+            self.this_val = Slot::of(
+                Kind::Reference,
+                Payload::Reference(self.global_obj),
+            );
         }
     }
 
@@ -1164,6 +1569,59 @@ enum RelOp {
     LessEqual,
     More,
     MoreEqual,
+}
+
+/// Count the `new_local` opcodes in a function body `[start, start+len)`,
+/// skipping any nested function bodies (a nested `code M` embeds M bytes
+/// that belong to the inner function, whose own `code` opcode counts
+/// them). Mirrors the dispatch loop's instruction-advance quirks: an
+/// `id`-operand opcode is `1 + ID_SIZE`, `new_property`/`new_property_at`
+/// carry a 2-byte inline flag operand (5 bytes total), and `code_*`
+/// advances past both its length operand and the embedded body. Used to
+/// meter the per-declared-local definition cost ([`FUNCTION_LOCAL_METERING`])
+/// at `code` time.
+fn count_new_locals(code: &[u8], start: usize, len: usize) -> usize {
+    let end = (start + len).min(code.len());
+    let mut pc = start;
+    let mut n = 0usize;
+    while pc < end {
+        let op = match Opcode::from_u8(code[pc]) {
+            Some(o) => o,
+            None => break,
+        };
+        if op == Opcode::XS_CODE_NEW_LOCAL {
+            n += 1;
+        }
+        let step = match op {
+            // Nested function body: skip the length operand and the M
+            // embedded body bytes (they are the inner function's locals).
+            Opcode::XS_CODE_CODE_1 => 2 + *code.get(pc + 1).unwrap_or(&0) as usize,
+            Opcode::XS_CODE_CODE_2 => {
+                3 + u16::from_le_bytes([
+                    *code.get(pc + 1).unwrap_or(&0),
+                    *code.get(pc + 2).unwrap_or(&0),
+                ]) as usize
+            }
+            Opcode::XS_CODE_CODE_4 => {
+                5 + u32::from_le_bytes([
+                    *code.get(pc + 1).unwrap_or(&0),
+                    *code.get(pc + 2).unwrap_or(&0),
+                    *code.get(pc + 3).unwrap_or(&0),
+                    *code.get(pc + 4).unwrap_or(&0),
+                ]) as usize
+            }
+            // The 2-byte inline flag operand `new_property`/`new_property_at`
+            // carry past their id (the dispatch loop advances 5, not the
+            // `instruction_len` id-opcode 3).
+            Opcode::XS_CODE_NEW_PROPERTY | Opcode::XS_CODE_NEW_PROPERTY_AT => 5,
+            _ => crate::opcode::instruction_len(code, pc).unwrap_or(1),
+        };
+        if step == 0 {
+            break;
+        }
+        pc += step;
+    }
+    n
 }
 
 #[inline]
@@ -1393,6 +1851,46 @@ mod tests {
         // Three dispatched opcodes: the forward branch, the backward
         // branch, and END — the index accumulated, no host was consulted.
         assert_eq!(out.dispatched, 3, "meter accumulates without checking");
+    }
+
+    #[test]
+    fn user_function_call_runs_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `(function(x){return x+1})(5)`
+        // (captured from the oracle), run oracle-free: the frame machinery
+        // (`constructor_function`/`code`/`function_environment`/`call`/
+        // `run_1`/`argument`/`end`) must produce the completion `6` and the
+        // C-XS computron count `30` — a standing lock on the definition-site
+        // allocation metering and dispatch-metered stack frames, so a
+        // regression is caught without linking C.
+        let code: [u8; 44] = [
+            0x0b, 0x00, 0x4b, 0xe0, 0x38, 0x00, 0x00, 0x2e, 0x13, 0x0b, 0x01, 0x9e, 0x01, 0x86,
+            0x01, 0x00, 0x02, 0x00, 0xe6, 0x01, 0x92, 0x5c, 0x01, 0x72, 0x01, 0x01, 0xbb, 0x44,
+            0x58, 0x92, 0x42, 0xe0, 0x89, 0x02, 0x00, 0x72, 0x04, 0x28, 0x72, 0x05, 0xab, 0x01,
+            0xbb, 0xa9,
+        ];
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "6", "the call returns x+1 with x=5");
+        assert_eq!(out.computrons, 30, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn nested_user_function_calls_run_and_meter_bit_exact() {
+        // `(function(){return (function(){return 1})()})()`, captured from
+        // the oracle: two definitions and two nested calls, completion `1`,
+        // C-XS computrons `36`.
+        let code: [u8; 51] = [
+            0x0b, 0x00, 0x4b, 0xe0, 0x38, 0x00, 0x00, 0x2e, 0x1c, 0x0b, 0x00, 0xe0, 0x38, 0x00,
+            0x00, 0x2e, 0x06, 0x0b, 0x00, 0x72, 0x01, 0xbb, 0x44, 0x58, 0x92, 0x42, 0xe0, 0x89,
+            0x01, 0x00, 0x72, 0x04, 0x28, 0xab, 0x00, 0xbb, 0x44, 0x58, 0x92, 0x42, 0xe0, 0x89,
+            0x01, 0x00, 0x72, 0x04, 0x28, 0xab, 0x00, 0xbb, 0xa9,
+        ];
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "1");
+        assert_eq!(out.computrons, 36, "bit-exact computrons vs C-XS");
     }
 
     #[test]

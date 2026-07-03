@@ -147,6 +147,21 @@ impl Meter {
         self.index += size * CHUNK_ALLOCATION_METERING;
     }
 
+    /// Meter one `fxNewChunk(size)` allocation **faithfully**: XS meters
+    /// the *adjusted* chunk size, not the requested `size`.
+    /// `fxAdjustChunkSize` (`xsMemory.c`) rounds the payload up to
+    /// `sizeof(size_t)` (8-byte) alignment and adds the `sizeof(txChunk)`
+    /// header — 16 bytes on the 64-bit oracle target
+    /// (`{ txSize size; txS4 dummy; txByte* temporary; }`). So a 5-byte
+    /// function-body chunk meters `round_up_8(5) + 16 = 24`, not 5. This is
+    /// what makes a function's computron count depend on its exact body
+    /// length in the way C-XS's does.
+    #[inline]
+    pub fn tick_chunk_new(&mut self, size: u64) {
+        let aligned = (size + 7) & !7;
+        self.index += (aligned + 16) * CHUNK_ALLOCATION_METERING;
+    }
+
     /// Accrue `n` raw 16.16-fixed-point units directly. Used for the
     /// program-frame + eval-environment setup aggregate C-XS meters
     /// during program entry (a bundle of `fxNewSlot`/`fxNewChunk`
