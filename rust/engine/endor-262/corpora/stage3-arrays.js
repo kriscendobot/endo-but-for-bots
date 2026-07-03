@@ -110,6 +110,24 @@ Array.isArray(5)
 Array.isArray("x")
 Array.isArray(Array(3))
 
+// --- array iterators (values/keys/entries + next, reused result object) ---
+var it=[1,2,3].values(); it.next().value
+var it=[1,2,3].values(); it.next(); it.next().value
+var it=[7,8].values(); it.next(); it.next().value
+[1,2,3].values().next().done
+[1,2,3].values().next().value
+var it=[5].keys(); it.next().value
+var it=[1,2].keys(); it.next(); it.next().value
+[1,2,3].keys().next().value
+var it=[1,2,3].entries(); it.next().value
+var it=[5,6].entries(); it.next(); it.next().value
+var it=[9].values(); it.next(); it.next().done
+var it=[9].values(); it.next(); it.next().value
+var it=[].values(); it.next().done
+var it=[].keys(); it.next().done
+var it=[1,2,3].keys(); it.next(); it.next(); it.next(); it.next().done
+var it=[7,8,9].values(); it.next(); it.next(); it.next().value
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

@@ -309,6 +309,33 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for the **array iterator objects**
+/// (`values`/`keys`/`entries` + `next` over the reused result object) — the
+/// bit-exact (result AND computron) explicit-iterator grammar. Builds a dense
+/// literal, opens an iterator of one of the three kinds, advances it a bounded
+/// number of `next()` calls (possibly past the end to reach `done`), and reads
+/// `.value` or `.done` off the final result. Rides the full symbol-linking
+/// differential check.
+pub fn gen_stage3_array_iterators_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let n = (b.next() % 5) as usize; // 0..=4 dense elements
+    let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
+    let lit = format!("[{}]", elems.join(","));
+    let method = ["values", "keys", "entries"][b.choice(3) as usize];
+    // 1..=(n+2) next() calls, so some runs step past the end into `done`.
+    let advances = 1 + (b.next() as usize % (n + 2));
+    let field = if b.choice(2) == 0 { "value" } else { "done" };
+    let mut s = format!("var it={}.{}();", lit, method);
+    for i in 0..advances {
+        if i + 1 < advances {
+            s.push_str(" it.next();");
+        } else {
+            s.push_str(&format!(" it.next().{}", field));
+        }
+    }
+    s
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -612,6 +639,48 @@ mod tests {
         assert!(distinct.len() > 30, "methods sweep too uniform: {} distinct", distinct.len());
         for (i, m) in methods.iter().enumerate() {
             assert!(*m, "array method {} never generated", i);
+        }
+    }
+
+    #[test]
+    fn generated_stage3_array_iterators_agree_bit_exact() {
+        // The array iterator objects (values/keys/entries + next over the
+        // reused result object) meter their fxNewIteratorInstance creation and
+        // per-next yield/element-read faithfully, so they ride the full
+        // result+computron differential. Sweep a spread of seeds so every
+        // iterator kind, a range of lengths, and both past-the-end and
+        // in-range exhaustion appear.
+        let mut checked = 0;
+        let mut kinds = [false; 3]; // values, keys, entries seen
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(11))
+                        .wrapping_add((seed as u8).wrapping_mul(4)),
+                );
+            }
+            let prog = gen_stage3_array_iterators_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains(".values(") {
+                kinds[0] = true;
+            } else if prog.contains(".keys(") {
+                kinds[1] = true;
+            } else if prog.contains(".entries(") {
+                kinds[2] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 array-iterators differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 30, "iterators sweep too uniform: {} distinct", distinct.len());
+        for (i, k) in kinds.iter().enumerate() {
+            assert!(*k, "iterator kind {} never generated", i);
         }
     }
 

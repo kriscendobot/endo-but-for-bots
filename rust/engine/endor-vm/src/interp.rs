@@ -318,6 +318,24 @@ pub const ARRAY_CTOR_BASE_METERING: u64 = 98816;
 /// argument).
 pub const ARRAY_ISARRAY_METERING: u64 = 0;
 
+/// The raw 16.16 cost of `Array.prototype.values()`/`keys()`/`entries()`
+/// beyond its dispatch: the native host frame plus `fxNewIteratorInstance`
+/// (the iterator instance + the reused `{value, done}` result object + the
+/// internal kind/iterable/index slots — a fixed cluster of `fxNewSlot`s).
+/// Calibrated against the pin `48ee02d8cfe0` via the completed-call raw-gap
+/// (isolated from `next()` by comparing one- vs two-`next()` programs).
+pub const ARRAY_ITERATOR_CREATE_METERING: u64 = 67592;
+/// The base raw 16.16 cost of `%ArrayIteratorPrototype%.next()` beyond its
+/// dispatch: the host frame, `fxCheckIteratorInstance`, and the result-object
+/// mutation (the result object is reused, so `next()` allocates nothing for
+/// kinds 0/1). A `values`/`entries` next that actually yields an element adds
+/// one array-element read ([`ARRAY_ITERATOR_ELEMENT_READ`]). Calibrated
+/// against the pin: `keys` next = 32768, `values` next = 65536.
+pub const ARRAY_ITERATOR_NEXT_METERING: u64 = 2 << 14;
+/// The extra raw 16.16 cost a `values`/`entries` `next()` accrues reading the
+/// array element it yields (`mxGetIndex`), over a `keys` next: `2 << 14`.
+pub const ARRAY_ITERATOR_ELEMENT_READ: u64 = 2 << 14;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -399,6 +417,16 @@ pub enum NativeMethod {
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
+    /// `Array.prototype.values()` / `keys()` / `entries()`
+    /// (`fx_Array_prototype_values` &co.): construct an Array Iterator over the
+    /// receiver with the given kind (0 values / 1 keys / 2 entries).
+    ArrayValues,
+    ArrayKeys,
+    ArrayEntries,
+    /// `%ArrayIteratorPrototype%.next()` (`fx_ArrayIterator_prototype_next`):
+    /// yield the next `{value, done}` (mutating and returning the iterator's
+    /// reused result object).
+    ArrayIteratorNext,
 }
 
 impl Default for FuncInfo {
@@ -424,6 +452,18 @@ impl Default for FuncInfo {
 struct ArrayData {
     length: u32,
     items: std::collections::BTreeMap<u32, Slot>,
+}
+
+/// An array iterator's state (XS's `fxNewIteratorInstance` internal slots for
+/// an Array Iterator). `kind` is 0 = values, 1 = keys, 2 = entries; `result`
+/// is the reused `{value, done}` object `next()` mutates and returns.
+#[derive(Clone, Debug)]
+struct IterState {
+    iterable: crate::value::SlotIndex,
+    index: u32,
+    kind: u8,
+    result: crate::value::SlotIndex,
+    done: bool,
 }
 
 /// An Error instance's stringification data (XS's `Error.prototype.toString`
@@ -770,6 +810,22 @@ pub struct Interp {
     /// `arr.length` get/set routes to the array length semantics. `None`
     /// when the program never references `length`.
     length_id: Option<u16>,
+    /// The realm's `%Array Iterator.prototype%` (a boot object) — the
+    /// prototype of the iterators `arr.values()`/`keys()`/`entries()` and
+    /// `arr[Symbol.iterator]()` produce. Carries `next` and a
+    /// `Symbol.iterator` returning the iterator itself.
+    array_iterator_proto: crate::value::SlotIndex,
+    /// Per-instance array-iterator state (XS's `fxNewIteratorInstance`
+    /// internal slots): the array being iterated, the next index to yield,
+    /// the iteration `kind` (0 = values, 1 = keys, 2 = entries), and the
+    /// **reused** result object (`{value, done}`) `next()` mutates and returns
+    /// — XS allocates it once at iterator creation, not per `next()`.
+    iterators: std::collections::HashMap<crate::value::SlotIndex, IterState>,
+    /// The program-local symbol ids of `value`/`done`, resolved at
+    /// [`Self::link_intrinsics`], so `next()` sets them on the result object
+    /// under the ids the program reads them by.
+    value_id: Option<u16>,
+    done_id: Option<u16>,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -896,6 +952,10 @@ impl Interp {
             array_proto: crate::value::SlotIndex::NULL,
             arrays: std::collections::HashMap::new(),
             length_id: None,
+            array_iterator_proto: crate::value::SlotIndex::NULL,
+            iterators: std::collections::HashMap::new(),
+            value_id: None,
+            done_id: None,
             jumps: Vec::new(),
         };
         interp.create_intrinsics();
@@ -974,10 +1034,20 @@ impl Interp {
             ("pop", NativeMethod::ArrayPop),
             ("indexOf", NativeMethod::ArrayIndexOf),
             ("join", NativeMethod::ArrayJoin),
+            ("values", NativeMethod::ArrayValues),
+            ("keys", NativeMethod::ArrayKeys),
+            ("entries", NativeMethod::ArrayEntries),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
         }
+        // `%Array Iterator.prototype%`: a boot object chaining to
+        // %Object.prototype%, carrying `next` (the iterators produced by
+        // `values`/`keys`/`entries` chain to it).
+        let array_iter_proto = self.slots.alloc(Slot::instance(object_proto));
+        self.array_iterator_proto = array_iter_proto;
+        let next_mf = self.alloc_method(NativeMethod::ArrayIteratorNext);
+        self.proto_methods.push((array_iter_proto, "next", next_mf));
         // `Array.isArray` — a static bound as an own property of the `Array`
         // constructor instance (not the prototype).
         if let Some(&array_ctor) = self.intrinsics.get("Array") {
@@ -1166,6 +1236,14 @@ impl Interp {
             .iter()
             .position(|n| n == "length")
             .map(|k| (k + 1) as u16);
+        let id_of = |want: &str| {
+            names
+                .iter()
+                .position(|n| n == want)
+                .map(|k| (k + 1) as u16)
+        };
+        self.value_id = id_of("value");
+        self.done_id = id_of("done");
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -3800,10 +3878,126 @@ impl Interp {
                 };
                 Slot::boolean(r)
             }
+            // `Array.prototype.values()`/`keys()`/`entries()`: build an Array
+            // Iterator over the receiver.
+            NativeMethod::ArrayValues | NativeMethod::ArrayKeys | NativeMethod::ArrayEntries => {
+                let arr = match this.value {
+                    Payload::Reference(i) if self.arrays.contains_key(&i) => i,
+                    _ => return Err(Halt::Unsupported("array-iterator:non-array")),
+                };
+                let kind = match m {
+                    NativeMethod::ArrayValues => 0u8,
+                    NativeMethod::ArrayKeys => 1u8,
+                    _ => 2u8,
+                };
+                self.make_array_iterator(arr, kind)
+            }
+            // `%ArrayIteratorPrototype%.next()`.
+            NativeMethod::ArrayIteratorNext => {
+                let iter = match this.value {
+                    Payload::Reference(i) if self.iterators.contains_key(&i) => i,
+                    _ => return Err(Halt::Unsupported("array-iterator-next:non-iterator")),
+                };
+                self.array_iterator_next(iter)?
+            }
         };
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// Build an Array Iterator over `arr` with the given `kind` (0 values, 1
+    /// keys, 2 entries): `fxNewIteratorInstance` — allocate the iterator
+    /// instance (chained to `%Array Iterator.prototype%`) and its reused
+    /// `{value, done}` result object, and record the [`IterState`]. Meters the
+    /// creation cluster ([`ARRAY_ITERATOR_CREATE_METERING`]).
+    fn make_array_iterator(&mut self, arr: crate::value::SlotIndex, kind: u8) -> Slot {
+        self.meter.tick_raw(ARRAY_ITERATOR_CREATE_METERING);
+        // The reused result object `{ value: undefined, done: false }`.
+        let result = self.slots.alloc(Slot::instance(self.object_proto));
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::undefined());
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(false));
+        }
+        let iter = self.slots.alloc(Slot::instance(self.array_iterator_proto));
+        self.iterators.insert(
+            iter,
+            IterState {
+                iterable: arr,
+                index: 0,
+                kind,
+                result,
+                done: false,
+            },
+        );
+        Slot::of(Kind::Reference, Payload::Reference(iter))
+    }
+
+    /// `fx_ArrayIterator_prototype_next`: advance the iterator, mutate its
+    /// reused result object's `value`/`done`, and return that object. Meters
+    /// [`ARRAY_ITERATOR_NEXT_METERING`]; an `entries` element allocates a fresh
+    /// `[index, value]` pair (its own array-create metering).
+    fn array_iterator_next(&mut self, iter: crate::value::SlotIndex) -> Result<Slot, Halt> {
+        let st = self.iterators[&iter].clone();
+        let result = st.result;
+        let (new_value, new_done, next_index): (Slot, bool, u32) = if st.done {
+            // An already-exhausted iterator: `next()` does the minimal work
+            // (no yield), metering only its dispatch.
+            (Slot::undefined(), true, st.index)
+        } else {
+            let length = self.arrays.get(&st.iterable).map(|a| a.length).unwrap_or(0);
+            if st.index < length {
+                // A yielding `next()`: the base result-object mutation cost,
+                // plus (for `values`/`entries`) the array-element read
+                // (`mxGetIndex`) `keys` does not do.
+                self.meter.tick_raw(ARRAY_ITERATOR_NEXT_METERING);
+                if st.kind == 0 || st.kind == 2 {
+                    self.meter.tick_raw(ARRAY_ITERATOR_ELEMENT_READ);
+                }
+                let v = match st.kind {
+                    0 => self
+                        .arrays
+                        .get(&st.iterable)
+                        .and_then(|a| a.items.get(&st.index).copied())
+                        .map(|s| Slot::of(s.kind, s.value))
+                        .unwrap_or_else(Slot::undefined),
+                    1 => Slot::integer(st.index as i32),
+                    _ => {
+                        // entries: a fresh `[index, arr[index]]` pair array.
+                        let elem = self
+                            .arrays
+                            .get(&st.iterable)
+                            .and_then(|a| a.items.get(&st.index).copied())
+                            .map(|s| Slot::of(s.kind, s.value))
+                            .unwrap_or_else(Slot::undefined);
+                        let pair = self.new_array();
+                        let a = self.arrays.get_mut(&pair).unwrap();
+                        a.length = 2;
+                        a.items.insert(0, Slot::integer(st.index as i32));
+                        a.items.insert(1, elem);
+                        self.meter.tick_raw(self.array_chunk_size_metering(2));
+                        Slot::of(Kind::Reference, Payload::Reference(pair))
+                    }
+                };
+                (v, false, st.index + 1)
+            } else {
+                (Slot::undefined(), true, st.index)
+            }
+        };
+        // Update the iterator state and the reused result object.
+        if let Some(s) = self.iterators.get_mut(&iter) {
+            s.index = next_index;
+            s.done = new_done;
+        }
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::of(new_value.kind, new_value.value));
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(new_done));
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(result)))
     }
 
     /// The array instance behind `this` **iff** it is a dense array (every
