@@ -779,6 +779,19 @@ impl Interp {
                         && !self.global_props.contains_key(&name)
                     {
                         self.materialize_global_property(name);
+                        // Creating a sloppy global through `SET_VARIABLE`
+                        // dispatches XS's setter machinery
+                        // (`mxBehaviorSetProperty` → the missing-property
+                        // define path), which meters one extra code unit
+                        // beyond the property allocation. Measured against
+                        // the pin: `y = 1` costs one create's 65536 raw more
+                        // than endor's allocation model, and N fresh
+                        // globals cost exactly N of them (an overwrite costs
+                        // none). This is the `SET_VARIABLE`-create path
+                        // only; the declared-`var` hoist at
+                        // `EVAL_ENVIRONMENT` (already bit-exact) does not
+                        // carry it.
+                        self.meter.tick_code();
                     }
                     self.resolve_set(name, value);
                     // The property store itself is one built-in step

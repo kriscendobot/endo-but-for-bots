@@ -21,6 +21,8 @@
 
 use endor_vm::{run_program, Halt, RunOutcome};
 
+pub mod test262;
+
 /// The four-valued completion agreement (design § test262 conformance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agreement {

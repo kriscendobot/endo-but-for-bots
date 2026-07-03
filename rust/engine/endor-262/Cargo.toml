@@ -10,6 +10,10 @@ publish.workspace = true
 name = "endor_262"
 path = "src/lib.rs"
 
+[[bin]]
+name = "test262-language"
+path = "src/bin/test262_language.rs"
+
 [dependencies]
 endor-vm = { path = "../endor-vm" }
 endor-oracle = { path = "../endor-oracle" }
