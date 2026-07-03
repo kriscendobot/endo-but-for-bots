@@ -788,6 +788,86 @@ pub fn gen_stage3_collections_program(data: &[u8]) -> String {
     }
 }
 
+/// A BigInt literal source token (`<decimal digits>n`), non-negative — a
+/// negative BigInt is `-` over a literal, which the grammar composes
+/// separately. Mixes single-limb values with occasional multi-limb magnitudes
+/// so the generator exercises carry/borrow across the `txU4` boundary.
+fn bigint_literal(b: &mut Bytes) -> String {
+    match b.choice(5) {
+        0 => "0n".to_string(),
+        1 => format!("{}n", b.next() as u32), // 0..=255
+        2 => format!("{}n", 4294967295u64 + b.next() as u64), // straddles 2^32
+        3 => format!("{}n", 9007199254740991u64 + b.next() as u64), // past 2^53
+        _ => format!("{}{}{}n", 1 + (b.next() % 9), b.next() % 10, b.next() % 10),
+    }
+}
+
+/// A single BigInt operand: a literal, optionally negated (`-` over the
+/// literal, XS's `fxBigInt_neg`).
+fn bigint_operand(b: &mut Bytes) -> String {
+    let lit = bigint_literal(b);
+    if b.choice(3) == 0 {
+        format!("(-{})", lit)
+    } else {
+        lit
+    }
+}
+
+/// Stage-3b (bigint) grammar: BigInt literals, the metered `+`/`-`/`*`
+/// (same-type only — a mixed BigInt/Number arithmetic op is a TypeError, so it
+/// is deliberately never generated), unary minus, strict/loose equality
+/// (including BigInt-vs-Number `==`/`!=`), both-BigInt relational order,
+/// `typeof`, and decimal rendering — every form bit-exact (result AND
+/// computron). Rides the plain [`differential_check`] (no built-in symbol
+/// references appear). Composes an accumulation chain so the digit-step and
+/// allocation metering ride the hot path.
+pub fn gen_stage3_bigint_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    match b.choice(6) {
+        // typeof over a (possibly negated) literal.
+        0 => format!("typeof {}", bigint_operand(&mut b)),
+        // A binary arithmetic op between two BigInt operands (same type).
+        1 => {
+            let op = small_op(&mut b);
+            format!("{} {} {}", bigint_operand(&mut b), op, bigint_operand(&mut b))
+        }
+        // Strict/loose equality or relational between two BigInt operands.
+        2 => {
+            let cmp = ["===", "!==", "<", ">", "<=", ">="][b.choice(6) as usize];
+            format!("{} {} {}", bigint_operand(&mut b), cmp, bigint_operand(&mut b))
+        }
+        // Loose equality of a BigInt with a Number (fxNumberToBigInt path).
+        3 => {
+            let cmp = if b.choice(2) == 0 { "==" } else { "!=" };
+            format!("{} {} {}", bigint_operand(&mut b), cmp, b.next() % 20)
+        }
+        // A three-operand arithmetic chain (carry/borrow/product hot path).
+        4 => {
+            let (o1, o2) = (small_op(&mut b), small_op(&mut b));
+            format!(
+                "{} {} {} {} {}",
+                bigint_operand(&mut b),
+                o1,
+                bigint_operand(&mut b),
+                o2,
+                bigint_operand(&mut b)
+            )
+        }
+        // A var accumulation loop-body unrolled: repeated compound updates.
+        _ => {
+            let seed = bigint_literal(&mut b);
+            let steps = 1 + (b.next() % 4);
+            let mut s = format!("var x={};", seed);
+            for _ in 0..steps {
+                let op = small_op(&mut b);
+                s.push_str(&format!(" x = x {} {};", op, bigint_operand(&mut b)));
+            }
+            s.push_str(" x");
+            s
+        }
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -1365,6 +1445,48 @@ mod tests {
         for (i, k) in kinds.iter().enumerate() {
             assert!(*k, "collections kind {} never generated", i);
         }
+    }
+
+    #[test]
+    fn generated_stage3_bigint_programs_agree_bit_exact() {
+        // The stage-3b BigInt grammar — literals, `+`/`-`/`*` (same-type),
+        // unary minus, strict/loose equality (including BigInt-vs-Number),
+        // relational order, typeof, and decimal rendering — bit-exact (result
+        // AND computron) vs C-XS. Sweep a spread of seeds so every arm and a
+        // range of operand magnitudes (single- and multi-limb) are reached.
+        let mut checked = 0;
+        let mut saw_typeof = false;
+        let mut saw_neg = false;
+        let mut saw_mul = false;
+        let mut saw_cmp = false;
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(29))
+                        .wrapping_add((seed as u8).wrapping_mul(4)),
+                );
+            }
+            let prog = gen_stage3_bigint_program(&buf);
+            distinct.insert(prog.clone());
+            saw_typeof |= prog.contains("typeof");
+            saw_neg |= prog.contains("(-");
+            saw_mul |= prog.contains('*');
+            saw_cmp |= prog.contains("===") || prog.contains('<') || prog.contains('>');
+            match differential_check(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3b bigint differential divergence on {:?}: {:?}", prog, d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 40, "bigint sweep too uniform: {} distinct", distinct.len());
+        assert!(saw_typeof, "typeof arm never generated");
+        assert!(saw_neg, "negation never generated");
+        assert!(saw_mul, "multiplication never generated");
+        assert!(saw_cmp, "comparison never generated");
     }
 
     #[test]

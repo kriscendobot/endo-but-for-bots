@@ -333,6 +333,19 @@ pub fn stage3_collections_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-collections.js"))
 }
 
+/// The stage-3b (bigint) curated corpus: the BigInt primitive per the pin —
+/// literals, the metered `+`/`-`/`*` (digit step over the trimmed result size
+/// plus the allocation-faithful result chunk at XS's pre-trim `fxBigInt_alloc`
+/// size), unary minus, strict/loose equality (including BigInt-vs-Number via
+/// `fxNumberToBigInt`), relational order, `typeof "bigint"`, and decimal
+/// completion rendering — bit-exact (completion value AND computron count)
+/// against the C-XS oracle. The BigInt arithmetic is `mxMeter`-driven at the
+/// digit-step granularity and otherwise allocation-driven, so the computrons
+/// track the exact `fxNewChunk` sequence.
+pub fn stage3_bigint_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3-bigint.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -934,6 +947,38 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3 collections bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3_bigint_corpus_is_bit_exact_against_oracle() {
+        // The stage-3b bigint acceptance bar: every BigInt program — literals,
+        // arithmetic (+/-/*), unary minus, strict/loose equality (including
+        // BigInt-vs-Number), relational order, typeof, and decimal rendering —
+        // agrees with C-XS on BOTH the completion value AND the computron
+        // count. The arithmetic digit step is `mxBigInt_meter`-driven over the
+        // trimmed result size; the result chunk is metered at XS's pre-trim
+        // `fxBigInt_alloc` size (add max+1, sub max, mul a+b limbs), so the
+        // computrons agree bit-exactly.
+        let programs = stage3_bigint_corpus();
+        assert!(!programs.is_empty(), "stage-3b bigint corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3b bigint bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
