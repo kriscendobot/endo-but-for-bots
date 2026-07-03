@@ -199,6 +199,14 @@ pub const IN_METERING: u64 = (1 << 16) + (1 << 14);
 /// as a further `2 × XS_CODE_METERING`, independent of chain depth or result.
 pub const INSTANCEOF_OBJECT_METERING: u64 = 2 << 16;
 
+/// The raw 16.16 cost a primitive-wrapper constructor (`new Boolean`/
+/// `new Number`/`new String`) accrues over the native `Object` constructor's
+/// empty-object cost: the internal `[[XxxData]]` slot plus the wrap step.
+/// Measured against the pin `48ee02d8cfe0` as the raw gap between
+/// `new Boolean()` and `new Object()` = `(1<<16) + 256` (65792). Accrued in
+/// [`Interp::build_wrapper`].
+pub const WRAPPER_CONSTRUCT_EXTRA: u64 = (1 << 16) + 256;
+
 /// The raw 16.16 cost an Error constructor accrues over the native `Object`
 /// constructor's empty-object cost: the extra internal slots and steps an
 /// error instance carries (`fx_Error`/`fxNewErrorInstance` — the stack-trace
@@ -543,6 +551,12 @@ pub struct Interp {
     /// exact abort value without a symbol-id lookup, graduating abort-value
     /// parity from primitive throws to real Error objects.
     error_data: std::collections::HashMap<crate::value::SlotIndex, ErrorInfo>,
+    /// Per-instance primitive-wrapper data (`new Boolean`/`Number`/`String`),
+    /// keyed by the wrapper instance's slot: the wrapped primitive slot
+    /// (XS's `[[BooleanData]]`/`[[NumberData]]`/`[[StringData]]`). A wrapper's
+    /// completion/`String()` stringifies as its wrapped primitive, so
+    /// [`Self::render`] reads it here.
+    wrapper_data: std::collections::HashMap<crate::value::SlotIndex, Slot>,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -658,6 +672,7 @@ impl Interp {
             ctor_prototype: std::collections::HashMap::new(),
             symbol_ids: std::collections::HashMap::new(),
             error_data: std::collections::HashMap::new(),
+            wrapper_data: std::collections::HashMap::new(),
             jumps: Vec::new(),
         };
         interp.create_intrinsics();
@@ -966,6 +981,10 @@ impl Interp {
                         Some(m) if !m.is_empty() => format!("{}: {}", info.name, m),
                         _ => info.name.to_string(),
                     }
+                } else if let Some(prim) = self.wrapper_data.get(&r).copied() {
+                    // A primitive wrapper (`new Boolean`/`Number`/`String`)
+                    // stringifies as its wrapped primitive value.
+                    self.render(&prim)
                 } else if let Some(n) = self.native_of(r) {
                     // A native (intrinsic) function stringifies through
                     // `Function.prototype.toString` as a host function
@@ -2595,6 +2614,61 @@ impl Interp {
                 let v = arg(0);
                 Slot::boolean(self.truthy(&v))
             }
+            // `new Boolean(v)` — the wrapper object (`[[BooleanData]]`).
+            Native::Boolean => {
+                let v = arg(0);
+                let prim = Slot::boolean(self.truthy(&v));
+                self.build_wrapper(Native::Boolean, prim)
+            }
+            // `Number(v)` / `new Number(v)`: the primitive number is
+            // ToNumber(v). endor handles the numeric fast path (identity) and
+            // the primitive `boolean`/`null`/`undefined` coercions — all
+            // metering-neutral; a string needs the number parser (a later
+            // increment) and self-names. `new` wraps the primitive.
+            Native::Number => {
+                let a = arg(0);
+                let prim = match a.kind {
+                    Kind::Integer | Kind::Number => a,
+                    Kind::Boolean | Kind::Null | Kind::Undefined if argc >= 1 => {
+                        Slot::number(to_number(&a))
+                    }
+                    _ if argc == 0 => Slot::integer(0),
+                    _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
+                };
+                if has_target {
+                    self.build_wrapper(Native::Number, prim)
+                } else {
+                    prim
+                }
+            }
+            // `String(v)` / `new String(v)`: the primitive string is
+            // ToString(v). A string argument is identity (metering-neutral);
+            // the general ToString of other kinds is metered via
+            // `to_string_bytes_metered`. `new` wraps the primitive.
+            Native::String => {
+                let prim = if argc == 0 {
+                    let off = self.chunks.alloc(b"");
+                    Slot::of(Kind::String, Payload::String(off))
+                } else {
+                    let a = arg(0);
+                    match a.kind {
+                        Kind::String => a,
+                        Kind::Reference => {
+                            return Err(Halt::Unsupported(native_unsupported_name(native)))
+                        }
+                        _ => {
+                            let bytes = self.to_string_bytes_metered(a);
+                            let off = self.chunks.alloc(&bytes);
+                            Slot::of(Kind::String, Payload::String(off))
+                        }
+                    }
+                };
+                if has_target {
+                    self.build_wrapper(Native::String, prim)
+                } else {
+                    prim
+                }
+            }
             // `Object([value])` / `new Object([value])` (`fx_Object`): with no
             // argument (or `undefined`/`null`), create a fresh empty ordinary
             // object; with an object argument, return it unchanged (ToObject
@@ -2702,6 +2776,22 @@ impl Interp {
             let off = self.chunks.alloc(text.as_bytes());
             self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
         }
+        Slot::of(Kind::Reference, Payload::Reference(inst))
+    }
+
+    /// Build a primitive-wrapper object (`new Boolean`/`Number`/`String`)
+    /// around the already-computed primitive `prim`. Meters the native
+    /// `Object` empty-object cost plus [`WRAPPER_CONSTRUCT_EXTRA`], chains the
+    /// wrapper to the constructor's `%X.prototype%` (so it is `instanceof X`),
+    /// and records the wrapped primitive so it stringifies as the primitive.
+    fn build_wrapper(&mut self, native: Native, prim: Slot) -> Slot {
+        self.meter.tick_builtin();
+        let inst = self.new_object();
+        self.meter.tick_raw(WRAPPER_CONSTRUCT_EXTRA);
+        if let Some(proto) = self.intrinsics.get(native.display_name()).and_then(|&c| self.prototype_of(c)) {
+            self.slots.get_mut(inst).value = Payload::Reference(proto);
+        }
+        self.wrapper_data.insert(inst, prim);
         Slot::of(Kind::Reference, Payload::Reference(inst))
     }
 

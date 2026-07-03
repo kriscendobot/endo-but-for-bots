@@ -140,3 +140,21 @@ function C2(){}; function D2(){}; (new C2()) instanceof D2
 'b' in {a:1, b:2}
 var oi = {x:1}; 'x' in oi
 var oj = {a:1, b:2, c:3}; 'c' in oj
+
+// Primitive wrapper construction (new Boolean/Number/String) — the wrapper
+// stringifies as its wrapped primitive; and the Number/String call forms.
+new Boolean(1)
+new Boolean(0)
+new Boolean()
+new Number(5)
+new Number()
+new Number(3.5)
+new String('x')
+new String()
+typeof new Boolean(1)
+(new Boolean(1)) instanceof Boolean
+(new Number(5)) instanceof Number
+Number(5)
+Number(true)
+Number(null)
+String('hi')
