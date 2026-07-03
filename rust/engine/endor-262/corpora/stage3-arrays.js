@@ -60,6 +60,15 @@ var a=[1,2,3]; a.length=0; a.length
 var a=[1,2,3]; a.length=5; a.length
 var a=[1,2,3]; a.length=5; a
 
+// --- length set that does not resize (isolates the create-vs-set cost the
+//     fuzz arm exposed: a second length store meters nothing beyond dispatch) ---
+var a=[]; a.length=0; a
+var a=[]; a.length=0; a.length
+var a=[1,2]; a.length=2; a
+var a=[1,2,3]; a.length=3; a
+var a=[4]; a[3]=5; a.length
+var a=[4]; a[3]=5; a
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

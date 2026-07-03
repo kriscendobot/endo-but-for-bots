@@ -219,6 +219,62 @@ fn gen_exception_program(b: &mut Bytes) -> String {
     }
 }
 
+/// Structure-aware generator for the **stage-3 arrays surface**: the array
+/// exotic object's grammar that is **bit-exact** (result AND computron) —
+/// array literals (with holes), computed index get/set over the item chunk,
+/// and the `length` accessor get/set. Deliberately excludes the honest-skip
+/// cases (integer-indexed *ordinary* objects, runtime-minted string keys,
+/// the iteration protocol, and `Array.prototype` methods), so every program
+/// it emits rides the full [`differential_check`]. Values stay in the small
+/// non-negative integer domain so element `String()` renderings are
+/// unambiguous, and indices stay small so the item chunk grows a bounded
+/// amount.
+pub fn gen_stage3_arrays_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    // A small array literal (1..=4 elements) of small ints, optionally with
+    // one hole, rendered as its source text.
+    let n = 1 + (b.next() % 4) as usize; // 1..=4 elements
+    let hole_at = if b.choice(2) == 0 { Some((b.next() % n as u8) as usize) } else { None };
+    let mut elems: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        if Some(i) == hole_at {
+            elems.push(String::new()); // an elision → a hole
+        } else {
+            elems.push(small_int(&mut b).to_string());
+        }
+    }
+    let lit = format!("[{}]", elems.join(","));
+    match b.choice(6) {
+        // The literal itself (Array.prototype.toString → join(",")).
+        0 => lit,
+        // An indexed read (in range or one past the end → undefined).
+        1 => {
+            let i = (b.next() as usize) % (n + 1);
+            format!("var a={}; a[{}]", lit, i)
+        }
+        // An indexed overwrite, then read it back.
+        2 => {
+            let i = (b.next() as usize) % n;
+            let v = small_int(&mut b);
+            format!("var a={}; a[{}]={}; a[{}]", lit, i, v, i)
+        }
+        // A grow-past-the-end write, then observe the new length.
+        3 => {
+            let k = n + 1 + (b.next() % 3) as usize;
+            let v = small_int(&mut b);
+            format!("var a={}; a[{}]={}; a.length", lit, k, v)
+        }
+        // A `length` read.
+        4 => format!("var a={}; a.length", lit),
+        // A `length` store (grow with holes, or shrink dropping items), then
+        // the resulting array joined.
+        _ => {
+            let m = (b.next() % (n as u8 + 3)) as usize;
+            format!("var a={}; a.length={}; a", lit, m)
+        }
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -267,6 +323,51 @@ pub fn differential_check(source: &str) -> Result<(), Divergence> {
         return Ok(());
     }
 
+    if oracle.completed != endor.completed {
+        return Err(Divergence {
+            source: source.to_string(),
+            detail: format!(
+                "completion: oracle={} endor={} (halt {:?})",
+                oracle.completed, endor.completed, endor.halt
+            ),
+        });
+    }
+    if oracle.completed {
+        if oracle.result != endor.result {
+            return Err(Divergence {
+                source: source.to_string(),
+                detail: format!("result: oracle={:?} endor={:?}", oracle.result, endor.result),
+            });
+        }
+        if oracle.computrons != endor.computrons {
+            return Err(Divergence {
+                source: source.to_string(),
+                detail: format!(
+                    "computrons: oracle={} endor={}",
+                    oracle.computrons, endor.computrons
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Differential check that **links the program's symbol table** before
+/// running on endor (`run_program_with_symbols`), the full result+computron
+/// comparison. Required for any grammar whose bytecode references a named
+/// property or intrinsic the engine must recognize by name — the stage-3
+/// arrays surface needs it so `length` routes to the array length semantics
+/// (a bare [`differential_check`] runs without symbols, where `arr.length`
+/// would be read as an ordinary numeric-id property and diverge).
+pub fn differential_check_with_symbols(source: &str) -> Result<(), Divergence> {
+    let oracle = match endor_oracle::run(source) {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let endor = endor_vm::run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
+    if let endor_vm::Halt::Unsupported(_) = endor.halt {
+        return Ok(());
+    }
     if oracle.completed != endor.completed {
         return Err(Divergence {
             source: source.to_string(),
@@ -383,6 +484,60 @@ mod tests {
             }
         }
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn generated_stage3_arrays_programs_agree_bit_exact() {
+        // The stage-3 arrays generator's literals, indexed get/set, grow, and
+        // length get/set programs must ALL agree with C-XS bit-for-bit
+        // (result AND computron): the array item chunk's allocation metering
+        // and the length accessor are modeled faithfully, so they ride the
+        // full `differential_check`. Sweep a spread of seeds so every branch
+        // of the grammar (all six shapes) and the hole/no-hole literal split
+        // are exercised.
+        let mut checked = 0;
+        let mut features = [false; 4]; // literal-only, indexed read, a write, a length op
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            // Widen the byte budget so the generator's later `choice`/`next`
+            // reads are never starved (a short buffer biases the shape).
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(7))
+                        .wrapping_add((seed as u8).wrapping_mul(3)),
+                );
+            }
+            let prog = gen_stage3_arrays_program(&buf);
+            distinct.insert(prog.clone());
+            if !prog.starts_with("var a=") {
+                features[0] = true; // a bare literal
+            }
+            if prog.contains("]=") {
+                features[2] = true; // an element write
+            } else if prog.contains('[') && prog.starts_with("var a=") {
+                features[1] = true; // an indexed read
+            }
+            if prog.contains("length") {
+                features[3] = true; // a length get/set
+            }
+            // Arrays need the symbol table linked so `length` routes to the
+            // array length semantics.
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 arrays differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        // The sweep must be real, varied coverage: a spread of distinct
+        // programs, and every top-level grammar feature exercised at least
+        // once.
+        assert!(distinct.len() > 30, "arrays sweep too uniform: {} distinct", distinct.len());
+        for (i, f) in features.iter().enumerate() {
+            assert!(*f, "arrays grammar feature {} never generated", i);
+        }
     }
 
     #[test]

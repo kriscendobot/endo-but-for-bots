@@ -243,26 +243,31 @@ pub const ERROR_CONSTRUCT_EXTRA: u64 = (1 << 16) + 768;
 pub const ERROR_MESSAGE_METERING: u64 = 280;
 
 /// The raw 16.16 cost the `XS_CODE_ARRAY` opcode accrues beyond its own
-/// dispatch: `fxNewArray(the, 0)` runs `fxNewArrayInstance`, which is
-/// `fxNewObjectInstance` (one instance `fxNewSlot`) plus one internal
-/// `XS_ARRAY_KIND` behavior slot (`fxNewSlot`) — two slot allocations,
-/// `2 × XS_SLOT_ALLOCATION_METERING` = 512 raw. `fxSetIndexSize(0)` and
-/// `fxIndexArray` allocate nothing for the empty array. Accrued in
-/// [`Interp::new_array`]; verified against the pin `48ee02d8cfe0`.
-pub const ARRAY_CREATE_METERING: u64 = 512;
+/// dispatch: `fxNewArray(the, 0)` runs `fxNewArrayInstance`
+/// (`fxNewObjectInstance` — one instance `fxNewSlot` — plus one internal
+/// `XS_ARRAY_KIND` behavior slot `fxNewSlot`: `2 × XS_SLOT_ALLOCATION_METERING`
+/// = 512), plus one built-in step (`XS_BUILTIN_METERING` = 1<<14 = 16384) the
+/// array-instance construction runs (`fxNewArrayInstance`/`fxIndexArray`) —
+/// 16896 raw total. Isolated against the pin `48ee02d8cfe0` via a *second*
+/// `arr.length = N` store (which the fuzz arm generated): the length
+/// accessor-setter itself meters **nothing** beyond dispatch when it does not
+/// resize the chunk ([`ARRAY_LENGTH_SET_METERING`] = 0), so the fixed
+/// per-array constant that made array *literals* bit-exact belongs to the
+/// `ARRAY` create, not to the literal's length prelude. Accrued in
+/// [`Interp::new_array`].
+pub const ARRAY_CREATE_METERING: u64 = 512 + (1 << 14);
 
 /// The raw 16.16 cost of an `arr.length = N` store that does **not** resize
-/// the item chunk (the array-literal length prelude sets the length before
-/// any element exists, so `fxSetArrayLength` allocates nothing). The store
-/// routes through the length accessor setter (`mxBehaviorSetProperty` returns
-/// `&mxArrayLengthAccessor`, whose `fxArrayLengthSetter` runs); measured
-/// against the pin `48ee02d8cfe0` as exactly **one built-in step**
-/// (`XS_BUILTIN_METERING`, `1 << 14` = 16384), constant in `N`. Accrued in
-/// the `SET_PROPERTY`/`SET_PROPERTY_AT` length path. (A length store that
-/// *shrinks* an array with a live item chunk additionally reallocs the chunk;
-/// that chunk metering is a later increment — the covered corpus shrinks only
-/// hole/short arrays whose chunk is unaffected.)
-pub const ARRAY_LENGTH_SET_METERING: u64 = 1 << 14;
+/// the item chunk (setting the length of an array with no live item chunk, or
+/// to a value the chunk already spans). Measured against the pin
+/// `48ee02d8cfe0` — isolated by a *second* `arr.length = N` store the fuzz arm
+/// generated — as **zero** beyond the store's own dispatch: the fixed
+/// per-array constant that makes literals bit-exact is the `ARRAY` create's
+/// build step ([`ARRAY_CREATE_METERING`]), not the length set. (A length
+/// store that *shrinks* an array with a live item chunk additionally reallocs
+/// the chunk; that chunk metering is a later increment — the covered corpus
+/// shrinks only hole/short arrays whose chunk is unaffected.)
+pub const ARRAY_LENGTH_SET_METERING: u64 = 0;
 
 /// The raw 16.16 cost of an `arr.length` read beyond its own dispatch.
 /// Measured against the pin `48ee02d8cfe0` as **zero**: the length accessor
