@@ -61,6 +61,33 @@ use crate::value::{number_to_ecma_string, to_int32, ChunkArena, Kind, Payload, S
 /// dispatch does, so caught exceptions are bit-exact without it.
 pub const THROW_HOST_ESCAPE_METERING: u64 = 1 << 15;
 
+/// XS's value stack is a fixed array of `stackCount` slots
+/// (`endor-oracle/csrc/endor_shim.c` and the endo `DEFAULT_CREATION`:
+/// **4096**), holding the value stack, every call frame's
+/// result/function/this/frame slots, its arguments, and its scope in one
+/// downward-growing region. XS's geometry is **width, not depth**: a
+/// program overflows when the *total* concurrent slot count crosses the
+/// bottom, so both deep recursion and a single very wide frame exhaust the
+/// same fixed budget. Exhaustion aborts with
+/// `XS_JAVASCRIPT_STACK_OVERFLOW_EXIT` (`fxOverflow` → `fxAbort`), an
+/// abort to the host rather than a catchable `RangeError`. endor models
+/// the same fixed geometry so a stack-exhausting program aborts on both
+/// engines instead of endor's unbounded `Vec` completing where C-XS
+/// overflows.
+pub const STACK_SLOT_COUNT: usize = 4096;
+/// XS reserves a fixed band at the top of the stack for the machine roots
+/// (`mxGlobal`/`mxException`/`mxProgram`/… — the `*StackIndex` slots in
+/// `xsAll.h`) plus the frame scratch `fxOverflow` guards against; the
+/// usable value region is below them. Held as a small reserve so endor's
+/// overflow point brackets C-XS's rather than overrunning it.
+pub const STACK_SLOT_RESERVED: usize = 32;
+/// The per-call fixed frame footprint XS keeps live on the stack for the
+/// duration of a call: the `result`/`function`/`this`/`frame` quartet
+/// (XS's `mxFrameResult`/`mxFrameFunction`/`mxFrameThis` at fixed offsets
+/// around the frame slot). Arguments and scope slots are counted
+/// separately.
+pub const FRAME_OVERHEAD_SLOTS: usize = 4;
+
 /// The fixed cost, in computrons, of the top-level program invocation
 /// that precedes the captured program bytecode. C-XS dispatches the
 /// program-as-function through its call machinery before the first
@@ -190,6 +217,13 @@ pub enum Halt {
     /// A JS-level throw (only the shapes stage 1 models, e.g. an
     /// explicit `throw`); carries a best-effort string.
     Throw(String),
+    /// The value stack was exhausted (XS's `fxOverflow` →
+    /// `fxAbort(XS_JAVASCRIPT_STACK_OVERFLOW_EXIT)`): a fixed-geometry
+    /// stack overflow. Like XS's, this is an **abort to the host**, not a
+    /// catchable `RangeError` — a deterministic, consensus-relevant limit
+    /// in the xsnap lineage. Carries the slot count over the limit for
+    /// diagnostics.
+    StackOverflow(usize),
 }
 
 /// The result of running one program's bytecode on endor-vm.
@@ -320,6 +354,13 @@ pub struct Interp {
     /// (binding the catch parameter) and clears it back to `undefined`;
     /// `RETHROW` re-unwinds with it. Default `undefined`.
     exception: Slot,
+    /// Running total of slots held by the **suspended** call frames (the
+    /// `call_stack` activations): each contributes its
+    /// [`FRAME_OVERHEAD_SLOTS`] plus its saved argument and scope slots.
+    /// Combined with the active frame's live slots
+    /// ([`Self::live_stack_slots`]), this mirrors XS's `stackTop - stack`
+    /// so the stack-overflow abort fires at the same fixed-geometry budget.
+    frame_slots: usize,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -399,8 +440,37 @@ impl Interp {
             this_val: Slot::undefined(),
             cur_func: crate::value::SlotIndex::NULL,
             exception: Slot::undefined(),
+            frame_slots: 0,
             jumps: Vec::new(),
         }
+    }
+
+    /// The slots the *active* frame holds live: the shared value stack, the
+    /// current scope, the current arguments, and the frame quartet. Added
+    /// to [`Self::frame_slots`] (the suspended frames) it mirrors XS's
+    /// `stackTop - stack` closely enough that the overflow abort brackets
+    /// C-XS's — over-counting slightly (the value stack still carries the
+    /// pre-truncation frame region at a call site) rather than under, so
+    /// endor never *completes* a program C-XS overflows on.
+    #[inline]
+    fn live_stack_slots(&self) -> usize {
+        self.stack.len() + self.locals.len() + self.args.len() + FRAME_OVERHEAD_SLOTS
+    }
+
+    /// Total concurrent slot usage across the active and suspended frames
+    /// (XS's `stackTop - stack`). The stack-overflow guard compares this
+    /// against the fixed budget.
+    #[inline]
+    fn stack_slots_in_use(&self) -> usize {
+        self.frame_slots + self.live_stack_slots()
+    }
+
+    /// Whether allocating `extra` more slots would exhaust the fixed value
+    /// stack (XS's `fxOverflow`: `stack + count < stackBottom`). The usable
+    /// budget is [`STACK_SLOT_COUNT`] minus the reserved root band.
+    #[inline]
+    fn would_overflow(&self, extra: usize) -> bool {
+        self.stack_slots_in_use() + extra > STACK_SLOT_COUNT - STACK_SLOT_RESERVED
     }
 
     /// Seed a global binding by id, so a program that reads an
@@ -623,6 +693,7 @@ impl Interp {
                     // stack-based `run` set it up, dispatch-only) does not.
                     if self.call_stack.is_empty() {
                         self.tick_program_overhead();
+                        self.bind_program_this();
                     } else {
                         self.bind_this_sloppy();
                     }
@@ -635,6 +706,10 @@ impl Interp {
                     self.strict = true;
                     if self.call_stack.is_empty() {
                         self.tick_program_overhead();
+                        // A top-level *script* frame's `this` is the realm
+                        // global in strict mode too (only an ES module's is
+                        // `undefined`, and modules are structurally skipped).
+                        self.bind_program_this();
                     }
                     pc += size as usize;
                 }
@@ -1210,6 +1285,111 @@ impl Interp {
                     pc += size as usize;
                 }
 
+                // ---- stage-3 language opcodes -----------------------
+                // `global` (XS_CODE_GLOBAL, xsRun.c:2733): push a
+                // reference to the realm's global object. Dispatch-metered
+                // (no allocation).
+                XS_CODE_GLOBAL => {
+                    let g = self.global_obj;
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(g)));
+                    pc += size as usize;
+                }
+                // `this` (XS_CODE_THIS, xsRun.c:1334): push the frame's
+                // `this` (`*mxFrameThis`). Bound to the realm global for a
+                // top-level script frame (set at program entry) and for a
+                // sloppy function call; dispatch-metered.
+                XS_CODE_THIS => {
+                    let t = self.this_val;
+                    self.push(t);
+                    pc += size as usize;
+                }
+                // `current` (XS_CODE_CURRENT, xsRun.c:1308): push the
+                // running function (`*mxFrameFunction`). Defined only inside
+                // a user-function frame; at program level there is no user
+                // function instance to name, so it self-names unsupported
+                // rather than pushing a bogus value.
+                XS_CODE_CURRENT => {
+                    if self.cur_func.is_null() {
+                        return Halt::Unsupported(op.name());
+                    }
+                    let f = self.cur_func;
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
+                    pc += size as usize;
+                }
+                // `to_numeric` (XS_CODE_TO_NUMERIC, xsRun.c:3358): coerce
+                // the stack top to a numeric. An int/number is already
+                // numeric (a no-op, exactly as C-XS); boolean/null/undefined
+                // coerce with `ToNumber` (no metering — `fxToNumber` on a
+                // primitive allocates nothing); a string/reference/bigint
+                // needs the ToPrimitive/BigInt path outside the covered
+                // primitive subset, so it self-names unsupported.
+                XS_CODE_TO_NUMERIC => {
+                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
+                    match top.kind {
+                        Kind::Integer | Kind::Number => {}
+                        Kind::Boolean | Kind::Null | Kind::Undefined => {
+                            if let Some(s) = self.stack.last_mut() {
+                                *s = Slot::number(to_number(&top));
+                            }
+                        }
+                        _ => return Halt::Unsupported(op.name()),
+                    }
+                    pc += size as usize;
+                }
+                // `increment`/`decrement` (XS_CODE_INCREMENT/DECREMENT,
+                // xsRun.c:3391/3366): ±1 on the numeric stack top, with XS's
+                // exact int-boundary promotion to number (INT_MAX for
+                // increment, -(INT_MAX) for decrement). A non-numeric top
+                // needs ToNumeric (unsupported here); the compiler emits a
+                // preceding `to_numeric`, so the top is numeric in the
+                // covered grammar.
+                XS_CODE_INCREMENT | XS_CODE_DECREMENT => {
+                    let inc = op == XS_CODE_INCREMENT;
+                    let top = match self.stack.last_mut() {
+                        Some(s) => s,
+                        None => return Halt::Unsupported(op.name()),
+                    };
+                    match (top.kind, top.value) {
+                        (Kind::Integer, Payload::Integer(v)) => {
+                            let boundary = if inc { i32::MAX } else { -i32::MAX };
+                            if v != boundary {
+                                top.value = Payload::Integer(if inc { v + 1 } else { v - 1 });
+                            } else {
+                                top.kind = Kind::Number;
+                                top.value =
+                                    Payload::Number(if inc { v as f64 + 1.0 } else { v as f64 - 1.0 });
+                            }
+                        }
+                        (Kind::Number, Payload::Number(n)) => {
+                            top.value = Payload::Number(if inc { n + 1.0 } else { n - 1.0 });
+                        }
+                        _ => return Halt::Unsupported(op.name()),
+                    }
+                    pc += size as usize;
+                }
+                // `exponentiation` (XS_CODE_EXPONENTIATION, xsRun.c:3574):
+                // `a ** b` → `fx_pow(a, b)` as a number. Numeric operands
+                // only (int/number × int/number, XS's fast path); a
+                // non-numeric operand needs the ToNumeric/BigInt general
+                // path, so it self-names unsupported without disturbing the
+                // operands.
+                XS_CODE_EXPONENTIATION => {
+                    let n = self.stack.len();
+                    if n < 2 {
+                        return Halt::Unsupported(op.name());
+                    }
+                    let a = numeric_of(&self.stack[n - 2]);
+                    let b = numeric_of(&self.stack[n - 1]);
+                    match (a, b) {
+                        (Some(x), Some(y)) => {
+                            self.stack.truncate(n - 2);
+                            self.push(Slot::number(fx_pow(x, y)));
+                        }
+                        _ => return Halt::Unsupported(op.name()),
+                    }
+                    pc += size as usize;
+                }
+
                 // ---- stack ------------------------------------------
                 XS_CODE_DUB => {
                     let top = self.stack.last().copied().unwrap_or_else(Slot::undefined);
@@ -1556,8 +1736,29 @@ impl Interp {
         };
         let body_start = self.functions[&func].body_start;
         let this_val = self.stack[base];
+        // Stack-overflow guard (XS's `fxOverflow` on the callee's frame
+        // allocation): entering this call suspends the caller (its frame
+        // quartet, args, and scope stay live) and opens a fresh callee
+        // frame. If the resulting concurrent slot count would cross the
+        // fixed budget, abort to the host exactly as C-XS does — this is
+        // what makes unbounded recursion overflow on endor too, rather than
+        // completing where C-XS aborts.
+        let caller_footprint =
+            FRAME_OVERHEAD_SLOTS + self.args.len() + self.locals.len();
+        // After truncating the frame region the callee holds `argc` args
+        // plus its (not-yet-allocated) scope and quartet.
+        let prospective = self.frame_slots
+            + caller_footprint
+            + (self.stack.len() - (argc + 4))
+            + FRAME_OVERHEAD_SLOTS
+            + argc;
+        if prospective > STACK_SLOT_COUNT - STACK_SLOT_RESERVED {
+            return Err(Halt::StackOverflow(prospective));
+        }
         // Unwind the frame region (THIS..last arg).
         self.stack.truncate(base);
+        // The caller's frame is now suspended: account its live slots.
+        self.frame_slots += caller_footprint;
         // Save the caller's activation and install the callee's.
         self.call_stack.push(CallerState {
             locals: std::mem::take(&mut self.locals),
@@ -1587,6 +1788,11 @@ impl Interp {
             .call_stack
             .pop()
             .expect("leave_call with empty call stack");
+        // The suspended caller is resumed: release its accounted frame
+        // slots (the inverse of the `enter_call` accrual).
+        self.frame_slots = self
+            .frame_slots
+            .saturating_sub(FRAME_OVERHEAD_SLOTS + caller.args.len() + caller.locals.len());
         self.locals = caller.locals;
         self.id_map = caller.id_map;
         self.result = caller.result;
@@ -1740,6 +1946,16 @@ impl Interp {
     /// in a sloppy function frame binds to the realm global. Recorded for
     /// the `this`/method semantics that observe it; the covered call
     /// grammar (plain calls) passes `undefined`.
+    /// A top-level script program's `this` binding: the realm global
+    /// object (`fxRunProgram` binds the program frame's `this` to the
+    /// realm global for a script; only an ES module binds `undefined`, and
+    /// modules are structurally skipped). Set once at program entry so a
+    /// top-level `this` opcode observes the global rather than the default
+    /// `undefined`.
+    fn bind_program_this(&mut self) {
+        self.this_val = Slot::of(Kind::Reference, Payload::Reference(self.global_obj));
+    }
+
     fn bind_this_sloppy(&mut self) {
         if matches!(self.this_val.kind, Kind::Undefined | Kind::Null) {
             self.this_val = Slot::of(
@@ -2160,7 +2376,35 @@ fn strict_equals(a: &Slot, b: &Slot) -> bool {
         (Payload::Number(x), Payload::Number(y)) => x == y, // NaN handled by IEEE
         (Payload::Integer(x), Payload::Number(y)) => (x as f64) == y,
         (Payload::Number(x), Payload::Integer(y)) => x == (y as f64),
+        // Reference identity: two references are `===` iff they name the
+        // same arena instance (XS compares `value.reference` pointers).
+        (Payload::Reference(x), Payload::Reference(y)) => x == y,
         _ => false,
+    }
+}
+
+/// `fx_pow` (xsMath.c:552): the `**` / `Math.pow` core. ECMAScript's
+/// exponentiation returns NaN when the base's magnitude is 1 and the
+/// exponent is non-finite; otherwise it is C `pow`, which Rust's
+/// `f64::powf` lowers to the same libm call, so the result is bit-exact
+/// with the oracle.
+fn fx_pow(x: f64, y: f64) -> f64 {
+    if !y.is_finite() && x.abs() == 1.0 {
+        return f64::NAN;
+    }
+    x.powf(y)
+}
+
+/// The `f64` value of a primitive numeric slot (integer or number), or
+/// `None` for any other kind — the fast-path guard the numeric opcodes
+/// share, mirroring XS's `XS_INTEGER_KIND`/`XS_NUMBER_KIND` discrimination
+/// before its general (ToNumeric/BigInt) fallback.
+#[inline]
+fn numeric_of(s: &Slot) -> Option<f64> {
+    match (s.kind, s.value) {
+        (Kind::Integer, Payload::Integer(i)) => Some(i as f64),
+        (Kind::Number, Payload::Number(n)) => Some(n),
+        _ => None,
     }
 }
 
@@ -2377,7 +2621,11 @@ mod tests {
             // must name the opcode under test (or `XS_NO_CODE`/a downstream
             // opcode reached after a clean dispatch), never be empty-by-bug.
             match out.halt {
-                Halt::Return | Halt::Throw(_) | Halt::MeterAbort | Halt::Unsupported(_) => {}
+                Halt::Return
+                | Halt::Throw(_)
+                | Halt::MeterAbort
+                | Halt::Unsupported(_)
+                | Halt::StackOverflow(_) => {}
                 Halt::Decode(_) => unreachable!("handled above"),
             }
         }
