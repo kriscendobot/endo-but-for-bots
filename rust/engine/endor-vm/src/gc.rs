@@ -202,6 +202,33 @@ mod tests {
     }
 
     #[test]
+    fn compacts_bigint_digit_chunks_and_rewrites_offsets() {
+        // A BigInt's digit chunk (`[sign: u8][LE u32 limbs]`) relocates in the
+        // slide-compactor exactly like a String's, through the same
+        // `chunk_ref`/`set_chunk_ref` edge — dead BigInt chunks are reclaimed
+        // and the surviving BigInt slot's offset is rewritten to still read the
+        // same sign+magnitude bytes.
+        let mut h = Heap::new();
+        let _dead = h.chunks.alloc(&[0u8, 7, 0, 0, 0]); // dead `7n`
+        // keep `-4294967297n` = 0x1_0000_0001, two limbs, negative.
+        let keep_bytes = [1u8, 0x01, 0, 0, 0, 0x01, 0, 0, 0];
+        let keep_off = h.chunks.alloc(&keep_bytes);
+        let _dead2 = h.chunks.alloc(&[0u8, 9, 0, 0, 0]); // dead `9n`
+        let keep = h.slots.alloc(Slot::of(Kind::BigInt, Payload::BigInt(keep_off)));
+
+        let before = h.chunks.byte_size();
+        let stats = h.collect(&[keep]);
+        assert!(
+            stats.chunk_bytes_after < before,
+            "compaction reclaimed the dead BigInt chunk bytes ({} -> {})",
+            before,
+            stats.chunk_bytes_after
+        );
+        let new_off = h.slots.get(keep).chunk_ref().unwrap();
+        assert_eq!(h.chunks.payload(new_off), &keep_bytes, "BigInt digits survive relocation");
+    }
+
+    #[test]
     fn traces_an_instance_property_chain() {
         // The stage-2b object-heap shape: an instance whose `next` chains
         // Property slots, one holding a Reference to a second instance.
