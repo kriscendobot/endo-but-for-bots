@@ -114,3 +114,21 @@ throw new Error()
 throw new Error('boom')
 throw new TypeError('nope')
 throw new RangeError('z')
+
+// instanceof completion (fxOrdinaryHasInstance): a prototype-chain identity
+// walk. Object/error/user-constructor chains, subtype relationships, and
+// primitive/negative left operands.
+({}) instanceof Object
+({}) instanceof Error
+(new Error('x')) instanceof Error
+(new TypeError('t')) instanceof TypeError
+(new TypeError('t')) instanceof Error
+(new Error()) instanceof TypeError
+(new RangeError('r')) instanceof RangeError
+(1) instanceof Object
+'s' instanceof Object
+true instanceof Object
+null instanceof Object
+function C0(){}; (new C0()) instanceof C0
+function C1(){}; (new C1()) instanceof Object
+function C2(){}; function D2(){}; (new C2()) instanceof D2

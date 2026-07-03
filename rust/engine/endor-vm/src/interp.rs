@@ -180,6 +180,19 @@ pub const FUNCTION_LOCAL_METERING: u64 = 280;
 /// entry at `begin`, in [`Interp::run_constructor`].
 pub const CONSTRUCTOR_HOST_FRAME_METERING: u64 = 2 << 16;
 
+/// The raw 16.16 cost the `instanceof` operator accrues beyond its own
+/// dispatch for the `Symbol.hasInstance` host-frame call itself
+/// (`fxRunInstanceOf` → `fxOrdinaryHasInstance`), measured against the pin
+/// `48ee02d8cfe0` as `2 × XS_CODE_METERING` — paid for every operand,
+/// object or primitive.
+pub const INSTANCEOF_METERING: u64 = 2 << 16;
+
+/// The additional raw 16.16 cost when the left operand is an object:
+/// `fxOrdinaryHasInstance` reads the constructor's `.prototype` and walks the
+/// chain, whereas a primitive short-circuits to `false` before it. Measured
+/// as a further `2 × XS_CODE_METERING`, independent of chain depth or result.
+pub const INSTANCEOF_OBJECT_METERING: u64 = 2 << 16;
+
 /// The raw 16.16 cost an Error constructor accrues over the native `Object`
 /// constructor's empty-object cost: the extra internal slots and steps an
 /// error instance carries (`fx_Error`/`fxNewErrorInstance` — the stack-trace
@@ -492,6 +505,22 @@ pub struct Interp {
     /// C-XS compiler assigned that name. Each value is a `functions`-tracked
     /// native function instance.
     intrinsics: std::collections::HashMap<&'static str, crate::value::SlotIndex>,
+    /// The realm's `%Object.prototype%` (XS's `mxObjectPrototype`), the root
+    /// of every ordinary object's prototype chain. A boot object; ordinary
+    /// objects ([`Self::new_object`]) and constructed `this` instances point
+    /// their prototype at it (or a subclass prototype), which is what
+    /// `instanceof` walks. Property *lookup* is unchanged (own-only) — the
+    /// prototype objects carry no data properties — so this is invisible to
+    /// the existing corpora; only the prototype *identity* chain is new.
+    object_proto: crate::value::SlotIndex,
+    /// Each constructor instance's `.prototype` object, by slot (XS's
+    /// `constructor.prototype`): the intrinsics' prototypes (wired at boot)
+    /// and every user function's default prototype (wired at
+    /// `constructor_function`). `fxRunConstructor` reads it to set the new
+    /// `this`'s prototype, and `instanceof` reads it as the right-hand test
+    /// object — so `(new F()) instanceof F` and `err instanceof TypeError`
+    /// are prototype-chain identity checks (`fxOrdinaryHasInstance`).
+    ctor_prototype: std::collections::HashMap<crate::value::SlotIndex, crate::value::SlotIndex>,
     /// The program's symbol `name → id` table, built at
     /// [`Self::link_intrinsics`] from the decoded symbols atom (the inverse
     /// of the id→name vector). A native built-in that must set a
@@ -619,6 +648,8 @@ impl Interp {
             exception: Slot::undefined(),
             frame_slots: 0,
             intrinsics: std::collections::HashMap::new(),
+            object_proto: crate::value::SlotIndex::NULL,
+            ctor_prototype: std::collections::HashMap::new(),
             symbol_ids: std::collections::HashMap::new(),
             error_data: std::collections::HashMap::new(),
             jumps: Vec::new(),
@@ -635,10 +666,18 @@ impl Interp {
     /// dispatch to the native handler), and remembered by name in
     /// [`Self::intrinsics`] for per-program linking.
     fn create_intrinsics(&mut self) {
+        // The prototype roots: %Object.prototype% (null proto) and
+        // %Function.prototype% (chains to it). Every native constructor is a
+        // callable whose own prototype is %Function.prototype%.
+        let object_proto = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        self.object_proto = object_proto;
+        let func_proto = self.slots.alloc(Slot::instance(object_proto));
+        // Each Error type's `.prototype`: the base `%Error.prototype%` chains
+        // to %Object.prototype%; each subtype's prototype chains to
+        // %Error.prototype% (so `TypeError` `instanceof Error`).
+        let error_proto = self.slots.alloc(Slot::instance(object_proto));
         for &(name, native) in Native::intrinsics() {
-            let f = self
-                .slots
-                .alloc(Slot::instance(crate::value::SlotIndex::NULL));
+            let f = self.slots.alloc(Slot::instance(func_proto));
             self.functions.insert(
                 f,
                 FuncInfo {
@@ -647,6 +686,62 @@ impl Interp {
                 },
             );
             self.intrinsics.insert(name, f);
+            // Wire the constructor's `.prototype` object (the `instanceof`
+            // right-hand test / the `new` this-prototype). Object and
+            // Function reuse the two prototype roots; the Error base reuses
+            // `%Error.prototype%`; every subtype gets a prototype chaining to
+            // it; the wrapper constructors get a plain `%X.prototype%`.
+            let proto = match native {
+                Native::Object => object_proto,
+                Native::Function => func_proto,
+                Native::Error => error_proto,
+                Native::EvalError
+                | Native::RangeError
+                | Native::ReferenceError
+                | Native::SyntaxError
+                | Native::TypeError
+                | Native::URIError
+                | Native::AggregateError => self.slots.alloc(Slot::instance(error_proto)),
+                Native::Boolean
+                | Native::Symbol
+                | Native::Number
+                | Native::String => self.slots.alloc(Slot::instance(object_proto)),
+            };
+            self.ctor_prototype.insert(f, proto);
+        }
+    }
+
+    /// The `.prototype` object of a constructor instance, if it is one.
+    #[inline]
+    fn prototype_of(&self, ctor: crate::value::SlotIndex) -> Option<crate::value::SlotIndex> {
+        self.ctor_prototype.get(&ctor).copied()
+    }
+
+    /// Whether `target` appears in `obj`'s prototype chain — the core of
+    /// `fxOrdinaryHasInstance`. The prototype is the instance slot's payload
+    /// reference (XS's `instance->value.instance.prototype`); the walk
+    /// follows it to the chain root (`NULL`).
+    fn prototype_chain_has(
+        &self,
+        obj: crate::value::SlotIndex,
+        target: crate::value::SlotIndex,
+    ) -> bool {
+        let mut cur = self.instance_prototype(obj);
+        while !cur.is_null() {
+            if cur == target {
+                return true;
+            }
+            cur = self.instance_prototype(cur);
+        }
+        false
+    }
+
+    /// An instance slot's prototype (its payload reference), or `NULL`.
+    #[inline]
+    fn instance_prototype(&self, inst: crate::value::SlotIndex) -> crate::value::SlotIndex {
+        match self.slots.get(inst).value {
+            Payload::Reference(p) => p,
+            _ => crate::value::SlotIndex::NULL,
         }
     }
 
@@ -1920,6 +2015,43 @@ impl Interp {
                     pc += size as usize;
                 }
 
+                // `instanceof` (`XS_CODE_INSTANCEOF`, xsRun.c → fxRunInstanceOf
+                // → fxOrdinaryHasInstance): is the right operand's `.prototype`
+                // in the left operand's prototype chain. Stack: [.., left
+                // (object), right (constructor)]. A non-callable right operand
+                // needs the `Symbol.hasInstance` general path (self-names); a
+                // non-object left is simply `false`. Meters the fixed
+                // host-frame `Symbol.hasInstance` cost ([`INSTANCEOF_METERING`],
+                // 4 computrons) beyond its dispatch.
+                XS_CODE_INSTANCEOF => {
+                    let right = self.pop();
+                    let left = self.pop();
+                    let ctor = match right.value {
+                        Payload::Reference(r) => r,
+                        _ => return Halt::Unsupported(op.name()),
+                    };
+                    let proto = match self.prototype_of(ctor) {
+                        Some(p) => p,
+                        // Not a modeled constructor (no `.prototype`): the
+                        // general `Symbol.hasInstance` path is a later
+                        // increment — self-name rather than answer wrongly.
+                        None => return Halt::Unsupported(op.name()),
+                    };
+                    // The `Symbol.hasInstance` host-frame call is paid for
+                    // every operand; an object left additionally reads the
+                    // constructor prototype and walks the chain.
+                    self.meter.tick_raw(INSTANCEOF_METERING);
+                    let result = match left.value {
+                        Payload::Reference(x) => {
+                            self.meter.tick_raw(INSTANCEOF_OBJECT_METERING);
+                            self.prototype_chain_has(x, proto)
+                        }
+                        _ => false,
+                    };
+                    self.push(Slot::boolean(result));
+                    pc += size as usize;
+                }
+
                 // ---- stack ------------------------------------------
                 XS_CODE_DUB => {
                     let top = self.stack.last().copied().unwrap_or_else(Slot::undefined);
@@ -2284,6 +2416,13 @@ impl Interp {
         }
         let f = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
         self.functions.insert(f, FuncInfo::default());
+        // `fxDefaultFunctionPrototype`: a `constructor_function` gets a default
+        // `.prototype` object (chaining to %Object.prototype%) that a later
+        // `new f()` uses as the instance prototype and `instanceof` tests
+        // against. Its allocation is already folded into the measured
+        // [`FUNCTION_DEFINE_METERING`] cluster, so it is created unmetered here.
+        let proto = self.slots.alloc(Slot::instance(self.object_proto));
+        self.ctor_prototype.insert(f, proto);
         f
     }
 
@@ -2481,6 +2620,12 @@ impl Interp {
         self.meter.tick_builtin();
         let inst = self.new_object();
         self.meter.tick_raw(ERROR_CONSTRUCT_EXTRA);
+        // Chain the error instance to its type's `%<Type>.prototype%` (so
+        // `err instanceof TypeError` / `instanceof Error` hold) rather than
+        // the plain `%Object.prototype%` `new_object` defaulted it to.
+        if let Some(proto) = self.intrinsics.get(name).and_then(|&c| self.prototype_of(c)) {
+            self.slots.get_mut(inst).value = Payload::Reference(proto);
+        }
         // The message argument: absent or `undefined` ⇒ no own message (XS
         // inherits `Error.prototype.message == ""`).
         let message: Option<String> = if argc >= 1 {
@@ -2748,9 +2893,12 @@ impl Interp {
         // 2 × `XS_CODE_METERING`), independent of the constructor's body.
         self.meter.tick_slot_alloc();
         self.meter.tick_raw(CONSTRUCTOR_HOST_FRAME_METERING);
-        let inst = self
-            .slots
-            .alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        // The new `this` chains to the constructor's `.prototype`
+        // (fxGetPrototypeFromConstructor), defaulting to %Object.prototype% —
+        // so `(new F()) instanceof F` holds. Reading the prototype is a
+        // property get (unmetered), already folded into the measured cost.
+        let proto = self.prototype_of(self.cur_func).unwrap_or(self.object_proto);
+        let inst = self.slots.alloc(Slot::instance(proto));
         self.this_val = Slot::of(Kind::Reference, Payload::Reference(inst));
     }
 
@@ -2773,7 +2921,10 @@ impl Interp {
     fn new_object(&mut self) -> crate::value::SlotIndex {
         self.meter.tick_builtin();
         self.meter.tick_slot_alloc();
-        self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL))
+        // Ordinary objects chain to %Object.prototype% (the payload holds the
+        // prototype). Property lookup stays own-only, so this is invisible to
+        // reads; it exists for the `instanceof` prototype-chain walk.
+        self.slots.alloc(Slot::instance(self.object_proto))
     }
 
     /// Find an own property slot of `inst` by key `id`, walking its
@@ -3745,6 +3896,26 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "5", "new F(5).x reads the constructed property");
         assert_eq!(out.computrons, 43, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn instanceof_prototype_chain_walk_meters_bit_exact() {
+        // The exact C-XS bytecode for `({}) instanceof Object` (captured from
+        // the oracle): the object's prototype chain reaches %Object.prototype%
+        // = Object.prototype, so the result is `true` at C-XS's 19 computrons
+        // (the fxOrdinaryHasInstance host-frame call + the object-chain walk,
+        // 4 computrons over the dispatch).
+        let code: [u8; 20] = [
+            0x0b, 0x00, 0x4b, 0x9e, 0x01, 0x8b, 0x90, 0xb5, 0x01, 0xe2, 0x01, 0x4d, 0x01, 0x00,
+            0x67, 0x01, 0x00, 0x70, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Object".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "true");
+        assert_eq!(out.computrons, 19, "bit-exact computrons vs C-XS");
     }
 
     #[test]
