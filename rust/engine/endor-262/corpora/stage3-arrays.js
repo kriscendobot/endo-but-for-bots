@@ -302,3 +302,9 @@ var a=[1,2,3,4,5]; a.splice(2)
 [1,2].flatMap(function(x){return [x]}).length
 [1,2,3].flatMap(function(x){return [x,x]}).join()
 [5].flatMap(function(x){return [x,x,x]}).length
+[1,2,3,4].toSpliced(1,2).length
+[1,2,3,4].toSpliced(1,2,9,9).join()
+[1,2,3].toSpliced(0,0,7).join()
+[1,2,3,4,5].toSpliced(2).join()
+[1,2,3].toSpliced(1,5,8,8,8).join()
+[10,20,30].toSpliced(-1,1,99).join()

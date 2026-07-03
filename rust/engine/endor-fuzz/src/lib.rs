@@ -290,7 +290,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let lit = format!("[{}]", elems.join(","));
     // `with` requires a non-empty array (out-of-range is a RangeError), so
     // restrict its shape to n>=1 by folding into copyWithin when empty.
-    match b.choice(21) {
+    match b.choice(22) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -392,7 +392,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
         // toReversed into a new array, joined.
         18 => format!("{}.toReversed().join()", lit),
         // splice: delete and/or insert a bounded range, observe the result.
-        _ => {
+        19 => {
             let s = (b.next() as usize) % (n + 1);
             let d = (b.next() as usize) % (n + 1 - s.min(n));
             match b.choice(3) {
@@ -408,7 +408,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
             }
         }
         // flat a one-level-nested array of the elements.
-        _ => {
+        20 => {
             // Wrap some elements in singleton sub-arrays so flat has work.
             let wrapped: Vec<String> = elems
                 .iter()
@@ -416,6 +416,23 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
                 .map(|(i, e)| if i % 2 == 0 { format!("[{}]", e) } else { e.clone() })
                 .collect();
             format!("[{}].flat().join()", wrapped.join(","))
+        }
+        // toSpliced: a non-mutating splice into a new array, joined. The
+        // receiver is untouched (verified: the source `a` is unchanged).
+        _ => {
+            let s = (b.next() as usize) % (n + 1);
+            let d = (b.next() as usize) % (n + 1 - s.min(n));
+            match b.choice(3) {
+                0 => format!("var a={}; a.toSpliced({},{}).join()", lit, s, d),
+                1 => format!(
+                    "var a={}; a.toSpliced({},{},{}).join()",
+                    lit,
+                    s,
+                    d,
+                    small_int(&mut b)
+                ),
+                _ => format!("var a={}; a.toSpliced({}); a.join()", lit, s),
+            }
         }
     }
 }

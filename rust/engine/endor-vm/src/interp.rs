@@ -370,6 +370,12 @@ pub const ARRAY_FLAT_PER_ARRAY_METERING: u64 = 11 << 14;
 /// `flatAux`'s function branch), beyond the callback body and the result
 /// flattening (which reuses the `flat` constants). Calibrated against the pin.
 pub const ARRAY_FLATMAP_CALLBACK_METERING: u64 = 6 << 14;
+/// `Array.prototype.toSpliced` frame cost (`fxNewArray` host frame), beyond the
+/// modeled result chunk and the per-region `mxMeterSome` copy costs
+/// (`start * 10` for the head, `5` per insertion, `rest * 10` for the tail,
+/// plus a trailing `4`). Non-mutating: the receiver is untouched. Calibrated
+/// against the pin.
+pub const ARRAY_TOSPLICED_FRAME_METERING: u64 = 131584;
 /// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
 /// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
 /// callback body's own metering. Calibrated against the pin.
@@ -644,6 +650,9 @@ pub enum NativeMethod {
     /// `Array.prototype.flatMap(callback[, thisArg])`
     /// (`fx_Array_prototype_flatMap`): map then flatten by one level.
     ArrayFlatMap,
+    /// `Array.prototype.toSpliced(start, deleteCount, ...items)`
+    /// (`fx_Array_prototype_toSpliced`): a non-mutating splice into a new array.
+    ArrayToSpliced,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1300,6 +1309,7 @@ impl Interp {
             ("splice", NativeMethod::ArraySplice),
             ("flat", NativeMethod::ArrayFlat),
             ("flatMap", NativeMethod::ArrayFlatMap),
+            ("toSpliced", NativeMethod::ArrayToSpliced),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -5083,6 +5093,65 @@ impl Interp {
                         a.items.insert(i as u32, Slot::of(s.kind, s.value));
                     }
                     a.length = deletions;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.toSpliced(start, deleteCount, ...items)` — a
+            // non-mutating splice: build a NEW array `head ++ inserted ++ tail`
+            // and leave the receiver untouched. XS meters the head copy at
+            // `start * 10`, each insertion at `5`, the tail copy at `rest * 10`,
+            // plus a trailing `mxMeterSome(4)` and the result item chunk.
+            NativeMethod::ArrayToSpliced => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("toSpliced:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                let start = self.arg_to_index(base, 0, 0, length);
+                let (insertions, skip): (u32, u32) = if argc == 0 {
+                    (0, 0)
+                } else if argc == 1 {
+                    (0, length - start)
+                } else {
+                    let ins = (argc - 2) as u32;
+                    let dc = match numeric_of(&self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined)) {
+                        Some(n) if n.is_nan() || n < 0.0 => 0,
+                        Some(n) if n > (length - start) as f64 => length - start,
+                        Some(n) => n.trunc() as u32,
+                        None => 0,
+                    };
+                    (ins, dc)
+                };
+                let result_len = length + insertions - skip;
+                let rest = length - (start + skip);
+                self.meter.tick_raw(ARRAY_TOSPLICED_FRAME_METERING);
+                if result_len > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(result_len));
+                }
+                self.meter.tick_builtin_some((start as u64) * 10);
+                for _ in 0..insertions {
+                    self.meter.tick_builtin_some(5);
+                }
+                self.meter.tick_builtin_some((rest as u64) * 10);
+                self.meter.tick_builtin_some(4);
+                // Build the result densely; the receiver stays untouched.
+                let cur: Vec<Slot> = (0..length)
+                    .map(|i| self.arrays[&inst].items.get(&i).copied().unwrap_or_else(Slot::undefined))
+                    .collect();
+                let inserted: Vec<Slot> = (0..insertions)
+                    .map(|k| self.stack.get(base + 4 + 2 + k as usize).copied().unwrap_or_else(Slot::undefined))
+                    .collect();
+                let mut rebuilt: Vec<Slot> = Vec::new();
+                rebuilt.extend_from_slice(&cur[..start as usize]);
+                rebuilt.extend(inserted);
+                rebuilt.extend_from_slice(&cur[(start + skip) as usize..]);
+                let result = self.new_array_unmetered();
+                {
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, s) in rebuilt.into_iter().enumerate() {
+                        a.items.insert(i as u32, Slot::of(s.kind, s.value));
+                    }
+                    a.length = result_len;
                 }
                 Slot::of(Kind::Reference, Payload::Reference(result))
             }
