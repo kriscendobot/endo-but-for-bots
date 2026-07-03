@@ -646,6 +646,58 @@ the covered count against the same zero-divergence bar. The differential
 fuzz grammar now spans objects, calls, closures, and thrown-and-caught
 exceptions, all bit-exact.
 
+**Stage-3 decomposition (supervisor, 2026-07-03).** The stage-2b review
+(s5, all acceptance evidence independently reproduced; all three s4
+findings verified closed) accepted stage 2 and confirmed stage 3 is
+monolith-sized — larger than the stage-2 monolith that twice overran the
+2400s handler wall-clock — so it executes as a **seven-child serial
+orchestration** (`xs2rust-endor-build-stage3`), each child independently
+green on this PR against the design's stage-3 bar (built-ins sections
+dual-run agreement **including computrons**; the `mxMeterSome` fast-path
+annotations land here):
+1. **language** — chunk-backed CESU-8 string *values* (literals, concat
+   with `XS_STRING_METERING`, comparison), the `global` opcode, and the
+   remaining language opcodes the `language/` sweeps name as top skip
+   reasons (`typeof`, `increment`/`decrement`/`to_numeric`,
+   exponentiation, `this`, `let`/`const` closures, `current`/
+   `refresh_local`, `delete_property`, `copy_object`/`extend`,
+   `branch_coalesce`/`branch_chain`, `arguments` sloppy/strict). Also
+   carries the review's parity observations: model XS's **fixed stack
+   limits** (`fxOverflow`/`mxStackCount`, including the value-stack
+   width-not-depth geometry) so stack-exhaustion aborts are bit-exact —
+   deterministic stack overflow is consensus-relevant in the xsnap
+   lineage — and decompose the measured `FUNCTION_*` definition
+   constants analytically to retire the ≤~288-raw per-definition
+   residuals.
+2. **fundamentals** — constructor calls (`to_instance`/`new`/`target`/
+   `instantiate`), Object, Function.prototype (`call`/`apply`/`bind`/
+   `toString`), Boolean, Symbol, and the real Error hierarchy (which
+   graduates abort-value parity from primitive throws to Error objects);
+   `instanceof`/`in` completion.
+3. **arrays** — the Array exotic object (length semantics), literals/
+   spread/holes, the iteration protocol (`for-of`/`for-in`, array and
+   string iterators; generators stay stage 4), Array.prototype methods.
+4. **text-math-json** — String.prototype (CESU-8 semantics), Number,
+   Math (canonical NaN), `parseInt`/`parseFloat`, JSON.
+5. **collections** — Map/Set/WeakMap/WeakSet, ArrayBuffer/TypedArray/
+   DataView, BigInt (`XS_BIGINT_METERING`).
+6. **promises** — Promise and the job queue with the pump-loop latch
+   semantics (daemon-rust-xs-performance is ground truth).
+7. **xsre** — the RegExp engine port (resolved question 6; the 11.6
+   KLOC cost the verdict priced in), RegExp built-in + literals, and a
+   structure-aware regex fuzz target.
+
+**GC roots contract (recorded by the s5 review).** `Heap::collect(roots)`
+is deliberately standalone in stage 2 (never called mid-run; the arenas
+grow without pressure). Whichever stage wires collection into the
+allocation path MUST pass a root set covering the interpreter's side
+tables — `functions[*].closures` environments, saved `CallerState`
+activations, `CatchJump` snapshots, and `global_props` — not just the
+value stack and scope, or arena-index reuse corrupts silently. The
+trigger points must also be deterministic (XS collects on allocation
+pressure at fixed thresholds), so collection scheduling cannot perturb
+metering parity.
+
 ## Dependencies
 
 | Design | Relationship |
