@@ -127,6 +127,13 @@ var a=[1,2,3]; a.at(5)
 var a=[1,2,3]; a.at(-5)
 var a=[5,6,7,8]; a.at(2)
 var a=[5,6,7,8]; a.at(-2)
+var a=[1,2,3]; a.reverse(); a
+var a=[1,2,3,4]; a.reverse(); a
+var a=[1,2]; a.reverse(); a
+var a=[1]; a.reverse(); a
+var a=[]; a.reverse(); a
+var a=[1,2,3,4,5]; a.reverse(); a
+var a=[9,8,7]; a.reverse(); a[0]
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()

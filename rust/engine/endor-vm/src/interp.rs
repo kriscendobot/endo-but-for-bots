@@ -320,6 +320,11 @@ pub const ARRAY_SLICE_FRAME_METERING: u64 = 377344;
 /// Calibrated against the pin.
 pub const ARRAY_AT_FRAME_METERING: u64 = 0;
 pub const ARRAY_AT_READ_METERING: u64 = 98304;
+/// `Array.prototype.reverse` frame cost + per-swap cost (each swap does
+/// `mxHasAt`/`mxGetAt`×2/`mxSetAt`×2 over the generic path). Calibrated
+/// against the pin.
+pub const ARRAY_REVERSE_FRAME_METERING: u64 = 98304;
+pub const ARRAY_REVERSE_PER_SWAP_METERING: u64 = 8 << 16;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -4101,11 +4106,35 @@ impl Interp {
                 }
                 this
             }
-            // `Array.prototype.reverse()` — reverses via the generic
-            // `mxHasAt`/`mxGetAt`/`mxSetAt` path, whose per-swap metering endor
-            // does not yet model; honest skip.
+            // `Array.prototype.reverse()` — reverse the elements in place and
+            // return the array. XS reverses via the generic `mxHasAt`/`mxGetAt`/
+            // `mxSetAt` path; metering is a frame constant plus a per-swap cost
+            // (`length/2` swaps), calibrated against the pin.
             NativeMethod::ArrayReverse => {
-                return Err(Halt::Unsupported("reverse:at-metering"));
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("reverse:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_REVERSE_FRAME_METERING);
+                let swaps = (length / 2) as u64;
+                self.meter.tick_raw(swaps * ARRAY_REVERSE_PER_SWAP_METERING);
+                let a = self.arrays.get_mut(&inst).unwrap();
+                let mut lo = 0u32;
+                let mut hi = length.saturating_sub(1);
+                while lo < hi {
+                    let l = a.items.remove(&lo);
+                    let h = a.items.remove(&hi);
+                    if let Some(h) = h {
+                        a.items.insert(lo, h);
+                    }
+                    if let Some(l) = l {
+                        a.items.insert(hi, l);
+                    }
+                    lo += 1;
+                    hi -= 1;
+                }
+                this
             }
             // `Array.prototype.slice([start[, end]])` — dense fast path. A new
             // array with the elements of `[start, end)`. Metering: a frame

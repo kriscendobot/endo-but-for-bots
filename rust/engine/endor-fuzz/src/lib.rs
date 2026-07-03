@@ -288,7 +288,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(12) {
+    match b.choice(13) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -334,10 +334,12 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
         // separator carries only a sub-computron residual).
         10 => format!("var a={}; a.join()", lit),
         // at a (possibly negative, possibly out-of-range) index.
-        _ => {
+        11 => {
             let i = (b.next() as i32 % (2 * (n as i32 + 2))) - (n as i32 + 2);
             format!("var a={}; a.at({})", lit, i)
         }
+        // reverse in place, observe the result.
+        _ => format!("var a={}; a.reverse(); a", lit),
     }
 }
 
