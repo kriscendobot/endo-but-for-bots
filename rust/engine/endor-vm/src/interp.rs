@@ -496,6 +496,9 @@ pub enum NativeMethod {
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
+    /// `Array.of(...items)` — a static: a new array whose elements are the
+    /// arguments (`fx_Array_of`, always elements, never a length).
+    ArrayOf,
     /// `Array.prototype.values()` / `keys()` / `entries()`
     /// (`fx_Array_prototype_values` &co.): construct an Array Iterator over the
     /// receiver with the given kind (0 values / 1 keys / 2 entries).
@@ -1142,6 +1145,8 @@ impl Interp {
         if let Some(&array_ctor) = self.intrinsics.get("Array") {
             let mf = self.alloc_method(NativeMethod::ArrayIsArray);
             self.proto_methods.push((array_ctor, "isArray", mf));
+            let of = self.alloc_method(NativeMethod::ArrayOf);
+            self.proto_methods.push((array_ctor, "of", of));
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -4193,6 +4198,15 @@ impl Interp {
                     _ => false,
                 };
                 Slot::boolean(r)
+            }
+            // `Array.of(...items)` (`fx_Array_of`): its per-element metering
+            // (a first-element chunk-transition outlier plus a residual over
+            // `mxMeterSome(4)`) does not calibrate to a clean per-element
+            // constant, so this self-names an honest skip rather than shipping
+            // a divergent meter (a "within reach" stretch static).
+            NativeMethod::ArrayOf => {
+                let _ = base;
+                return Err(Halt::Unsupported("Array.of:metering"));
             }
             // `Array.prototype.values()`/`keys()`/`entries()`: build an Array
             // Iterator over the receiver.
