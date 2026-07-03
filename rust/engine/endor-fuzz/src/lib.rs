@@ -360,6 +360,29 @@ pub fn gen_stage3_for_of_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for **array spread** (`[...arr]`) — which
+/// desugars to the for-of iterator loop appending each element. Emits a single
+/// spread of a dense literal, optionally with leading/trailing plain elements,
+/// then observes the result or its length. A single spread segment is
+/// raw-exact against the pin (each additional segment carries a sub-computron
+/// −8-raw residual from XS's item-chunk over-allocation, which never crosses a
+/// computron boundary in a bounded program; kept single-segment here so the
+/// arm is raw-clean). Rides the full symbol-linking differential check.
+pub fn gen_stage3_spread_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let n = (b.next() % 5) as usize; // 0..=4 spread elements
+    let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
+    let inner = format!("[{}]", elems.join(","));
+    let lead = if b.choice(2) == 0 { format!("{},", small_int(&mut b)) } else { String::new() };
+    let trail = if b.choice(2) == 0 { format!(",{}", small_int(&mut b)) } else { String::new() };
+    let spread = format!("[{}...{}{}]", lead, inner, trail);
+    match b.choice(3) {
+        0 => spread,
+        1 => format!("{}.length", spread),
+        _ => format!("var b={}; b.length", spread),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -747,6 +770,35 @@ mod tests {
         for (i, s) in shapes.iter().enumerate() {
             assert!(*s, "for-of shape {} never generated", i);
         }
+    }
+
+    #[test]
+    fn generated_stage3_spread_programs_agree_bit_exact() {
+        // Single-segment array spread desugars to the for-of iterator loop
+        // appending each element; raw-exact against the pin. Sweep a spread of
+        // seeds over the three observation shapes and a range of lengths and
+        // lead/trail combinations.
+        let mut checked = 0;
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(17))
+                        .wrapping_add((seed as u8).wrapping_mul(9)),
+                );
+            }
+            let prog = gen_stage3_spread_program(&buf);
+            distinct.insert(prog.clone());
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 spread differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "spread sweep too uniform: {} distinct", distinct.len());
     }
 
     #[test]

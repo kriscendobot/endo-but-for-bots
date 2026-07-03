@@ -138,6 +138,17 @@ var s=""; for (var x of [1,2,3]) s=s+x; s
 var n=0; for (var x of [7,7,7]) n=n+1; n
 var s=0; for (var x of [1,2,3,4,5]) s=s+x; s
 
+// --- spread (desugars to the for-of iterator loop appending each element) ---
+[...[1,2,3]]
+[...[]]
+[...[9]]
+[0,...[1,2],3]
+var a=[5,6,7]; [...a]
+[...[1,2,3]].length
+[...[1,2,3]][2]
+var a=[1,2]; var b=[...a]; b[0]
+var a=[1,2,3]; [...a][2]
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

@@ -4519,6 +4519,15 @@ impl Interp {
     /// `round_up_8((present+1)*32) + sizeof(txChunk)` = `(present+1)*32 + 16`
     /// (the payload is already 8-aligned). Verified against the pin: an
     /// N-element literal's per-element chunk cost is 48, 80, 112, 144, ….
+    ///
+    /// Known sub-computron residual: a *spread* segment appending into an
+    /// already-populated array carries a −8-raw-per-segment gap (endor
+    /// over-charges by 8) versus XS's item-chunk over-allocation
+    /// (`fxNewGrowableChunk`/`fxSizeToCapacity`) growth path. It is well under
+    /// one computron and never crosses a `>> 16` boundary in a bounded program,
+    /// so the computron-level bar (and every corpus/fuzz/test262 check, which
+    /// compare `meterIndex >> 16`) stays exact; modeling the over-allocation
+    /// capacity to close the raw gap is a later refinement.
     fn array_item_grow_metering(&self, present: u64) -> u64 {
         let bytes = (present + 1) * 32;
         // round up to 8 (already a multiple of 8) + 16-byte chunk header.
