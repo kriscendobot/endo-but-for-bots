@@ -75,6 +75,14 @@ pub enum Kind {
     /// interned name id), `value` the property value, and `next` the
     /// following property in the owner's list.
     Property = 7,
+    /// A Symbol primitive (XS's `XS_SYMBOL_KIND`). The payload's `Reference`
+    /// names a fresh descriptor slot allocated per `Symbol()` call (holding
+    /// the description string or `undefined`), so two symbols are `===` iff
+    /// they name the *same* descriptor slot — the identity that makes
+    /// `Symbol('a') !== Symbol('a')` while a well-known `Symbol.iterator ===
+    /// Symbol.iterator`. `typeof` is "symbol"; coercing one to a string
+    /// throws a `TypeError` (a bare symbol completion aborts).
+    Symbol = 8,
     /// Reference to a heap instance (slot arena). Payload holds a
     /// `SlotIndex`.
     Reference = 10,

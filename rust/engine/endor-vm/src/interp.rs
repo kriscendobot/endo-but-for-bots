@@ -222,6 +222,11 @@ pub const INSTANCEOF_OBJECT_METERING: u64 = 2 << 16;
 /// [`Interp::build_wrapper`].
 pub const WRAPPER_CONSTRUCT_EXTRA: u64 = (1 << 16) + 256;
 
+/// The raw 16.16 cost of a `Symbol()` call (`fx_Symbol`/`fxNewSymbol`): the
+/// symbol slot plus its registration. Measured against the pin `48ee02d8cfe0`
+/// as 33792 raw, independent of the description. Accrued per `Symbol()` call.
+pub const SYMBOL_CREATE_METERING: u64 = 33792;
+
 /// The raw 16.16 cost an Error constructor accrues over the native `Object`
 /// constructor's empty-object cost: the extra internal slots and steps an
 /// error instance carries (`fx_Error`/`fxNewErrorInstance` — the stack-trace
@@ -598,6 +603,11 @@ pub struct Interp {
     /// `err.hasOwnProperty('name')` is correctly `false`, matching XS). Bound
     /// only when the program references the name; unmetered.
     proto_data: Vec<(crate::value::SlotIndex, &'static str, String)>,
+    /// The well-known symbols (`Symbol.iterator`, `Symbol.hasInstance`, …) as
+    /// `(name, symbol value)` — fixed `Kind::Symbol` values created once at
+    /// boot and bound as own properties of the `Symbol` constructor at link
+    /// time (only when referenced), so `Symbol.iterator === Symbol.iterator`.
+    well_known_symbols: Vec<(&'static str, Slot)>,
     /// The program's symbol `name → id` table, built at
     /// [`Self::link_intrinsics`] from the decoded symbols atom (the inverse
     /// of the id→name vector). A native built-in that must set a
@@ -647,6 +657,7 @@ struct StaticStrings {
     number: crate::value::ChunkOffset,
     string: crate::value::ChunkOffset,
     function: crate::value::ChunkOffset,
+    symbol: crate::value::ChunkOffset,
 }
 
 /// A suspended activation: the caller's scope and resume point, saved by
@@ -711,6 +722,7 @@ impl Interp {
             number: chunks.alloc(b"number"),
             string: chunks.alloc(b"string"),
             function: chunks.alloc(b"function"),
+            symbol: chunks.alloc(b"symbol"),
         };
         let mut interp = Interp {
             stack: Vec::with_capacity(64),
@@ -740,6 +752,7 @@ impl Interp {
             ctor_prototype: std::collections::HashMap::new(),
             proto_methods: Vec::new(),
             proto_data: Vec::new(),
+            well_known_symbols: Vec::new(),
             symbol_ids: std::collections::HashMap::new(),
             symbol_names: Vec::new(),
             error_data: std::collections::HashMap::new(),
@@ -874,6 +887,31 @@ impl Interp {
                 }
             }
         }
+        // The well-known symbols: each a fixed `Kind::Symbol` value whose
+        // descriptor slot holds its `Symbol.<name>` description, bound as own
+        // properties of the `Symbol` constructor at link time.
+        for name in [
+            "iterator",
+            "asyncIterator",
+            "hasInstance",
+            "isConcatSpreadable",
+            "match",
+            "matchAll",
+            "replace",
+            "search",
+            "species",
+            "split",
+            "toPrimitive",
+            "toStringTag",
+            "unscopables",
+        ] {
+            let desc = self.chunks.alloc(format!("Symbol.{}", name).as_bytes());
+            let d = self
+                .slots
+                .alloc(Slot::of(Kind::String, Payload::String(desc)));
+            let value = Slot::of(Kind::Symbol, Payload::Reference(d));
+            self.well_known_symbols.push((name, value));
+        }
         // The wrapper prototypes carry valueOf + toString over the primitive.
         for native in [Native::Boolean, Native::Number, Native::String] {
             if let Some(&c) = self.intrinsics.get(native.display_name()) {
@@ -998,6 +1036,16 @@ impl Interp {
             }
         }
         self.proto_data = data;
+        // Well-known symbols as own properties of the `Symbol` constructor.
+        if let Some(&symbol_ctor) = self.intrinsics.get("Symbol") {
+            let wks = std::mem::take(&mut self.well_known_symbols);
+            for (name, value) in &wks {
+                if let Some(&wid) = self.symbol_ids.get(*name) {
+                    self.set_own_unmetered(symbol_ctor, wid, *value);
+                }
+            }
+            self.well_known_symbols = wks;
+        }
     }
 
     /// The native identity of a function instance, if it is an intrinsic.
@@ -1200,7 +1248,16 @@ impl Interp {
 
     /// Run a program bytecode buffer to completion.
     pub fn run(&mut self, code: &[u8]) -> RunOutcome {
-        let halt = self.dispatch(code);
+        let mut halt = self.dispatch(code);
+        // A program that completes with a Symbol *value* is coerced to a
+        // string by the harness (`String(result)`), which throws — so the
+        // oracle reports the run as an abort, not a completion. Mirror that:
+        // a Symbol completion becomes the same `TypeError` abort. The ToString
+        // throw is post-run in the shim, so it adds no run computrons (the
+        // meter already matches the oracle's run-only count).
+        if halt == Halt::Return && self.result.kind == Kind::Symbol {
+            halt = Halt::Throw("TypeError: cannot coerce symbol to string".to_string());
+        }
         let completed = halt == Halt::Return;
         let result = if completed {
             self.render(&self.result)
@@ -1989,9 +2046,10 @@ impl Interp {
                             }
                             _ => self.static_str.object,
                         },
+                        Kind::Symbol => self.static_str.symbol,
                         // Closure/EnvReference/Uninitialized are never live
-                        // stack *values*; a symbol/bigint would need its own
-                        // interned name (later stages).
+                        // stack *values*; a bigint would need its own interned
+                        // name (later stages).
                         _ => return Halt::Unsupported(op.name()),
                     };
                     if let Some(s) = self.stack.last_mut() {
@@ -2951,6 +3009,17 @@ impl Interp {
             Native::SyntaxError => self.build_error("SyntaxError", base, argc),
             Native::TypeError => self.build_error("TypeError", base, argc),
             Native::URIError => self.build_error("URIError", base, argc),
+            // `Symbol([description])`: a fresh unique symbol. Its descriptor
+            // slot holds the description (or `undefined`), and its identity is
+            // that slot — so `Symbol('a') !== Symbol('a')`. Metering-neutral,
+            // like the other primitive coercions (measured against the pin).
+            // `new Symbol()` throws in JS; a `has_target` call self-names.
+            Native::Symbol if !has_target => {
+                let desc = arg(0);
+                let d = self.slots.alloc(desc);
+                self.meter.tick_raw(SYMBOL_CREATE_METERING);
+                Slot::of(Kind::Symbol, Payload::Reference(d))
+            }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -4455,6 +4524,44 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "5", "new F(5).x reads the constructed property");
         assert_eq!(out.computrons, 43, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn symbol_create_and_typeof_meters_bit_exact() {
+        // The exact C-XS bytecode for `typeof Symbol()` (captured from the
+        // oracle): `Symbol()` creates a fresh symbol primitive, `typeof`
+        // reads "symbol", at C-XS's 13 computrons (the symbol-creation cost
+        // plus dispatch).
+        let code: [u8; 16] = [
+            0x0b, 0x00, 0x4b, 0xe0, 0x4d, 0x01, 0x00, 0x66, 0x01, 0x00, 0x28, 0xab, 0x00, 0xde,
+            0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Symbol".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "symbol");
+        assert_eq!(out.computrons, 13, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn bare_symbol_completion_is_a_typeerror_abort() {
+        // A program whose completion value is a Symbol aborts: the harness's
+        // `String(result)` throws (a symbol cannot coerce to a string). The
+        // exact C-XS bytecode for `Symbol()` (captured from the oracle).
+        let code: [u8; 15] = [
+            0x0b, 0x00, 0x4b, 0xe0, 0x4d, 0x01, 0x00, 0x66, 0x01, 0x00, 0x28, 0xab, 0x00, 0xbb,
+            0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Symbol".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(
+            out.halt,
+            Halt::Throw("TypeError: cannot coerce symbol to string".into())
+        );
+        assert!(!out.completed);
     }
 
     #[test]

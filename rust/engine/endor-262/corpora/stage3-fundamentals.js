@@ -184,3 +184,19 @@ var fc2 = function () { return this.x }; fc2.call({ x: 5 })
 var fc3 = function (a, b) { return a + b }; fc3.call(null, 2, 3)
 function idc(x) { return x }; idc.call(null, 42)
 var fc4 = function (a, b, c) { return a + b + c }; fc4.call(null, 1, 2, 3)
+
+// Symbol: a fresh unique primitive (identity), typeof "symbol", and the
+// well-known symbols as stable properties of the Symbol constructor. (A bare
+// symbol completion aborts — the harness String()-coerces it and throws.)
+typeof Symbol()
+typeof Symbol('d')
+typeof Symbol.iterator
+typeof Symbol.hasInstance
+Symbol('a') === Symbol('a')
+Symbol() === Symbol()
+Symbol.iterator === Symbol.iterator
+Symbol.iterator === Symbol.asyncIterator
+var sy1 = Symbol('x'); sy1 === sy1
+var sy2 = Symbol('k'); var sy3 = sy2; sy2 === sy3
+!Symbol()
+Symbol() ? 1 : 2
