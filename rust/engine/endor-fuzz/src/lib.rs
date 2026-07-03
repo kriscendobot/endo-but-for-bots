@@ -290,7 +290,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let lit = format!("[{}]", elems.join(","));
     // `with` requires a non-empty array (out-of-range is a RangeError), so
     // restrict its shape to n>=1 by folding into copyWithin when empty.
-    match b.choice(20) {
+    match b.choice(21) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -406,6 +406,16 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
                 ),
                 _ => format!("var a={}; a.splice({},{})", lit, s, d),
             }
+        }
+        // flat a one-level-nested array of the elements.
+        _ => {
+            // Wrap some elements in singleton sub-arrays so flat has work.
+            let wrapped: Vec<String> = elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| if i % 2 == 0 { format!("[{}]", e) } else { e.clone() })
+                .collect();
+            format!("[{}].flat().join()", wrapped.join(","))
         }
     }
 }

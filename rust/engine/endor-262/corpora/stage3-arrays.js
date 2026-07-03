@@ -289,3 +289,11 @@ var a=[1,2,3]; a.splice(0,0); a.join()
 var a=[1,2,3,4]; a.splice(1,2,7,8,9); a.join()
 var a=[1,2,3]; a.splice(0,3); a.join()
 var a=[1,2,3,4,5]; a.splice(2)
+[1,2,3].flat().join()
+[1,[2,3]].flat().join()
+[[1],[2],[3]].flat().join()
+[[1,2],[3]].flat().join()
+[].flat().length
+[1,[2,[3,4]]].flat(2).join()
+[[1],[2]].flat().length
+[1,2,3,4].flat().length

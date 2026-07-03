@@ -357,6 +357,15 @@ pub const ARRAY_TOREVERSED_FRAME_METERING: u64 = 131584;
 /// beyond the modeled result chunk, tail-shift, per-item, and per-`mxMeterSome`
 /// costs. Calibrated against the pin.
 pub const ARRAY_SPLICE_FRAME_METERING: u64 = 377344;
+/// `Array.prototype.flat` frame cost (`fxCreateArraySpecies` + host frame, as
+/// slice/splice), plus the per-appended-leaf cost (the visit read + the
+/// `mxDefineIndex` step, `9 << 14`; the chunk growth is metered separately) and
+/// the per-array-element cost (the visit read + the `.length` read before
+/// recursing, `11 << 14`). Calibrated against the pin by solving the linear
+/// system (the visit count is `leaves + arrays`, so two constants suffice).
+pub const ARRAY_FLAT_FRAME_METERING: u64 = 377344;
+pub const ARRAY_FLAT_PER_LEAF_METERING: u64 = 9 << 14;
+pub const ARRAY_FLAT_PER_ARRAY_METERING: u64 = 11 << 14;
 /// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
 /// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
 /// callback body's own metering. Calibrated against the pin.
@@ -625,6 +634,9 @@ pub enum NativeMethod {
     /// (`fx_Array_prototype_splice`): remove `deleteCount` elements at `start`
     /// and insert `items`, returning a new array of the removed elements.
     ArraySplice,
+    /// `Array.prototype.flat([depth])` (`fx_Array_prototype_flat`): a new array
+    /// with sub-array elements flattened to `depth` (default 1).
+    ArrayFlat,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1279,6 +1291,7 @@ impl Interp {
             ("findLastIndex", NativeMethod::ArrayFindLastIndex),
             ("toReversed", NativeMethod::ArrayToReversed),
             ("splice", NativeMethod::ArraySplice),
+            ("flat", NativeMethod::ArrayFlat),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -5065,6 +5078,42 @@ impl Interp {
                 }
                 Slot::of(Kind::Reference, Payload::Reference(result))
             }
+            // `Array.prototype.flat([depth])` — a new array with sub-array
+            // elements flattened to `depth` (default 1). XS's `flatAux` visits
+            // each source index, recursing into array elements (up to `depth`)
+            // and appending leaves via `mxDefineIndex` (which grows the result
+            // item chunk one slot at a time). Metering models the per-visit
+            // read, the per-array-element length read, and the per-appended
+            // element chunk growth, plus a frame constant.
+            NativeMethod::ArrayFlat => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("flat:non-dense-array")),
+                };
+                let depth = if argc >= 1 {
+                    match numeric_of(&arg0) {
+                        Some(n) if n.is_nan() || n < 0.0 => 0,
+                        Some(n) => n.trunc() as u32,
+                        None => 0,
+                    }
+                } else {
+                    1
+                };
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_FLAT_FRAME_METERING);
+                let mut out: Vec<Slot> = Vec::new();
+                self.flat_into(inst, length, depth, &mut out);
+                let result = self.new_array_unmetered();
+                let total = out.len() as u32;
+                {
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, s) in out.into_iter().enumerate() {
+                        a.items.insert(i as u32, Slot::of(s.kind, s.value));
+                    }
+                    a.length = total;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default
             // ","), and the result materialized into one final chunk. Metering
@@ -5722,6 +5771,36 @@ impl Interp {
         let inst = self.slots.alloc(Slot::instance(self.array_proto));
         self.arrays.insert(inst, ArrayData::default());
         inst
+    }
+
+    /// XS's `flatAux`: visit each index of `src` (length `len`), recursing into
+    /// array elements while `depth > 0` and appending leaves to `out`. Meters
+    /// the per-visit read, the per-array-element length read, and each
+    /// appended leaf's `mxDefineIndex` chunk growth as it goes.
+    fn flat_into(&mut self, src: crate::value::SlotIndex, len: u32, depth: u32, out: &mut Vec<Slot>) {
+        for index in 0..len {
+            let item = match self.arrays.get(&src).and_then(|a| a.items.get(&index).copied()) {
+                Some(it) => it,
+                None => continue, // a hole is skipped (fxHasIndex false)
+            };
+            let is_array = matches!(item.value, Payload::Reference(r) if self.arrays.contains_key(&r));
+            if depth > 0 && is_array {
+                let sub = match item.value {
+                    Payload::Reference(r) => r,
+                    _ => unreachable!(),
+                };
+                self.meter.tick_raw(ARRAY_FLAT_PER_ARRAY_METERING);
+                let sub_len = self.arrays[&sub].length;
+                self.flat_into(sub, sub_len, depth - 1, out);
+            } else {
+                // Append the leaf: the per-leaf cost plus the `mxDefineIndex`
+                // chunk growth to `out.len() + 1` slots.
+                self.meter.tick_raw(ARRAY_FLAT_PER_LEAF_METERING);
+                self.meter
+                    .tick_raw(self.array_item_grow_metering(out.len() as u64));
+                out.push(item);
+            }
+        }
     }
 
     /// Allocate an empty array instance **without** charging the standalone
