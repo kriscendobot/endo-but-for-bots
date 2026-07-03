@@ -227,3 +227,10 @@ var s=""; for (var k in {p:1,q:2,r:3,s:4,t:5}) s=s+k; s
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a
+var a=[1,2,3,4,5]; a.copyWithin(0,3); a
+var a=[1,2,3,4,5]; a.copyWithin(1,3); a
+var a=[1,2,3]; a.copyWithin(0,1); a
+var a=[1,2,3,4,5]; a.copyWithin(0,3,4); a
+var a=[1,2,3]; a.copyWithin(2,0); a
+var a=[1,2,3]; a.copyWithin(0,0); a
+var a=[1,2,3,4]; a.copyWithin(1,2); a

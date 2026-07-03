@@ -342,6 +342,9 @@ pub const ARRAY_CONCAT_CHECK_METERING: u64 = 196608;
 pub const ARRAY_CONCAT_SPREAD_EXTRA_METERING: u64 = 98304;
 /// Extra raw per appended non-array value, over the key slot + `mxMeterSome(4)`.
 pub const ARRAY_CONCAT_PRIM_EXTRA_METERING: u64 = 2 << 14;
+/// `Array.prototype.copyWithin` frame cost, beyond the `mxMeterSome(count*10)`
+/// for the copied block. Calibrated against the pin.
+pub const ARRAY_COPYWITHIN_FRAME_METERING: u64 = 98304;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -529,6 +532,10 @@ pub enum NativeMethod {
     /// (`fx_Array_prototype_unshift`): prepend the arguments, returning the new
     /// length.
     ArrayUnshift,
+    /// `Array.prototype.copyWithin(target[, start[, end]])` — dense fast path
+    /// (`fx_Array_prototype_copyWithin`): copy the block `[start, end)` to
+    /// `target` in place, returning the array.
+    ArrayCopyWithin,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1168,6 +1175,7 @@ impl Interp {
             ("at", NativeMethod::ArrayAt),
             ("shift", NativeMethod::ArrayShift),
             ("unshift", NativeMethod::ArrayUnshift),
+            ("copyWithin", NativeMethod::ArrayCopyWithin),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4378,6 +4386,46 @@ impl Interp {
                 }
                 self.meter.tick_builtin_some(2);
                 Slot::integer((length + c) as i32)
+            }
+            // `Array.prototype.copyWithin(target[, start[, end]])` — dense fast
+            // path. Copy the block `[start, end)` (clamped to fit) to `target`
+            // in place. Metering: a frame constant + `mxMeterSome(count*10)`.
+            NativeMethod::ArrayCopyWithin => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("copyWithin:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                let to = self.arg_to_index(base, 0, 0, length);
+                let from = self.arg_to_index(base, 1, 0, length);
+                let end = self.arg_to_index(base, 2, length, length);
+                let mut count = end.saturating_sub(from);
+                if count > length - to {
+                    count = length - to;
+                }
+                self.meter.tick_raw(ARRAY_COPYWITHIN_FRAME_METERING);
+                if count > 0 {
+                    self.meter.tick_builtin_some((count as u64) * 10);
+                    // Snapshot the source range, then write to the destination
+                    // (memmove semantics — overlapping ranges are handled by the
+                    // snapshot).
+                    let src: Vec<Option<Slot>> = (0..count)
+                        .map(|i| self.arrays[&inst].items.get(&(from + i)).copied())
+                        .collect();
+                    let a = self.arrays.get_mut(&inst).unwrap();
+                    for (i, s) in src.into_iter().enumerate() {
+                        let dst = to + i as u32;
+                        match s {
+                            Some(v) => {
+                                a.items.insert(dst, v);
+                            }
+                            None => {
+                                a.items.remove(&dst);
+                            }
+                        }
+                    }
+                }
+                this
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default

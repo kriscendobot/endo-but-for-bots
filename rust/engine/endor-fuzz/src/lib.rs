@@ -288,7 +288,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(16) {
+    match b.choice(17) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -356,7 +356,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
             }
         }
         // concat an array and/or a value, observe the result.
-        _ => match b.choice(3) {
+        15 => match b.choice(3) {
             0 => format!(
                 "var a={}; a.concat([{},{}]); a",
                 lit,
@@ -371,6 +371,12 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
                 small_int(&mut b)
             ),
         },
+        // copyWithin a block in place, observe the result.
+        _ => {
+            let t = (b.next() as usize) % (n + 1);
+            let s = (b.next() as usize) % (n + 1);
+            format!("var a={}; a.copyWithin({},{}); a", lit, t, s)
+        }
     }
 }
 
