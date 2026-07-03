@@ -187,6 +187,12 @@ pub const CONSTRUCTOR_HOST_FRAME_METERING: u64 = 2 << 16;
 /// object or primitive.
 pub const INSTANCEOF_METERING: u64 = 2 << 16;
 
+/// The raw 16.16 cost the `in` operator accrues beyond its own dispatch when
+/// the property is present: `fxRunIn` wraps `fxHasAt` in a host frame — one
+/// code unit plus one built-in step. Measured against the pin `48ee02d8cfe0`
+/// as exactly `(1<<16) + (1<<14)` (81920 raw), independent of the object.
+pub const IN_METERING: u64 = (1 << 16) + (1 << 14);
+
 /// The additional raw 16.16 cost when the left operand is an object:
 /// `fxOrdinaryHasInstance` reads the constructor's `.prototype` and walks the
 /// chain, whereas a primitive short-circuits to `false` before it. Measured
@@ -2050,6 +2056,42 @@ impl Interp {
                     };
                     self.push(Slot::boolean(result));
                     pc += size as usize;
+                }
+
+                // `in` (`XS_CODE_IN`, xsRun.c → fxRunIn → fxHasAt): does the
+                // right operand (object) have a property named by the left
+                // (key). Stack: [.., left (key), right (object)]. endor answers
+                // only the case it can decide soundly: the key resolves to a
+                // program symbol whose property is an **own** property of the
+                // object ⇒ `true` (metered one built-in step, `fxHasAt`). A
+                // key that is *not* an own property cannot be answered `false`
+                // safely — endor's per-program symbol table cannot tell a
+                // genuinely-absent key from an unreferenced inherited built-in
+                // (`'toString' in {}` is `true` in XS), so it self-names rather
+                // than risk a wrong `false`. A non-object right operand throws
+                // in XS ("in: not an object") — self-name there too.
+                XS_CODE_IN => {
+                    let obj = self.pop();
+                    let key = self.pop();
+                    let objref = match obj.value {
+                        Payload::Reference(r) => r,
+                        _ => return Halt::Unsupported(op.name()),
+                    };
+                    let id = match key.value {
+                        Payload::String(off) => {
+                            let s = String::from_utf8_lossy(self.str_content(off)).into_owned();
+                            self.symbol_ids.get(&s).copied()
+                        }
+                        _ => None,
+                    };
+                    match id.and_then(|i| self.find_property(objref, i)) {
+                        Some(_) => {
+                            self.meter.tick_raw(IN_METERING);
+                            self.push(Slot::boolean(true));
+                            pc += size as usize;
+                        }
+                        None => return Halt::Unsupported(op.name()),
+                    }
                 }
 
                 // ---- stack ------------------------------------------

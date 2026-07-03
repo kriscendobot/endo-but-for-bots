@@ -132,3 +132,11 @@ null instanceof Object
 function C0(){}; (new C0()) instanceof C0
 function C1(){}; (new C1()) instanceof Object
 function C2(){}; function D2(){}; (new C2()) instanceof D2
+
+// `in` completion (fxHasAt) — the own-present case (a `true` endor can decide
+// soundly; an absent/inherited key self-names rather than risk a wrong false).
+'a' in {a:1}
+'a' in {a:1, b:2}
+'b' in {a:1, b:2}
+var oi = {x:1}; 'x' in oi
+var oj = {a:1, b:2, c:3}; 'c' in oj
