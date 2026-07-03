@@ -174,3 +174,13 @@ function named1(){}; named1.toString()
 (new Boolean(1)).toString()
 (new Number(5)).toString()
 (new String('hi')).toString()
+
+// Function.prototype.call (the re-entrant trampoline): invoke the receiver
+// with a rebound `this` and forwarded arguments. (A primitive thisArg needs
+// sloppy `this`-boxing, not yet modeled, and self-names.)
+var fc0 = function () { return 1 }; fc0.call()
+var fc1 = function () { return 1 }; fc1.call(null)
+var fc2 = function () { return this.x }; fc2.call({ x: 5 })
+var fc3 = function (a, b) { return a + b }; fc3.call(null, 2, 3)
+function idc(x) { return x }; idc.call(null, 42)
+var fc4 = function (a, b, c) { return a + b + c }; fc4.call(null, 1, 2, 3)

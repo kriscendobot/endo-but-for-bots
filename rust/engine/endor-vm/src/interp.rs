@@ -188,6 +188,12 @@ pub const METHOD_OBJECT_TOSTRING_METERING: u64 = 49216;
 pub const METHOD_FUNCTION_TOSTRING_METERING: u64 = 131176;
 pub const METHOD_ERROR_TOSTRING_METERING: u64 = 98360;
 pub const METHOD_HAS_OWN_PROPERTY_METERING: u64 = 1 << 16;
+/// The fixed re-dispatch overhead `Function.prototype.call` accrues beyond
+/// the visible `.call` opcodes and the callee body (measured as `2<<16`),
+/// plus one built-in step ([`CALL_TRAMPOLINE_PER_ARG`]) per forwarded
+/// argument (XS copies each). Calibrated against the pin via the raw-gap.
+pub const CALL_TRAMPOLINE_METERING: u64 = 2 << 16;
+pub const CALL_TRAMPOLINE_PER_ARG: u64 = 1 << 14;
 
 /// The raw 16.16 cost the `instanceof` operator accrues beyond its own
 /// dispatch for the `Symbol.hasInstance` host-frame call itself
@@ -275,6 +281,11 @@ pub enum NativeMethod {
     ObjectValueOf,
     ObjectIsPrototypeOf,
     FunctionToString,
+    /// `Function.prototype.call` — a re-entrant trampoline: invoke the
+    /// receiver function with the first argument as `this` and the rest as
+    /// its arguments. Handled specially in the `run` dispatch (it re-enters
+    /// the interpreter frame machinery rather than computing a value).
+    FunctionCall,
     ErrorToString,
     /// A primitive wrapper's `valueOf` (returns the wrapped primitive).
     WrapperValueOf,
@@ -809,6 +820,8 @@ impl Interp {
         }
         let fp_tostring = self.alloc_method(NativeMethod::FunctionToString);
         self.proto_methods.push((func_proto, "toString", fp_tostring));
+        let fp_call = self.alloc_method(NativeMethod::FunctionCall);
+        self.proto_methods.push((func_proto, "call", fp_call));
         // Every Error prototype (base + each subtype) gets `toString`.
         let error_protos: Vec<crate::value::SlotIndex> = {
             let mut v = vec![error_proto];
@@ -1726,6 +1739,18 @@ impl Interp {
                                     return Halt::MeterAbort;
                                 }
                                 pc = ret_pc;
+                            }
+                            Err(h) => return h,
+                        }
+                    } else if let Some((NativeMethod::FunctionCall, base)) = method {
+                        // `Function.prototype.call`: re-enter the target frame
+                        // (a trampoline), resuming the caller after this `run`.
+                        match self.enter_call_dot_call(base, argc, ret_pc) {
+                            Ok(body_start) => {
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = body_start;
                             }
                             Err(h) => return h,
                         }
@@ -3032,6 +3057,70 @@ impl Interp {
         }
     }
 
+    /// `Function.prototype.call` trampoline: reshape the call frame from
+    /// `[f, callMethod, RESULT, FRAME, thisArg, args…]` into a direct call
+    /// `[thisArg, f, RESULT, FRAME, args…]` and enter the receiver's body,
+    /// so the receiver runs with `thisArg` as `this` and the trailing
+    /// arguments, resuming the caller after this `run`. The receiver must be
+    /// a user function (a native/method receiver self-names). Meters the fixed
+    /// `.call` re-dispatch overhead ([`CALL_TRAMPOLINE_METERING`]) beyond the
+    /// visible opcodes and the callee body.
+    fn enter_call_dot_call(
+        &mut self,
+        base: usize,
+        argc: usize,
+        ret_pc: usize,
+    ) -> Result<usize, Halt> {
+        let f = self.stack.get(base).copied().unwrap_or_else(Slot::undefined);
+        let fref = match f.value {
+            Payload::Reference(r)
+                if self
+                    .functions
+                    .get(&r)
+                    .map_or(false, |fi| fi.native.is_none() && fi.method.is_none()) =>
+            {
+                r
+            }
+            _ => return Err(Halt::Unsupported("call:non-user-function-receiver")),
+        };
+        let _ = fref;
+        let this_arg = self
+            .stack
+            .get(base + 4)
+            .copied()
+            .unwrap_or_else(Slot::undefined);
+        // A primitive `thisArg` is boxed to its wrapper object in a sloppy
+        // callee (XS's `fxToInstance`) but left as-is in a strict callee — a
+        // meter-affecting distinction endor does not yet model, and the
+        // callee's strictness is not known until its `begin`. Self-name for a
+        // primitive `thisArg` rather than answer a `this`-dependent test
+        // wrongly; `undefined`/`null` (→ global / kept) and an object
+        // `thisArg` are handled.
+        if !matches!(
+            this_arg.kind,
+            Kind::Undefined | Kind::Null | Kind::Reference
+        ) {
+            return Err(Halt::Unsupported("call:primitive-this-boxing"));
+        }
+        let real_args: Vec<Slot> = if argc >= 1 {
+            self.stack[base + 5..base + 4 + argc].to_vec()
+        } else {
+            Vec::new()
+        };
+        let n = real_args.len();
+        self.stack.truncate(base);
+        self.stack.push(this_arg); // THIS
+        self.stack.push(f); // FUNCTION (the receiver)
+        self.stack.push(Slot::undefined()); // RESULT
+        self.stack.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
+        for a in real_args {
+            self.stack.push(a);
+        }
+        self.meter
+            .tick_raw(CALL_TRAMPOLINE_METERING + n as u64 * CALL_TRAMPOLINE_PER_ARG);
+        self.enter_call(n, ret_pc, false)
+    }
+
     /// Dispatch a native prototype **method** call (`obj.toString()`,
     /// `obj.hasOwnProperty(k)`, `wrapper.valueOf()`, …). The value stack holds
     /// the call frame `[THIS, FUNCTION, RESULT, FRAME]` from `base`; `THIS` is
@@ -3044,6 +3133,9 @@ impl Interp {
         let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
         let _ = argc;
         let result: Slot = match m {
+            // `Function.prototype.call` is handled by the `run` trampoline
+            // (`enter_call_dot_call`) and never reaches here.
+            NativeMethod::FunctionCall => return Err(Halt::Unsupported("call:unexpected")),
             // `Object.prototype.valueOf`: returns the receiver unchanged.
             NativeMethod::ObjectValueOf => this,
             // `<wrapper>.valueOf`: the wrapped primitive.
