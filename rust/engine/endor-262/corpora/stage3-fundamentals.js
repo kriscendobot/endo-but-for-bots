@@ -90,3 +90,27 @@ Object().x
 new Object().x
 var oo = Object(); oo.a = 1; oo.a
 var on = new Object(); on.x = 5; on.x
+
+// The real Error hierarchy (fx_Error): constructing and throwing real Error
+// objects with XS's name/message/toString semantics — this graduates
+// abort-value parity from primitive throws to real Error objects.
+new Error()
+new Error('boom')
+Error('boom')
+new TypeError('bad')
+new RangeError('r')
+new SyntaxError('s')
+new ReferenceError('x')
+new EvalError('e')
+new URIError('u')
+new Error(5)
+new Error('a' + 'b')
+typeof new Error('x')
+(new Error('x')).message
+(new Error('x')).name
+var e1 = new Error('m'); e1.message
+var e2 = new TypeError('t'); e2.name
+throw new Error()
+throw new Error('boom')
+throw new TypeError('nope')
+throw new RangeError('z')

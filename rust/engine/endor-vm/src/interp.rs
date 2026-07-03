@@ -180,6 +180,21 @@ pub const FUNCTION_LOCAL_METERING: u64 = 280;
 /// entry at `begin`, in [`Interp::run_constructor`].
 pub const CONSTRUCTOR_HOST_FRAME_METERING: u64 = 2 << 16;
 
+/// The raw 16.16 cost an Error constructor accrues over the native `Object`
+/// constructor's empty-object cost: the extra internal slots and steps an
+/// error instance carries (`fx_Error`/`fxNewErrorInstance` — the stack-trace
+/// capture and internal `[[ErrorData]]`). Measured against the pin
+/// `48ee02d8cfe0` as the raw gap between `new Error()` and `new Object()` =
+/// 66304 (one built-in step `1<<16` plus 768 for the extra slots). Accrued
+/// in [`Interp::build_error`].
+pub const ERROR_CONSTRUCT_EXTRA: u64 = (1 << 16) + 768;
+
+/// The raw 16.16 cost of an Error's own `message` property when a message
+/// argument is supplied (`fx_Error` defining `message`). Measured against the
+/// pin as `new Error('x')` minus `new Error()` = 280 raw, independent of the
+/// message length (the message string's own chunk is metered at its literal).
+pub const ERROR_MESSAGE_METERING: u64 = 280;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -215,6 +230,14 @@ impl Default for FuncInfo {
             native: None,
         }
     }
+}
+
+/// An Error instance's stringification data (XS's `Error.prototype.toString`
+/// inputs): the constructor's `name` and the optional own `message`.
+#[derive(Clone, Debug)]
+struct ErrorInfo {
+    name: &'static str,
+    message: Option<String>,
 }
 
 /// One intrinsic (native) function endor models. The variant is the
@@ -469,6 +492,22 @@ pub struct Interp {
     /// C-XS compiler assigned that name. Each value is a `functions`-tracked
     /// native function instance.
     intrinsics: std::collections::HashMap<&'static str, crate::value::SlotIndex>,
+    /// The program's symbol `name → id` table, built at
+    /// [`Self::link_intrinsics`] from the decoded symbols atom (the inverse
+    /// of the id→name vector). A native built-in that must set a
+    /// well-known-named own property (`message`/`name` on an Error) looks up
+    /// the program-local id here — XS uses a fixed global symbol id
+    /// (`mxID(_message)`), which endor's program-local numbering must relink
+    /// against, exactly as the intrinsic constructors relink by name. A name
+    /// the program never references has no id (and no read of it occurs).
+    symbol_ids: std::collections::HashMap<String, u16>,
+    /// Per-instance Error metadata (name + message), keyed by the error
+    /// instance's slot index. An Error object's completion/abort value
+    /// stringifies as `name` (no/empty message) or `name: message` — XS's
+    /// `Error.prototype.toString`. Kept here so [`Self::render`] produces the
+    /// exact abort value without a symbol-id lookup, graduating abort-value
+    /// parity from primitive throws to real Error objects.
+    error_data: std::collections::HashMap<crate::value::SlotIndex, ErrorInfo>,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -580,6 +619,8 @@ impl Interp {
             exception: Slot::undefined(),
             frame_slots: 0,
             intrinsics: std::collections::HashMap::new(),
+            symbol_ids: std::collections::HashMap::new(),
+            error_data: std::collections::HashMap::new(),
             jumps: Vec::new(),
         };
         interp.create_intrinsics();
@@ -619,6 +660,10 @@ impl Interp {
     pub fn link_intrinsics(&mut self, names: &[String]) {
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
+            // Record the program-local id for every name, so a native
+            // built-in can relink a well-known property name (`message`,
+            // `name`, …) to the id the compiler assigned it in this program.
+            self.symbol_ids.entry(name.clone()).or_insert(id);
             if self.global_props.contains_key(&id) {
                 continue;
             }
@@ -810,14 +855,25 @@ impl Interp {
             Payload::String(off) => {
                 String::from_utf8_lossy(self.str_content(off)).into_owned()
             }
-            // A native (intrinsic) function stringifies through XS's
-            // `Function.prototype.toString`, which prints a host function as
-            // `function ["name"] (){[native code]}` (verified against the
-            // pin's completion rendering for a bare `Object`/`Boolean`/… ).
-            Payload::Reference(r) => match self.native_of(r) {
-                Some(n) => format!("function [\"{}\"] (){{[native code]}}", n.display_name()),
-                None => slot_to_ecma_string(s),
-            },
+            Payload::Reference(r) => {
+                // An Error instance stringifies through `Error.prototype.
+                // toString`: `name` with an empty/absent message, else
+                // `name: message` — the abort/completion value parity the
+                // Error hierarchy graduates.
+                if let Some(info) = self.error_data.get(&r) {
+                    match &info.message {
+                        Some(m) if !m.is_empty() => format!("{}: {}", info.name, m),
+                        _ => info.name.to_string(),
+                    }
+                } else if let Some(n) = self.native_of(r) {
+                    // A native (intrinsic) function stringifies through
+                    // `Function.prototype.toString` as a host function
+                    // (verified against the pin for a bare `Object`/`Boolean`).
+                    format!("function [\"{}\"] (){{[native code]}}", n.display_name())
+                } else {
+                    slot_to_ecma_string(s)
+                }
+            }
             _ => slot_to_ecma_string(s),
         }
     }
@@ -2382,6 +2438,21 @@ impl Interp {
                     _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
                 }
             }
+            // The Error hierarchy (`fx_Error` and the per-type constructors):
+            // `new TypeError(msg)` / `TypeError(msg)` both build a fresh error
+            // instance carrying the type's `name` and, when a message argument
+            // is given, an own `message` property set to ToString(message).
+            // This is what graduates abort-value parity: a thrown error's
+            // completion/abort value stringifies as `name` or `name: message`
+            // (XS's `Error.prototype.toString`), not a primitive. `has_target`
+            // is immaterial — an Error called as a function constructs too.
+            Native::Error => self.build_error("Error", base, argc),
+            Native::EvalError => self.build_error("EvalError", base, argc),
+            Native::RangeError => self.build_error("RangeError", base, argc),
+            Native::ReferenceError => self.build_error("ReferenceError", base, argc),
+            Native::SyntaxError => self.build_error("SyntaxError", base, argc),
+            Native::TypeError => self.build_error("TypeError", base, argc),
+            Native::URIError => self.build_error("URIError", base, argc),
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -2392,6 +2463,79 @@ impl Interp {
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// Build a fresh Error instance of type `name` from a native Error
+    /// constructor call/construct (`fx_Error`). Meters the construct cost
+    /// (the native `Object` object cost plus [`ERROR_CONSTRUCT_EXTRA`]) and,
+    /// when a message argument is present, ToString's it into an own
+    /// `message` property ([`ERROR_MESSAGE_METERING`]). Records the
+    /// `(name, message)` in [`Self::error_data`] so the value stringifies as
+    /// `name` / `name: message`, and sets own `name`/`message` properties
+    /// (under the program's relinked ids) so guest reads resolve — both
+    /// unmetered, mirroring XS where `name` is the inherited prototype value
+    /// and the property slot cost is folded into the measured constants.
+    fn build_error(&mut self, name: &'static str, base: usize, argc: usize) -> Slot {
+        // Base object cost, exactly as the native `Object` constructor
+        // (`tick_builtin` + `fxNewObject`), plus the error-instance extra.
+        self.meter.tick_builtin();
+        let inst = self.new_object();
+        self.meter.tick_raw(ERROR_CONSTRUCT_EXTRA);
+        // The message argument: absent or `undefined` ⇒ no own message (XS
+        // inherits `Error.prototype.message == ""`).
+        let message: Option<String> = if argc >= 1 {
+            let a = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+            if a.kind == Kind::Undefined {
+                None
+            } else {
+                let bytes = self.to_string_bytes_metered(a);
+                self.meter.tick_raw(ERROR_MESSAGE_METERING);
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        } else {
+            None
+        };
+        self.error_data.insert(
+            inst,
+            ErrorInfo {
+                name,
+                message: message.clone(),
+            },
+        );
+        // Own `name`/`message` properties for guest reads, relinked to the
+        // program's symbol ids (only when the program references them). Set
+        // unmetered: `name` is XS's inherited prototype value, and the own
+        // `message` slot cost is already folded into the measured constants.
+        if let Some(&nid) = self.symbol_ids.get("name") {
+            let off = self.chunks.alloc(name.as_bytes());
+            self.set_own_unmetered(inst, nid, Slot::of(Kind::String, Payload::String(off)));
+        }
+        if let Some(&mid) = self.symbol_ids.get("message") {
+            let text = message.unwrap_or_default();
+            let off = self.chunks.alloc(text.as_bytes());
+            self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
+        }
+        Slot::of(Kind::Reference, Payload::Reference(inst))
+    }
+
+    /// Insert or overwrite an own property `id = value` on `inst` **without**
+    /// metering — for intrinsic-supplied properties whose cost is either an
+    /// inherited prototype value (unmetered in XS) or already folded into a
+    /// measured construct constant.
+    fn set_own_unmetered(&mut self, inst: crate::value::SlotIndex, id: u16, value: Slot) {
+        if let Some(p) = self.find_property(inst, id) {
+            let s = self.slots.get_mut(p);
+            s.kind = value.kind;
+            s.value = value.value;
+        } else {
+            let head = self.slots.get(inst).next;
+            let mut prop = value;
+            prop.id = id;
+            prop.flag = 0;
+            prop.next = head;
+            let idx = self.slots.alloc(prop);
+            self.slots.get_mut(inst).next = idx;
+        }
     }
 
     /// Leave a user-function call (`XS_CODE_END`): restore the caller's
@@ -3601,6 +3745,43 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "5", "new F(5).x reads the constructed property");
         assert_eq!(out.computrons, 43, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn new_error_constructs_renders_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `new Error('boom')` (captured from the
+        // oracle): the native Error constructor builds an error object whose
+        // completion stringifies `Error: boom` (Error.prototype.toString) at
+        // C-XS's 13 computrons.
+        let code: [u8; 21] = [
+            0x0b, 0x00, 0x4b, 0x4d, 0x01, 0x00, 0x67, 0x01, 0x00, 0x84, 0xc9, 0x05, 0x62, 0x6f,
+            0x6f, 0x6d, 0x00, 0xab, 0x01, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Error".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "Error: boom");
+        assert_eq!(out.computrons, 13, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn uncaught_thrown_error_escapes_with_real_error_value_bit_exact() {
+        // The exact C-XS bytecode for `throw new TypeError('nope')` (captured
+        // from the oracle): an uncaught real Error escapes to the host as
+        // `TypeError: nope` (graduating abort-value parity from primitive
+        // throws) at C-XS's 12 computrons.
+        let code: [u8; 21] = [
+            0x0b, 0x00, 0x4b, 0x4d, 0x01, 0x00, 0x67, 0x01, 0x00, 0x84, 0xc9, 0x05, 0x6e, 0x6f,
+            0x70, 0x65, 0x00, 0xab, 0x01, 0xd7, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["TypeError".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Throw("TypeError: nope".into()));
+        assert!(!out.completed);
+        assert_eq!(out.computrons, 12, "bit-exact host-escape computrons vs C-XS");
     }
 
     #[test]
