@@ -291,6 +291,14 @@ pub fn stage3_arrays_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-arrays.js"))
 }
 
+/// Stage-3 child-4 (text-math-json) curated corpus: the `Math` namespace
+/// object, its numeric constants, and the modeled `Math.*` statics, plus the
+/// Number::toString fixed-vs-exponential rendering corners — bit-exact (result
+/// AND computron) against the oracle.
+pub fn stage3_math_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3-math.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -804,6 +812,35 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3 arrays bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3_math_corpus_is_bit_exact_against_oracle() {
+        // The stage-3 child-4 Math acceptance bar: every Math program — the
+        // namespace object, the numeric constants, and every modeled static
+        // (including the NaN-canonicalization and ±0 determinism corners the
+        // design flags consensus-critical) — agrees with C-XS on BOTH the
+        // completion value AND the computron count.
+        let programs = stage3_math_corpus();
+        assert!(!programs.is_empty(), "stage-3 math corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3 math bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

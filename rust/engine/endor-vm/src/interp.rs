@@ -498,6 +498,19 @@ pub const ARRAY_FOR_IN_EXTRA_METERING: u64 = 10488;
 /// the yielded key's own string-chunk allocation. Calibrated against the pin.
 pub const ENUMERATOR_NEXT_METERING: u64 = (2 << 14) + 256;
 
+/// The whole raw 16.16 computron cost of a `Math.*` static call, beyond the
+/// `RUN` opcode's own dispatch metering. Every `xsMath.c` body carries no
+/// `mxMeterSome` and allocates no chunk (the result is a number/integer
+/// slot, never heap), so the cost is exactly the native host frame
+/// (`fxBeginHost`/`fxEndHost` + the callback dispatch), a single constant
+/// shared by every Math function regardless of arity. Calibrated against the
+/// pin `48ee02d8cfe0` as **zero**: the `RUN` opcode endor already meters
+/// (`1 << 16`) plus the argument-push opcodes fully account for the observed
+/// oracle computrons — the C host frame (`fxBeginHost`/`fxEndHost`) adds no
+/// metered step of its own for a `Math.*` call (raw_gap measured 0 across
+/// `abs`/`max`/`sqrt`/`floor`/… on the pin).
+pub const MATH_FRAME_METERING: u64 = 0;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -530,6 +543,51 @@ struct FuncInfo {
     /// The function's own name (for `Function.prototype.toString`), an empty
     /// string for an anonymous function.
     name: String,
+}
+
+/// The `Math` static functions endor models (`xsMath.c`). Each is a
+/// property of the `Math` namespace object, dispatched through
+/// [`NativeMethod::Math`] ignoring the receiver. The bodies carry **no**
+/// `mxMeterSome` (verified against the pin: `grep -c mxMeter xsMath.c` is
+/// 0), so a Math call's whole computron cost is the native host frame
+/// ([`MATH_FRAME_METERING`]); the result NaN is the canonical `f64::NAN`
+/// (`C_NAN`), which the design flags consensus-critical.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MathId {
+    Abs,
+    Acos,
+    Acosh,
+    Asin,
+    Asinh,
+    Atan,
+    Atanh,
+    Atan2,
+    Cbrt,
+    Ceil,
+    Clz32,
+    Cos,
+    Cosh,
+    Exp,
+    Expm1,
+    Floor,
+    Fround,
+    Hypot,
+    Imul,
+    Log,
+    Log1p,
+    Log10,
+    Log2,
+    Max,
+    Min,
+    Pow,
+    Round,
+    Sign,
+    Sin,
+    Sinh,
+    Sqrt,
+    Tan,
+    Tanh,
+    Trunc,
 }
 
 /// A native prototype method endor models (dispatched with the receiver as
@@ -705,6 +763,8 @@ pub enum NativeMethod {
     /// yield the next `{value, done}` (mutating and returning the iterator's
     /// reused result object).
     ArrayIteratorNext,
+    /// A `Math.*` static (`xsMath.c`), dispatched ignoring the receiver.
+    Math(MathId),
 }
 
 impl Default for FuncInfo {
@@ -1101,6 +1161,17 @@ pub struct Interp {
     /// `arr[Symbol.iterator]()` produce. Carries `next` and a
     /// `Symbol.iterator` returning the iterator itself.
     array_iterator_proto: crate::value::SlotIndex,
+    /// The realm's `Math` namespace object (XS's `mxMathObject`) — a boot
+    /// object carrying the `Math.*` functions and the numeric constants
+    /// (`Math.PI`, …) as own properties, bound into the global object under
+    /// the program-local `Math` id at [`Self::link_intrinsics`]. Not a
+    /// function, so `typeof Math === "object"`.
+    math_object: crate::value::SlotIndex,
+    /// Native prototype/namespace **numeric** data properties to bind at link
+    /// time: `(owner instance, property name, value)`. Used for `Math.PI` &co.
+    /// (the `Math` constants) and `Number.MAX_VALUE` &co.; bound only when the
+    /// program references the name, unmetered.
+    proto_value_data: Vec<(crate::value::SlotIndex, &'static str, Slot)>,
     /// Per-instance array-iterator state (XS's `fxNewIteratorInstance`
     /// internal slots): the array being iterated, the next index to yield,
     /// the iteration `kind` (0 = values, 1 = keys, 2 = entries), and the
@@ -1239,6 +1310,8 @@ impl Interp {
             arrays: std::collections::HashMap::new(),
             length_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
+            math_object: crate::value::SlotIndex::NULL,
+            proto_value_data: Vec::new(),
             iterators: std::collections::HashMap::new(),
             value_id: None,
             done_id: None,
@@ -1491,6 +1564,76 @@ impl Interp {
                 }
             }
         }
+        self.create_math();
+    }
+
+    /// Build the `Math` namespace object (XS's `mxMathObject`, `xsMath.c`):
+    /// a boot object chaining to `%Object.prototype%`, carrying every
+    /// `Math.*` function and numeric constant as own properties (bound at
+    /// link time only for the names the program references). Registered in
+    /// `intrinsics` under `"Math"` so [`Self::link_intrinsics`] binds it into
+    /// the global object like a constructor — but it is not a function, so
+    /// `typeof Math === "object"`.
+    fn create_math(&mut self) {
+        let object_proto = self.object_proto;
+        let math = self.slots.alloc(Slot::instance(object_proto));
+        self.math_object = math;
+        self.intrinsics.insert("Math", math);
+        use MathId::*;
+        for (name, id) in [
+            ("abs", Abs),
+            ("acos", Acos),
+            ("acosh", Acosh),
+            ("asin", Asin),
+            ("asinh", Asinh),
+            ("atan", Atan),
+            ("atanh", Atanh),
+            ("atan2", Atan2),
+            ("cbrt", Cbrt),
+            ("ceil", Ceil),
+            ("clz32", Clz32),
+            ("cos", Cos),
+            ("cosh", Cosh),
+            ("exp", Exp),
+            ("expm1", Expm1),
+            ("floor", Floor),
+            ("fround", Fround),
+            ("hypot", Hypot),
+            ("imul", Imul),
+            ("log", Log),
+            ("log1p", Log1p),
+            ("log10", Log10),
+            ("log2", Log2),
+            ("max", Max),
+            ("min", Min),
+            ("pow", Pow),
+            ("round", Round),
+            ("sign", Sign),
+            ("sin", Sin),
+            ("sinh", Sinh),
+            ("sqrt", Sqrt),
+            ("tan", Tan),
+            ("tanh", Tanh),
+            ("trunc", Trunc),
+        ] {
+            let mf = self.alloc_method(NativeMethod::Math(id));
+            self.proto_methods.push((math, name, mf));
+        }
+        // The numeric constants (`fxNextNumberProperty`, XS's `C_M_*`): the
+        // exact IEEE doubles from `math.h`, reproduced by Rust's
+        // `std::f64::consts` (identical bit patterns).
+        for (name, v) in [
+            ("E", std::f64::consts::E),
+            ("LN10", std::f64::consts::LN_10),
+            ("LN2", std::f64::consts::LN_2),
+            ("LOG10E", std::f64::consts::LOG10_E),
+            ("LOG2E", std::f64::consts::LOG2_E),
+            ("PI", std::f64::consts::PI),
+            ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+            ("SQRT2", std::f64::consts::SQRT_2),
+        ] {
+            self.proto_value_data.push((math, name, Slot::number(v)));
+        }
     }
 
     /// Allocate a native prototype-method function instance (chained to
@@ -1618,6 +1761,15 @@ impl Interp {
             }
         }
         self.proto_data = data;
+        // Native numeric data properties (`Math.PI` &co.): bound as own
+        // properties of their owner under the program-local id, unmetered.
+        let vdata = std::mem::take(&mut self.proto_value_data);
+        for (owner, pname, value) in &vdata {
+            if let Some(&pid) = self.symbol_ids.get(*pname) {
+                self.set_own_unmetered(*owner, pid, *value);
+            }
+        }
+        self.proto_value_data = vdata;
         // Well-known symbols as own properties of the `Symbol` constructor.
         if let Some(&symbol_ctor) = self.intrinsics.get("Symbol") {
             let wks = std::mem::take(&mut self.well_known_symbols);
@@ -5477,10 +5629,241 @@ impl Interp {
                 };
                 self.array_iterator_next(iter)?
             }
+            NativeMethod::Math(id) => self.call_math(id, base, argc)?,
         };
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// Dispatch a `Math.*` static (`xsMath.c`). Reads the positional
+    /// arguments off the call frame (`stack[base + 4 + i]`), coerces each to a
+    /// number (`fxToNumber` — free for a number/integer/boolean/undefined/null
+    /// operand; a string operand routes through ToNumber, which endor does not
+    /// yet model here, so a string argument self-names an honest skip), and
+    /// meters the single native host frame ([`MATH_FRAME_METERING`]). No
+    /// `mxMeterSome` and no chunk — the pin's bodies carry neither. A NaN
+    /// result is the canonical `f64::NAN`.
+    fn call_math(&mut self, id: MathId, base: usize, argc: usize) -> Result<Slot, Halt> {
+        let arg = |i: usize| -> Option<Slot> {
+            if i < argc {
+                Some(
+                    self.stack
+                        .get(base + 4 + i)
+                        .copied()
+                        .unwrap_or_else(Slot::undefined),
+                )
+            } else {
+                None
+            }
+        };
+        // ToNumber that self-names on a string/reference operand (endor does
+        // not yet model string→number coercion in the Math built-ins).
+        let num = |s: Slot| -> Result<f64, Halt> {
+            match s.kind {
+                Kind::String | Kind::Reference | Kind::Symbol => {
+                    Err(Halt::Unsupported("Math:non-numeric-argument"))
+                }
+                _ => Ok(to_number(&s)),
+            }
+        };
+        use MathId::*;
+        // Unary functions taking one argument, NaN when called with none
+        // (the `mxNanResultIfNoArg` macro).
+        let unary = |f: fn(f64) -> f64, a: Option<Slot>| -> Result<Slot, Halt> {
+            match a {
+                None => Ok(Slot::number(f64::NAN)),
+                Some(s) => Ok(Slot::number(f(num(s)?))),
+            }
+        };
+        self.meter.tick_raw(MATH_FRAME_METERING);
+        let r = match id {
+            Abs => unary(f64::abs, arg(0))?,
+            Acos => unary(f64::acos, arg(0))?,
+            Acosh => unary(f64::acosh, arg(0))?,
+            Asin => unary(f64::asin, arg(0))?,
+            Asinh => unary(f64::asinh, arg(0))?,
+            Atan => unary(f64::atan, arg(0))?,
+            Atanh => unary(f64::atanh, arg(0))?,
+            Cbrt => unary(f64::cbrt, arg(0))?,
+            Ceil => unary(f64::ceil, arg(0))?,
+            Cos => unary(f64::cos, arg(0))?,
+            Cosh => unary(f64::cosh, arg(0))?,
+            Exp => unary(f64::exp, arg(0))?,
+            Expm1 => unary(f64::exp_m1, arg(0))?,
+            Floor => unary(f64::floor, arg(0))?,
+            Log => unary(f64::ln, arg(0))?,
+            Log1p => unary(f64::ln_1p, arg(0))?,
+            Log10 => unary(f64::log10, arg(0))?,
+            // The pin computes `log2` as `c_log(x) / c_log(2)` only under
+            // `mxNoFunctionLength`-style configs it does not enable here; the
+            // default build calls `c_log2`, so endor uses `f64::log2`.
+            Log2 => unary(f64::log2, arg(0))?,
+            Sin => unary(f64::sin, arg(0))?,
+            Sinh => unary(f64::sinh, arg(0))?,
+            Sqrt => unary(f64::sqrt, arg(0))?,
+            Tan => unary(f64::tan, arg(0))?,
+            Tanh => unary(f64::tanh, arg(0))?,
+            Atan2 => match (arg(0), arg(1)) {
+                (Some(y), Some(x)) => Slot::number(num(y)?.atan2(num(x)?)),
+                _ => Slot::number(f64::NAN),
+            },
+            // `fx_Math_pow` → `fx_pow`: `(±1) ** ±Infinity` is NaN (the pin's
+            // explicit special-case), otherwise `c_pow`.
+            Pow => match (arg(0), arg(1)) {
+                (Some(x), Some(y)) => {
+                    let (x, y) = (num(x)?, num(y)?);
+                    let v = if !y.is_finite() && x.abs() == 1.0 {
+                        f64::NAN
+                    } else {
+                        x.powf(y)
+                    };
+                    Slot::number(v)
+                }
+                _ => Slot::number(f64::NAN),
+            },
+            // `fx_Math_hypot`: no arg → 0; XS special-cases the 2-argument
+            // `c_hypot`, else sums the squares and takes the sqrt.
+            Hypot => {
+                let vals: Vec<f64> = (0..argc)
+                    .map(|i| num(arg(i).unwrap()))
+                    .collect::<Result<_, _>>()?;
+                let v = match vals.len() {
+                    0 => 0.0,
+                    2 => vals[0].hypot(vals[1]),
+                    _ => vals.iter().map(|x| x * x).sum::<f64>().sqrt(),
+                };
+                Slot::number(v)
+            }
+            // `fx_Math_sign`: NaN→NaN, <0→-1, >0→1, else the argument (±0),
+            // then `fx_Math_toInteger` folds an exact integer to integer kind.
+            Sign => match arg(0) {
+                None => Slot::number(f64::NAN),
+                Some(s) => {
+                    let a = num(s)?;
+                    let r = if a.is_nan() {
+                        f64::NAN
+                    } else if a < 0.0 {
+                        -1.0
+                    } else if a > 0.0 {
+                        1.0
+                    } else {
+                        a
+                    };
+                    math_to_integer(r)
+                }
+            },
+            // `fx_Math_round`: an integer argument passes through; otherwise
+            // XS rounds half-up (`floor(x + 0.5)`) inside the ±(2^52-1) normal
+            // window, with the ±0 corners, then folds to integer kind.
+            Round => match arg(0) {
+                None => Slot::number(f64::NAN),
+                Some(s) if s.kind == Kind::Integer => s,
+                Some(s) => {
+                    let mut a = num(s)?;
+                    if a.is_normal() && (-4503599627370495.0 < a) && (a < 4503599627370495.0) {
+                        if a < -0.5 || 0.5 <= a {
+                            a = (a + 0.5).floor();
+                        } else if a < 0.0 {
+                            a = -0.0;
+                        } else if a > 0.0 {
+                            a = 0.0;
+                        }
+                    }
+                    math_to_integer(a)
+                }
+            },
+            // `fx_Math_trunc`: `c_trunc`, then fold to integer kind.
+            Trunc => match arg(0) {
+                None => Slot::number(f64::NAN),
+                Some(s) => math_to_integer(num(s)?.trunc()),
+            },
+            // `fx_Math_fround`: an integer passes through; otherwise round to
+            // the nearest `f32` and widen back.
+            Fround => match arg(0) {
+                None => Slot::number(f64::NAN),
+                Some(s) if s.kind == Kind::Integer => s,
+                Some(s) => Slot::number(num(s)? as f32 as f64),
+            },
+            // `fx_Math_clz32`: count leading zeros of ToUint32(arg); 32 for 0.
+            Clz32 => {
+                let x = match arg(0) {
+                    None => 0u32,
+                    Some(s) => to_int32(num(s)?) as u32,
+                };
+                Slot::integer(x.leading_zeros() as i32)
+            }
+            // `fx_Math_imul`: (ToInt32(a) * ToInt32(b)) as a 32-bit product.
+            Imul => {
+                let a = arg(0).map(num).transpose()?.map(to_int32).unwrap_or(0);
+                let b = arg(1).map(num).transpose()?.map(to_int32).unwrap_or(0);
+                Slot::integer(a.wrapping_mul(b))
+            }
+            Max => self.math_extremum(argc, base, true)?,
+            Min => self.math_extremum(argc, base, false)?,
+        };
+        Ok(r)
+    }
+
+    /// `fx_Math_max`/`fx_Math_min`: the running extremum over the arguments,
+    /// preserving XS's integer-kind fast path (an all-integer argument list
+    /// stays integer) and its ±0 tie-break (`max(+0,-0)===+0`,
+    /// `min(+0,-0)===-0`), with a NaN argument poisoning the result (after
+    /// still coercing the remaining arguments — a no-op for endor's numeric
+    /// operands). `max` seeds `-Infinity`, `min` seeds `+Infinity`.
+    fn math_extremum(&mut self, argc: usize, base: usize, is_max: bool) -> Result<Slot, Halt> {
+        let a = |i: usize| self.stack.get(base + 4 + i).copied().unwrap_or_else(Slot::undefined);
+        if argc == 0 {
+            return Ok(Slot::number(if is_max { f64::NEG_INFINITY } else { f64::INFINITY }));
+        }
+        // Integer fast path while every argument seen so far is an integer.
+        let first = a(0);
+        let mut int_acc: Option<i32> = if first.kind == Kind::Integer {
+            match first.value {
+                Payload::Integer(v) => Some(v),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut acc: f64 = if is_max { f64::NEG_INFINITY } else { f64::INFINITY };
+        let start = if int_acc.is_some() { 1 } else { 0 };
+        for i in start..argc {
+            let s = a(i);
+            if let Some(iv) = int_acc {
+                if s.kind == Kind::Integer {
+                    if let Payload::Integer(v) = s.value {
+                        int_acc = Some(if is_max { iv.max(v) } else { iv.min(v) });
+                        continue;
+                    }
+                }
+                // Leaving the integer path: seed the float accumulator.
+                acc = iv as f64;
+                int_acc = None;
+            }
+            if matches!(s.kind, Kind::String | Kind::Reference | Kind::Symbol) {
+                return Err(Halt::Unsupported("Math:non-numeric-argument"));
+            }
+            let n = to_number(&s);
+            if n.is_nan() {
+                return Ok(Slot::number(f64::NAN));
+            }
+            if is_max {
+                if acc < n {
+                    acc = n;
+                } else if acc == 0.0 && n == 0.0 && acc.is_sign_negative() && n.is_sign_positive() {
+                    acc = 0.0;
+                }
+            } else if acc > n {
+                acc = n;
+            } else if acc == 0.0 && n == 0.0 && acc.is_sign_positive() && n.is_sign_negative() {
+                acc = -0.0;
+            }
+        }
+        Ok(match int_acc {
+            Some(v) => Slot::integer(v),
+            None => Slot::number(acc),
+        })
     }
 
     /// Build an Array Iterator over `arr` with the given `kind` (0 values, 1
@@ -6960,6 +7343,21 @@ fn to_boolean(s: &Slot) -> bool {
 }
 
 // ToNumber (ECMAScript 7.1.4) for stage-1 value kinds.
+/// `fx_Math_toInteger` (`xsMath.c`): fold a number result to an INTEGER-kind
+/// slot when it is an exact `txInteger` (32-bit) value and not negative zero,
+/// exactly as `round`/`sign`/`trunc` do before returning. Otherwise the
+/// NUMBER-kind slot is preserved. Both kinds stringify identically, so this
+/// affects only the value representation, matching the pin.
+fn math_to_integer(number: f64) -> Slot {
+    let integer = number as i32;
+    let check = integer as f64;
+    if number == check && (number != 0.0 || !number.is_sign_negative()) {
+        Slot::integer(integer)
+    } else {
+        Slot::number(number)
+    }
+}
+
 fn to_number(s: &Slot) -> f64 {
     match s.value {
         Payload::None => match s.kind {
