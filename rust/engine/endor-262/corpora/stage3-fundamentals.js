@@ -80,3 +80,13 @@ function F3() { this.a = 1; this.b = 2 }; var o3 = new F3(); o3.a + o3.b
 function F4() { return 7 }; new F4()
 function P(x) { this.x = x }; function mk() { return new P(9).x }; mk()
 function Pair(a, b) { this.a = a; this.b = b }; var p = new Pair(3, 4); p.a * p.b
+
+// The native Object constructor — empty-object call and construct forms
+// (fx_Object), both allocating a fresh ordinary object.
+Object()
+new Object()
+typeof Object()
+Object().x
+new Object().x
+var oo = Object(); oo.a = 1; oo.a
+var on = new Object(); on.x = 5; on.x

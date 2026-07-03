@@ -1353,14 +1353,8 @@ impl Interp {
                         }
                     });
                     if let Some((native, base)) = callee {
-                        // A native (intrinsic) callee. `new` on a native (the
-                        // wrapper-object constructors) is a separate,
-                        // not-yet-modeled path — self-name rather than
-                        // mis-execute.
-                        if has_target {
-                            return Halt::Unsupported(native_unsupported_name(native));
-                        }
-                        match self.call_native(native, base, argc) {
+                        // A native (intrinsic) callee, called or constructed.
+                        match self.call_native(native, base, argc, has_target) {
                             Ok(()) => {
                                 // Return into the JS caller: `END_ALL` checks.
                                 if self.check_meter() == MeterCheck::Abort {
@@ -2340,7 +2334,13 @@ impl Interp {
     /// A native whose call behavior endor does not yet model returns
     /// [`Halt::Unsupported`] naming the built-in — an honest skip, never a
     /// mis-executed result.
-    fn call_native(&mut self, native: Native, base: usize, argc: usize) -> Result<(), Halt> {
+    fn call_native(
+        &mut self,
+        native: Native,
+        base: usize,
+        argc: usize,
+        has_target: bool,
+    ) -> Result<(), Halt> {
         // Argument i is at `base + 4 + i` (arg0 is the deepest); missing
         // arguments read `undefined`.
         let arg = |i: usize| -> Slot {
@@ -2353,13 +2353,37 @@ impl Interp {
             // call's dispatch — a `Boolean(x)` costs exactly its opcodes
             // (the argument expression's chunk allocations, if any, are
             // metered where they occur). A `new Boolean` (the wrapper object)
-            // is the separate construct path, not this one.
-            Native::Boolean => {
+            // is the separate construct path, not yet modeled.
+            Native::Boolean if !has_target => {
                 let v = arg(0);
                 Slot::boolean(self.truthy(&v))
             }
-            // The remaining fundamentals constructors' call/coerce behaviors
-            // land incrementally; until then a call self-names so the
+            // `Object([value])` / `new Object([value])` (`fx_Object`): with no
+            // argument (or `undefined`/`null`), create a fresh empty ordinary
+            // object; with an object argument, return it unchanged (ToObject
+            // identity). Both the call and construct forms behave and meter
+            // identically here (verified: same raw). Wrapping a *primitive*
+            // argument (a Number/String/Boolean object) needs the wrapper
+            // path and self-names. Metering measured against the pin: one
+            // `fxNewObject` ([`Self::new_object`], 16640) plus one extra
+            // built-in step ([`crate::meter::Meter::tick_builtin`], 16384) —
+            // 33024 raw total, the fractional gap over a bare object literal.
+            Native::Object => {
+                let a = arg(0);
+                match a.kind {
+                    Kind::Reference => a,
+                    Kind::Undefined | Kind::Null => {
+                        self.meter.tick_builtin();
+                        let inst = self.new_object();
+                        Slot::of(Kind::Reference, Payload::Reference(inst))
+                    }
+                    // A primitive → its wrapper object (Number/String/Boolean
+                    // object): the wrapper machinery is a later increment.
+                    _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
+                }
+            }
+            // The remaining fundamentals constructors' call/coerce/construct
+            // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
             _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
         };
@@ -3577,6 +3601,25 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "5", "new F(5).x reads the constructed property");
         assert_eq!(out.computrons, 43, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn native_object_construct_allocates_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `new Object()` (captured from the
+        // oracle): the native Object constructor allocates a fresh empty
+        // object (rendered `[object Object]`) at C-XS's 11 computrons — one
+        // fxNewObject plus one built-in step, the fractional gap over a bare
+        // object literal.
+        let code: [u8; 14] = [
+            0x0b, 0x00, 0x4b, 0x4d, 0x01, 0x00, 0x67, 0x01, 0x00, 0x84, 0xab, 0x00, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Object".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "[object Object]");
+        assert_eq!(out.computrons, 11, "bit-exact computrons vs C-XS");
     }
 
     #[test]
