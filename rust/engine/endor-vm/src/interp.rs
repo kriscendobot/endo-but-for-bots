@@ -355,6 +355,21 @@ pub const ARRAY_WITH_PER_ELEM_METERING: u64 = 10 << 14;
 /// callback body's own metering. Calibrated against the pin.
 pub const ARRAY_FOREACH_FRAME_METERING: u64 = 8;
 pub const ARRAY_FOREACH_PER_ELEM_METERING: u64 = 13 << 14;
+/// Frame/per-element residuals for the other callback-taking methods, beyond
+/// the shared per-element `fxCallThisItem` overhead
+/// ([`ARRAY_FOREACH_PER_ELEM_METERING`]) and the callback body. Calibrated
+/// against the pin.
+pub const ARRAY_MAP_FRAME_METERING: u64 = 377352;
+pub const ARRAY_SOMEEVERY_FRAME_METERING: u64 = 8;
+pub const ARRAY_FILTER_FRAME_METERING: u64 = 328456;
+pub const ARRAY_FILTER_KEEP_METERING: u64 = 65792;
+/// The `fxToBoolean` of a predicate callback's result (`some`/`every`/`find`/
+/// `filter`).
+pub const ARRAY_PREDICATE_TOBOOL_METERING: u64 = 0;
+/// `find`/`findIndex` use `fxFindThisItem` (calls the callback for every index,
+/// holes included), a different per-element overhead than `fxCallThisItem`.
+pub const ARRAY_FIND_FRAME_METERING: u64 = 8;
+pub const ARRAY_FIND_PER_ELEM_METERING: u64 = 9 << 14;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -555,6 +570,24 @@ pub enum NativeMethod {
     /// each present element; returns `undefined`. The first re-entrant method
     /// (drives a user callback per element via [`Interp::run_callback`]).
     ArrayForEach,
+    /// `Array.prototype.map(callback[, thisArg])`: a new array of the callback
+    /// results, one per element.
+    ArrayMap,
+    /// `Array.prototype.some(callback[, thisArg])`: `true` if the callback is
+    /// truthy for any element (short-circuits).
+    ArraySome,
+    /// `Array.prototype.every(callback[, thisArg])`: `true` if the callback is
+    /// truthy for every element (short-circuits on the first falsy).
+    ArrayEvery,
+    /// `Array.prototype.find(callback[, thisArg])`: the first element for which
+    /// the callback is truthy, or `undefined`.
+    ArrayFind,
+    /// `Array.prototype.findIndex(callback[, thisArg])`: the index of the first
+    /// element for which the callback is truthy, or `-1`.
+    ArrayFindIndex,
+    /// `Array.prototype.filter(callback[, thisArg])`: a new array of the
+    /// elements for which the callback is truthy.
+    ArrayFilter,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1197,6 +1230,12 @@ impl Interp {
             ("copyWithin", NativeMethod::ArrayCopyWithin),
             ("with", NativeMethod::ArrayWith),
             ("forEach", NativeMethod::ArrayForEach),
+            ("map", NativeMethod::ArrayMap),
+            ("some", NativeMethod::ArraySome),
+            ("every", NativeMethod::ArrayEvery),
+            ("find", NativeMethod::ArrayFind),
+            ("findIndex", NativeMethod::ArrayFindIndex),
+            ("filter", NativeMethod::ArrayFilter),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4608,6 +4647,169 @@ impl Interp {
                     }
                 }
                 Slot::undefined()
+            }
+            // `Array.prototype.map` — a new array of the callback results.
+            // Per element: the `fxCallThisItem` overhead + the callback body +
+            // `mxMeterSome(2)` (the result store); plus the result chunk.
+            NativeMethod::ArrayMap => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("map:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_MAP_FRAME_METERING);
+                let result = self.new_array_unmetered();
+                if length > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(length));
+                }
+                for i in 0..length {
+                    let item = self.arrays[&inst].items.get(&i).copied();
+                    if let Some(item) = item {
+                        self.meter.tick_raw(ARRAY_FOREACH_PER_ELEM_METERING);
+                        let cb_args = [item, Slot::integer(i as i32), this];
+                        let r = self.run_callback(code, callback, this_arg, &cb_args)?;
+                        self.meter.tick_builtin_some(2);
+                        let mut v = r;
+                        v.id = 0;
+                        v.next = crate::value::SlotIndex::NULL;
+                        self.arrays.get_mut(&result).unwrap().items.insert(i, v);
+                    }
+                }
+                self.arrays.get_mut(&result).unwrap().length = length;
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.some`/`every` — short-circuiting boolean folds.
+            // Per element: the `fxCallThisItem` overhead + the callback body +
+            // the `fxToBoolean` of its result.
+            NativeMethod::ArraySome | NativeMethod::ArrayEvery => {
+                let is_every = m == NativeMethod::ArrayEvery;
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("some/every:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_SOMEEVERY_FRAME_METERING);
+                let mut answer = is_every;
+                for i in 0..length {
+                    let item = self.arrays[&inst].items.get(&i).copied();
+                    if let Some(item) = item {
+                        self.meter.tick_raw(ARRAY_FOREACH_PER_ELEM_METERING);
+                        let cb_args = [item, Slot::integer(i as i32), this];
+                        let r = self.run_callback(code, callback, this_arg, &cb_args)?;
+                        self.meter.tick_raw(ARRAY_PREDICATE_TOBOOL_METERING);
+                        let truthy = self.truthy(&r);
+                        if is_every && !truthy {
+                            answer = false;
+                            break;
+                        }
+                        if !is_every && truthy {
+                            answer = true;
+                            break;
+                        }
+                    }
+                }
+                Slot::boolean(answer)
+            }
+            // `Array.prototype.find`/`findIndex` — the first element/index whose
+            // callback is truthy. `fxFindThisItem` calls the callback for EVERY
+            // index (holes yield `undefined`), so the receiver need not be
+            // dense; the per-element cost is the find overhead + callback body.
+            NativeMethod::ArrayFind | NativeMethod::ArrayFindIndex => {
+                let want_index = m == NativeMethod::ArrayFindIndex;
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("find:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_FIND_FRAME_METERING);
+                if !want_index {
+                    // `find` (not `findIndex`) allocates a temporary for the
+                    // element result (`mxTemporary(item)`): a fixed 2<<14 over
+                    // `findIndex`, independent of the match.
+                    self.meter.tick_raw(2 << 14);
+                }
+                let mut found: Option<(u32, Slot)> = None;
+                for i in 0..length {
+                    let item = self
+                        .arrays[&inst]
+                        .items
+                        .get(&i)
+                        .copied()
+                        .unwrap_or_else(Slot::undefined);
+                    self.meter.tick_raw(ARRAY_FIND_PER_ELEM_METERING);
+                    let cb_args = [item, Slot::integer(i as i32), this];
+                    let r = self.run_callback(code, callback, this_arg, &cb_args)?;
+                    self.meter.tick_raw(ARRAY_PREDICATE_TOBOOL_METERING);
+                    if self.truthy(&r) {
+                        found = Some((i, item));
+                        break;
+                    }
+                }
+                match found {
+                    Some((i, item)) => {
+                        if want_index {
+                            Slot::integer(i as i32)
+                        } else {
+                            item
+                        }
+                    }
+                    None => {
+                        if want_index {
+                            Slot::integer(-1)
+                        } else {
+                            Slot::undefined()
+                        }
+                    }
+                }
+            }
+            // `Array.prototype.filter` — a new array of the truthy-callback
+            // elements. Per element: the `fxCallThisItem` overhead + the
+            // callback body + `fxToBoolean`; a kept element appends (a slot +
+            // `mxMeterSome`). The result chunk is sized to the kept count.
+            NativeMethod::ArrayFilter => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("filter:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_FILTER_FRAME_METERING);
+                let mut kept: Vec<Slot> = Vec::new();
+                for i in 0..length {
+                    let item = self.arrays[&inst].items.get(&i).copied();
+                    if let Some(item) = item {
+                        self.meter.tick_raw(ARRAY_FOREACH_PER_ELEM_METERING);
+                        let cb_args = [item, Slot::integer(i as i32), this];
+                        let r = self.run_callback(code, callback, this_arg, &cb_args)?;
+                        self.meter.tick_raw(ARRAY_PREDICATE_TOBOOL_METERING);
+                        if self.truthy(&r) {
+                            self.meter.tick_raw(ARRAY_FILTER_KEEP_METERING);
+                            kept.push(item);
+                        }
+                    }
+                }
+                let result = self.new_array_unmetered();
+                let total = kept.len() as u32;
+                if total > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(total));
+                }
+                {
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, mut v) in kept.into_iter().enumerate() {
+                        v.id = 0;
+                        v.next = crate::value::SlotIndex::NULL;
+                        a.items.insert(i as u32, v);
+                    }
+                    a.length = total;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default

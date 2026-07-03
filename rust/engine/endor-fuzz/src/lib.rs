@@ -506,23 +506,27 @@ pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(3) {
-        // accumulate the elements with an overflow-safe operator.
+    let thr = small_int(&mut b);
+    match b.choice(8) {
+        // forEach: accumulate the elements with an overflow-safe operator.
         0 => {
             let op = ["+", "-", "*"][b.choice(3) as usize];
             let seed = small_int(&mut b);
-            format!(
-                "var s={}; {}.forEach(function(x){{s=s{}x}}); s",
-                seed, lit, op
-            )
+            format!("var s={}; {}.forEach(function(x){{s=s{}x}}); s", seed, lit, op)
         }
-        // sum the indices.
-        1 => format!(
-            "var s=0; {}.forEach(function(x,i){{s=s+i}}); s",
-            lit
-        ),
-        // count the elements.
-        _ => format!("var n=0; {}.forEach(function(x){{n=n+1}}); n", lit),
+        // forEach: sum the indices.
+        1 => format!("var s=0; {}.forEach(function(x,i){{s=s+i}}); s", lit),
+        // forEach: count the elements.
+        2 => format!("var n=0; {}.forEach(function(x){{n=n+1}}); n", lit),
+        // map, joined so the result renders unambiguously.
+        3 => format!("{}.map(function(x){{return x+1}}).join()", lit),
+        // some / every over a threshold predicate.
+        4 => format!("{}.some(function(x){{return x>{}}})", lit, thr),
+        5 => format!("{}.every(function(x){{return x>{}}})", lit, thr),
+        // find / findIndex over a threshold predicate.
+        6 => format!("{}.find(function(x){{return x>{}}})", lit, thr),
+        // filter, joined.
+        _ => format!("{}.filter(function(x){{return x>{}}}).join()", lit, thr),
     }
 }
 

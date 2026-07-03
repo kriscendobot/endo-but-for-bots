@@ -247,3 +247,19 @@ var s=0; [5].forEach(function(x){s=s+x}); s
 var s=0; [1,2,3].forEach(function(x,i){s=s+i}); s
 var p=1; [2,3,4].forEach(function(x){p=p*x}); p
 var s=0; [1,2,3,4,5].forEach(function(x){s=s+x}); s
+[1,2,3].map(function(x){return x*2}).join()
+[1,2].map(function(x){return x+1}).join()
+[].map(function(x){return x}).join()
+[1,2,3].map(function(x){return x*2})[1]
+[1,2,3].some(function(x){return x>2})
+[1,2,3].some(function(x){return x>5})
+[1,2,3].every(function(x){return x>0})
+[1,2,3].every(function(x){return x>1})
+[1,2,3].find(function(x){return x>1})
+[1,2,3].find(function(x){return x>5})
+[1,2,3].findIndex(function(x){return x>1})
+[1,2,3].findIndex(function(x){return x>5})
+[1,2,3,4].filter(function(x){return x>2}).join()
+[1,2,3,4].filter(function(x){return x>0}).join()
+[1,2,3,4].filter(function(x){return x>5}).length
+var s=0; [1,2,3].map(function(x){return x*2}).forEach(function(y){s=s+y}); s
