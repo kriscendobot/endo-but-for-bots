@@ -456,6 +456,33 @@ pub const ARRAY_BUFFER_CTOR_FRAME_METERING: u64 = 99072;
 /// stored `bufferInfo.length` and meters nothing itself).
 pub const ARRAY_BUFFER_BYTE_LENGTH_GET_METERING: u64 = 0;
 
+/// The constant raw 16.16 cost of a `new <TypedArray>(length)` construct
+/// beyond the byteLength-dependent backing-store chunk: the native host
+/// frame, `fxConstructTypedArray` (`fxGetPrototypeFromConstructor` +
+/// `fxNewTypedArrayInstance` — the object instance plus its three internal
+/// `fxNewSlot`s: dispatch, view, and buffer-ref), and the inner
+/// `new ArrayBuffer(length << shift)` construct's own frame (`mxNew`/
+/// `mxRunCount`). The only length-dependent piece is the backing
+/// `fxNewChunk(length << shift)`, metered separately. Calibrated raw-exact
+/// against the pin `48ee02d8cfe0` (280320 = the TypedArray instance frame +
+/// the inner `new ArrayBuffer` construct frame; the length-dependent chunk
+/// is metered by `alloc_array_buffer`, independent of this constant).
+pub const TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING: u64 = 280320;
+/// The constant raw 16.16 cost of a `new <TypedArray>(buffer[, offset[,
+/// length]])` construct over an existing ArrayBuffer: the native host frame
+/// and `fxConstructTypedArray` (the instance + three internal slots). No
+/// backing store is allocated (the view shares the argument buffer), so
+/// this is the whole cost. Calibrated raw-exact against the pin (99336).
+pub const TYPED_ARRAY_BUFFER_CTOR_FRAME_METERING: u64 = 99336;
+/// The raw 16.16 cost of the TypedArray `length`/`byteLength`/`byteOffset`
+/// accessor getters (`fx_TypedArray_prototype_*_get`) beyond the
+/// `GET_PROPERTY` dispatch: measured against the pin.
+pub const TYPED_ARRAY_LENGTH_GET_METERING: u64 = 0;
+/// The raw 16.16 cost of a single TypedArray element read/write through the
+/// exotic index behavior (`fxTypedArrayGetter`/`fxTypedArraySetter` →
+/// `mxMeterOne`) beyond the index-property dispatch: one built-in step.
+pub const TYPED_ARRAY_ELEMENT_METERING: u64 = 1 << 14;
+
 /// The raw 16.16 cost of `Array.prototype.values()`/`keys()`/`entries()`
 /// beyond its dispatch: the native host frame plus `fxNewIteratorInstance`
 /// (the iterator instance + the reused `{value, done}` result object + the
@@ -1120,11 +1147,54 @@ struct CollectionData {
 #[derive(Copy, Clone, Debug)]
 struct ArrayBufferData {
     /// The chunk-arena offset of the zero-filled backing store. Read by the
-    /// view surfaces (TypedArray element access, DataView get/set, and
-    /// `ArrayBuffer.prototype.slice`) landing in the sibling stage-3b
-    /// children; the ArrayBuffer surface itself only exposes `length`.
-    #[allow(dead_code)]
+    /// view surfaces (TypedArray element access, DataView get/set) and by
+    /// `ArrayBuffer.prototype.slice`; the ArrayBuffer surface itself only
+    /// exposes `length`.
     data: crate::value::ChunkOffset,
+    length: u32,
+}
+
+/// One TypedArray element type (XS's `gxTypeDispatches` row): the
+/// constructor name, the element byte `size`, and the `shift` (log2 of the
+/// size, so `byteLength == length << shift`). The order mirrors
+/// `gxTypeDispatches` (with `mxFloat16` off, as the oracle target builds
+/// it), so [`Native::TypedArray`]'s index maps 1:1 to the C table.
+#[derive(Copy, Clone, Debug)]
+pub struct TypedArrayType {
+    pub name: &'static str,
+    pub size: u8,
+    pub shift: u8,
+}
+
+/// The concrete TypedArray constructors endor binds, in `gxTypeDispatches`
+/// order. `Native::TypedArray(i)` indexes this table.
+pub const TYPED_ARRAY_TYPES: &[TypedArrayType] = &[
+    TypedArrayType { name: "BigInt64Array", size: 8, shift: 3 },
+    TypedArrayType { name: "BigUint64Array", size: 8, shift: 3 },
+    TypedArrayType { name: "Float32Array", size: 4, shift: 2 },
+    TypedArrayType { name: "Float64Array", size: 8, shift: 3 },
+    TypedArrayType { name: "Int8Array", size: 1, shift: 0 },
+    TypedArrayType { name: "Int16Array", size: 2, shift: 1 },
+    TypedArrayType { name: "Int32Array", size: 4, shift: 2 },
+    TypedArrayType { name: "Uint8Array", size: 1, shift: 0 },
+    TypedArrayType { name: "Uint16Array", size: 2, shift: 1 },
+    TypedArrayType { name: "Uint32Array", size: 4, shift: 2 },
+    TypedArrayType { name: "Uint8ClampedArray", size: 1, shift: 0 },
+];
+
+/// A TypedArray instance's internal state (XS's `XS_TYPED_ARRAY_KIND`
+/// dispatch slot + `XS_DATA_VIEW_KIND` view slot + buffer reference). Kept
+/// in the [`Interp::typed_arrays`] side table. `kind` indexes
+/// [`TYPED_ARRAY_TYPES`]; `buffer` names the backing `ArrayBuffer`
+/// instance; `offset` is the `byteOffset`; `length` is the element count
+/// (XS's `size >> shift`). A BigInt-element view (`kind` 0/1) is bound and
+/// constructs, but its element read/write self-names until BigInt coercion
+/// lands.
+#[derive(Copy, Clone, Debug)]
+struct TypedArrayData {
+    kind: u8,
+    buffer: crate::value::SlotIndex,
+    offset: u32,
     length: u32,
 }
 
@@ -1192,6 +1262,11 @@ pub enum Native {
     /// `fx_ArrayBuffer`). Its per-instance backing store lives in the
     /// [`Interp::array_buffers`] side table.
     ArrayBuffer,
+    /// A concrete TypedArray constructor (`Uint8Array`/`Int32Array`/… —
+    /// `xsDataView.c` `fx_TypedArray`). The payload indexes
+    /// [`TYPED_ARRAY_TYPES`] (the element type). Its per-instance view state
+    /// lives in the [`Interp::typed_arrays`] side table.
+    TypedArray(u8),
 }
 
 impl Native {
@@ -1219,6 +1294,7 @@ impl Native {
             Native::WeakMap => "WeakMap",
             Native::WeakSet => "WeakSet",
             Native::ArrayBuffer => "ArrayBuffer",
+            Native::TypedArray(i) => TYPED_ARRAY_TYPES[i as usize].name,
         }
     }
 
@@ -1226,8 +1302,8 @@ impl Native {
     /// pairs. The name is what the C-XS compiler records in the symbols
     /// atom; [`Interp::link_intrinsics`] binds each to the program-local id
     /// the compiler assigned it.
-    pub fn intrinsics() -> &'static [(&'static str, Native)] {
-        &[
+    pub fn intrinsics() -> Vec<(&'static str, Native)> {
+        let mut v = vec![
             ("Object", Native::Object),
             ("Function", Native::Function),
             ("Boolean", Native::Boolean),
@@ -1248,7 +1324,13 @@ impl Native {
             ("WeakMap", Native::WeakMap),
             ("WeakSet", Native::WeakSet),
             ("ArrayBuffer", Native::ArrayBuffer),
-        ]
+        ];
+        // The concrete TypedArray constructors (`Uint8Array`/…), each a
+        // `fx_TypedArray` callback distinguished by its element type index.
+        for (i, t) in TYPED_ARRAY_TYPES.iter().enumerate() {
+            v.push((t.name, Native::TypedArray(i as u8)));
+        }
+        v
     }
 }
 
@@ -1528,6 +1610,17 @@ pub struct Interp {
     /// `buffer.byteLength` get routes to the buffer byte-length accessor.
     /// `None` when the program never references `byteLength`.
     byte_length_id: Option<u16>,
+    /// Per-instance TypedArray view state (XS's `XS_TYPED_ARRAY_KIND` +
+    /// `XS_DATA_VIEW_KIND` internal slots + buffer reference). Keyed by the
+    /// view instance's slot, like [`Self::array_buffers`]. See
+    /// [`TypedArrayData`].
+    typed_arrays: std::collections::HashMap<crate::value::SlotIndex, TypedArrayData>,
+    /// The program-local symbol ids of `byteOffset` and `buffer`, resolved
+    /// at [`Self::link_intrinsics`], so a `ta.byteOffset` / `ta.buffer` get
+    /// routes to the TypedArray (and DataView) view accessors. `None` when
+    /// the program never references the name.
+    byte_offset_id: Option<u16>,
+    buffer_id: Option<u16>,
     /// The program-local symbol id of `size`, resolved at
     /// [`Self::link_intrinsics`] (XS's `mxID(_size)`), so a `map.size`/
     /// `set.size` get routes to the collection size accessor. `None` when the
@@ -1709,6 +1802,9 @@ impl Interp {
             array_buffers: std::collections::HashMap::new(),
             arraybuffer_proto: crate::value::SlotIndex::NULL,
             byte_length_id: None,
+            typed_arrays: std::collections::HashMap::new(),
+            byte_offset_id: None,
+            buffer_id: None,
             size_id: None,
             length_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
@@ -1744,7 +1840,7 @@ impl Interp {
         // to %Object.prototype%; each subtype's prototype chains to
         // %Error.prototype% (so `TypeError` `instanceof Error`).
         let error_proto = self.slots.alloc(Slot::instance(object_proto));
-        for &(name, native) in Native::intrinsics() {
+        for (name, native) in Native::intrinsics() {
             let f = self.slots.alloc(Slot::instance(func_proto));
             self.functions.insert(
                 f,
@@ -1792,6 +1888,16 @@ impl Interp {
                 // the `slice` method bound below. The per-instance backing
                 // store lives in the `array_buffers` side table.
                 Native::ArrayBuffer => self.slots.alloc(Slot::instance(object_proto)),
+                // `%Uint8Array.prototype%` &co.: each concrete TypedArray
+                // prototype is a plain boot object chaining to
+                // %Object.prototype% (endor does not model the intermediate
+                // abstract `%TypedArray.prototype%` — the `length`/`byteLength`/
+                // `byteOffset`/`buffer` accessors are special-cased by id and
+                // element access is the exotic index behavior, neither of which
+                // the prototype chain observes for the covered grammar). The
+                // per-instance view state lives in the `typed_arrays` side
+                // table.
+                Native::TypedArray(_) => self.slots.alloc(Slot::instance(object_proto)),
             };
             self.ctor_prototype.insert(f, proto);
         }
@@ -1986,7 +2092,7 @@ impl Interp {
         // Every Error prototype (base + each subtype) gets `toString`.
         let error_protos: Vec<crate::value::SlotIndex> = {
             let mut v = vec![error_proto];
-            for &(_, native) in Native::intrinsics() {
+            for (_, native) in Native::intrinsics() {
                 if matches!(
                     native,
                     Native::EvalError
@@ -2016,7 +2122,7 @@ impl Interp {
         // up the chain while `err.hasOwnProperty('name')` is `false`, as XS.
         self.proto_data.push((error_proto, "name", "Error".to_string()));
         self.proto_data.push((error_proto, "message", String::new()));
-        for &(_, native) in Native::intrinsics() {
+        for (_, native) in Native::intrinsics() {
             if matches!(
                 native,
                 Native::EvalError
@@ -2335,6 +2441,8 @@ impl Interp {
         self.done_id = id_of("done");
         self.size_id = id_of("size");
         self.byte_length_id = id_of("byteLength");
+        self.byte_offset_id = id_of("byteOffset");
+        self.buffer_id = id_of("buffer");
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -3205,6 +3313,30 @@ impl Interp {
                             // (`fx_ArrayBuffer_prototype_get_byteLength`).
                             self.meter.tick_raw(ARRAY_BUFFER_BYTE_LENGTH_GET_METERING);
                             Slot::integer(self.array_buffers[&inst].length as i32)
+                        }
+                        Payload::Reference(inst) if self.typed_arrays.contains_key(&inst) => {
+                            // The TypedArray view accessors
+                            // (`fx_TypedArray_prototype_*_get`): `length`,
+                            // `byteLength`, `byteOffset` (each an integer), and
+                            // `buffer` (the backing ArrayBuffer reference). A
+                            // non-accessor name resolves up the prototype chain.
+                            let ta = self.typed_arrays[&inst];
+                            let shift = TYPED_ARRAY_TYPES[ta.kind as usize].shift as u32;
+                            if Some(id) == self.length_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::integer(ta.length as i32)
+                            } else if Some(id) == self.byte_length_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::integer((ta.length << shift) as i32)
+                            } else if Some(id) == self.byte_offset_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::integer(ta.offset as i32)
+                            } else if Some(id) == self.buffer_id {
+                                self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
+                                Slot::of(Kind::Reference, Payload::Reference(ta.buffer))
+                            } else {
+                                self.instance_get(inst, id)
+                            }
                         }
                         Payload::Reference(inst) => self.instance_get(inst, id),
                         // A primitive string boxes to `%String.prototype%`
@@ -4918,11 +5050,121 @@ impl Interp {
                     _ => return Err(Halt::Unsupported("native-call:ArrayBuffer:coerce-length")),
                 };
                 self.meter.tick_raw(ARRAY_BUFFER_CTOR_FRAME_METERING);
-                self.meter.tick_chunk_new(byte_length as u64);
-                let data = self.chunks.alloc(&vec![0u8; byte_length as usize]);
-                let inst = self.slots.alloc(Slot::instance(self.arraybuffer_proto));
-                self.array_buffers.insert(inst, ArrayBufferData { data, length: byte_length });
+                let inst = self.alloc_array_buffer(byte_length);
                 Slot::of(Kind::Reference, Payload::Reference(inst))
+            }
+            // `new <TypedArray>(...)` (`fx_TypedArray` + `fxConstructTypedArray`
+            // + `fxNewTypedArrayInstance`). Two covered forms:
+            //   - `new TA(length)`: allocate a fresh `new ArrayBuffer(length <<
+            //     shift)` backing store (the inner construct's frame is folded
+            //     into [`TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING`]; the chunk is
+            //     metered by `alloc_array_buffer`), view offset 0.
+            //   - `new TA(buffer[, byteOffset[, length]])`: a view over an
+            //     existing ArrayBuffer, sharing its store (no allocation).
+            // The from-iterable / from-TypedArray / from-array-like copy forms
+            // (`fx_TypedArray_from_object`, the source-TypedArray element copy)
+            // drive the iterator/element protocol and self-name honest skips.
+            Native::TypedArray(idx) if has_target => {
+                let ty = TYPED_ARRAY_TYPES[idx as usize];
+                let shift = ty.shift as u32;
+                let proto = self
+                    .intrinsics
+                    .get(ty.name)
+                    .and_then(|&c| self.ctor_prototype.get(&c).copied())
+                    .unwrap_or(self.object_proto);
+                let a = arg(0);
+                match a.value {
+                    // View over an existing ArrayBuffer.
+                    Payload::Reference(r) if self.array_buffers.contains_key(&r) => {
+                        let buf_len = self.array_buffers[&r].length;
+                        // byteOffset (arg1): a non-negative integer, a multiple
+                        // of the element size.
+                        let offset: u32 = match self.arg_to_byte_length(base, 1, 0) {
+                            Some(o) => o,
+                            None => return Err(Halt::Unsupported("native-call:TypedArray:coerce-offset")),
+                        };
+                        if offset & ((1 << shift) - 1) != 0 {
+                            return Err(Halt::Unsupported("native-call:TypedArray:bad-offset"));
+                        }
+                        // length (arg2): explicit element count, or the
+                        // remaining buffer (which must divide evenly).
+                        let byte_size: u32;
+                        if argc >= 3 && arg(2).kind != Kind::Undefined {
+                            let len = match self.arg_to_byte_length(base, 2, 0) {
+                                Some(l) => l,
+                                None => return Err(Halt::Unsupported("native-call:TypedArray:coerce-length")),
+                            };
+                            let delta = match len.checked_shl(shift) {
+                                Some(d) => d,
+                                None => return Err(Halt::Unsupported("native-call:TypedArray:bad-length")),
+                            };
+                            let end = match offset.checked_add(delta) {
+                                Some(e) => e,
+                                None => return Err(Halt::Unsupported("native-call:TypedArray:bad-length")),
+                            };
+                            if buf_len < end {
+                                return Err(Halt::Unsupported("native-call:TypedArray:bad-length"));
+                            }
+                            byte_size = delta;
+                        } else {
+                            if offset > buf_len || (buf_len & ((1 << shift) - 1)) != 0 {
+                                return Err(Halt::Unsupported("native-call:TypedArray:bad-byteLength"));
+                            }
+                            byte_size = buf_len - offset;
+                        }
+                        self.meter.tick_raw(TYPED_ARRAY_BUFFER_CTOR_FRAME_METERING);
+                        let inst = self.slots.alloc(Slot::instance(proto));
+                        self.typed_arrays.insert(
+                            inst,
+                            TypedArrayData { kind: idx, buffer: r, offset, length: byte_size >> shift },
+                        );
+                        Slot::of(Kind::Reference, Payload::Reference(inst))
+                    }
+                    // A source TypedArray or an array-like/iterable object → the
+                    // element-copy / from-object path; honest skip.
+                    Payload::Reference(_) => {
+                        return Err(Halt::Unsupported("native-call:TypedArray:from-object"))
+                    }
+                    // Length form: `new TA(n)`.
+                    _ => {
+                        let length: u32 = match a.kind {
+                            Kind::Undefined if argc == 0 => 0,
+                            Kind::Undefined => 0,
+                            Kind::Integer => match a.value {
+                                Payload::Integer(i) if i >= 0 => i as u32,
+                                _ => return Err(Halt::Unsupported("native-call:TypedArray:bad-length")),
+                            },
+                            Kind::Number => match a.value {
+                                Payload::Number(n) => {
+                                    let t = n.trunc();
+                                    if t.is_nan() {
+                                        0
+                                    } else if t < 0.0 || t > (0x7FFF_FFFFu32 >> shift) as f64 {
+                                        return Err(Halt::Unsupported("native-call:TypedArray:bad-length"));
+                                    } else {
+                                        t as u32
+                                    }
+                                }
+                                _ => return Err(Halt::Unsupported("native-call:TypedArray:bad-length")),
+                            },
+                            // A boolean/string length needs the general ToNumber
+                            // coercion metering — honest skip.
+                            _ => return Err(Halt::Unsupported("native-call:TypedArray:coerce-length")),
+                        };
+                        if length > (0x7FFF_FFFFu32 >> shift) {
+                            return Err(Halt::Unsupported("native-call:TypedArray:bad-length"));
+                        }
+                        let byte_length = length << shift;
+                        self.meter.tick_raw(TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING);
+                        let buffer = self.alloc_array_buffer(byte_length);
+                        let inst = self.slots.alloc(Slot::instance(proto));
+                        self.typed_arrays.insert(
+                            inst,
+                            TypedArrayData { kind: idx, buffer, offset: 0, length },
+                        );
+                        Slot::of(Kind::Reference, Payload::Reference(inst))
+                    }
+                }
             }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
@@ -8175,6 +8417,181 @@ impl Interp {
         }
     }
 
+    /// Read TypedArray element `index` (XS's per-type `*Getter` →
+    /// `mxMeterOne`): decode the native-endian element bytes from the
+    /// backing store to a number/integer completion. `index` must be in
+    /// bounds (the caller checks; an out-of-bounds index reads `undefined`
+    /// with no element metering). Returns `None` for a BigInt-element view
+    /// (its BigInt read is a later increment). Reads the little-endian
+    /// element the oracle target (x86-64, `EndianNative == little`) stores.
+    fn typed_array_element_get(&self, ta: TypedArrayData, index: u32) -> Option<Slot> {
+        let ty = TYPED_ARRAY_TYPES[ta.kind as usize];
+        let size = ty.size as usize;
+        let buf = self.array_buffers[&ta.buffer];
+        let base = ta.offset as usize + index as usize * size;
+        let bytes = self.chunks.payload(buf.data);
+        let b = &bytes[base..base + size];
+        Some(match ta.kind {
+            // BigInt64 / BigUint64: BigInt read is a later increment.
+            0 | 1 => return None,
+            // Float32
+            2 => Slot::number(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            // Float64
+            3 => Slot::number(f64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ])),
+            // Int8
+            4 => Slot::integer(b[0] as i8 as i32),
+            // Int16
+            5 => Slot::integer(i16::from_le_bytes([b[0], b[1]]) as i32),
+            // Int32
+            6 => Slot::integer(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            // Uint8 / Uint8Clamped
+            7 | 10 => Slot::integer(b[0] as i32),
+            // Uint16
+            8 => Slot::integer(u16::from_le_bytes([b[0], b[1]]) as i32),
+            // Uint32: an integer completion when it fits int32, else a number
+            // (XS's `fxUint32Getter`).
+            9 => {
+                let u = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                if u <= 0x7FFF_FFFF {
+                    Slot::integer(u as i32)
+                } else {
+                    Slot::number(u as f64)
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// Coerce `value` to this element type and write TypedArray element
+    /// `index` (XS's dispatch `coerce` — `fxToInteger`/`fxToUnsigned`/
+    /// `fxToNumber` — then the per-type `*Setter` → `mxMeterOne`). The
+    /// coercion of a primitive number/integer/boolean is metering-neutral
+    /// (like `Number(v)`); an object value needs `ToPrimitive`/`valueOf` and
+    /// a BigInt-element view needs BigInt coercion — both return `Err` so the
+    /// caller records an honest skip. `index` must be in bounds (an
+    /// out-of-bounds index is a silent no-op with no element metering).
+    fn typed_array_element_set(
+        &mut self,
+        ta: TypedArrayData,
+        index: u32,
+        value: Slot,
+    ) -> Result<(), Halt> {
+        // The numeric value to coerce (a primitive). An object self-names.
+        let n: f64 = match value.kind {
+            Kind::Integer => match value.value {
+                Payload::Integer(i) => i as f64,
+                _ => return Err(Halt::Unsupported("typed-array-set:value")),
+            },
+            Kind::Number => match value.value {
+                Payload::Number(v) => v,
+                _ => return Err(Halt::Unsupported("typed-array-set:value")),
+            },
+            Kind::Boolean => match value.value {
+                Payload::Boolean(bv) => {
+                    if bv {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => return Err(Halt::Unsupported("typed-array-set:value")),
+            },
+            Kind::Undefined => f64::NAN,
+            // A reference (object) needs ToPrimitive; a BigInt view needs
+            // BigInt coercion — honest skips.
+            _ => return Err(Halt::Unsupported("typed-array-set:coerce")),
+        };
+        let ty = TYPED_ARRAY_TYPES[ta.kind as usize];
+        let size = ty.size as usize;
+        let buf = self.array_buffers[&ta.buffer];
+        let base = ta.offset as usize + index as usize * size;
+        // ToInteger: truncate toward zero, NaN → 0 (the int/uint coercions).
+        let to_int = |x: f64| -> f64 {
+            if x.is_nan() {
+                0.0
+            } else {
+                x.trunc()
+            }
+        };
+        let dst = self.chunks.slice_mut(buf.data, base + size);
+        let out = &mut dst[base..base + size];
+        match ta.kind {
+            0 | 1 => return Err(Halt::Unsupported("typed-array-set:bigint")),
+            // Float32
+            2 => out.copy_from_slice(&(n as f32).to_le_bytes()),
+            // Float64
+            3 => out.copy_from_slice(&n.to_le_bytes()),
+            // Int8 / Uint8 (ToInteger/ToUint then truncate to one byte).
+            4 | 7 => out[0] = to_int(n) as i64 as u8,
+            // Int16 / Uint16
+            5 | 8 => out.copy_from_slice(&((to_int(n) as i64 as u16).to_le_bytes())),
+            // Int32 / Uint32
+            6 | 9 => out.copy_from_slice(&((to_int(n) as i64 as u32).to_le_bytes())),
+            // Uint8Clamped (ToNumber, clamp to [0,255], round half-to-even).
+            10 => {
+                let v = if n.is_nan() || n <= 0.0 {
+                    0.0
+                } else if n >= 255.0 {
+                    255.0
+                } else {
+                    round_half_even(n)
+                };
+                out[0] = v as u8;
+            }
+            _ => return Err(Halt::Unsupported("typed-array-set:kind")),
+        }
+        Ok(())
+    }
+
+    /// XS's `fxArgToByteLength(argi, length)`: coerce call argument `argi`
+    /// (at `stack[base + 4 + argi]`) to a non-negative byte length. Returns
+    /// `Some(default)` when the argument is absent/`undefined`, `Some(v)` for
+    /// a non-negative integer or a truncated in-range number (NaN → 0), and
+    /// `None` when the value is negative/oversized (a RangeError in XS) or a
+    /// kind needing general ToNumber coercion — an honest skip for the
+    /// caller. The `default` is only returned for an absent/undefined arg.
+    fn arg_to_byte_length(&self, base: usize, argi: usize, default: u32) -> Option<u32> {
+        let a = self.stack.get(base + 4 + argi).copied().unwrap_or_else(Slot::undefined);
+        match a.kind {
+            Kind::Undefined => Some(default),
+            Kind::Integer => match a.value {
+                Payload::Integer(i) if i >= 0 => Some(i as u32),
+                _ => None,
+            },
+            Kind::Number => match a.value {
+                Payload::Number(n) => {
+                    let t = n.trunc();
+                    if t.is_nan() {
+                        Some(0)
+                    } else if t < 0.0 || t > 0x7FFF_FFFFu32 as f64 {
+                        None
+                    } else {
+                        Some(t as u32)
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Allocate a fresh zero-filled `ArrayBuffer` of `byte_length` bytes
+    /// (`fxNewArrayBufferInstance` + `fxNewChunk`), metering **only** the
+    /// backing-store chunk (`fxNewChunk(byteLength)` at XS's 8-byte-aligned
+    /// adjusted size). The caller meters the native construct frame. Returns
+    /// the buffer instance slot. Shared by the `ArrayBuffer` constructor and
+    /// a length-form TypedArray construct (whose inner `new ArrayBuffer` this
+    /// mirrors).
+    fn alloc_array_buffer(&mut self, byte_length: u32) -> crate::value::SlotIndex {
+        self.meter.tick_chunk_new(byte_length as u64);
+        let data = self.chunks.alloc(&vec![0u8; byte_length as usize]);
+        let inst = self.slots.alloc(Slot::instance(self.arraybuffer_proto));
+        self.array_buffers.insert(inst, ArrayBufferData { data, length: byte_length });
+        inst
+    }
+
     /// `fxCheckMapKey`: normalize a collection key so `-0` is stored/compared
     /// as `+0` (every other value is unchanged; SameValueZero already unifies
     /// `NaN`).
@@ -8659,6 +9076,23 @@ impl Interp {
                     .and_then(|a| a.items.get(&index).copied())
                     .map(|s| Slot::of(s.kind, s.value))
                     .unwrap_or_else(Slot::undefined))
+            } else if let Some(&ta) = self.typed_arrays.get(&inst) {
+                // A TypedArray element read (the exotic index [[Get]] →
+                // per-type `*Getter`): in bounds decodes the element and meters
+                // one built-in step; out of bounds reads `undefined` with no
+                // element metering (the canonical numeric index is absent). A
+                // BigInt-element view self-names.
+                if index >= ta.length {
+                    Ok(Slot::undefined())
+                } else {
+                    match self.typed_array_element_get(ta, index) {
+                        Some(v) => {
+                            self.meter.tick_raw(TYPED_ARRAY_ELEMENT_METERING);
+                            Ok(v)
+                        }
+                        None => Err(Halt::Unsupported("get_property_at:typed-array-bigint")),
+                    }
+                }
             } else {
                 // A non-array object indexed numerically stores its items in a
                 // separate index chunk (XS's `fxSetIndexProperty` on an
@@ -8699,6 +9133,20 @@ impl Interp {
             if self.arrays.contains_key(&inst) {
                 self.array_item_set(inst, index, value, define);
                 Ok(())
+            } else if let Some(&ta) = self.typed_arrays.get(&inst) {
+                // A TypedArray element write (the exotic index [[Set]]: coerce
+                // then per-type `*Setter` → `mxMeterOne`). In bounds coerces +
+                // writes + meters one built-in step; an out-of-bounds index is
+                // a silent no-op with no element metering (the canonical
+                // numeric index is unwritable past the length). An object value
+                // or a BigInt view self-names.
+                if index >= ta.length {
+                    Ok(())
+                } else {
+                    self.typed_array_element_set(ta, index, value)?;
+                    self.meter.tick_raw(TYPED_ARRAY_ELEMENT_METERING);
+                    Ok(())
+                }
             } else {
                 // Numeric index on a non-array object uses the ordinary-object
                 // index chunk (see [`Self::property_at_get`]); its metering is
@@ -9504,6 +9952,23 @@ fn value_global(name: &str) -> Option<Slot> {
     }
 }
 
+/// Round to the nearest integer, ties to even (C's `c_nearbyint` under the
+/// default rounding mode) — the `Uint8ClampedArray` setter's rounding.
+fn round_half_even(x: f64) -> f64 {
+    let r = x.round(); // ties away from zero
+    if (x - x.trunc()).abs() == 0.5 {
+        // A halfway value: pick the even neighbor.
+        let lower = x.floor();
+        if (lower as i64) % 2 == 0 {
+            lower
+        } else {
+            x.ceil()
+        }
+    } else {
+        r
+    }
+}
+
 /// A `&'static str` naming an unmodeled native **call** for
 /// [`Halt::Unsupported`], so the differential runner records the skip
 /// attributed to the specific built-in (never a silent mis-execution).
@@ -9529,6 +9994,7 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::WeakMap => "native-call:WeakMap",
         Native::WeakSet => "native-call:WeakSet",
         Native::ArrayBuffer => "native-call:ArrayBuffer",
+        Native::TypedArray(_) => "native-call:TypedArray",
     }
 }
 

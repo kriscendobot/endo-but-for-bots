@@ -887,7 +887,16 @@ pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
             _ => ((b.next() as u32) % 512) + 256,
         }
     };
-    match b.choice(5) {
+    // The concrete numeric TypedArray element types (the BigInt views are
+    // excluded — their element read/write self-names until BigInt coercion
+    // lands). Paired with a small element count.
+    const TA: &[&str] = &[
+        "Uint8Array", "Int8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+        "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+    ];
+    let ta = |b: &mut Bytes| -> &'static str { TA[(b.next() as usize) % TA.len()] };
+    let count = |b: &mut Bytes| -> u32 { 1 + (b.next() as u32 % 6) };
+    match b.choice(9) {
         // Construct and read the byteLength directly.
         0 => format!("new ArrayBuffer({}).byteLength", len(&mut b)),
         // A missing argument defaults the byteLength to 0.
@@ -900,11 +909,48 @@ pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
         // typeof an ArrayBuffer instance ("object").
         3 => format!("typeof new ArrayBuffer({})", len(&mut b)),
         // Two independent buffers; sum their byte lengths.
-        _ => {
+        4 => {
             let (m, n) = (len(&mut b), len(&mut b));
             format!(
                 "var p = new ArrayBuffer({}); var q = new ArrayBuffer({}); p.byteLength + q.byteLength",
                 m, n
+            )
+        }
+        // Length-form TypedArray construct + a length/byteLength accessor.
+        5 => {
+            let acc = if b.choice(2) == 0 { "length" } else { "byteLength" };
+            format!("new {}({}).{}", ta(&mut b), count(&mut b), acc)
+        }
+        // Element write then read at an in-bounds index.
+        6 => {
+            let n = count(&mut b);
+            let idx = (b.next() as u32) % n;
+            let val = (b.next() as i32) - 128;
+            format!(
+                "var a = new {}({}); a[{}] = {}; a[{}]",
+                ta(&mut b),
+                n,
+                idx,
+                val,
+                idx
+            )
+        }
+        // Buffer-form construct: a view over an existing ArrayBuffer.
+        7 => {
+            let words = 1 + (b.next() as u32 % 4);
+            format!(
+                "var b = new ArrayBuffer({}); new Int32Array(b).length",
+                words * 4
+            )
+        }
+        // Fill a small typed array in a loop and sum it (the metering hot path).
+        _ => {
+            let n = count(&mut b);
+            format!(
+                "var a = new {}({}); var i = 0; while (i < {}) {{ a[i] = i; i = i + 1; }} a[0]",
+                ta(&mut b),
+                n,
+                n
             )
         }
     }
@@ -1539,11 +1585,12 @@ mod tests {
         // computron) vs C-XS. Rides the symbol-linking differential check
         // (the `ArrayBuffer` global and `byteLength` are program symbols).
         let mut checked = 0;
-        let mut saw_typeof = false;
-        let mut saw_var = false;
-        let mut saw_sum = false;
+        let mut saw_buffer = false;
+        let mut saw_typed = false;
+        let mut saw_element = false;
+        let mut saw_loop = false;
         let mut distinct = std::collections::BTreeSet::new();
-        for seed in 0u32..800 {
+        for seed in 0u32..1200 {
             let data = seed.to_le_bytes();
             let mut buf = Vec::new();
             for k in 0..(16 + (seed % 24)) {
@@ -1555,19 +1602,21 @@ mod tests {
             }
             let prog = gen_stage3b_binary_program(&buf);
             distinct.insert(prog.clone());
-            saw_typeof |= prog.contains("typeof");
-            saw_var |= prog.contains("var a =");
-            saw_sum |= prog.contains('+');
+            saw_buffer |= prog.contains("new ArrayBuffer");
+            saw_typed |= prog.contains("Array(");
+            saw_element |= prog.contains("] =");
+            saw_loop |= prog.contains("while");
             match differential_check_with_symbols(&prog) {
                 Ok(()) => checked += 1,
                 Err(d) => panic!("stage-3b binary differential divergence on {:?}: {:?}", prog, d),
             }
         }
         assert!(checked > 0);
-        assert!(distinct.len() > 20, "binary sweep too uniform: {} distinct", distinct.len());
-        assert!(saw_typeof, "typeof arm never generated");
-        assert!(saw_var, "var-binding arm never generated");
-        assert!(saw_sum, "two-buffer sum arm never generated");
+        assert!(distinct.len() > 40, "binary sweep too uniform: {} distinct", distinct.len());
+        assert!(saw_buffer, "ArrayBuffer arm never generated");
+        assert!(saw_typed, "TypedArray arm never generated");
+        assert!(saw_element, "element write/read arm never generated");
+        assert!(saw_loop, "fill-loop arm never generated");
     }
 
     #[test]

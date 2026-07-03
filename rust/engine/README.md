@@ -199,7 +199,33 @@ constructor and the not-yet-landed TypedArray/DataView view kinds), `resize`/
 negative/oversized/non-integer byteLength (each a RangeError), and the
 `ArrayBuffer(n)` call without `new` (a TypeError) — each self-names
 `Halt::Unsupported` rather than ship a wrong value or a computron divergence; the
-TypedArray family and DataView are sibling stage-3b children. The stage-3 built-ins reach
+DataView view is a sibling stage-3b child. The same child binds the
+**TypedArray family** — the eleven concrete constructors (`Uint8Array`/`Int8Array`/
+`Uint8ClampedArray`/`Int16Array`/`Uint16Array`/`Int32Array`/`Uint32Array`/
+`Float32Array`/`Float64Array` plus the `BigInt64Array`/`BigUint64Array` shells) as
+`Native::TypedArray(i)` indexing the `gxTypeDispatches` element-type table, with the
+per-instance view state (dispatch + `byteOffset`/`size` + backing-buffer reference)
+in a `typed_arrays` side table. Two construct forms are computron-exact: the
+length form `new TA(n)` (which allocates its own `new ArrayBuffer(n << shift)`
+backing store — the inner construct's frame folded into
+`TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING`, the store chunk metered by
+`alloc_array_buffer`) and the buffer form `new TA(buffer[, byteOffset[, length]])`
+(a view sharing the argument buffer's store, byteOffset aligned to the element
+size). The `length`/`byteLength`/`byteOffset`/`buffer` accessors and the exotic
+**index element read/write** (`ta[i]` — one `mxMeterOne` built-in step per
+in-bounds access, `undefined`/silent-no-op out of bounds) are bit-exact, including
+the per-type coercions: Int/Uint wrap-around, `Uint8ClampedArray` clamp-and-round
+(ties to even), the `Uint32` integer-vs-number completion split, and the IEEE
+float encodings. The dual-run sections agree with **zero divergence**:
+`built-ins/ArrayBuffer total=80 covered=3 divergent=0 skipped=77`,
+`built-ins/TypedArray total=1054 covered=0 divergent=0 skipped=1054` (its tests
+drive the abstract `%TypedArray%` helpers and methods endor honestly skips),
+`built-ins/TypedArrayConstructors/{Uint8Array,Int32Array} covered=1 divergent=0`.
+The deferred TypedArray paths are honest **named skips**: the from-iterable /
+from-array-like / source-TypedArray copy constructors, the BigInt-element
+read/write (BigInt coercion is a later increment), an object element value (needing
+`ToPrimitive`), the prototype methods (`set`/`subarray`/`fill`/`map`/… and the
+statics `from`/`of`), and the resizable/species corners. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic

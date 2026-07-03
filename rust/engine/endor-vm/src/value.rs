@@ -458,6 +458,16 @@ impl ChunkArena {
         self.slice(off, self.len_of(off))
     }
 
+    /// A mutable view of `len` bytes of the block whose payload begins at
+    /// `off` — for in-place mutation of an ArrayBuffer backing store
+    /// (TypedArray/DataView element writes), which XS does by writing
+    /// directly through `arrayBuffer.address`.
+    #[inline]
+    pub fn slice_mut(&mut self, off: ChunkOffset, len: usize) -> &mut [u8] {
+        let start = off.0 as usize;
+        &mut self.bytes[start..start + len]
+    }
+
     /// Slide-compact: keep only the blocks whose payload offsets are in
     /// `live`, packing them to the front of the arena in ascending
     /// offset order, and return the old→new payload-offset remap the
