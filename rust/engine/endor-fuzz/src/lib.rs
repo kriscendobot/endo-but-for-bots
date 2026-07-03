@@ -290,7 +290,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let lit = format!("[{}]", elems.join(","));
     // `with` requires a non-empty array (out-of-range is a RangeError), so
     // restrict its shape to n>=1 by folding into copyWithin when empty.
-    match b.choice(18) {
+    match b.choice(19) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -381,7 +381,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
         }
         // with: replace an in-range index into a new array (n>=1; else fall
         // back to a copyWithin so the index is always valid).
-        _ => {
+        17 => {
             if n == 0 {
                 format!("var a={}; a.copyWithin(0,0); a", lit)
             } else {
@@ -389,6 +389,8 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
                 format!("var a={}; a.with({},{}); a", lit, i, small_int(&mut b))
             }
         }
+        // toReversed into a new array, joined.
+        _ => format!("{}.toReversed().join()", lit),
     }
 }
 

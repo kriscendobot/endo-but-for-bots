@@ -350,6 +350,9 @@ pub const ARRAY_COPYWITHIN_FRAME_METERING: u64 = 98304;
 /// pin.
 pub const ARRAY_WITH_FRAME_METERING: u64 = 66048;
 pub const ARRAY_WITH_PER_ELEM_METERING: u64 = 10 << 14;
+/// `Array.prototype.toReversed` frame cost (the same copy loop as `with`, one
+/// code unit more of setup). Measured against the pin as 131584.
+pub const ARRAY_TOREVERSED_FRAME_METERING: u64 = 131584;
 /// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
 /// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
 /// callback body's own metering. Calibrated against the pin.
@@ -611,6 +614,9 @@ pub enum NativeMethod {
     /// `Array.prototype.findLastIndex(callback[, thisArg])`: the index of the
     /// last element for which the callback is truthy, or `-1`.
     ArrayFindLastIndex,
+    /// `Array.prototype.toReversed()` (`fx_Array_prototype_toReversed`): a new
+    /// array with the receiver's elements reversed (non-mutating).
+    ArrayToReversed,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1263,6 +1269,7 @@ impl Interp {
             ("reduceRight", NativeMethod::ArrayReduceRight),
             ("findLast", NativeMethod::ArrayFindLast),
             ("findLastIndex", NativeMethod::ArrayFindLastIndex),
+            ("toReversed", NativeMethod::ArrayToReversed),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4933,6 +4940,39 @@ impl Interp {
                         }
                     }
                 }
+            }
+            // `Array.prototype.toReversed()` — a new array with the elements
+            // reversed (non-mutating), copied over the generic
+            // `mxGetAt`/`mxDefineAt` path. Metering reuses `with`'s frame +
+            // per-element constants (same copy loop) + the result chunk.
+            NativeMethod::ArrayToReversed => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("toReversed:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_TOREVERSED_FRAME_METERING);
+                self.meter.tick_raw((length as u64) * ARRAY_WITH_PER_ELEM_METERING);
+                let result = self.new_array_unmetered();
+                if length > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(length));
+                    let items: Vec<Slot> = (0..length)
+                        .map(|to| {
+                            let from = length - 1 - to;
+                            self.arrays[&inst]
+                                .items
+                                .get(&from)
+                                .copied()
+                                .unwrap_or_else(Slot::undefined)
+                        })
+                        .collect();
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (to, s) in items.into_iter().enumerate() {
+                        a.items.insert(to as u32, Slot::of(s.kind, s.value));
+                    }
+                    a.length = length;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default

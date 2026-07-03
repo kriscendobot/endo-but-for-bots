@@ -275,3 +275,8 @@ var s=0; [1,2,3].map(function(x){return x*2}).forEach(function(y){s=s+y}); s
 [1,2,3].findLastIndex(function(x){return x<3})
 [1,2,3].findLastIndex(function(x){return x<0})
 [1,2,3,4,5].findLast(function(x){return x<4})
+[1,2,3].toReversed().join()
+[1,2,3,4].toReversed().join()
+[5].toReversed()[0]
+[].toReversed().length
+var a=[1,2,3]; a.toReversed(); a
