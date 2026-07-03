@@ -185,6 +185,13 @@ var fc3 = function (a, b) { return a + b }; fc3.call(null, 2, 3)
 function idc(x) { return x }; idc.call(null, 42)
 var fc4 = function (a, b, c) { return a + b + c }; fc4.call(null, 1, 2, 3)
 
+// Function.prototype.apply, the no-array subset (thisArg only; an actual
+// arguments array needs child-3 Array machinery and self-names).
+var fa0 = function () { return 7 }; fa0.apply(null)
+var fa1 = function () { return 7 }; fa1.apply()
+var fa2 = function () { return this.x }; fa2.apply({ x: 9 })
+var fa3 = function () { return 1 }; fa3.apply(undefined)
+
 // Symbol: a fresh unique primitive (identity), typeof "symbol", and the
 // well-known symbols as stable properties of the Symbol constructor. (A bare
 // symbol completion aborts — the harness String()-coerces it and throws.)

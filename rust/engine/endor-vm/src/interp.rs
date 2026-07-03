@@ -291,6 +291,12 @@ pub enum NativeMethod {
     /// its arguments. Handled specially in the `run` dispatch (it re-enters
     /// the interpreter frame machinery rather than computing a value).
     FunctionCall,
+    /// `Function.prototype.apply` — like `call`, but the arguments come from
+    /// an array. endor models the no-array subset (`f.apply(thisArg)` /
+    /// `f.apply(thisArg, null|undefined)`), identical to `call` with no
+    /// arguments; an actual arguments array self-names (the Array read is
+    /// child-3 machinery).
+    FunctionApply,
     ErrorToString,
     /// A primitive wrapper's `valueOf` (returns the wrapped primitive).
     WrapperValueOf,
@@ -835,6 +841,8 @@ impl Interp {
         self.proto_methods.push((func_proto, "toString", fp_tostring));
         let fp_call = self.alloc_method(NativeMethod::FunctionCall);
         self.proto_methods.push((func_proto, "call", fp_call));
+        let fp_apply = self.alloc_method(NativeMethod::FunctionApply);
+        self.proto_methods.push((func_proto, "apply", fp_apply));
         // Every Error prototype (base + each subtype) gets `toString`.
         let error_protos: Vec<crate::value::SlotIndex> = {
             let mut v = vec![error_proto];
@@ -1803,6 +1811,18 @@ impl Interp {
                         // `Function.prototype.call`: re-enter the target frame
                         // (a trampoline), resuming the caller after this `run`.
                         match self.enter_call_dot_call(base, argc, ret_pc) {
+                            Ok(body_start) => {
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = body_start;
+                            }
+                            Err(h) => return h,
+                        }
+                    } else if let Some((NativeMethod::FunctionApply, base)) = method {
+                        // `Function.prototype.apply` (no-array subset): re-enter
+                        // the target with the rebound `this` and no arguments.
+                        match self.enter_call_dot_apply(base, argc, ret_pc) {
                             Ok(body_start) => {
                                 if self.check_meter() == MeterCheck::Abort {
                                     return Halt::MeterAbort;
@@ -3190,6 +3210,53 @@ impl Interp {
         self.enter_call(n, ret_pc, false)
     }
 
+    /// `Function.prototype.apply` (no-array subset): invoke the receiver with
+    /// the rebound `this` and **no** arguments — the case where the arguments
+    /// array is absent, `undefined`, or `null`. An actual arguments array (a
+    /// reference) self-names: reading its elements is child-3 Array machinery.
+    /// Identical to `call` with zero arguments (same trampoline, same meter).
+    fn enter_call_dot_apply(
+        &mut self,
+        base: usize,
+        argc: usize,
+        ret_pc: usize,
+    ) -> Result<usize, Halt> {
+        let f = self.stack.get(base).copied().unwrap_or_else(Slot::undefined);
+        match f.value {
+            Payload::Reference(r)
+                if self
+                    .functions
+                    .get(&r)
+                    .map_or(false, |fi| fi.native.is_none() && fi.method.is_none()) => {}
+            _ => return Err(Halt::Unsupported("apply:non-user-function-receiver")),
+        }
+        let this_arg = self
+            .stack
+            .get(base + 4)
+            .copied()
+            .unwrap_or_else(Slot::undefined);
+        if !matches!(
+            this_arg.kind,
+            Kind::Undefined | Kind::Null | Kind::Reference
+        ) {
+            return Err(Halt::Unsupported("apply:primitive-this-boxing"));
+        }
+        // The arguments array (the second argument): only absent/undefined/null
+        // is the no-array subset; a real array self-names (child-3 Array read).
+        let arg_array = self.stack.get(base + 5).copied();
+        match arg_array.map(|s| s.kind) {
+            None | Some(Kind::Undefined) | Some(Kind::Null) => {}
+            _ => return Err(Halt::Unsupported("apply:arguments-array")),
+        }
+        self.stack.truncate(base);
+        self.stack.push(this_arg); // THIS
+        self.stack.push(f); // FUNCTION (the receiver)
+        self.stack.push(Slot::undefined()); // RESULT
+        self.stack.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
+        self.meter.tick_raw(CALL_TRAMPOLINE_METERING);
+        self.enter_call(0, ret_pc, false)
+    }
+
     /// Dispatch a native prototype **method** call (`obj.toString()`,
     /// `obj.hasOwnProperty(k)`, `wrapper.valueOf()`, …). The value stack holds
     /// the call frame `[THIS, FUNCTION, RESULT, FRAME]` from `base`; `THIS` is
@@ -3205,6 +3272,9 @@ impl Interp {
             // `Function.prototype.call` is handled by the `run` trampoline
             // (`enter_call_dot_call`) and never reaches here.
             NativeMethod::FunctionCall => return Err(Halt::Unsupported("call:unexpected")),
+            // `Function.prototype.apply` is handled by the `run` trampoline
+            // (`enter_call_dot_apply`) and never reaches here.
+            NativeMethod::FunctionApply => return Err(Halt::Unsupported("apply:unexpected")),
             // `Object.prototype.valueOf`: returns the receiver unchanged.
             NativeMethod::ObjectValueOf => this,
             // `<wrapper>.valueOf`: the wrapped primitive.
