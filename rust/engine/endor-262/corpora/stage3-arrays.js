@@ -149,6 +149,17 @@ var a=[5,6,7]; [...a]
 var a=[1,2]; var b=[...a]; b[0]
 var a=[1,2,3]; [...a][2]
 
+// --- for-in over objects and arrays (fx_Enumerator; XS enumeration order) ---
+var s=""; for (var k in {a:1,b:2}) s=s+k; s
+var s=""; for (var k in {x:1,y:2,z:3}) s=s+k; s
+var s=""; for (var k in {}) s=s+k; s
+var n=0; for (var k in {a:1,b:2,c:3}) n=n+1; n
+var s=""; for (var k in [10,20,30]) s=s+k; s
+var s=""; for (var k in [5]) s=s+k; s
+var n=0; for (var k in []) n=n+1; n
+var n=0; for (var k in [7,7,7,7,7]) n=n+1; n
+var s=""; for (var k in {p:1,q:2,r:3,s:4,t:5}) s=s+k; s
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

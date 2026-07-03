@@ -343,6 +343,28 @@ pub const ARRAY_ITERATOR_ELEMENT_READ: u64 = 2 << 14;
 /// [`Interp::make_array_iterator`]) — a constant `2 << 16`, independent of the
 /// iterable's length.
 pub const FOR_OF_GET_ITERATOR_METERING: u64 = 2 << 16;
+/// The raw 16.16 cost of building a for-in enumerator (`XS_CODE_FOR_IN` →
+/// `mxEnumeratorFunction` → `fx_Enumerator`): the enumerator + result objects,
+/// the own-keys collection, and the host frame — a fixed cluster independent
+/// of the key count (the per-key string allocation is metered in
+/// [`ENUMERATOR_NEXT_METERING`] + the key chunk). Calibrated against the pin
+/// for an empty ordinary-object enumeration; an array adds
+/// [`ARRAY_FOR_IN_EXTRA_METERING`]. Known sub-computron residual: the exact
+/// non-empty keys-list handling carries a ±8-raw chunk-alignment gap
+/// (analogous to the array-spread residual) that is well under one computron
+/// and never crosses a `>> 16` boundary in a bounded program, so the
+/// computron-level bar (which every corpus/fuzz/test262 check uses) stays
+/// exact; modeling the keys-instance chunk capacity to close it is a later
+/// refinement.
+pub const FOR_IN_ENUMERATOR_METERING: u64 = 202248;
+/// The extra raw 16.16 cost of a for-in enumerator over an **array** (vs an
+/// ordinary object): `mxBehaviorOwnKeys` for an exotic array (`fxArrayOwnKeys`
+/// queuing the index keys) does more than `fxOrdinaryOwnKeys`. Measured
+/// against the pin as a constant, independent of the element count.
+pub const ARRAY_FOR_IN_EXTRA_METERING: u64 = 10488;
+/// The base raw 16.16 cost of a yielding `fx_Enumerator_prototype_next` beyond
+/// the yielded key's own string-chunk allocation. Calibrated against the pin.
+pub const ENUMERATOR_NEXT_METERING: u64 = (2 << 14) + 256;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -462,9 +484,12 @@ struct ArrayData {
     items: std::collections::BTreeMap<u32, Slot>,
 }
 
-/// An array iterator's state (XS's `fxNewIteratorInstance` internal slots for
-/// an Array Iterator). `kind` is 0 = values, 1 = keys, 2 = entries; `result`
-/// is the reused `{value, done}` object `next()` mutates and returns.
+/// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
+/// keys, 2 = entries) `iterable` is the array and `index` the cursor. For a
+/// **for-in enumerator** (`kind` = 3) `enum_keys` is the pre-collected list of
+/// enumerable property keys `(id, index)` to yield as strings (an `id ==
+/// XS_NO_ID` entry is an array index), and `index` cursors it. `result` is the
+/// reused `{value, done}` object `next()` mutates and returns.
 #[derive(Clone, Debug)]
 struct IterState {
     iterable: crate::value::SlotIndex,
@@ -472,6 +497,7 @@ struct IterState {
     kind: u8,
     result: crate::value::SlotIndex,
     done: bool,
+    enum_keys: Vec<(u16, u32)>,
 }
 
 /// An Error instance's stringification data (XS's `Error.prototype.toString`
@@ -1938,6 +1964,27 @@ impl Interp {
                     };
                     self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
                     let it = self.make_array_iterator(arr, 0);
+                    self.push(it);
+                    pc += size as usize;
+                }
+                // `for_in` (`XS_CODE_FOR_IN`): call the enumerator function on
+                // the top-of-stack object, replacing it with a for-in
+                // enumerator; the surrounding loop reads `.next` and drives the
+                // key-yielding {value,done} protocol through already-modeled
+                // opcodes. A non-object (or an object with a non-covered
+                // prototype) self-names an honest skip. XS's `XS_CODE_FOR_IN`
+                // sets up a `RUN_ALL` of `mxEnumeratorFunction`; endor builds
+                // the enumerator in place with the equivalent metering.
+                XS_CODE_FOR_IN => {
+                    let obj = self.pop();
+                    let inst = match obj.value {
+                        // `undefined`/`null` for-in is a legal empty loop, but
+                        // its zero-key enumerator setup is a later increment;
+                        // an object receiver is the covered case.
+                        Payload::Reference(i) => i,
+                        _ => return Halt::Unsupported(op.name()),
+                    };
+                    let it = self.make_enumerator(inst);
                     self.push(it);
                     pc += size as usize;
                 }
@@ -3968,9 +4015,90 @@ impl Interp {
                 kind,
                 result,
                 done: false,
+                enum_keys: Vec::new(),
             },
         );
         Slot::of(Kind::Reference, Payload::Reference(iter))
+    }
+
+    /// Build a for-in enumerator over `obj` (XS's `fx_Enumerator`): collect the
+    /// object's enumerable own-then-inherited string keys in XS enumeration
+    /// order (integer indices ascending, then string keys in insertion order,
+    /// per prototype level, skipping shadowed keys), and record them as an
+    /// enumerator [`IterState`] (kind 3) whose `next()` yields each as a
+    /// string. Meters the creation cluster ([`FOR_IN_ENUMERATOR_METERING`]);
+    /// each yielded key's string allocation is metered in `next()`.
+    fn make_enumerator(&mut self, obj: crate::value::SlotIndex) -> Slot {
+        self.meter.tick_raw(FOR_IN_ENUMERATOR_METERING);
+        if self.arrays.contains_key(&obj) {
+            self.meter.tick_raw(ARRAY_FOR_IN_EXTRA_METERING);
+        }
+        let keys = self.enumerable_keys(obj);
+        let result = self.slots.alloc(Slot::instance(self.object_proto));
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::undefined());
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(false));
+        }
+        let iter = self.slots.alloc(Slot::instance(self.array_iterator_proto));
+        self.iterators.insert(
+            iter,
+            IterState {
+                iterable: obj,
+                index: 0,
+                kind: 3,
+                result,
+                done: false,
+                enum_keys: keys,
+            },
+        );
+        Slot::of(Kind::Reference, Payload::Reference(iter))
+    }
+
+    /// The enumerable own-then-inherited string keys of `obj` in XS for-in
+    /// order, as `(id, index)` pairs (`id == XS_NO_ID` ⇒ an array index). For
+    /// an array: the present item indices ascending. For an ordinary object:
+    /// its own string-named properties in insertion order. The prototype chain
+    /// is walked (skipping already-seen keys), but the covered grammar's
+    /// prototypes (`%Object.prototype%` / `%Array.prototype%`) carry no
+    /// enumerable data properties, so only own keys appear.
+    fn enumerable_keys(&self, obj: crate::value::SlotIndex) -> Vec<(u16, u32)> {
+        let mut out: Vec<(u16, u32)> = Vec::new();
+        let mut seen: std::collections::HashSet<(u16, u32)> = std::collections::HashSet::new();
+        let mut cur = obj;
+        while !cur.is_null() {
+            // Array index keys first (ascending), then string keys.
+            if let Some(a) = self.arrays.get(&cur) {
+                let mut idxs: Vec<u32> = a.items.keys().copied().collect();
+                idxs.sort_unstable();
+                for i in idxs {
+                    let k = (crate::value::XS_NO_ID, i);
+                    if seen.insert(k) {
+                        out.push(k);
+                    }
+                }
+            }
+            // Own string-named properties, in insertion order. The property
+            // list is prepend-ordered (newest first), so collect and reverse.
+            let mut names: Vec<(u16, u32)> = Vec::new();
+            let mut p = self.slots.get(cur).next;
+            while !p.is_null() {
+                let s = self.slots.get(p);
+                if s.id != crate::value::XS_NO_ID {
+                    names.push((s.id, 0));
+                }
+                p = s.next;
+            }
+            names.reverse();
+            for k in names {
+                if seen.insert(k) {
+                    out.push(k);
+                }
+            }
+            cur = self.instance_prototype(cur);
+        }
+        out
     }
 
     /// `fx_ArrayIterator_prototype_next`: advance the iterator, mutate its
@@ -3978,6 +4106,9 @@ impl Interp {
     /// [`ARRAY_ITERATOR_NEXT_METERING`]; an `entries` element allocates a fresh
     /// `[index, value]` pair (its own array-create metering).
     fn array_iterator_next(&mut self, iter: crate::value::SlotIndex) -> Result<Slot, Halt> {
+        if self.iterators[&iter].kind == 3 {
+            return Ok(self.enumerator_next(iter));
+        }
         let st = self.iterators[&iter].clone();
         let result = st.result;
         let (new_value, new_done, next_index): (Slot, bool, u32) = if st.done {
@@ -4036,6 +4167,55 @@ impl Interp {
             self.set_own_unmetered(result, did, Slot::boolean(new_done));
         }
         Ok(Slot::of(Kind::Reference, Payload::Reference(result)))
+    }
+
+    /// `fx_Enumerator_prototype_next` for a for-in enumerator: yield the next
+    /// enumerable key as a string, mutating and returning the reused result
+    /// object. Meters the per-`next()` base plus the yielded key's string
+    /// allocation.
+    fn enumerator_next(&mut self, iter: crate::value::SlotIndex) -> Slot {
+        let st = self.iterators[&iter].clone();
+        let result = st.result;
+        let (new_value, new_done, next_index): (Slot, bool, u32) =
+            if st.done || (st.index as usize) >= st.enum_keys.len() {
+                (Slot::undefined(), true, st.index)
+            } else {
+                self.meter.tick_raw(ENUMERATOR_NEXT_METERING);
+                let (id, idx) = st.enum_keys[st.index as usize];
+                // The key string: an array index renders as a fresh decimal
+                // (`fxKeyAt` allocates it, metered per byte + NUL); a named key
+                // reuses its interned symbol name (no run-time allocation in
+                // XS, so endor allocates the chunk it needs to produce the
+                // value but does NOT meter it).
+                let bytes: Vec<u8> = if id == crate::value::XS_NO_ID {
+                    let b = number_to_ecma_string(idx as f64).into_bytes();
+                    self.meter.tick_chunk_new((b.len() + 1) as u64);
+                    b
+                } else {
+                    self.symbol_names
+                        .get(id as usize - 1)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_bytes()
+                };
+                let off = self.chunks.alloc(&bytes);
+                (
+                    Slot::of(Kind::String, Payload::String(off)),
+                    false,
+                    st.index + 1,
+                )
+            };
+        if let Some(s) = self.iterators.get_mut(&iter) {
+            s.index = next_index;
+            s.done = new_done;
+        }
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, Slot::of(new_value.kind, new_value.value));
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(new_done));
+        }
+        Slot::of(Kind::Reference, Payload::Reference(result))
     }
 
     /// The array instance behind `this` **iff** it is a dense array (every

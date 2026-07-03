@@ -383,6 +383,36 @@ pub fn gen_stage3_spread_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for **`for-in`** over an object literal or an
+/// array — the computron-exact enumeration grammar (a sub-computron ±8-raw
+/// chunk residual never crosses a `>> 16` boundary). Builds an object literal
+/// (string keys) or a dense array and a count/concat loop over its keys. Rides
+/// the full symbol-linking differential check.
+pub fn gen_stage3_for_in_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    // The enumerable: either an object literal with 0..=3 single-letter string
+    // keys, or a dense array of 0..=4 small ints.
+    let target = if b.choice(2) == 0 {
+        let n = (b.next() % 4) as usize;
+        let mut props: Vec<String> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Distinct keys a,b,c so the object is well-formed.
+            let key = (b'a' + i as u8) as char;
+            props.push(format!("{}:{}", key, small_int(&mut b)));
+        }
+        format!("{{{}}}", props.join(","))
+    } else {
+        let n = (b.next() % 5) as usize;
+        let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
+        format!("[{}]", elems.join(","))
+    };
+    if b.choice(2) == 0 {
+        format!("var s=\"\"; for (var k in {}) s=s+k; s", target)
+    } else {
+        format!("var n=0; for (var k in {}) n=n+1; n", target)
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -799,6 +829,44 @@ mod tests {
         }
         assert!(checked > 0);
         assert!(distinct.len() > 20, "spread sweep too uniform: {} distinct", distinct.len());
+    }
+
+    #[test]
+    fn generated_stage3_for_in_programs_agree_bit_exact() {
+        // for-in over an object literal or array drives the enumerator's key
+        // collection + per-key yield, computron-exact. Sweep a spread of seeds
+        // over object/array targets, a range of key counts (including empty),
+        // and both loop bodies.
+        let mut checked = 0;
+        let mut kinds = [false; 2]; // object target, array target
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(19))
+                        .wrapping_add((seed as u8).wrapping_mul(2)),
+                );
+            }
+            let prog = gen_stage3_for_in_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains("in {") {
+                kinds[0] = true;
+            } else if prog.contains("in [") {
+                kinds[1] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 for-in differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "for-in sweep too uniform: {} distinct", distinct.len());
+        for (i, k) in kinds.iter().enumerate() {
+            assert!(*k, "for-in target {} never generated", i);
+        }
     }
 
     #[test]
