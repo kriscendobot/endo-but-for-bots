@@ -551,6 +551,33 @@ pub const STRING_METHOD_FRAME_METERING: u64 = 0;
 /// sub-computron rounding).
 pub const STRING_METERSOME_FRAME_METERING: u64 = (2 << 14) + (2 << 8);
 
+/// The native residual of `new Map()` / `new Set()` (`fx_Map`/`fx_Set` with no
+/// iterable argument) BEYOND the `RUN` dispatch and the explicit
+/// allocation ticks the construct path charges (four `fxNewSlot`s — instance,
+/// table, list, size — plus the initial `fxNewChunk(mxTableMinLength * 8)`
+/// address array). Covers the native host frame and
+/// `fxGetPrototypeFromConstructor`. Calibrated raw-exact against the pin
+/// `48ee02d8cfe0`.
+pub const MAP_CTOR_FRAME_METERING: u64 = 98304;
+/// The native residual of `new WeakMap()` / `new WeakSet()` beyond the two
+/// `fxNewSlot`s (`fxNewWeakMapInstance`: instance + weak list; no table, no
+/// chunk). Calibrated raw-exact against the pin.
+pub const WEAK_CTOR_FRAME_METERING: u64 = 98312;
+/// The per-linked-slot residual an inserting `fxSetEntry`/`fxSetWeakEntry`
+/// charges over each new entry slot BEYOND the first (measured `1 << 15` raw
+/// units per slot). A `Map.set`/`WeakMap.set`/`WeakSet.add` new entry (three
+/// slots) charges `2×`; a `Set.add` new entry (two slots) charges `1×`. Query
+/// methods (`get`/`has`) and an in-place update allocate nothing and carry no
+/// residual. Calibrated against the pin `48ee02d8cfe0`.
+pub const COLLECTION_SLOT_LINK_METERING: u64 = 1 << 15;
+/// The native residual of the `Map`/`Set` `size` accessor getter
+/// (`fx_Map_prototype_size`) beyond the `GET_PROPERTY` dispatch. Calibrated
+/// against the pin.
+pub const COLLECTION_SIZE_GET_METERING: u64 = 0;
+/// XS's `mxTableMinLength`: the initial (and minimum) Map/Set hash-table
+/// address-array length. The table grows/shrinks by powers of two around it.
+pub const MAP_MIN_TABLE_LENGTH: u32 = 1;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -895,6 +922,29 @@ pub enum NativeMethod {
     JsonStringify,
     /// `JSON.parse(text)` (`fx_JSON_parse`): parse `text` to a value.
     JsonParse,
+    /// `Map.prototype.set(k, v)` / `WeakMap.prototype.set(k, v)`
+    /// (`fx_Map_prototype_set` / `fx_WeakMap_prototype_set`): insert or update
+    /// the entry, returning the receiver. A new key allocates the entry slots
+    /// (`fxSetEntry`/`fxSetWeakEntry`) — the sole metering (xsMapSet.c calls no
+    /// `mxMeter`); an existing key updates in place, allocation-free.
+    MapSet,
+    /// `Map.prototype.get(k)` / `WeakMap.prototype.get(k)`: the value for `k`,
+    /// or `undefined`. Allocation-free (`fxGetEntry`/`fxGetWeakEntry`).
+    MapGet,
+    /// `Map.prototype.has(k)` / `WeakMap.prototype.has(k)`: membership.
+    MapHas,
+    /// `Map.prototype.delete(k)` / `WeakMap.prototype.delete(k)`: remove and
+    /// report whether present. A Map shrink may reallocate the address chunk
+    /// (`fxResizeEntries`); a WeakMap unlink is allocation-free.
+    MapDelete,
+    /// `Set.prototype.add(v)` / `WeakSet.prototype.add(v)`: insert `v`,
+    /// returning the receiver (`fxSetEntry` with no pair → two entry slots;
+    /// the weak form allocates three).
+    SetAdd,
+    /// `Set.prototype.has(v)` / `WeakSet.prototype.has(v)`.
+    SetHas,
+    /// `Set.prototype.delete(v)` / `WeakSet.prototype.delete(v)`.
+    SetDelete,
 }
 
 impl Default for FuncInfo {
@@ -920,6 +970,36 @@ impl Default for FuncInfo {
 struct ArrayData {
     length: u32,
     items: std::collections::BTreeMap<u32, Slot>,
+}
+
+/// Which collection an instance is (XS's `XS_MAP_KIND`/`XS_SET_KIND`/
+/// `XS_WEAK_MAP_KIND`/`XS_WEAK_SET_KIND` internal slot).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CollKind {
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+}
+
+/// A Map/Set/WeakMap/WeakSet instance's internal state (XS's exotic
+/// collection: the hash table + insertion-ordered entry list, or the
+/// weak-entry list). Kept in the [`Interp::collections`] side table like
+/// [`ArrayData`]; entry key/value slots are never swept underneath it (the
+/// stage-2 no-mid-run-GC contract). `entries` preserves insertion order
+/// (XS's `list` order, what `forEach`/iterators visit); Set/WeakSet ignore
+/// the value half.
+///
+/// Metering is purely allocation-driven — xsMapSet.c contains no `mxMeter`
+/// calls — so `table_length` tracks XS's power-of-two address-array length
+/// (`fxResizeEntries`) to charge the `fxNewChunk(length * 8)` on the exact
+/// rehash boundaries C-XS crosses. Weak collections have no table (their
+/// entries hang off the key object), so `table_length` is unused for them.
+#[derive(Clone, Debug)]
+struct CollectionData {
+    kind: CollKind,
+    entries: Vec<(Slot, Slot)>,
+    table_length: u32,
 }
 
 /// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
@@ -978,6 +1058,10 @@ pub enum Native {
     TypeError,
     URIError,
     AggregateError,
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
 }
 
 impl Native {
@@ -1000,6 +1084,10 @@ impl Native {
             Native::TypeError => "TypeError",
             Native::URIError => "URIError",
             Native::AggregateError => "AggregateError",
+            Native::Map => "Map",
+            Native::Set => "Set",
+            Native::WeakMap => "WeakMap",
+            Native::WeakSet => "WeakSet",
         }
     }
 
@@ -1024,6 +1112,10 @@ impl Native {
             ("TypeError", Native::TypeError),
             ("URIError", Native::URIError),
             ("AggregateError", Native::AggregateError),
+            ("Map", Native::Map),
+            ("Set", Native::Set),
+            ("WeakMap", Native::WeakMap),
+            ("WeakSet", Native::WeakSet),
         ]
     }
 }
@@ -1281,6 +1373,22 @@ pub struct Interp {
     /// item value slots (which may be references) are never swept underneath
     /// it (the stage-2 GC roots contract).
     arrays: std::collections::HashMap<crate::value::SlotIndex, ArrayData>,
+    /// Per-instance Map/Set/WeakMap/WeakSet data (XS's exotic collection
+    /// internal slots). Keyed by the collection instance's slot, like
+    /// [`Self::arrays`]. See [`CollectionData`].
+    collections: std::collections::HashMap<crate::value::SlotIndex, CollectionData>,
+    /// The realm's `%Map.prototype%`/`%Set.prototype%`/`%WeakMap.prototype%`/
+    /// `%WeakSet.prototype%` (boot objects), so a `new Map()` instance chains
+    /// to the right one and its methods resolve.
+    map_proto: crate::value::SlotIndex,
+    set_proto: crate::value::SlotIndex,
+    weakmap_proto: crate::value::SlotIndex,
+    weakset_proto: crate::value::SlotIndex,
+    /// The program-local symbol id of `size`, resolved at
+    /// [`Self::link_intrinsics`] (XS's `mxID(_size)`), so a `map.size`/
+    /// `set.size` get routes to the collection size accessor. `None` when the
+    /// program never references `size`.
+    size_id: Option<u16>,
     /// The program-local symbol id of `length`, resolved at
     /// [`Self::link_intrinsics`] (XS's `mxID(_length)`), so an
     /// `arr.length` get/set routes to the array length semantics. `None`
@@ -1447,6 +1555,12 @@ impl Interp {
             wrapper_data: std::collections::HashMap::new(),
             array_proto: crate::value::SlotIndex::NULL,
             arrays: std::collections::HashMap::new(),
+            collections: std::collections::HashMap::new(),
+            map_proto: crate::value::SlotIndex::NULL,
+            set_proto: crate::value::SlotIndex::NULL,
+            weakmap_proto: crate::value::SlotIndex::NULL,
+            weakset_proto: crate::value::SlotIndex::NULL,
+            size_id: None,
             length_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
             math_object: crate::value::SlotIndex::NULL,
@@ -1516,6 +1630,14 @@ impl Interp {
                 // %Object.prototype% (its own array-ness is unobservable to the
                 // covered grammar, which never reads `Array.prototype.length`).
                 Native::Array => self.slots.alloc(Slot::instance(object_proto)),
+                // `%Map.prototype%` / `%Set.prototype%` / `%WeakMap.prototype%`
+                // / `%WeakSet.prototype%`: plain boot objects chaining to
+                // %Object.prototype%, carrying the collection methods bound
+                // below. Their per-instance table lives in the `collections`
+                // side table, not on the prototype.
+                Native::Map | Native::Set | Native::WeakMap | Native::WeakSet => {
+                    self.slots.alloc(Slot::instance(object_proto))
+                }
             };
             self.ctor_prototype.insert(f, proto);
         }
@@ -1594,6 +1716,59 @@ impl Interp {
             self.proto_methods.push((array_ctor, "from", from));
             let from_async = self.alloc_method(NativeMethod::ArrayFromAsync);
             self.proto_methods.push((array_ctor, "fromAsync", from_async));
+        }
+        // The collection prototypes (`%Map.prototype%` &co.), remembered so a
+        // `new Map()`/`new Set()`/… instance chains to the right one and its
+        // methods resolve. `set`/`get`/`has`/`delete` on Map and WeakMap share
+        // the `MapSet`/`MapGet`/`MapHas`/`MapDelete` handlers (identical body
+        // apart from the weak key check); `add`/`has`/`delete` on Set and
+        // WeakSet share `SetAdd`/`SetHas`/`SetDelete`. Bound at link time only
+        // when the program references the name (like every native method).
+        for (name, cache) in [
+            ("Map", 0usize),
+            ("Set", 1),
+            ("WeakMap", 2),
+            ("WeakSet", 3),
+        ] {
+            let proto = self
+                .intrinsics
+                .get(name)
+                .and_then(|&c| self.ctor_prototype.get(&c).copied())
+                .unwrap_or(crate::value::SlotIndex::NULL);
+            match cache {
+                0 => self.map_proto = proto,
+                1 => self.set_proto = proto,
+                2 => self.weakmap_proto = proto,
+                _ => self.weakset_proto = proto,
+            }
+            let methods: &[(&'static str, NativeMethod)] = match cache {
+                0 => &[
+                    ("set", NativeMethod::MapSet),
+                    ("get", NativeMethod::MapGet),
+                    ("has", NativeMethod::MapHas),
+                    ("delete", NativeMethod::MapDelete),
+                ],
+                1 => &[
+                    ("add", NativeMethod::SetAdd),
+                    ("has", NativeMethod::SetHas),
+                    ("delete", NativeMethod::SetDelete),
+                ],
+                2 => &[
+                    ("set", NativeMethod::MapSet),
+                    ("get", NativeMethod::MapGet),
+                    ("has", NativeMethod::MapHas),
+                    ("delete", NativeMethod::MapDelete),
+                ],
+                _ => &[
+                    ("add", NativeMethod::SetAdd),
+                    ("has", NativeMethod::SetHas),
+                    ("delete", NativeMethod::SetDelete),
+                ],
+            };
+            for &(m_name, m) in methods {
+                let mf = self.alloc_method(m);
+                self.proto_methods.push((proto, m_name, mf));
+            }
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -1967,6 +2142,7 @@ impl Interp {
         };
         self.value_id = id_of("value");
         self.done_id = id_of("done");
+        self.size_id = id_of("size");
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -2228,6 +2404,17 @@ impl Interp {
                         }
                     }
                     out
+                } else if let Some(c) = self.collections.get(&r) {
+                    // A Map/Set/WeakMap/WeakSet stringifies through
+                    // `Object.prototype.toString` under its `Symbol.toStringTag`
+                    // ("Map"/"Set"/…): `[object Map]` &co. — the completion the
+                    // oracle reports for a bare collection.
+                    match c.kind {
+                        CollKind::Map => "[object Map]".to_string(),
+                        CollKind::Set => "[object Set]".to_string(),
+                        CollKind::WeakMap => "[object WeakMap]".to_string(),
+                        CollKind::WeakSet => "[object WeakSet]".to_string(),
+                    }
                 } else if let Some(info) = self.error_data.get(&r) {
                     match &info.message {
                         Some(m) if !m.is_empty() => format!("{}: {}", info.name, m),
@@ -2779,6 +2966,20 @@ impl Interp {
                             // getter (`fxArrayLengthGetter`).
                             self.meter.tick_raw(ARRAY_LENGTH_GET_METERING);
                             Slot::integer(self.arrays[&inst].length as i32)
+                        }
+                        Payload::Reference(inst)
+                            if Some(id) == self.size_id
+                                && self
+                                    .collections
+                                    .get(&inst)
+                                    .map(|c| matches!(c.kind, CollKind::Map | CollKind::Set))
+                                    .unwrap_or(false) =>
+                        {
+                            // `map.size` / `set.size`: the collection size
+                            // accessor getter (`fx_Map_prototype_size`), reading
+                            // the size slot. WeakMap/WeakSet have no `size`.
+                            self.meter.tick_raw(COLLECTION_SIZE_GET_METERING);
+                            Slot::integer(self.collections[&inst].entries.len() as i32)
                         }
                         Payload::Reference(inst) => self.instance_get(inst, id),
                         // A primitive string boxes to `%String.prototype%`
@@ -4335,6 +4536,60 @@ impl Interp {
                     data.length = argc as u32;
                 }
                 self.arrays.insert(inst, data);
+                Slot::of(Kind::Reference, Payload::Reference(inst))
+            }
+            // `new Map()` / `new Set()` (`fx_Map`/`fx_Set` + `fxNewMapInstance`/
+            // `fxNewSetInstance`): a fresh empty collection. The instance is
+            // four `fxNewSlot`s (instance/table/list/size) plus the initial
+            // `fxNewChunk(mxTableMinLength * 8)` address array — the sole
+            // metering (xsMapSet.c calls no `mxMeter`), charged explicitly here
+            // since the table lives in the `collections` side table. An
+            // iterable argument (the copy-constructor form) drives the iterator
+            // protocol and self-names an honest skip. `Map()` without `new`
+            // throws a TypeError (its abort metering is a later increment).
+            Native::Map | Native::Set if has_target => {
+                let a = arg(0);
+                if argc >= 1 && a.kind != Kind::Undefined && a.kind != Kind::Null {
+                    return Err(Halt::Unsupported("native-call:Map:iterable"));
+                }
+                let (proto, kind) = match native {
+                    Native::Map => (self.map_proto, CollKind::Map),
+                    _ => (self.set_proto, CollKind::Set),
+                };
+                self.meter.tick_raw(MAP_CTOR_FRAME_METERING);
+                self.meter.tick_slot_alloc(); // instance
+                self.meter.tick_slot_alloc(); // table
+                self.meter.tick_slot_alloc(); // list
+                self.meter.tick_slot_alloc(); // size
+                self.meter.tick_chunk_new(MAP_MIN_TABLE_LENGTH as u64 * 8);
+                let inst = self.slots.alloc(Slot::instance(proto));
+                self.collections.insert(
+                    inst,
+                    CollectionData { kind, entries: Vec::new(), table_length: MAP_MIN_TABLE_LENGTH },
+                );
+                Slot::of(Kind::Reference, Payload::Reference(inst))
+            }
+            // `new WeakMap()` / `new WeakSet()` (`fxNewWeakMapInstance`): only
+            // two `fxNewSlot`s (instance + weak list); there is no table or
+            // address chunk — the entries hang off the key objects. An iterable
+            // argument self-names.
+            Native::WeakMap | Native::WeakSet if has_target => {
+                let a = arg(0);
+                if argc >= 1 && a.kind != Kind::Undefined && a.kind != Kind::Null {
+                    return Err(Halt::Unsupported("native-call:WeakMap:iterable"));
+                }
+                let (proto, kind) = match native {
+                    Native::WeakMap => (self.weakmap_proto, CollKind::WeakMap),
+                    _ => (self.weakset_proto, CollKind::WeakSet),
+                };
+                self.meter.tick_raw(WEAK_CTOR_FRAME_METERING);
+                self.meter.tick_slot_alloc(); // instance
+                self.meter.tick_slot_alloc(); // weak list
+                let inst = self.slots.alloc(Slot::instance(proto));
+                self.collections.insert(
+                    inst,
+                    CollectionData { kind, entries: Vec::new(), table_length: 0 },
+                );
                 Slot::of(Kind::Reference, Payload::Reference(inst))
             }
             // The remaining fundamentals constructors' call/coerce/construct
@@ -5935,10 +6190,121 @@ impl Interp {
             NativeMethod::JsonStringify | NativeMethod::JsonParse => {
                 self.call_json(m, base, argc)?
             }
+            NativeMethod::MapSet
+            | NativeMethod::MapGet
+            | NativeMethod::MapHas
+            | NativeMethod::MapDelete
+            | NativeMethod::SetAdd
+            | NativeMethod::SetHas
+            | NativeMethod::SetDelete => self.call_collection(m, this, base, argc)?,
         };
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// Dispatch a Map/Set/WeakMap/WeakSet mutator or query method (xsMapSet.c).
+    /// The receiver `this` names the collection; argument 0 is the key/value
+    /// (`stack[base + 4]`), argument 1 the value for `Map.set`
+    /// (`stack[base + 5]`). Metering is purely allocation-driven — xsMapSet.c
+    /// calls no `mxMeter` — so a new entry charges its `fxNewSlot`s (and, for a
+    /// Map/Set, any `fxResizeEntries` rehash chunk) while a query or an
+    /// in-place update is allocation-free; each carries only the calibrated
+    /// native-frame residual. A receiver that is not the right collection kind,
+    /// or a WeakMap/WeakSet primitive key (a TypeError in XS), self-names an
+    /// honest skip rather than mis-metering the throw.
+    fn call_collection(
+        &mut self,
+        m: NativeMethod,
+        this: Slot,
+        base: usize,
+        argc: usize,
+    ) -> Result<Slot, Halt> {
+        let _ = argc;
+        let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        let inst = match self.collection_ref(this) {
+            Some(i) => i,
+            None => return Err(Halt::Unsupported("collection-method:non-collection-this")),
+        };
+        let kind = self.collections[&inst].kind;
+        // The method families: `MapSet`/`MapGet`/`MapHas`/`MapDelete` serve Map
+        // AND WeakMap; `SetAdd`/`SetHas`/`SetDelete` serve Set AND WeakSet. A
+        // receiver of the wrong family self-names.
+        let is_map_family = matches!(kind, CollKind::Map | CollKind::WeakMap);
+        let is_set_family = matches!(kind, CollKind::Set | CollKind::WeakSet);
+        let weak = matches!(kind, CollKind::WeakMap | CollKind::WeakSet);
+        match m {
+            NativeMethod::MapSet if is_map_family => {
+                let val = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                let key = self.normalize_coll_key(arg0);
+                if weak && key.kind != Kind::Reference {
+                    return Err(Halt::Unsupported("WeakMap.set:non-object-key"));
+                }
+                match self.collection_find(inst, &key) {
+                    Some(p) => {
+                        self.collections.get_mut(&inst).unwrap().entries[p].1 = val;
+                    }
+                    None => {
+                        // `fxSetEntry`/`fxSetWeakEntry` new key: three slots
+                        // (Map: key + value + entry; WeakMap: keyEntry +
+                        // listEntry + closure).
+                        self.charge_new_entry_slots(3);
+                        self.collections.get_mut(&inst).unwrap().entries.push((key, val));
+                        self.collection_table_resize(inst);
+                    }
+                }
+                Ok(this)
+            }
+            NativeMethod::SetAdd if is_set_family => {
+                let key = self.normalize_coll_key(arg0);
+                if weak && key.kind != Kind::Reference {
+                    return Err(Halt::Unsupported("WeakSet.add:non-object-value"));
+                }
+                if self.collection_find(inst, &key).is_none() {
+                    // `fxSetEntry` with no pair → two slots (value + entry);
+                    // `fxSetWeakEntry` → three (keyEntry + listEntry + closure).
+                    let n = if weak { 3 } else { 2 };
+                    self.charge_new_entry_slots(n);
+                    self.collections.get_mut(&inst).unwrap().entries.push((key, Slot::undefined()));
+                    self.collection_table_resize(inst);
+                }
+                Ok(this)
+            }
+            NativeMethod::MapGet if is_map_family => {
+                let key = self.normalize_coll_key(arg0);
+                let v = self
+                    .collection_find(inst, &key)
+                    .map(|p| self.collections[&inst].entries[p].1)
+                    .unwrap_or_else(Slot::undefined);
+                Ok(v)
+            }
+            NativeMethod::MapHas if is_map_family => {
+                let key = self.normalize_coll_key(arg0);
+                Ok(Slot::boolean(self.collection_find(inst, &key).is_some()))
+            }
+            NativeMethod::SetHas if is_set_family => {
+                let key = self.normalize_coll_key(arg0);
+                Ok(Slot::boolean(self.collection_find(inst, &key).is_some()))
+            }
+            NativeMethod::MapDelete | NativeMethod::SetDelete
+                if (m == NativeMethod::MapDelete && is_map_family)
+                    || (m == NativeMethod::SetDelete && is_set_family) =>
+            {
+                let key = self.normalize_coll_key(arg0);
+                match self.collection_find(inst, &key) {
+                    Some(p) => {
+                        self.collections.get_mut(&inst).unwrap().entries.remove(p);
+                        // `fxDeleteEntry` calls `fxResizeEntries` (a Map/Set may
+                        // shrink its address chunk; a weak unlink is
+                        // allocation-free).
+                        self.collection_table_resize(inst);
+                        Ok(Slot::boolean(true))
+                    }
+                    None => Ok(Slot::boolean(false)),
+                }
+            }
+            _ => Err(Halt::Unsupported("collection-method:wrong-kind")),
+        }
     }
 
     /// Dispatch a `Math.*` static (`xsMath.c`). Reads the positional
@@ -7224,6 +7590,85 @@ impl Interp {
         self.strict_equal(a, b)
     }
 
+    /// If `this` is a reference to a Map/Set/WeakMap/WeakSet instance, its
+    /// slot index; else `None`.
+    fn collection_ref(&self, this: Slot) -> Option<crate::value::SlotIndex> {
+        match this.value {
+            Payload::Reference(r) if self.collections.contains_key(&r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// `fxCheckMapKey`: normalize a collection key so `-0` is stored/compared
+    /// as `+0` (every other value is unchanged; SameValueZero already unifies
+    /// `NaN`).
+    fn normalize_coll_key(&self, key: Slot) -> Slot {
+        match key.value {
+            Payload::Number(n) if n == 0.0 => Slot::number(0.0),
+            _ => key,
+        }
+    }
+
+    /// The index of `key` among `inst`'s entries by SameValueZero, or `None`.
+    fn collection_find(&self, inst: crate::value::SlotIndex, key: &Slot) -> Option<usize> {
+        let data = self.collections.get(&inst)?;
+        data.entries.iter().position(|(k, _)| self.same_value_zero(k, key))
+    }
+
+    /// Charge the metering of an inserting `fxSetEntry`/`fxSetWeakEntry` new
+    /// entry of `n` slots: the `fxNewSlot` base (`XS_SLOT_ALLOCATION_METERING`)
+    /// per slot, plus [`COLLECTION_SLOT_LINK_METERING`] for each slot beyond the
+    /// first (the measured per-linked-slot residual). The rehash chunk, if any,
+    /// is charged separately by [`Self::collection_table_resize`].
+    fn charge_new_entry_slots(&mut self, n: u64) {
+        for _ in 0..n {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw((n - 1) * COLLECTION_SLOT_LINK_METERING);
+    }
+
+    /// `fxResizeEntries` after a Map/Set size change: grow/shrink the
+    /// power-of-two address array and, when its length changes, charge the
+    /// `fxNewChunk(currentLength * 8)` — the rehash's only allocation. A weak
+    /// collection has no table, so this is a no-op for it.
+    fn collection_table_resize(&mut self, inst: crate::value::SlotIndex) {
+        let (former, size) = {
+            let data = &self.collections[&inst];
+            if data.kind == CollKind::WeakMap || data.kind == CollKind::WeakSet {
+                return;
+            }
+            (data.table_length, data.entries.len() as u32)
+        };
+        // mxTableThreshold(L) = (L>>1) + (L>>2); high = threshold, low = high>>1.
+        let high = (former >> 1) + (former >> 2);
+        let low = high >> 1;
+        let mut current = former;
+        if high < size {
+            current = former << 1;
+            let max = 1024 * 1024;
+            if current > max {
+                current = max;
+            }
+        } else if low >= size {
+            current = former >> 1;
+            if current < MAP_MIN_TABLE_LENGTH {
+                current = MAP_MIN_TABLE_LENGTH;
+            }
+        }
+        if current != former {
+            self.meter.tick_chunk_new(current as u64 * 8);
+            // The first grow away from the minimum-length (1) address array
+            // carries a measured one-time `+8` raw over the plain
+            // `fxNewChunk(current * 8)` (the length-1 array the fresh
+            // instance's `fxNewChunk(mxTableMinLength * 8)` created is released
+            // as the new one is installed). Raw-exact against the pin.
+            if former == MAP_MIN_TABLE_LENGTH && current > former {
+                self.meter.tick_raw(8);
+            }
+            self.collections.get_mut(&inst).unwrap().table_length = current;
+        }
+    }
+
     /// `fxArgToIndex`: the argument at `base`+`argi` coerced to a relative
     /// index in `[0, length]` (negative counts from the end, clamped). Absent
     /// or `undefined` uses `default`. The covered grammar passes small
@@ -8261,6 +8706,10 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::TypeError => "native-call:TypeError",
         Native::URIError => "native-call:URIError",
         Native::AggregateError => "native-call:AggregateError",
+        Native::Map => "native-call:Map",
+        Native::Set => "native-call:Set",
+        Native::WeakMap => "native-call:WeakMap",
+        Native::WeakSet => "native-call:WeakSet",
     }
 }
 

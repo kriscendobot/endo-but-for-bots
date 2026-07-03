@@ -323,6 +323,16 @@ pub fn stage3_json_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-json.js"))
 }
 
+/// The stage-3 child-5 (collections) curated corpus: Map/Set/WeakMap/WeakSet
+/// construction, `set`/`add`/`get`/`has`/`delete`/`size`, growth across the
+/// hash-table rehash boundaries, SameValueZero key equality, and reference
+/// keys — bit-exact (result AND computron) against the oracle. Every entry
+/// allocation is `fxNewSlot`-visible and every rehash an `fxNewChunk`, so the
+/// computron count tracks the exact allocation sequence.
+pub fn stage3_collections_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3-collections.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -892,6 +902,38 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3 json bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3_collections_corpus_is_bit_exact_against_oracle() {
+        // The stage-3 child-5 collections acceptance bar: every Map/Set/
+        // WeakMap/WeakSet program — construction, set/add/get/has/delete/size,
+        // growth over the hash-table rehash boundaries, SameValueZero key
+        // equality, and reference keys — agrees with C-XS on BOTH the
+        // completion value AND the computron count. Metering is purely
+        // allocation-driven (xsMapSet.c calls no `mxMeter`): the entry
+        // `fxNewSlot`s, the per-linked-slot residual, and the `fxResizeEntries`
+        // rehash chunks are reproduced so the computrons agree bit-exactly.
+        let programs = stage3_collections_corpus();
+        assert!(!programs.is_empty(), "stage-3 collections corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3 collections bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
