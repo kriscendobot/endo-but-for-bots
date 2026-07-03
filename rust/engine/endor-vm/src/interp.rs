@@ -335,6 +335,14 @@ pub const ARRAY_ITERATOR_NEXT_METERING: u64 = 2 << 14;
 /// The extra raw 16.16 cost a `values`/`entries` `next()` accrues reading the
 /// array element it yields (`mxGetIndex`), over a `keys` next: `2 << 14`.
 pub const ARRAY_ITERATOR_ELEMENT_READ: u64 = 2 << 14;
+/// The raw 16.16 cost of `XS_CODE_FOR_OF` (`fxRunForOf` → `fxGetIterator`)
+/// beyond the `values()` iterator creation it performs: the `fxGetIterator`
+/// host frame, the `arr[Symbol.iterator]` lookup, and the zero-argument call
+/// dispatch. Calibrated against the pin `48ee02d8cfe0` via the completed
+/// for-of loop raw-gap (the `values()` create cost itself is metered inside
+/// [`Interp::make_array_iterator`]) — a constant `2 << 16`, independent of the
+/// iterable's length.
+pub const FOR_OF_GET_ITERATOR_METERING: u64 = 2 << 16;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -1912,6 +1920,36 @@ impl Interp {
                         return h;
                     }
                     pc += 3;
+                }
+                // `for_of` (`XS_CODE_FOR_OF` → `fxRunForOf` → `fxGetIterator`):
+                // replace the top-of-stack iterable with its iterator,
+                // `iterable[Symbol.iterator]()`. For an array that is the
+                // `values` iterator; the surrounding loop then reads `.next`
+                // and drives the {value,done} protocol through already-modeled
+                // opcodes. A non-array iterable (string/user iterator) self-
+                // names an honest skip (its iterator wiring is a later
+                // increment). Metering is the `fxGetIterator` cost measured
+                // against the pin.
+                XS_CODE_FOR_OF => {
+                    let iterable = self.pop();
+                    let arr = match iterable.value {
+                        Payload::Reference(i) if self.arrays.contains_key(&i) => i,
+                        _ => return Halt::Unsupported(op.name()),
+                    };
+                    self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
+                    let it = self.make_array_iterator(arr, 0);
+                    self.push(it);
+                    pc += size as usize;
+                }
+                // `check_instance` (`XS_CODE_CHECK_INSTANCE`): the iterator
+                // result must be an object; a non-reference top throws a
+                // `TypeError` (XS's `fxRunDebug`). Dispatch-metered only.
+                XS_CODE_CHECK_INSTANCE => {
+                    let top = self.stack.last().copied().unwrap_or_else(Slot::undefined);
+                    if top.kind != Kind::Reference {
+                        return Halt::Throw("iterator result: not an object".into());
+                    }
+                    pc += size as usize;
                 }
                 // Define a new own property (object-literal member).
                 // Stack: [.., objectRef, value]; consumes both. Encoded

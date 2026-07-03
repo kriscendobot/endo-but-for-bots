@@ -128,6 +128,16 @@ var it=[].keys(); it.next().done
 var it=[1,2,3].keys(); it.next(); it.next(); it.next(); it.next().done
 var it=[7,8,9].values(); it.next(); it.next(); it.next().value
 
+// --- for-of over arrays (fxGetIterator + the values iterator protocol) ---
+var s=0; for (var x of [1,2,3]) s=s+x; s
+var s=0; for (var x of [10,20]) s=s+x; s
+var s=0; for (var x of []) s=s+x; s
+var s=0; for (var x of [5]) s=s+x; s
+var p=1; for (var x of [1,2,3,4]) p=p*x; p
+var s=""; for (var x of [1,2,3]) s=s+x; s
+var n=0; for (var x of [7,7,7]) n=n+1; n
+var s=0; for (var x of [1,2,3,4,5]) s=s+x; s
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

@@ -336,6 +336,30 @@ pub fn gen_stage3_array_iterators_program(data: &[u8]) -> String {
     s
 }
 
+/// Structure-aware generator for **`for-of` over an array literal** — the
+/// bit-exact (result AND computron) iteration grammar. Builds a dense literal
+/// and a bounded reduce/count loop over it. The loop body stays inside the
+/// overflow-safe small-integer domain (`+`/`-`/`*`), so results are
+/// unambiguous. Rides the full symbol-linking differential check.
+pub fn gen_stage3_for_of_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let n = (b.next() % 5) as usize; // 0..=4 dense elements
+    let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
+    let lit = format!("[{}]", elems.join(","));
+    match b.choice(3) {
+        // A reduce with +/-/*.
+        0 => {
+            let op = small_op(&mut b);
+            let seed = small_int(&mut b);
+            format!("var s={}; for (var x of {}) s=s{}x; s", seed, lit, op)
+        }
+        // A count.
+        1 => format!("var n=0; for (var x of {}) n=n+1; n", lit),
+        // String concatenation of the elements.
+        _ => format!("var s=\"\"; for (var x of {}) s=s+x; s", lit),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -681,6 +705,47 @@ mod tests {
         assert!(distinct.len() > 30, "iterators sweep too uniform: {} distinct", distinct.len());
         for (i, k) in kinds.iter().enumerate() {
             assert!(*k, "iterator kind {} never generated", i);
+        }
+    }
+
+    #[test]
+    fn generated_stage3_for_of_programs_agree_bit_exact() {
+        // for-of over an array literal drives fxGetIterator + the values
+        // iterator's per-element next() protocol, all metered faithfully, so
+        // it rides the full result+computron differential. Sweep a spread of
+        // seeds over the three loop shapes and a range of array lengths
+        // (including the empty array).
+        let mut checked = 0;
+        let mut shapes = [false; 3];
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(13))
+                        .wrapping_add((seed as u8).wrapping_mul(6)),
+                );
+            }
+            let prog = gen_stage3_for_of_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains("n=n+1") {
+                shapes[1] = true;
+            } else if prog.contains("s=\"\"") {
+                shapes[2] = true;
+            } else {
+                shapes[0] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 for-of differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "for-of sweep too uniform: {} distinct", distinct.len());
+        for (i, s) in shapes.iter().enumerate() {
+            assert!(*s, "for-of shape {} never generated", i);
         }
     }
 
