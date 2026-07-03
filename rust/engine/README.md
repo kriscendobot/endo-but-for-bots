@@ -94,14 +94,23 @@ first-class values, `Boolean`/`Object` native calls, the value globals
 the Array exotic object: literals with holes, computed index get/set over the
 item chunk, the `length` accessor get/set, the dense `Array.prototype` methods
 — the non-callback `push`/`pop`/`shift`/`unshift`/`indexOf`/`lastIndexOf`/
-`includes`/`fill`/`slice`/`join`/`at`/`reverse`/`concat`/`copyWithin`/`with`
-and the re-entrant callback methods `forEach`/`map`/`filter`/`some`/`every`/
-`find`/`findIndex`/`findLast`/`findLastIndex`/`reduce`/`reduceRight` (driven
-through a re-entrant `run_callback` substrate) — the `Array(...)` constructor +
+`includes`/`fill`/`slice`/`join`/`toString`/`at`/`reverse`/`concat`/
+`copyWithin`/`with`/`splice`/`toSpliced`/`toReversed`/`flat` and the re-entrant
+callback methods `forEach`/`map`/`filter`/`some`/`every`/`find`/`findIndex`/
+`findLast`/`findLastIndex`/`reduce`/`reduceRight`/`flatMap` (driven through a
+re-entrant `run_callback` substrate) — the `Array(...)` constructor +
 `Array.isArray`, the `values`/`keys`/`entries` array iterators, and the
 iteration protocol — `for-of`, `for-in`, and array spread `[...arr]`),
 all bit-exact
-(result AND computron) against the oracle. The stage-3 built-ins reach
+(result AND computron) against the oracle. Methods whose metering is
+data-dependent or routes through un-modeled machinery (`sort`/`toSorted` —
+comparator-driven; `toLocaleString`; the `Array.from`/`fromAsync`/`of` statics)
+are bound as **honest named skips** (`Halt::Unsupported`) rather than left to
+resolve to `undefined` and throw — so a reference is a NAMED skip, never a
+completion divergence or a wrong value. The stage's built-ins/Array dual-run
+reflects this: `total=2625 covered=403 divergent=0 skipped=2222` (every skip
+named), and the iteration protocol grows `statements/for-in` to `covered=19`
+and `statements/for-of` to `covered=76`, both `divergent=0`. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic
