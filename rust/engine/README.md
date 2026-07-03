@@ -174,7 +174,9 @@ every skip named:
 `built-ins/WeakSet total=75 covered=9 divergent=0 skipped=66`
 (and `MapIteratorPrototype`/`SetIteratorPrototype` `divergent=0`, covered=0 —
 their tests exercise `Symbol.toStringTag` / direct-prototype corners endor
-honestly skips). The stage-3b remainder also lands `clear` (`fxClearEntries`: drop every entry
+honestly skips). The Map/Set `for-of` contribution also grows
+`language/statements/for-of` to `covered=89` (from the arrays child's 79), still
+`divergent=0`. The stage-3b remainder also lands `clear` (`fxClearEntries`: drop every entry
 and shrink the address table back toward `mxTableMinLength`), computron-exact.
 The deferred collection paths are honest **named skips**: the
 copy-constructor iterable argument (`new Map([[k,v]])`), a WeakMap/WeakSet

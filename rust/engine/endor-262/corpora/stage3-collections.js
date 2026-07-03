@@ -155,3 +155,10 @@ var s=new Set(); s.add(1); s.add(2); s.clear(); s.size
 var s=new Set(); s.add(1); s.clear(); s.has(1)
 var s=new Set(); for(var i=0;i<16;i++){s.add(i);} s.clear(); s.size
 var s=new Set(); for(var i=0;i<20;i++){s.add(i);} s.clear(); var t=0; for(var x of s){t=t+1;} t
+
+// --- iteration corners: reference keys, multi-step, ordered accumulation ---
+var a={}; var b={}; var m=new Map(); m.set(a,1); m.set(b,2); var t=0; m.forEach(function(v){t+=v;}); t
+var a={}; var m=new Map(); m.set(a,7); var it=m.keys(); it.next().value===a
+var m=new Map(); m.set(1,2); m.set(3,4); var it=m.entries(); var e1=it.next().value; var e2=it.next().value; e1[0]+e2[1]
+var m=new Map(); for(var i=0;i<5;i++)m.set(i,i*i); var t=0; m.forEach(function(v,k){t+=k;}); t
+var s=new Set(); s.add(1); s.add(2); s.add(3); var a=[...s]; a[0]+a[1]+a[2]
