@@ -316,6 +316,9 @@ pub struct Interp {
     pub slots: SlotArena,
     /// The machine chunk heap (CESU-8 strings and later data).
     pub chunks: ChunkArena,
+    /// The interned `typeof` result strings (XS's `mxUndefinedString`
+    /// &co.), allocated once at construction so `typeof` is dispatch-only.
+    static_str: StaticStrings,
     /// Count of bytecode opcodes dispatched, before the invocation
     /// baseline — the raw dispatch count the differential harness reports
     /// for isolating a metering divergence. Distinct from the meter's
@@ -372,6 +375,20 @@ pub struct Interp {
     jumps: Vec<CatchJump>,
 }
 
+/// The interned `typeof`-result strings, held as chunk offsets into the
+/// machine chunk heap. Allocated once at [`Interp::new`], before any run,
+/// so `typeof` names a preexisting string (XS's `XS_STRING_X_KIND`
+/// interned strings) rather than allocating — dispatch-only, as C-XS.
+#[derive(Copy, Clone)]
+struct StaticStrings {
+    undefined: crate::value::ChunkOffset,
+    object: crate::value::ChunkOffset,
+    boolean: crate::value::ChunkOffset,
+    number: crate::value::ChunkOffset,
+    string: crate::value::ChunkOffset,
+    function: crate::value::ChunkOffset,
+}
+
 /// A suspended activation: the caller's scope and resume point, saved by
 /// `run` and restored by `end` (XS's `mxFrame->value.frame.{code,scope}`
 /// plus the environment the frame aliases). The value stack is shared and
@@ -421,6 +438,19 @@ impl Interp {
         // the intrinsics seam); its allocation predates metering, so it
         // is not metered.
         let global_obj = slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        // Intern the `typeof` result strings (XS's `mxUndefinedString`
+        // &co. — preexisting `XS_STRING_X_KIND` slots), allocated into the
+        // chunk arena *before* any run so `typeof` costs only its dispatch,
+        // exactly as C-XS (no per-use allocation for an interned string).
+        let mut chunks = ChunkArena::new();
+        let static_str = StaticStrings {
+            undefined: chunks.alloc(b"undefined"),
+            object: chunks.alloc(b"object"),
+            boolean: chunks.alloc(b"boolean"),
+            number: chunks.alloc(b"number"),
+            string: chunks.alloc(b"string"),
+            function: chunks.alloc(b"function"),
+        };
         Interp {
             stack: Vec::with_capacity(64),
             locals: Vec::new(),
@@ -432,7 +462,8 @@ impl Interp {
             meter: Meter::new(),
             meter_host: None,
             slots,
-            chunks: ChunkArena::new(),
+            chunks,
+            static_str,
             n_dispatched: 0,
             functions: std::collections::HashMap::new(),
             call_stack: Vec::new(),
@@ -588,12 +619,38 @@ impl Interp {
         self.stack.pop().unwrap_or_else(Slot::undefined)
     }
 
+    /// The content bytes of a heap string (up to the C NUL terminator, or
+    /// the whole payload for an interned string stored without one): XS's
+    /// `mxStringLength`/`c_strlen` view of a string value.
+    #[inline]
+    fn str_content(&self, off: crate::value::ChunkOffset) -> &[u8] {
+        let p = self.chunks.payload(off);
+        let end = p.iter().position(|&b| b == 0).unwrap_or(p.len());
+        &p[..end]
+    }
+
+    /// Render a completion/thrown value the way the oracle shim does:
+    /// `fxToString` then the raw CESU-8 bytes up to the NUL through
+    /// `from_utf8_lossy` (`endor-oracle` `cstr_field`). Because both
+    /// engines run the same CESU-8 bytes through `from_utf8_lossy`, a
+    /// string value renders byte-identically to the oracle even for astral
+    /// code points (CESU-8 surrogate pairs both decode lossily the same
+    /// way). Non-string kinds defer to [`slot_to_ecma_string`].
+    fn render(&self, s: &Slot) -> String {
+        match s.value {
+            Payload::String(off) => {
+                String::from_utf8_lossy(self.str_content(off)).into_owned()
+            }
+            _ => slot_to_ecma_string(s),
+        }
+    }
+
     /// Run a program bytecode buffer to completion.
     pub fn run(&mut self, code: &[u8]) -> RunOutcome {
         let halt = self.dispatch(code);
         let completed = halt == Halt::Return;
         let result = if completed {
-            slot_to_ecma_string(&self.result)
+            self.render(&self.result)
         } else {
             String::new()
         };
@@ -1171,112 +1228,217 @@ impl Interp {
                     self.push(Slot::undefined());
                     pc += size as usize;
                 }
+                // `string` (XS_CODE_STRING_1/2/4, xsRun.c:3044): a string
+                // literal. The operand is a length-prefixed run of inline
+                // CESU-8 bytes (including the compiler's trailing NUL);
+                // `fxNewChunk(len)` copies them into a fresh chunk (metered
+                // per adjusted byte, `tick_chunk_new`), and a String slot
+                // referencing the chunk is pushed. `len` is the byte count
+                // from the length prefix, exactly XS's `index`.
+                XS_CODE_STRING_1 | XS_CODE_STRING_2 | XS_CODE_STRING_4 => {
+                    let (n, data) = match op {
+                        XS_CODE_STRING_1 => (code[pc + 1] as usize, pc + 2),
+                        XS_CODE_STRING_2 => {
+                            (u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize, pc + 3)
+                        }
+                        _ => (
+                            u32::from_le_bytes([
+                                code[pc + 1],
+                                code[pc + 2],
+                                code[pc + 3],
+                                code[pc + 4],
+                            ]) as usize,
+                            pc + 5,
+                        ),
+                    };
+                    self.meter.tick_chunk_new(n as u64);
+                    let off = self.chunks.alloc(&code[data..data + n]);
+                    self.push(Slot::of(Kind::String, Payload::String(off)));
+                    pc += ilen;
+                }
+                // `typeof` (XS_CODE_TYPEOF, xsRun.c:4162): replace the stack
+                // top with the interned type-name string. A reference is a
+                // "function" when it is a callable instance (endor tracks
+                // those in `functions`), else "object"; `null` is "object".
+                // Dispatch-only: the type strings are preinterned.
+                XS_CODE_TYPEOF => {
+                    let top = self.stack.last().copied().unwrap_or_else(Slot::undefined);
+                    let off = match top.kind {
+                        Kind::Undefined => self.static_str.undefined,
+                        Kind::Null => self.static_str.object,
+                        Kind::Boolean => self.static_str.boolean,
+                        Kind::Integer | Kind::Number => self.static_str.number,
+                        Kind::String => self.static_str.string,
+                        Kind::Reference => match top.value {
+                            Payload::Reference(r) if self.functions.contains_key(&r) => {
+                                self.static_str.function
+                            }
+                            _ => self.static_str.object,
+                        },
+                        // Closure/EnvReference/Uninitialized are never live
+                        // stack *values*; a symbol/bigint would need its own
+                        // interned name (later stages).
+                        _ => return Halt::Unsupported(op.name()),
+                    };
+                    if let Some(s) = self.stack.last_mut() {
+                        *s = Slot::of(Kind::String, Payload::String(off));
+                    }
+                    pc += size as usize;
+                }
 
                 // ---- arithmetic -------------------------------------
                 XS_CODE_ADD => {
-                    self.binary_arith(ArithOp::Add);
+                    if self.op_add().is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_SUBTRACT => {
-                    self.binary_arith(ArithOp::Sub);
+                    if self.binary_arith(ArithOp::Sub).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_MULTIPLY => {
-                    self.binary_arith(ArithOp::Mul);
+                    if self.binary_arith(ArithOp::Mul).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_DIVIDE => {
-                    self.binary_arith(ArithOp::Div);
+                    if self.binary_arith(ArithOp::Div).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_MODULO => {
-                    self.binary_arith(ArithOp::Mod);
+                    if self.binary_arith(ArithOp::Mod).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
 
                 // ---- bitwise ----------------------------------------
                 XS_CODE_BIT_AND => {
-                    self.binary_bit(BitOp::And);
+                    if self.binary_bit(BitOp::And).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_BIT_OR => {
-                    self.binary_bit(BitOp::Or);
+                    if self.binary_bit(BitOp::Or).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_BIT_XOR => {
-                    self.binary_bit(BitOp::Xor);
+                    if self.binary_bit(BitOp::Xor).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_LEFT_SHIFT => {
-                    self.binary_bit(BitOp::Shl);
+                    if self.binary_bit(BitOp::Shl).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_SIGNED_RIGHT_SHIFT => {
-                    self.binary_bit(BitOp::Sar);
+                    if self.binary_bit(BitOp::Sar).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_UNSIGNED_RIGHT_SHIFT => {
-                    self.binary_bit(BitOp::Shr);
+                    if self.binary_bit(BitOp::Shr).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_BIT_NOT => {
                     let a = self.pop();
+                    if a.kind == Kind::String {
+                        return Halt::Unsupported(op.name());
+                    }
                     self.push(Slot::integer(!to_int32(to_number(&a))));
                     pc += size as usize;
                 }
 
                 // ---- comparison -------------------------------------
                 XS_CODE_LESS => {
-                    self.relational(RelOp::Less);
+                    if self.relational(RelOp::Less).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_LESS_EQUAL => {
-                    self.relational(RelOp::LessEqual);
+                    if self.relational(RelOp::LessEqual).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_MORE => {
-                    self.relational(RelOp::More);
+                    if self.relational(RelOp::More).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_MORE_EQUAL => {
-                    self.relational(RelOp::MoreEqual);
+                    if self.relational(RelOp::MoreEqual).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_STRICT_EQUAL => {
-                    self.equality(true, false);
+                    if self.equality(true, false).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_STRICT_NOT_EQUAL => {
-                    self.equality(true, true);
+                    if self.equality(true, true).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_EQUAL => {
-                    self.equality(false, false);
+                    if self.equality(false, false).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_NOT_EQUAL => {
-                    self.equality(false, true);
+                    if self.equality(false, true).is_err() {
+                        return Halt::Unsupported(op.name());
+                    }
                     pc += size as usize;
                 }
 
                 // ---- unary ------------------------------------------
                 XS_CODE_MINUS => {
                     let a = self.pop();
+                    // `-string` needs ToNumber(string); defer.
+                    if a.kind == Kind::String {
+                        return Halt::Unsupported(op.name());
+                    }
                     self.push(unary_minus(&a));
                     pc += size as usize;
                 }
                 XS_CODE_PLUS => {
                     let a = self.pop();
-                    // ToNumber; an integer stays an integer.
+                    // ToNumber; an integer stays an integer. `+string` needs
+                    // string→number parsing; defer.
                     match a.kind {
                         Kind::Integer => self.push(a),
+                        Kind::String => return Halt::Unsupported(op.name()),
                         _ => self.push(Slot::number(to_number(&a))),
                     }
                     pc += size as usize;
                 }
                 XS_CODE_NOT => {
                     let a = self.pop();
-                    self.push(Slot::boolean(!to_boolean(&a)));
+                    let t = self.truthy(&a);
+                    self.push(Slot::boolean(!t));
                     pc += size as usize;
                 }
                 XS_CODE_VOID => {
@@ -1459,7 +1621,8 @@ impl Interp {
                 // is an `mxBranch`, so it checks when its offset < 0.
                 XS_CODE_BRANCH_ELSE_1 => {
                     let off = s1!(1);
-                    let cond = to_boolean(&self.pop());
+                    let v = self.pop();
+                    let cond = self.truthy(&v);
                     if cond {
                         pc += size as usize;
                     } else {
@@ -1471,7 +1634,8 @@ impl Interp {
                 }
                 XS_CODE_BRANCH_ELSE_2 => {
                     let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let cond = to_boolean(&self.pop());
+                    let v = self.pop();
+                    let cond = self.truthy(&v);
                     if cond {
                         pc += size as usize;
                     } else {
@@ -1486,7 +1650,8 @@ impl Interp {
                 // fall-through takes INDEX with no check.
                 XS_CODE_BRANCH_IF_1 => {
                     let off = s1!(1);
-                    let cond = to_boolean(&self.pop());
+                    let v = self.pop();
+                    let cond = self.truthy(&v);
                     if cond {
                         if off < 0 && self.check_meter() == MeterCheck::Abort {
                             return Halt::MeterAbort;
@@ -1498,7 +1663,8 @@ impl Interp {
                 }
                 XS_CODE_BRANCH_IF_2 => {
                     let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    let cond = to_boolean(&self.pop());
+                    let v = self.pop();
+                    let cond = self.truthy(&v);
                     if cond {
                         if off < 0 && self.check_meter() == MeterCheck::Abort {
                             return Halt::MeterAbort;
@@ -1620,7 +1786,7 @@ impl Interp {
                         }
                         None => {
                             self.meter_host_escape();
-                            return Halt::Throw(slot_to_ecma_string(&v));
+                            return Halt::Throw(self.render(&v));
                         }
                     }
                 }
@@ -1639,7 +1805,7 @@ impl Interp {
                         }
                         None => {
                             self.meter_host_escape();
-                            return Halt::Throw(slot_to_ecma_string(&v));
+                            return Halt::Throw(self.render(&v));
                         }
                     }
                 }
@@ -1745,15 +1911,12 @@ impl Interp {
         // completing where C-XS aborts.
         let caller_footprint =
             FRAME_OVERHEAD_SLOTS + self.args.len() + self.locals.len();
-        // After truncating the frame region the callee holds `argc` args
-        // plus its (not-yet-allocated) scope and quartet.
-        let prospective = self.frame_slots
-            + caller_footprint
-            + (self.stack.len() - (argc + 4))
-            + FRAME_OVERHEAD_SLOTS
-            + argc;
-        if prospective > STACK_SLOT_COUNT - STACK_SLOT_RESERVED {
-            return Err(Halt::StackOverflow(prospective));
+        // Opening the callee frame allocates its quartet and argument slots
+        // on top of everything currently live (the caller's frame stays
+        // suspended on the stack). If that crosses the fixed budget, abort
+        // to the host exactly as C-XS's `fxOverflow`.
+        if self.would_overflow(FRAME_OVERHEAD_SLOTS + argc) {
+            return Err(Halt::StackOverflow(self.stack_slots_in_use()));
         }
         // Unwind the frame region (THIS..last arg).
         self.stack.truncate(base);
@@ -2108,17 +2271,42 @@ impl Interp {
         }
     }
 
-    // Binary numeric arithmetic, ported from the xsRun.c integer fast
-    // paths with checked-overflow promotion to f64.
-    fn binary_arith(&mut self, op: ArithOp) {
-        let b = self.pop();
-        let a = self.pop();
-        self.push(apply_arith(op, &a, &b));
+    /// ToBoolean with chunk access: a heap string is truthy iff its
+    /// content is non-empty (XS's `mxStringLength != 0`); every other kind
+    /// defers to the pure [`to_boolean`]. The empty-string case is why this
+    /// must route through the machine — a bare `to_boolean` cannot see the
+    /// chunk and would call `""` truthy.
+    #[inline]
+    fn truthy(&self, s: &Slot) -> bool {
+        match s.value {
+            Payload::String(off) => !self.str_content(off).is_empty(),
+            _ => to_boolean(s),
+        }
     }
 
-    fn binary_bit(&mut self, op: BitOp) {
+    // Binary numeric arithmetic, ported from the xsRun.c integer fast
+    // paths with checked-overflow promotion to f64. A string operand needs
+    // `ToNumber(string)` (string→number parsing), outside the covered
+    // primitive subset, so it returns `Err` and the caller self-names
+    // unsupported rather than producing a spurious `NaN`. (A reference
+    // operand ToPrimitives to `NaN` for a plain object, which matches C-XS,
+    // so it is left on the numeric path.)
+    fn binary_arith(&mut self, op: ArithOp) -> Result<(), ()> {
         let b = self.pop();
         let a = self.pop();
+        if a.kind == Kind::String || b.kind == Kind::String {
+            return Err(());
+        }
+        self.push(apply_arith(op, &a, &b));
+        Ok(())
+    }
+
+    fn binary_bit(&mut self, op: BitOp) -> Result<(), ()> {
+        let b = self.pop();
+        let a = self.pop();
+        if a.kind == Kind::String || b.kind == Kind::String {
+            return Err(());
+        }
         let ai = to_int32(to_number(&a));
         let bi = to_int32(to_number(&b));
         let r = match op {
@@ -2135,15 +2323,41 @@ impl Interp {
             let u = (ai as u32) >> (bi & 0x1f);
             if u > i32::MAX as u32 {
                 self.push(Slot::number(u as f64));
-                return;
+                return Ok(());
             }
         }
         self.push(Slot::integer(r));
+        Ok(())
     }
 
-    fn relational(&mut self, op: RelOp) {
+    /// Relational comparison (`<`/`<=`/`>`/`>=`). Two strings compare
+    /// lexicographically by CESU-8 byte (== UTF-16 code-unit order, XS's
+    /// `c_strcmp`, and the ECMAScript abstract relational comparison on
+    /// strings); two numerics compare as `f64` with NaN → false. A mixed
+    /// string/numeric pair needs `ToNumber(string)` (or `ToPrimitive` of a
+    /// reference), outside the covered subset, so it returns `Err` and the
+    /// caller self-names unsupported.
+    fn relational(&mut self, op: RelOp) -> Result<(), ()> {
         let b = self.pop();
         let a = self.pop();
+        if a.kind == Kind::String && b.kind == Kind::String {
+            if let (Payload::String(x), Payload::String(y)) = (a.value, b.value) {
+                let r = {
+                    let (ca, cb) = (self.str_content(x), self.str_content(y));
+                    match op {
+                        RelOp::Less => ca < cb,
+                        RelOp::LessEqual => ca <= cb,
+                        RelOp::More => ca > cb,
+                        RelOp::MoreEqual => ca >= cb,
+                    }
+                };
+                self.push(Slot::boolean(r));
+                return Ok(());
+            }
+        }
+        if a.kind == Kind::String || b.kind == Kind::String {
+            return Err(());
+        }
         let x = to_number(&a);
         let y = to_number(&b);
         let r = if x.is_nan() || y.is_nan() {
@@ -2157,17 +2371,124 @@ impl Interp {
             }
         };
         self.push(Slot::boolean(r));
+        Ok(())
     }
 
-    fn equality(&mut self, strict: bool, negate: bool) {
+    /// Equality (`===`/`!==`/`==`/`!=`). String↔string compares content
+    /// bytes; string↔{null,undefined} is unequal on both operators;
+    /// string↔{number,boolean,reference} is unequal under `===` (a type
+    /// mismatch) but needs `ToNumber(string)` under `==`, so the loose case
+    /// returns `Err` (the caller self-names unsupported). Non-string kinds
+    /// keep the existing primitive/reference-identity comparison.
+    fn equality(&mut self, strict: bool, negate: bool) -> Result<(), ()> {
         let b = self.pop();
         let a = self.pop();
-        let eq = if strict {
-            strict_equals(&a, &b)
-        } else {
-            loose_equals(&a, &b)
+        let eq = match (a.kind, b.kind) {
+            (Kind::String, Kind::String) => match (a.value, b.value) {
+                (Payload::String(x), Payload::String(y)) => {
+                    self.str_content(x) == self.str_content(y)
+                }
+                _ => false,
+            },
+            // A string is never `==`/`===` to null/undefined.
+            (Kind::String, Kind::Null)
+            | (Kind::String, Kind::Undefined)
+            | (Kind::Null, Kind::String)
+            | (Kind::Undefined, Kind::String) => false,
+            (Kind::String, _) | (_, Kind::String) => {
+                if strict {
+                    false // `===` across types is false without coercion
+                } else {
+                    return Err(()); // `==` needs ToNumber(string)
+                }
+            }
+            _ => {
+                if strict {
+                    strict_equals(&a, &b)
+                } else {
+                    loose_equals(&a, &b)
+                }
+            }
         };
         self.push(Slot::boolean(eq ^ negate));
+        Ok(())
+    }
+
+    /// `XS_CODE_ADD` with the string/reference cases (xsRun.c's
+    /// `XS_CODE_ADD_GENERAL`): a reference operand needs `ToPrimitive`
+    /// (unsupported); a string operand means concatenation
+    /// ([`Self::concat_add`]); otherwise the numeric fast path
+    /// ([`Self::binary_arith`]).
+    fn op_add(&mut self) -> Result<(), ()> {
+        let n = self.stack.len();
+        if n < 2 {
+            return self.binary_arith(ArithOp::Add);
+        }
+        let a = self.stack[n - 2];
+        let b = self.stack[n - 1];
+        if a.kind == Kind::Reference || b.kind == Kind::Reference {
+            return Err(());
+        }
+        if a.kind == Kind::String || b.kind == Kind::String {
+            self.stack.truncate(n - 2);
+            self.concat_add(a, b);
+            Ok(())
+        } else {
+            self.binary_arith(ArithOp::Add)
+        }
+    }
+
+    /// String `+`: `ToString` both operands and concatenate, metering
+    /// exactly at XS's sites — a `ToString` of a number allocates its
+    /// rendered chunk (`tick_chunk_new(len+1)`; `ToString` of a
+    /// string/boolean/null/undefined is an interned or identity no-op with
+    /// no allocation), and `fxConcatString` allocates the joined chunk
+    /// `fxNewChunk(aSize + bSize + 1)`. The result is a new heap String.
+    fn concat_add(&mut self, a: Slot, b: Slot) {
+        let sa = self.to_string_bytes_metered(a);
+        let sb = self.to_string_bytes_metered(b);
+        // fxConcatString: one fxNewChunk(aSize + bSize + 1).
+        self.meter.tick_chunk_new((sa.len() + sb.len() + 1) as u64);
+        let mut joined = Vec::with_capacity(sa.len() + sb.len() + 1);
+        joined.extend_from_slice(&sa);
+        joined.extend_from_slice(&sb);
+        joined.push(0); // C NUL terminator, as XS stores
+        let off = self.chunks.alloc(&joined);
+        self.push(Slot::of(Kind::String, Payload::String(off)));
+    }
+
+    /// `ToString` of a primitive to its content bytes (no NUL), metering
+    /// the allocation XS's `fxToString` performs: a number renders to a
+    /// fresh chunk (`fxNumberToString` → `tick_chunk_new(len+1)`); a string
+    /// is identity and a boolean/null/undefined is an interned string, both
+    /// allocation-free.
+    fn to_string_bytes_metered(&mut self, s: Slot) -> Vec<u8> {
+        match s.value {
+            Payload::String(off) => self.str_content(off).to_vec(),
+            Payload::Integer(i) => {
+                let r = i.to_string().into_bytes();
+                // `fxToString`/`fxNumberToString` on a number renders into a
+                // fresh chunk (`tick_chunk_new(len+1)`) and meters one
+                // built-in step (`mxMeterOne`) for the conversion — measured
+                // against the pin as exactly `XS_BUILTIN_METERING` over the
+                // allocation.
+                self.meter.tick_builtin();
+                self.meter.tick_chunk_new((r.len() + 1) as u64);
+                r
+            }
+            Payload::Number(n) => {
+                let r = number_to_ecma_string(n).into_bytes();
+                self.meter.tick_builtin();
+                self.meter.tick_chunk_new((r.len() + 1) as u64);
+                r
+            }
+            Payload::Boolean(bv) => if bv { b"true".to_vec() } else { b"false".to_vec() },
+            Payload::None => match s.kind {
+                Kind::Null => b"null".to_vec(),
+                _ => b"undefined".to_vec(),
+            },
+            Payload::Reference(_) => Vec::new(), // unreachable: op_add rejects references
+        }
     }
 }
 
