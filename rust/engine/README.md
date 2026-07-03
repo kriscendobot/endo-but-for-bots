@@ -94,9 +94,10 @@ first-class values, `Boolean`/`Object` native calls, the value globals
 the Array exotic object: literals with holes, computed index get/set over the
 item chunk, the `length` accessor get/set, the dense `Array.prototype` methods
 `push`/`pop`/`shift`/`unshift`/`indexOf`/`lastIndexOf`/`includes`/`fill`/
-`slice`/`join`/`at`/`reverse`, the `Array(...)` constructor + `Array.isArray`,
-the `values`/`keys`/`entries` array iterators, and the iteration protocol —
-`for-of`, `for-in`, and array spread `[...arr]`), all bit-exact
+`slice`/`join`/`at`/`reverse`/`concat`/`copyWithin`/`with`, the `Array(...)`
+constructor + `Array.isArray`, the `values`/`keys`/`entries` array iterators,
+and the iteration protocol — `for-of`, `for-in`, and array spread `[...arr]`),
+all bit-exact
 (result AND computron) against the oracle. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
