@@ -68,3 +68,15 @@ Boolean(0) === false
 Boolean(1) && Boolean(0)
 var b = Boolean(1); b
 var t = typeof Boolean; t
+
+// Constructor calls (`new f()`): the construct frame geometry — `new`'s
+// uninitialized `this` placeholder, fxRunConstructor's fresh instance,
+// `end` returning `this` — with the fixed host-frame metering. Native
+// (wrapper) constructors like `new Boolean` are a later increment.
+function F0() {}; new F0()
+function F1() { this.x = 1 }; var o1 = new F1(); o1.x
+function F2(a) { this.x = a }; (new F2(5)).x
+function F3() { this.a = 1; this.b = 2 }; var o3 = new F3(); o3.a + o3.b
+function F4() { return 7 }; new F4()
+function P(x) { this.x = x }; function mk() { return new P(9).x }; mk()
+function Pair(a, b) { this.a = a; this.b = b }; var p = new Pair(3, 4); p.a * p.b

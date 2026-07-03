@@ -171,6 +171,15 @@ pub const FUNCTION_ENVIRONMENT_METERING: u64 = 0;
 /// bar.)
 pub const FUNCTION_LOCAL_METERING: u64 = 280;
 
+/// The fixed cost `fxRunConstructor` accrues over a plain call, beyond the
+/// `this`-instance `fxNewSlot`: the `fxBeginHost`/`fxEndHost` host-frame
+/// entry/exit around the prototype lookup and `fxNewHostInstance`. Measured
+/// against the pin `48ee02d8cfe0` as exactly `2 × XS_CODE_METERING` (131072
+/// raw) — the whole-computron gap between `new f()` and `f()` for an empty
+/// constructor, independent of body or arity. Accrued once per constructor
+/// entry at `begin`, in [`Interp::run_constructor`].
+pub const CONSTRUCTOR_HOST_FRAME_METERING: u64 = 2 << 16;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -434,6 +443,13 @@ pub struct Interp {
     /// [`FuncInfo`] carries the closure environment closure opcodes resolve
     /// against. `NULL` in the program frame.
     cur_func: crate::value::SlotIndex,
+    /// Whether the active frame is a **constructor** invocation (XS's
+    /// `mxFrameHasTarget` — a `new f(...)`). Set when `run` enters a callee
+    /// whose `THIS` slot is the uninitialized construct placeholder; drives
+    /// `begin`'s `fxRunConstructor` (allocate the `this` instance) and the
+    /// construct return semantics at `end` (a non-object completion yields
+    /// `this`). `false` for a plain call and the program frame.
+    cur_target: bool,
     /// The pending thrown value (XS's `mxException`). `THROW` sets it and
     /// unwinds to the innermost jump; `EXCEPTION` moves it to the stack
     /// (binding the catch parameter) and clears it back to `undefined`;
@@ -491,6 +507,7 @@ struct CallerState {
     args: Vec<Slot>,
     this_val: Slot,
     cur_func: crate::value::SlotIndex,
+    cur_target: bool,
     /// The caller's code cursor to resume at (just past its `run`).
     ret_pc: usize,
 }
@@ -559,6 +576,7 @@ impl Interp {
             args: Vec::new(),
             this_val: Slot::undefined(),
             cur_func: crate::value::SlotIndex::NULL,
+            cur_target: false,
             exception: Slot::undefined(),
             frame_slots: 0,
             intrinsics: std::collections::HashMap::new(),
@@ -910,6 +928,10 @@ impl Interp {
                     if self.call_stack.is_empty() {
                         self.tick_program_overhead();
                         self.bind_program_this();
+                    } else if self.cur_target {
+                        // A constructor frame (`new f(...)`): allocate the
+                        // `this` instance (`fxRunConstructor`) before the body.
+                        self.run_constructor();
                     } else {
                         self.bind_this_sloppy();
                     }
@@ -926,6 +948,12 @@ impl Interp {
                         // global in strict mode too (only an ES module's is
                         // `undefined`, and modules are structurally skipped).
                         self.bind_program_this();
+                    } else if self.cur_target && op == XS_CODE_BEGIN_STRICT {
+                        // A strict `function` constructor invoked with `new`:
+                        // `fxRunConstructor` allocates `this` (the class
+                        // `*_BASE`/`*_DERIVED` forms need the class machinery,
+                        // out of the covered grammar — left to self-name).
+                        self.run_constructor();
                     }
                     pc += size as usize;
                 }
@@ -1263,6 +1291,23 @@ impl Interp {
                     self.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
                     pc += size as usize;
                 }
+                // `new` (`XS_CODE_NEW`, xsRun.c): the constructor is already
+                // on the stack (from `get_variable`). Reshape the single
+                // constructor slot into the construct frame geometry
+                // `[THIS, FUNCTION, RESULT, FRAME]`, where `THIS` is the
+                // **uninitialized** construct placeholder — XS's `RUN_ALL`
+                // reads that (`mxFrameThis->kind == XS_UNINITIALIZED_KIND`) as
+                // the target flag, and `begin`'s `fxRunConstructor` fills it
+                // with the fresh instance. No heap allocation here (the frame
+                // is stack slots); dispatch-metered only, as C-XS's `NEW`.
+                XS_CODE_NEW => {
+                    let ctor = self.pop();
+                    self.push(Slot::uninitialized()); // THIS (construct placeholder)
+                    self.push(ctor); // FUNCTION
+                    self.push(Slot::undefined()); // RESULT
+                    self.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
+                    pc += size as usize;
+                }
                 // `run`/`run_N` (`XS_CODE_RUN*`): invoke the function with N
                 // arguments. Stack below the N args is
                 // `[THIS, FUNCTION, RESULT, FRAME]` (XS's frame geometry:
@@ -1292,15 +1337,29 @@ impl Interp {
                     // into this JS frame — where `END_ALL`'s `mxFirstCode`
                     // does check. A non-target (plain) call only; `new` on a
                     // native is a separate, not-yet-modeled path.
-                    let callee = {
-                        let len = self.stack.len();
-                        len.checked_sub(argc + 4)
-                            .and_then(|base| match self.stack.get(base + 1).map(|s| s.value) {
-                                Some(Payload::Reference(f)) => self.native_of(f).map(|n| (n, base)),
-                                _ => None,
-                            })
-                    };
+                    // A construct call (`new`) leaves the `THIS` slot as the
+                    // uninitialized placeholder (XS's `RUN_ALL` target
+                    // detection: `mxFrameThis->kind == XS_UNINITIALIZED_KIND`);
+                    // a plain call pushed a real/`undefined` `this`.
+                    let base_opt = self.stack.len().checked_sub(argc + 4);
+                    let has_target = base_opt
+                        .and_then(|b| self.stack.get(b))
+                        .map(|s| s.kind == Kind::Uninitialized)
+                        .unwrap_or(false);
+                    let callee = base_opt.and_then(|base| {
+                        match self.stack.get(base + 1).map(|s| s.value) {
+                            Some(Payload::Reference(f)) => self.native_of(f).map(|n| (n, base)),
+                            _ => None,
+                        }
+                    });
                     if let Some((native, base)) = callee {
+                        // A native (intrinsic) callee. `new` on a native (the
+                        // wrapper-object constructors) is a separate,
+                        // not-yet-modeled path — self-name rather than
+                        // mis-execute.
+                        if has_target {
+                            return Halt::Unsupported(native_unsupported_name(native));
+                        }
                         match self.call_native(native, base, argc) {
                             Ok(()) => {
                                 // Return into the JS caller: `END_ALL` checks.
@@ -1312,7 +1371,7 @@ impl Interp {
                             Err(h) => return h,
                         }
                     } else {
-                        match self.enter_call(argc, ret_pc) {
+                        match self.enter_call(argc, ret_pc, has_target) {
                             Ok(body_start) => {
                                 // Call entry: `mxFirstCode()` runs a meter check
                                 // before the callee's first opcode.
@@ -2028,7 +2087,14 @@ impl Interp {
                         // no meter check (exit-to-host END).
                         return Halt::Return;
                     }
-                    let ret = self.result;
+                    // Construct return (XS's `END` with `mxFrameHasTarget`):
+                    // a constructor's completion is its `this` instance unless
+                    // the body explicitly returned an object.
+                    let ret = if self.cur_target && self.result.kind != Kind::Reference {
+                        self.this_val
+                    } else {
+                        self.result
+                    };
                     let resume = self.leave_call();
                     self.push(ret);
                     pc = resume;
@@ -2208,7 +2274,7 @@ impl Interp {
     /// the callee body's start pc, or `Halt::Throw` when the callee is not a
     /// known user function (the covered grammar only calls functions it
     /// defined).
-    fn enter_call(&mut self, argc: usize, ret_pc: usize) -> Result<usize, Halt> {
+    fn enter_call(&mut self, argc: usize, ret_pc: usize, has_target: bool) -> Result<usize, Halt> {
         let len = self.stack.len();
         if len < argc + 4 {
             return Err(Halt::Throw("call: stack underflow".into()));
@@ -2253,6 +2319,7 @@ impl Interp {
             args: std::mem::take(&mut self.args),
             this_val: self.this_val,
             cur_func: self.cur_func,
+            cur_target: self.cur_target,
             ret_pc,
         });
         self.result = Slot::undefined();
@@ -2260,6 +2327,7 @@ impl Interp {
         self.args = args;
         self.this_val = this_val;
         self.cur_func = func;
+        self.cur_target = has_target;
         Ok(body_start)
     }
 
@@ -2324,6 +2392,7 @@ impl Interp {
         self.args = caller.args;
         self.this_val = caller.this_val;
         self.cur_func = caller.cur_func;
+        self.cur_target = caller.cur_target;
         caller.ret_pc
     }
 
@@ -2489,6 +2558,32 @@ impl Interp {
     /// `undefined`.
     fn bind_program_this(&mut self) {
         self.this_val = Slot::of(Kind::Reference, Payload::Reference(self.global_obj));
+    }
+
+    /// `fxRunConstructor` (driven by `begin` in a construct frame): allocate
+    /// the fresh `this` instance the constructor populates, and bind the
+    /// frame's `this` to it. XS reads the prototype from the constructor's
+    /// `.prototype` (defaulting to `%Object.prototype%`); the covered grammar
+    /// reads only own properties of `this`, so endor allocates the instance
+    /// with a null prototype and leaves the intrinsic-prototype wiring to the
+    /// object-model stage. Meters the single instance `fxNewSlot`
+    /// ([`crate::meter::SLOT_ALLOCATION_METERING`], 256 raw) exactly where
+    /// `fxNewHostInstance` allocates it — measured against the pin as the
+    /// whole construct overhead over a plain call.
+    fn run_constructor(&mut self) {
+        // `fxRunConstructor` runs `fxBeginHost`/`fxEndHost` around
+        // `fxGetPrototypeFromConstructor` and then `fxNewHostInstance`. Beyond
+        // the instance `fxNewSlot` ([`crate::meter::SLOT_ALLOCATION_METERING`],
+        // 256 raw), the host-frame entry/exit accrues a fixed two code units
+        // ([`CONSTRUCTOR_HOST_FRAME_METERING`]) — measured against the pin as
+        // exactly the gap between `new f()` and a plain `f()` (131072 raw =
+        // 2 × `XS_CODE_METERING`), independent of the constructor's body.
+        self.meter.tick_slot_alloc();
+        self.meter.tick_raw(CONSTRUCTOR_HOST_FRAME_METERING);
+        let inst = self
+            .slots
+            .alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        self.this_val = Slot::of(Kind::Reference, Payload::Reference(inst));
     }
 
     fn bind_this_sloppy(&mut self) {
@@ -3459,6 +3554,29 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "true");
         assert_eq!(out.computrons, 13, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn user_constructor_new_runs_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `function F(a){this.x=a}; (new F(5)).x`
+        // (captured from the oracle): the construct path — `new` reshaping the
+        // frame with the uninitialized `this` placeholder, `begin`'s
+        // fxRunConstructor allocating the fresh instance, the body setting
+        // `this.x`, `end` returning `this` — yields `5` at C-XS's 43
+        // computrons, a standing lock on the construct frame geometry and its
+        // fixed host-frame metering without linking C.
+        let code: [u8; 69] = [
+            0x0b, 0x00, 0x9e, 0x01, 0x86, 0x01, 0x00, 0x8e, 0xe6, 0x01, 0x92, 0x4b, 0x4d, 0x01,
+            0x00, 0x38, 0x01, 0x00, 0x2e, 0x14, 0x0b, 0x01, 0x9e, 0x01, 0x86, 0x02, 0x00, 0x02,
+            0x00, 0xe6, 0x01, 0x92, 0xd6, 0x5c, 0x01, 0xb9, 0x03, 0x00, 0x92, 0x44, 0x58, 0x92,
+            0x42, 0xe0, 0x89, 0x04, 0x00, 0x72, 0x04, 0xbf, 0x01, 0x00, 0x92, 0x4d, 0x01, 0x00,
+            0x67, 0x01, 0x00, 0x84, 0x72, 0x05, 0xab, 0x01, 0x60, 0x03, 0x00, 0xbb, 0xa9,
+        ];
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "5", "new F(5).x reads the constructed property");
+        assert_eq!(out.computrons, 43, "bit-exact computrons vs C-XS");
     }
 
     #[test]
