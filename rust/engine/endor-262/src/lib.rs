@@ -19,7 +19,7 @@
 //! test262 submodule (maintainer directive, PR #600, 2026-07-03;
 //! design section "test262 conformance").
 
-use endor_vm::{run_program, Halt, RunOutcome};
+use endor_vm::{run_program_with_symbols, Halt, RunOutcome};
 
 pub mod test262;
 
@@ -113,7 +113,12 @@ impl DualRun {
 pub fn dual_run(source: &str) -> Option<DualRun> {
     let oracle = endor_oracle::run(source)?;
 
-    let endor: RunOutcome = run_program(&oracle.bytecode);
+    // Pass the oracle's symbols atom so endor relinks the program's
+    // intrinsic references (`Object`, `Boolean`, the Error hierarchy, …) to
+    // its own intrinsics by name — the C-XS compiler numbers those symbols
+    // program-locally, so the id→name table is what makes `Boolean` mean the
+    // native `Boolean` and not an undefined variable (design § fundamentals).
+    let endor: RunOutcome = run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
 
     let agreement = match (oracle.completed, endor.completed) {
         (true, true) => Agreement::BothComplete,
@@ -261,6 +266,21 @@ pub fn stage2b_exceptions_corpus() -> Vec<String> {
 /// (result AND computron) against the oracle.
 pub fn stage3_language_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-language.js"))
+}
+
+/// The stage-3 child-2 (fundamentals) corpus: the intrinsic constructors as
+/// first-class global values (`Object`/`Boolean`/`Symbol`/`Number`/`String`/
+/// `Function` and the Error hierarchy), `typeof` over them, and the
+/// `Boolean` primitive coercion. Bit-exact (result AND computron) against
+/// the oracle: a bare constructor reference resolves to endor's intrinsic
+/// (relinked by the program's symbol id → name table) and stringifies as
+/// `function ["name"] (){[native code]}`; `typeof` reads "function"; and
+/// `Boolean(value)` runs the native ToBoolean with the metering-neutral cost
+/// the pin measures (`endor_vm::interp` § the native call path). Built-in
+/// construction (`new`), `instanceof`/`in`, and object-returning calls are
+/// deferred to later increments and honestly skipped until then.
+pub fn stage3_fundamentals_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3-fundamentals.js"))
 }
 
 /// A summary over a corpus run.
@@ -715,6 +735,37 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3 language bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3_fundamentals_corpus_is_bit_exact_against_oracle() {
+        // The stage-3 child-2 acceptance bar: every fundamentals program —
+        // the intrinsic constructors as first-class values, `typeof` over
+        // them, and `Boolean` primitive coercion — agrees with C-XS on BOTH
+        // the completion value AND the computron count. The constructors
+        // relink from the program's symbol table to endor's intrinsics; the
+        // bare reference renders through Function.prototype.toString's
+        // host-function form; the `Boolean` native call is metering-neutral.
+        let programs = stage3_fundamentals_corpus();
+        assert!(!programs.is_empty(), "stage-3 fundamentals corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3 fundamentals bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

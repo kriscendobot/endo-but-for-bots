@@ -189,6 +189,12 @@ struct FuncInfo {
     /// The captured closure environment (a frame-cell owner), or `NULL`
     /// until `function_environment` runs / for a non-capturing function.
     closures: crate::value::SlotIndex,
+    /// For an intrinsic (native) function — a `Some` marks this instance a
+    /// C-backed built-in (XS's `XS_CALLBACK_KIND`) rather than a bytecode
+    /// function: `call`/`run` dispatches to the native handler instead of
+    /// entering a bytecode frame, and the completion renders as
+    /// `function ["name"] (){[native code]}`. `None` for a user function.
+    native: Option<Native>,
 }
 
 impl Default for FuncInfo {
@@ -197,7 +203,83 @@ impl Default for FuncInfo {
             body_start: 0,
             body_len: 0,
             closures: crate::value::SlotIndex::NULL,
+            native: None,
         }
+    }
+}
+
+/// One intrinsic (native) function endor models. The variant is the
+/// identity the `run`/`new` dispatch and the completion renderer key off;
+/// [`Native::display_name`] is the name XS's `Function.prototype.toString`
+/// prints for it (`function ["Object"] (){[native code]}`).
+///
+/// The **fundamentals** built-ins (stage-3 child 2): the constructors and
+/// the Error hierarchy the design's stage-3 decomposition names. A bare
+/// reference and `typeof` are modeled for every variant (both are pure
+/// dispatch, bit-exact); the *call* and *construct* behaviors land
+/// incrementally, and an unmodeled one self-names [`Halt::Unsupported`]
+/// (an honest skip) rather than mis-executing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Native {
+    Object,
+    Function,
+    Boolean,
+    Symbol,
+    Number,
+    String,
+    Error,
+    EvalError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
+    TypeError,
+    URIError,
+    AggregateError,
+}
+
+impl Native {
+    /// The name XS prints for this built-in (its `name` property, shown by
+    /// `Function.prototype.toString` and by the completion renderer).
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Native::Object => "Object",
+            Native::Function => "Function",
+            Native::Boolean => "Boolean",
+            Native::Symbol => "Symbol",
+            Native::Number => "Number",
+            Native::String => "String",
+            Native::Error => "Error",
+            Native::EvalError => "EvalError",
+            Native::RangeError => "RangeError",
+            Native::ReferenceError => "ReferenceError",
+            Native::SyntaxError => "SyntaxError",
+            Native::TypeError => "TypeError",
+            Native::URIError => "URIError",
+            Native::AggregateError => "AggregateError",
+        }
+    }
+
+    /// The intrinsic global constructors endor binds, in `(name, variant)`
+    /// pairs. The name is what the C-XS compiler records in the symbols
+    /// atom; [`Interp::link_intrinsics`] binds each to the program-local id
+    /// the compiler assigned it.
+    pub fn intrinsics() -> &'static [(&'static str, Native)] {
+        &[
+            ("Object", Native::Object),
+            ("Function", Native::Function),
+            ("Boolean", Native::Boolean),
+            ("Symbol", Native::Symbol),
+            ("Number", Native::Number),
+            ("String", Native::String),
+            ("Error", Native::Error),
+            ("EvalError", Native::EvalError),
+            ("RangeError", Native::RangeError),
+            ("ReferenceError", Native::ReferenceError),
+            ("SyntaxError", Native::SyntaxError),
+            ("TypeError", Native::TypeError),
+            ("URIError", Native::URIError),
+            ("AggregateError", Native::AggregateError),
+        ]
     }
 }
 
@@ -364,6 +446,13 @@ pub struct Interp {
     /// ([`Self::live_stack_slots`]), this mirrors XS's `stackTop - stack`
     /// so the stack-overflow abort fires at the same fixed-geometry budget.
     frame_slots: usize,
+    /// The intrinsic (native) constructors, keyed by name, created once at
+    /// construction (an unmetered machine-boot cost, as XS builds its
+    /// intrinsics before the guest runs). [`Self::link_intrinsics`] binds
+    /// each into the global object under the program-local symbol id the
+    /// C-XS compiler assigned that name. Each value is a `functions`-tracked
+    /// native function instance.
+    intrinsics: std::collections::HashMap<&'static str, crate::value::SlotIndex>,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -451,7 +540,7 @@ impl Interp {
             string: chunks.alloc(b"string"),
             function: chunks.alloc(b"function"),
         };
-        Interp {
+        let mut interp = Interp {
             stack: Vec::with_capacity(64),
             locals: Vec::new(),
             id_map: std::collections::HashMap::new(),
@@ -472,8 +561,64 @@ impl Interp {
             cur_func: crate::value::SlotIndex::NULL,
             exception: Slot::undefined(),
             frame_slots: 0,
+            intrinsics: std::collections::HashMap::new(),
             jumps: Vec::new(),
+        };
+        interp.create_intrinsics();
+        interp
+    }
+
+    /// Materialize the intrinsic (native) constructor instances once, at
+    /// machine boot, before any guest bytecode runs — so, like XS's
+    /// intrinsic construction, they carry **no** run-only metering. Each is
+    /// a real arena instance registered in [`Self::functions`] with its
+    /// [`Native`] marker (so `typeof` reads "function" and `run`/`new`
+    /// dispatch to the native handler), and remembered by name in
+    /// [`Self::intrinsics`] for per-program linking.
+    fn create_intrinsics(&mut self) {
+        for &(name, native) in Native::intrinsics() {
+            let f = self
+                .slots
+                .alloc(Slot::instance(crate::value::SlotIndex::NULL));
+            self.functions.insert(
+                f,
+                FuncInfo {
+                    native: Some(native),
+                    ..FuncInfo::default()
+                },
+            );
+            self.intrinsics.insert(name, f);
         }
+    }
+
+    /// Bind the intrinsic constructors this program references into the
+    /// global object, keyed by the program-local symbol id the C-XS compiler
+    /// assigned each name (`names[k]` is the name of id `k + 1`; see
+    /// [`crate::symbols`]). Only names that match a known intrinsic are
+    /// bound; everything else is left to resolve as an ordinary global (a
+    /// `var`/sloppy-global) or to miss. Unmetered: these globals pre-exist
+    /// the guest run exactly as XS's do, so no allocation is charged.
+    pub fn link_intrinsics(&mut self, names: &[String]) {
+        for (k, name) in names.iter().enumerate() {
+            if let Some(&func) = self.intrinsics.get(name.as_str()) {
+                let id = (k + 1) as u16;
+                if self.global_props.contains_key(&id) {
+                    continue;
+                }
+                // The global binding is an own property whose value is a
+                // **reference** to the intrinsic function instance, exactly
+                // like any other global property (so `get_variable` /
+                // `get_this_variable` resolve a `Reference`, and `typeof`
+                // sees a callable). Not metered — a pre-existing global.
+                self.create_global_property(id, (Kind::Reference, Payload::Reference(func)));
+            }
+        }
+    }
+
+    /// The native identity of a function instance, if it is an intrinsic.
+    #[inline]
+    fn native_of(&self, f: crate::value::SlotIndex) -> Option<Native> {
+        self.functions.get(&f).and_then(|fi| fi.native)
     }
 
     /// The slots the *active* frame holds live: the shared value stack, the
@@ -641,6 +786,14 @@ impl Interp {
             Payload::String(off) => {
                 String::from_utf8_lossy(self.str_content(off)).into_owned()
             }
+            // A native (intrinsic) function stringifies through XS's
+            // `Function.prototype.toString`, which prints a host function as
+            // `function ["name"] (){[native code]}` (verified against the
+            // pin's completion rendering for a bare `Object`/`Boolean`/… ).
+            Payload::Reference(r) => match self.native_of(r) {
+                Some(n) => format!("function [\"{}\"] (){{[native code]}}", n.display_name()),
+                None => slot_to_ecma_string(s),
+            },
             _ => slot_to_ecma_string(s),
         }
     }
@@ -1125,16 +1278,45 @@ impl Interp {
                         ]) as usize,
                     };
                     let ret_pc = pc + size as usize;
-                    match self.enter_call(argc, ret_pc) {
-                        Ok(body_start) => {
-                            // Call entry: `mxFirstCode()` runs a meter check
-                            // before the callee's first opcode.
-                            if self.check_meter() == MeterCheck::Abort {
-                                return Halt::MeterAbort;
+                    // A native (intrinsic) callee runs a C handler in place
+                    // rather than entering a bytecode frame (XS's
+                    // `XS_CALLBACK_KIND` branch of `RUN_ALL`): no call-entry
+                    // `mxFirstCode` check (the C path leaves `mxCode` null),
+                    // the handler meters its own steps, and control returns
+                    // into this JS frame — where `END_ALL`'s `mxFirstCode`
+                    // does check. A non-target (plain) call only; `new` on a
+                    // native is a separate, not-yet-modeled path.
+                    let callee = {
+                        let len = self.stack.len();
+                        len.checked_sub(argc + 4)
+                            .and_then(|base| match self.stack.get(base + 1).map(|s| s.value) {
+                                Some(Payload::Reference(f)) => self.native_of(f).map(|n| (n, base)),
+                                _ => None,
+                            })
+                    };
+                    if let Some((native, base)) = callee {
+                        match self.call_native(native, base, argc) {
+                            Ok(()) => {
+                                // Return into the JS caller: `END_ALL` checks.
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = ret_pc;
                             }
-                            pc = body_start;
+                            Err(h) => return h,
                         }
-                        Err(h) => return h,
+                    } else {
+                        match self.enter_call(argc, ret_pc) {
+                            Ok(body_start) => {
+                                // Call entry: `mxFirstCode()` runs a meter check
+                                // before the callee's first opcode.
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = body_start;
+                            }
+                            Err(h) => return h,
+                        }
                     }
                 }
                 // `argument i` (`XS_CODE_ARGUMENT`): push the frame's i-th
@@ -2075,6 +2257,45 @@ impl Interp {
         Ok(body_start)
     }
 
+    /// Dispatch a plain (non-`new`) call to an intrinsic native function.
+    /// The value stack below the `argc` args holds the frame geometry
+    /// `[THIS, FUNCTION, RESULT, FRAME]` beginning at `base`; the handler
+    /// reads its arguments, collapses the whole `[THIS..argN-1]` region to a
+    /// single result slot (XS's `mxStack = mxFrameEnd; *mxStack =
+    /// *mxFrameResult`), and meters exactly what the C built-in meters.
+    /// A native whose call behavior endor does not yet model returns
+    /// [`Halt::Unsupported`] naming the built-in — an honest skip, never a
+    /// mis-executed result.
+    fn call_native(&mut self, native: Native, base: usize, argc: usize) -> Result<(), Halt> {
+        // Argument i is at `base + 4 + i` (arg0 is the deepest); missing
+        // arguments read `undefined`.
+        let arg = |i: usize| -> Slot {
+            self.stack.get(base + 4 + i).copied().unwrap_or_else(Slot::undefined)
+        };
+        let result: Slot = match native {
+            // `Boolean(value)` (`fx_Boolean`): ToBoolean(argument0), or
+            // `false` when called with no argument. Measured against the pin,
+            // the primitive coercion meters **no** built-in step beyond the
+            // call's dispatch — a `Boolean(x)` costs exactly its opcodes
+            // (the argument expression's chunk allocations, if any, are
+            // metered where they occur). A `new Boolean` (the wrapper object)
+            // is the separate construct path, not this one.
+            Native::Boolean => {
+                let v = arg(0);
+                Slot::boolean(self.truthy(&v))
+            }
+            // The remaining fundamentals constructors' call/coerce behaviors
+            // land incrementally; until then a call self-names so the
+            // differential runner records an honest skip.
+            _ => return Err(Halt::Unsupported(native_unsupported_name(native))),
+        };
+        // Collapse the call region to the single result (frame teardown).
+        let _ = argc;
+        self.stack.truncate(base);
+        self.push(result);
+        Ok(())
+    }
+
     /// Leave a user-function call (`XS_CODE_END`): restore the caller's
     /// saved activation and return the pc to resume the caller at. The
     /// callee's result has already been captured by the caller of this
@@ -2662,6 +2883,28 @@ impl Interp {
     }
 }
 
+/// A `&'static str` naming an unmodeled native **call** for
+/// [`Halt::Unsupported`], so the differential runner records the skip
+/// attributed to the specific built-in (never a silent mis-execution).
+fn native_unsupported_name(native: Native) -> &'static str {
+    match native {
+        Native::Object => "native-call:Object",
+        Native::Function => "native-call:Function",
+        Native::Boolean => "native-call:Boolean",
+        Native::Symbol => "native-call:Symbol",
+        Native::Number => "native-call:Number",
+        Native::String => "native-call:String",
+        Native::Error => "native-call:Error",
+        Native::EvalError => "native-call:EvalError",
+        Native::RangeError => "native-call:RangeError",
+        Native::ReferenceError => "native-call:ReferenceError",
+        Native::SyntaxError => "native-call:SyntaxError",
+        Native::TypeError => "native-call:TypeError",
+        Native::URIError => "native-call:URIError",
+        Native::AggregateError => "native-call:AggregateError",
+    }
+}
+
 #[derive(Copy, Clone)]
 enum ArithOp {
     Add,
@@ -3158,6 +3401,58 @@ mod tests {
         assert_eq!(out.halt, Halt::Throw("7".into()), "no handler ⇒ escape to host");
         assert!(!out.completed);
         assert_eq!(out.computrons, 6, "bit-exact host-escape computrons vs C-XS");
+    }
+
+    #[test]
+    fn bare_intrinsic_reference_renders_as_native_function() {
+        // The exact C-XS bytecode for `Boolean` (captured from the oracle):
+        // begin_sloppy, eval_environment, eval_reference #1,
+        // get_variable #1, set_result, return. With the intrinsic linked to
+        // symbol id 1 the completion is the native function, rendered by
+        // Function.prototype.toString's host-function form, at C-XS's 9
+        // computrons (pure dispatch + program setup).
+        let code: [u8; 11] = [
+            0x0b, 0x00, 0x4b, 0x4d, 0x01, 0x00, 0x67, 0x01, 0x00, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Boolean".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "function [\"Boolean\"] (){[native code]}");
+        assert_eq!(out.computrons, 9, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn native_boolean_call_coerces_and_meters_bit_exact() {
+        // The exact C-XS bytecode for `Boolean(1)` (captured from the
+        // oracle): the native call path runs ToBoolean and returns `true`
+        // at C-XS's 13 computrons — the native adds no metering beyond the
+        // call's dispatch.
+        let code: [u8; 17] = [
+            0x0b, 0x00, 0x4b, 0xe0, 0x4d, 0x01, 0x00, 0x66, 0x01, 0x00, 0x28, 0x72, 0x01, 0xab,
+            0x01, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["Boolean".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "true");
+        assert_eq!(out.computrons, 13, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn unlinked_intrinsic_name_still_misses() {
+        // Without linking, `Boolean` is an ordinary undeclared global: the
+        // reference misses and the run throws, exactly as before the
+        // intrinsics seam (a program that references an unbound global is
+        // an honest endor abort, not a silent completion).
+        let code: [u8; 11] = [
+            0x0b, 0x00, 0x4b, 0x4d, 0x01, 0x00, 0x67, 0x01, 0x00, 0xbb, 0xa9,
+        ];
+        let out = Interp::new().run(&code);
+        assert!(matches!(out.halt, Halt::Throw(_)), "unbound global must miss");
     }
 
     #[test]

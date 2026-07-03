@@ -25,19 +25,34 @@ pub mod gc;
 pub mod interp;
 pub mod meter;
 pub mod opcode;
+pub mod symbols;
 pub mod value;
 
 pub use compartment::{Compartment, Intrinsics, Machine};
 pub use gc::{GcStats, Heap};
-pub use interp::{Halt, Interp, RunOutcome, PROGRAM_INVOCATION_COMPUTRONS};
+pub use interp::{Halt, Interp, Native, RunOutcome, PROGRAM_INVOCATION_COMPUTRONS};
 pub use meter::{Meter, MeterCheck};
 pub use opcode::{instruction_len, Opcode};
+pub use symbols::parse_symbols;
 pub use value::{ChunkArena, ChunkOffset, Kind, Payload, Slot, SlotArena, SlotIndex};
 
 /// Run a program bytecode buffer (as emitted by the C-XS compiler) on
 /// a fresh interpreter, returning the completion value and computrons.
 pub fn run_program(bytecode: &[u8]) -> RunOutcome {
     Interp::new().run(bytecode)
+}
+
+/// Run a program bytecode buffer with its C-XS `symbols` atom, so the
+/// program's intrinsic references (`Object`, `Boolean`, the Error
+/// constructors, …) relink to endor's intrinsics by name (design §
+/// test262 conformance). The symbol atom carries the compiler's
+/// program-local id→name table ([`parse_symbols`]); binding is unmetered,
+/// matching XS where the global's intrinsics pre-exist the guest run.
+pub fn run_program_with_symbols(bytecode: &[u8], symbols: &[u8]) -> RunOutcome {
+    let names = parse_symbols(symbols);
+    let mut interp = Interp::new();
+    interp.link_intrinsics(&names);
+    interp.run(bytecode)
 }
 
 /// Disassemble a bytecode buffer to `(offset, mnemonic)` pairs, walking
