@@ -69,6 +69,28 @@ var a=[1,2,3]; a.length=3; a
 var a=[4]; a[3]=5; a.length
 var a=[4]; a[3]=5; a
 
+// --- Array.prototype mutation methods (dense fast path, mxMeterSome-exact) ---
+var a=[1,2]; a.push(3)
+var a=[1,2]; a.push(3); a
+var a=[1,2,3]; a.push(9)
+var a=[1]; a.push(2,3)
+var a=[1]; a.push(2,3); a.length
+var a=[]; a.push(1)
+var a=[]; a.push(1); a
+var a=[1,2,3]; a.pop()
+var a=[5]; a.pop()
+var a=[]; a.pop()
+var a=[1,2,3]; a.pop(); a
+var a=[1,2,3]; a.pop(); a.length
+var a=[1,2,3]; a.push(4); a.pop()
+var a=[1,2,3]; a.indexOf(2)
+var a=[1,2,3]; a.indexOf(9)
+var a=[1,2,3]; a.indexOf(1)
+var a=[1,2,3]; a.indexOf(3)
+var a=[]; a.indexOf(1)
+var a=[10,20,30]; a.indexOf(20)
+var a=["x","y","z"]; a.indexOf("z")
+
 // --- mixed literal + mutation ---
 var a=[1,2,3]; a[0]=a[2]; a
 var a=[0,0,0]; a[0]=1; a[2]=3; a

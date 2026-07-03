@@ -285,6 +285,24 @@ pub const ARRAY_LENGTH_GET_METERING: u64 = 0;
 /// growth is metered separately by [`Interp::array_item_grow_metering`].
 pub const ARRAY_ITEM_DEFINE_STEP_METERING: u64 = 1 << 14;
 
+/// The fixed raw 16.16 cost of a dense `Array.prototype.push` call beyond the
+/// per-item `mxMeterSome(5)`, the two bracketing `mxMeterSome(2)` steps, and
+/// the item-chunk grow this stage already models: two further built-in steps
+/// (`2 << 14` = 32768) the fast path runs unconditionally (host-frame /
+/// `fxCheckArray` residual). Measured against the pin `48ee02d8cfe0` as the
+/// constant raw-gap across a spread of receiver lengths and argument counts.
+pub const ARRAY_PUSH_FRAME_METERING: u64 = 2 << 14;
+/// The fixed raw 16.16 cost of a dense `Array.prototype.pop` call beyond its
+/// modeled `mxMeterSome(2 + 8 + 4)` and the chunk shrink: **zero** (measured
+/// bit-exact against the pin with no residual).
+pub const ARRAY_POP_FRAME_METERING: u64 = 0;
+/// The fixed frame cost of `Array.prototype.indexOf` (`2 << 14`) and its
+/// per-element scan step (`5 << 14` = 81920, `mxMeterSome(5)` per compared
+/// element). Measured against the pin: `gap = 32768 + 81920 × elements_scanned`
+/// (scanning stops at the first strict-equal match).
+pub const ARRAY_METHOD_INDEXOF_FRAME_METERING: u64 = 2 << 14;
+pub const ARRAY_INDEXOF_PER_STEP: u64 = 5 << 14;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -345,6 +363,24 @@ pub enum NativeMethod {
     WrapperValueOf,
     /// A primitive wrapper's `toString` (stringifies the wrapped primitive).
     WrapperToString,
+    /// `Array.prototype.push(...items)` — the **dense** fast path
+    /// (`fx_Array_prototype_push` with `fxCheckArray` succeeding): append the
+    /// arguments and return the new length. A sparse receiver (holes) takes
+    /// XS's generic slow path (different metering), so endor self-names it an
+    /// honest skip.
+    ArrayPush,
+    /// `Array.prototype.pop()` — the dense fast path
+    /// (`fx_Array_prototype_pop`): remove and return the last element (or
+    /// `undefined` on an empty array), shrinking the item chunk.
+    ArrayPop,
+    /// `Array.prototype.indexOf(value[, from])` — the dense fast path
+    /// (`fx_Array_prototype_indexOf`): the first index at which `value` is
+    /// found by strict equality, or `-1`.
+    ArrayIndexOf,
+    /// `Array.prototype.join([sep])` — the dense fast path
+    /// (`fx_Array_prototype_join`): the elements stringified and joined by
+    /// `sep` (default `","`), holes/`undefined`/`null` contributing empty.
+    ArrayJoin,
 }
 
 impl Default for FuncInfo {
@@ -912,6 +948,18 @@ impl Interp {
             .get("Array")
             .and_then(|&c| self.ctor_prototype.get(&c).copied())
             .unwrap_or(crate::value::SlotIndex::NULL);
+        // The `Array.prototype` methods endor models (dense fast paths), bound
+        // as own properties of `%Array.prototype%` at link time only when the
+        // program references the method name.
+        for (name, m) in [
+            ("push", NativeMethod::ArrayPush),
+            ("pop", NativeMethod::ArrayPop),
+            ("indexOf", NativeMethod::ArrayIndexOf),
+            ("join", NativeMethod::ArrayJoin),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((self.array_proto, name, mf));
+        }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
         // carries toString/valueOf/hasOwnProperty/isPrototypeOf; each Error
@@ -3574,10 +3622,153 @@ impl Interp {
                 self.meter.tick_raw(METHOD_HAS_OWN_PROPERTY_METERING);
                 Slot::boolean(r)
             }
+            // `Array.prototype.push(...items)` — dense fast path only.
+            NativeMethod::ArrayPush => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("push:non-dense-array")),
+                };
+                let args: Vec<Slot> = (0..argc)
+                    .map(|i| self.stack.get(base + 4 + i).copied().unwrap_or_else(Slot::undefined))
+                    .collect();
+                let c = args.len() as u32;
+                let length = self.arrays[&inst].length;
+                // `mxMeterSome(2)` + the grow to `length + c`
+                // (`fxSetIndexSize`, growable chunk) + `mxMeterSome(5)` per
+                // appended item + a closing `mxMeterSome(2)`, plus the fixed
+                // native-method frame constant.
+                self.meter.tick_raw(ARRAY_PUSH_FRAME_METERING);
+                self.meter.tick_builtin_some(2);
+                if c > 0 {
+                    self.meter
+                        .tick_raw(self.array_chunk_size_metering(length + c));
+                }
+                for (i, a) in args.into_iter().enumerate() {
+                    let idx = length + i as u32;
+                    let mut v = a;
+                    v.id = 0;
+                    v.next = crate::value::SlotIndex::NULL;
+                    self.arrays.get_mut(&inst).unwrap().items.insert(idx, v);
+                    self.meter.tick_builtin_some(5);
+                }
+                let a = self.arrays.get_mut(&inst).unwrap();
+                a.length = length + c;
+                self.meter.tick_builtin_some(2);
+                Slot::integer((length + c) as i32)
+            }
+            // `Array.prototype.pop()` — dense fast path only.
+            NativeMethod::ArrayPop => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("pop:non-dense-array")),
+                };
+                self.meter.tick_raw(ARRAY_POP_FRAME_METERING);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_builtin_some(2);
+                let result = if length > 0 {
+                    let new_len = length - 1;
+                    let removed = self
+                        .arrays
+                        .get_mut(&inst)
+                        .unwrap()
+                        .items
+                        .remove(&new_len)
+                        .unwrap_or_else(Slot::undefined);
+                    // `fxSetIndexSize(length-1, XS_CHUNK)` reallocs the item
+                    // chunk down; `mxMeterSome(8)`.
+                    self.meter.tick_raw(self.array_chunk_size_metering(new_len));
+                    self.meter.tick_builtin_some(8);
+                    self.arrays.get_mut(&inst).unwrap().length = new_len;
+                    Slot::of(removed.kind, removed.value)
+                } else {
+                    Slot::undefined()
+                };
+                self.meter.tick_builtin_some(4);
+                result
+            }
+            // `Array.prototype.indexOf(value[, from])` — dense fast path.
+            NativeMethod::ArrayIndexOf => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("indexOf:non-dense-array")),
+                };
+                let target = arg0;
+                let (found, steps) = {
+                    let a = &self.arrays[&inst];
+                    let mut found: i32 = -1;
+                    let mut steps: u64 = 0;
+                    for i in 0..a.length {
+                        steps += 1;
+                        if let Some(item) = a.items.get(&i) {
+                            if self.strict_equal(item, &target) {
+                                found = i as i32;
+                                break;
+                            }
+                        }
+                    }
+                    (found, steps)
+                };
+                self.meter.tick_raw(ARRAY_METHOD_INDEXOF_FRAME_METERING);
+                // `ARRAY_INDEXOF_PER_STEP` is already in raw 16.16 units.
+                self.meter.tick_raw(steps * ARRAY_INDEXOF_PER_STEP);
+                Slot::integer(found)
+            }
+            // `Array.prototype.join([sep])` — the per-element `ToString`
+            // allocation metering (each number element renders through
+            // `fxNumberToString` into its own chunk) is a later increment, so
+            // this self-names an honest skip rather than under-metering.
+            NativeMethod::ArrayJoin => {
+                let _ = arg0;
+                return Err(Halt::Unsupported("join:tostring-metering"));
+            }
         };
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// The array instance behind `this` **iff** it is a dense array (every
+    /// index in `[0, length)` present, no holes) — the receiver shape XS's
+    /// `fxCheckArray` fast path accepts. A sparse array (holes) or a
+    /// non-array returns `None`, and the caller self-names an honest skip
+    /// (XS's generic slow path is a later increment).
+    fn dense_array_this(&self, this: Slot) -> Option<crate::value::SlotIndex> {
+        let inst = match this.value {
+            Payload::Reference(i) => i,
+            _ => return None,
+        };
+        let a = self.arrays.get(&inst)?;
+        if a.items.len() as u32 == a.length {
+            Some(inst)
+        } else {
+            None
+        }
+    }
+
+    /// The raw 16.16 metering of an array item-chunk (re)size to `slots`
+    /// item slots (XS's `fxSetIndexSize`/`fxNewChunk`/`fxRenewChunk` of a
+    /// `slots * sizeof(txSlot)` chunk): the adjusted chunk size
+    /// `round_up_8(slots*32) + sizeof(txChunk)` = `slots*32 + 16` (payload
+    /// already 8-aligned). Zero slots allocate nothing.
+    fn array_chunk_size_metering(&self, slots: u32) -> u64 {
+        if slots == 0 {
+            0
+        } else {
+            (slots as u64) * 32 + 16
+        }
+    }
+
+    /// Strict equality (`===`) with chunk-aware string comparison: two heap
+    /// strings are equal iff their CESU-8 content matches (the free
+    /// [`strict_equals`] compares only primitive/reference kinds and treats
+    /// two strings as unequal because it cannot see the chunk arena).
+    fn strict_equal(&self, a: &Slot, b: &Slot) -> bool {
+        match (a.value, b.value) {
+            (Payload::String(x), Payload::String(y)) => {
+                self.str_content(x) == self.str_content(y)
+            }
+            _ => strict_equals(a, b),
+        }
     }
 
     /// Leave a user-function call (`XS_CODE_END`): restore the caller's

@@ -275,6 +275,40 @@ pub fn gen_stage3_arrays_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for the **dense `Array.prototype` mutation
+/// methods** (`push`/`pop`/`indexOf`) — the fast paths that are bit-exact
+/// (result AND computron). It always builds a **dense** literal (no holes, so
+/// `fxCheckArray`'s fast path applies), then applies a method and observes its
+/// return value, the resulting array, or the length. Excludes `join` (its
+/// per-element `ToString` metering is a later increment) and sparse receivers
+/// (which take XS's slow path). Rides the full symbol-linking differential
+/// check.
+pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let n = (b.next() % 5) as usize; // 0..=4 dense elements
+    let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
+    let lit = format!("[{}]", elems.join(","));
+    match b.choice(6) {
+        // push one, observe the new length (its return value).
+        0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
+        // push one, observe the resulting array.
+        1 => format!("var a={}; a.push({}); a", lit, small_int(&mut b)),
+        // push several, observe the length.
+        2 => format!(
+            "var a={}; a.push({},{}); a.length",
+            lit,
+            small_int(&mut b),
+            small_int(&mut b)
+        ),
+        // pop, observe the removed element.
+        3 => format!("var a={}; a.pop()", lit),
+        // pop, observe the resulting array and length.
+        4 => format!("var a={}; a.pop(); a.length", lit),
+        // indexOf a value that may or may not be present.
+        _ => format!("var a={}; a.indexOf({})", lit, small_int(&mut b)),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -537,6 +571,47 @@ mod tests {
         assert!(distinct.len() > 30, "arrays sweep too uniform: {} distinct", distinct.len());
         for (i, f) in features.iter().enumerate() {
             assert!(*f, "arrays grammar feature {} never generated", i);
+        }
+    }
+
+    #[test]
+    fn generated_stage3_array_methods_agree_bit_exact() {
+        // The dense push/pop/indexOf fast paths meter their mxMeterSome
+        // annotations and chunk (re)size faithfully, so they ride the full
+        // result+computron differential (symbol-linked, since the method
+        // names resolve through the program symbol table). Sweep a spread of
+        // seeds so every method shape and a range of receiver lengths appear.
+        let mut checked = 0;
+        let mut methods = [false; 3]; // push, pop, indexOf seen
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..600 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(5))
+                        .wrapping_add((seed as u8).wrapping_mul(2)),
+                );
+            }
+            let prog = gen_stage3_array_methods_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains(".push(") {
+                methods[0] = true;
+            } else if prog.contains(".pop(") {
+                methods[1] = true;
+            } else if prog.contains(".indexOf(") {
+                methods[2] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 array-methods differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 30, "methods sweep too uniform: {} distinct", distinct.len());
+        for (i, m) in methods.iter().enumerate() {
+            assert!(*m, "array method {} never generated", i);
         }
     }
 
