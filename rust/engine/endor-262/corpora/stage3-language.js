@@ -76,6 +76,11 @@ var z = 0; z ?? 9
 let u; u ?? 7
 let v = 3; v ?? 7
 
+// --- delete (own property) ---
+var d1 = { a: 1, b: 2 }; delete d1.a
+var d2 = { a: 1 }; delete d2.a; d2.a
+var d3 = { x: 5, y: 6 }; delete d3.y; d3.x
+
 // --- optional chaining (?.) ---
 var o = { a: 1 }; o?.a
 var o2 = null; o2?.a

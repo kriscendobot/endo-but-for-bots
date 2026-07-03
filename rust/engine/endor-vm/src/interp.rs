@@ -994,6 +994,35 @@ impl Interp {
                     self.push(v);
                     pc += ilen;
                 }
+                // `delete o.k` (XS_CODE_DELETE_PROPERTY, xsRun.c): remove the
+                // own property `id` from the top-of-stack object, replacing
+                // the object slot with the boolean result (XS keeps the stack
+                // slot in place). A configurable own data property (all the
+                // covered grammar creates) deletes to `true`; deleting an
+                // absent own property is also `true`. A non-reference target
+                // needs `mxToInstance` (which throws), so it self-names
+                // unsupported.
+                XS_CODE_DELETE_PROPERTY => {
+                    let id = id!(1);
+                    let obj = *self.stack.last().unwrap_or(&Slot::undefined());
+                    match obj.value {
+                        Payload::Reference(inst) => {
+                            // `fxRunDelete` wraps `mxBehaviorDeleteProperty`
+                            // in a host frame (`fxBeginHost`/`fxEndHost`),
+                            // whose teardown meters one built-in step
+                            // (`mxMeterOne`) — measured against the pin as
+                            // exactly `XS_BUILTIN_METERING` over the
+                            // allocation-free unlink.
+                            self.meter.tick_builtin();
+                            let deleted = self.delete_own_property(inst, id);
+                            if let Some(s) = self.stack.last_mut() {
+                                *s = Slot::boolean(deleted);
+                            }
+                        }
+                        _ => return Halt::Unsupported(op.name()),
+                    }
+                    pc += ilen;
+                }
 
                 // ---- user functions: definition ---------------------
                 // `constructor_function` / `function` (`fxNewFunctionInstance`):
@@ -2296,6 +2325,31 @@ impl Interp {
             self.slots.get_mut(inst).next = idx;
             true
         }
+    }
+
+    /// Delete own property `id` from instance `inst` (XS's
+    /// `mxBehaviorDeleteProperty` for an ordinary object): unlink the
+    /// property slot from the owner's `next`-linked list and free it.
+    /// Returns `true` when the property was configurable-and-removed or was
+    /// absent (both are `true` for `delete`); the covered grammar creates
+    /// only configurable own data properties, so this is always `true`. No
+    /// allocation, so — like XS's ordinary delete — it meters only its
+    /// dispatch.
+    fn delete_own_property(&mut self, inst: crate::value::SlotIndex, id: u16) -> bool {
+        let mut prev = inst;
+        let mut cur = self.slots.get(inst).next;
+        while !cur.is_null() {
+            let s = *self.slots.get(cur);
+            if s.id == id {
+                // Unlink `cur` from the chain and free its slot.
+                self.slots.get_mut(prev).next = s.next;
+                self.slots.free(cur);
+                return true;
+            }
+            prev = cur;
+            cur = s.next;
+        }
+        true
     }
 
     /// Read own property `id` of instance `inst` (or `undefined` when
