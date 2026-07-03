@@ -625,6 +625,27 @@ END/RETURN exits to the C caller, and `fxBeginMetering` scales the
 host's interval `<<16` and resets `meterIndex` — both to be matched
 exactly (stage-2a review findings 1 and 2).
 
+**Stage-2b complete (2026-07-03).** The three-part 2b orchestration landed:
+child 1 the allocation-faithful object heap, child 2 call/return frame
+switching and closures via heap cells, child 3 exceptions (the XS
+jump-buffer chain with the JS/host flag reduced to a structural predicate:
+`catch`/`uncatch`/`exception`/`throw`/`rethrow`, uncaught propagation to the
+host boundary with its measured host-escape metering), full 245-opcode
+decode+dispatch coverage (built-ins stubbed — each opcode executes with
+faithful stack/frame/meter effects where its semantics need no built-in, or
+halts `Unsupported` self-naming where they do), and the tightened
+`DualRun::is_bit_exact` (a shared abort compares thrown value AND computrons,
+like the completion arm). The stage-2 acceptance bar is met as the real
+test262 `language/` dual-run runner (`endor_262::test262`): every test it
+runs end-to-end agrees bit-exactly (result/thrown-value AND computron) with
+the C-XS oracle — **zero divergence** — with the covered/skipped split
+stated honestly (each skip named by the unsupported opcode or built-in gap,
+never folded into a pass rate). The covered grammar is what stage 2b models;
+the built-ins the bulk of `language/` needs arrive in later stages, growing
+the covered count against the same zero-divergence bar. The differential
+fuzz grammar now spans objects, calls, closures, and thrown-and-caught
+exceptions, all bit-exact.
+
 ## Dependencies
 
 | Design | Relationship |

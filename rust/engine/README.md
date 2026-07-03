@@ -75,13 +75,30 @@ cd rust/engine
 cargo run -p endor-262 --bin harness          # stage-1 corpus
 cargo run -p endor-262 --bin harness -- '1 + 2 * 3'   # ad-hoc program
 cargo test  --workspace -- --test-threads=1   # includes the bar as a test
+
+# The real test262 language/ dual-run runner (stage-2 acceptance bar).
+# Run per subtree — the C-XS oracle accumulates memory across a whole-tree
+# walk, so `expressions`/`statements` in separate processes bound the RSS.
+cargo run -p endor-262 --bin test262-language -- expressions
+cargo run -p endor-262 --bin test262-language -- statements/for
 ```
 
 The stage-scoped curated corpora under `endor-262/corpora/` are the
-bootstrap. Per the maintainer directive on PR #600 (2026-07-03), the
-whole-section parity runs that succeed them draw from the monorepo's
-existing `packages/test262-runner` test262 subset and its
-`ses-xs-parity` feature markers — the same tree and convention that
-package already uses to prove XS↔Node HardenedJS parity — rather than a
-separate pinned test262 submodule. See the design's § test262
-conformance (requirement 6).
+bootstrap (stage-1 arithmetic/logic/control-flow; stage-2 var/loop/object;
+stage-2b functions/closures/exceptions), all bit-exact (result AND
+computron) against the oracle. Per the maintainer directive on PR #600
+(2026-07-03), the whole-section parity runs that succeed them draw from the
+monorepo's existing `packages/test262-runner` test262 subset — the same
+tree and convention that package already uses to prove XS↔Node HardenedJS
+parity — rather than a separate pinned test262 submodule. The
+`test262-language` runner (module `endor_262::test262`) assembles each
+`language/` test the standard test262 way and dual-runs it, reporting an
+**honest covered/skipped split**: `covered` is bit-exact (result AND
+computron, four-valued completion) only; every skip is named by the opcode
+or built-in gap that stopped endor (never folded into a pass rate); a wrong
+primitive value is a hard divergence. The covered grammar is expressions,
+`var`/scope/loops, objects, functions, closures, and exceptions — it does
+not include the built-ins (`eval`/`String`/`Array`/`typeof`/real `Error`
+objects) the bulk of `language/` needs, so most tests are honestly skipped
+today, the covered count growing as later stages land the built-ins. See
+the design's § test262 conformance (requirement 6).
