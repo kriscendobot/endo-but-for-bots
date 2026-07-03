@@ -4586,6 +4586,16 @@ impl Interp {
                         Kind::Reference => {
                             return Err(Halt::Unsupported(native_unsupported_name(native)))
                         }
+                        // `String(aBigInt)` renders through `fxBigintToString`,
+                        // whose radix-derived working-chunk allocation +
+                        // `fxBigInt_dup` + call-frame residual this stage does
+                        // not yet model computron-exactly — an honest named skip
+                        // rather than a wrong meter. (The bare-completion decimal
+                        // render, [`Self::render`], is modeled separately and
+                        // stays bit-exact.)
+                        Kind::BigInt => {
+                            return Err(Halt::Unsupported(native_unsupported_name(native)))
+                        }
                         _ => {
                             let bytes = self.to_string_bytes_metered(a);
                             let off = self.chunks.alloc(&bytes);
