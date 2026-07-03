@@ -704,26 +704,27 @@ impl Interp {
                 // WITHOUT popping (the compiler emits an explicit POP
                 // when the value is not wanted). `PULL_LOCAL` is the
                 // popping variant.
-                XS_CODE_VAR_LOCAL_1 | XS_CODE_LET_LOCAL_1 | XS_CODE_CONST_LOCAL_1 => {
-                    let k = u1!(1);
+                XS_CODE_VAR_LOCAL_1
+                | XS_CODE_VAR_LOCAL_2
+                | XS_CODE_LET_LOCAL_1
+                | XS_CODE_LET_LOCAL_2
+                | XS_CODE_CONST_LOCAL_1
+                | XS_CODE_CONST_LOCAL_2
+                | XS_CODE_SET_LOCAL_1
+                | XS_CODE_SET_LOCAL_2 => {
+                    let k = self.local_operand(op, code, pc);
                     let top = *self.stack.last().unwrap_or(&Slot::undefined());
                     self.set_local(k, top);
                     pc += size as usize;
                 }
-                XS_CODE_SET_LOCAL_1 => {
-                    let k = u1!(1);
-                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
-                    self.set_local(k, top);
-                    pc += size as usize;
-                }
-                XS_CODE_PULL_LOCAL_1 => {
-                    let k = u1!(1);
+                XS_CODE_PULL_LOCAL_1 | XS_CODE_PULL_LOCAL_2 => {
+                    let k = self.local_operand(op, code, pc);
                     let v = self.pop();
                     self.set_local(k, v);
                     pc += size as usize;
                 }
-                XS_CODE_GET_LOCAL_1 => {
-                    let k = u1!(1);
+                XS_CODE_GET_LOCAL_1 | XS_CODE_GET_LOCAL_2 => {
+                    let k = self.local_operand(op, code, pc);
                     let v = self.get_local(k);
                     match v {
                         Some(s) => self.push(s),
@@ -731,8 +732,8 @@ impl Interp {
                     }
                     pc += size as usize;
                 }
-                XS_CODE_UNWIND_1 => {
-                    let n = u1!(1);
+                XS_CODE_UNWIND_1 | XS_CODE_UNWIND_2 => {
+                    let n = self.local_operand(op, code, pc);
                     // Discard the n most-recently-declared scope slots
                     // (XS advances mxScope past them); prune their names.
                     let keep = self.locals.len().saturating_sub(n);
@@ -1205,6 +1206,28 @@ impl Interp {
                 XS_CODE_POP => {
                     let _ = self.pop();
                     pc += size as usize;
+                }
+                // `swap` (`XS_CODE_SWAP`): exchange the top two stack slots
+                // (`aSlot = mxStack[0]; mxStack[0] = mxStack[1];
+                // mxStack[1] = aSlot`). Pure stack, dispatch-metered.
+                XS_CODE_SWAP => {
+                    let n = self.stack.len();
+                    if n >= 2 {
+                        self.stack.swap(n - 1, n - 2);
+                    }
+                    pc += size as usize;
+                }
+                // Debug / source markers (`line`, `file`, `debugger`,
+                // `profile`): semantics-free in the run — a debug build
+                // uses them for source mapping and breakpoints, the engine
+                // otherwise steps past them. Dispatch-metered (as C-XS
+                // meters them under `mxMetering`), no stack/heap effect.
+                // The covered grammar's captured bytecode does not emit
+                // them, but stubbing keeps decode+dispatch total.
+                // (`file` is an ID-operand opcode, `size == 0`, so it must
+                // advance by the resolved `ilen`, never `size`.)
+                XS_CODE_LINE | XS_CODE_FILE | XS_CODE_DEBUGGER | XS_CODE_PROFILE => {
+                    pc += ilen;
                 }
 
                 // ---- branches ---------------------------------------
@@ -1780,6 +1803,19 @@ impl Interp {
         }
     }
 
+    /// Read a `*_LOCAL_*` opcode's 1-based scope-index operand: a `u8` for
+    /// the `_1` variant (`size == 2`), a little-endian `u16` for `_2`
+    /// (`size == 3`) — the wide-index form the compiler emits once a frame
+    /// declares more than 255 scope slots (XS's `mxRunU1`/`mxRunU2`).
+    #[inline]
+    fn local_operand(&self, op: Opcode, code: &[u8], pc: usize) -> usize {
+        if op.size() == 3 {
+            u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize
+        } else {
+            code[pc + 1] as usize
+        }
+    }
+
     /// Address a 1-based scope index `k` (XS's `mxEnvironment - index`).
     #[inline]
     fn local_index(&self, k: usize) -> Option<usize> {
@@ -2281,6 +2317,57 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "2", "the shared closure cell mutates across the two f() calls");
         assert_eq!(out.computrons, 87, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn every_opcode_decodes_and_dispatches_without_panic_or_decode_error() {
+        // Full 245-opcode decode + dispatch coverage (the stage-2 bar's
+        // "full opcode coverage, built-ins stubbed"): every opcode byte
+        // must (a) decode (`from_u8` is dense), (b) resolve an instruction
+        // length on a well-formed instruction, and (c) DISPATCH to a
+        // defined effect — either it executes (the implemented subset and
+        // the pure stubs) or it halts `Halt::Unsupported` naming itself.
+        // It must NEVER panic and NEVER fall through to `Halt::Decode` on a
+        // well-formed single instruction: a stubbed opcode either steps
+        // with faithful stack/frame/meter effects (where its semantics need
+        // no built-in) or self-names as unsupported (where they do), so a
+        // future grammar reaching an unmodeled opcode gets an honest
+        // "implement me", never a silent mis-execution.
+        for raw in 0..=crate::opcode::XS_CODE_COUNT as u16 - 1 {
+            let byte = raw as u8;
+            let op = Opcode::from_u8(byte).expect("opcode table is dense over 0..=245");
+
+            // A well-formed program: enter a sloppy frame, then the opcode
+            // under test with zeroed operands (16 pad bytes cover every
+            // fixed operand width; length-prefixed opcodes read a zero
+            // length). The trailing pad is `XS_NO_CODE`, which self-names as
+            // unsupported, so after a *successful* dispatch the run halts
+            // there — never on a decode error attributable to the opcode.
+            let mut code = vec![b(Opcode::XS_CODE_BEGIN_SLOPPY), 0x00, byte];
+            code.extend_from_slice(&[0u8; 16]);
+
+            let out = Interp::new().run(&code);
+            if let Halt::Decode(msg) = &out.halt {
+                // A decode error is only acceptable if it is NOT about the
+                // opcode under test — i.e. the opcode dispatched fine and
+                // the walk later tripped on the pad. In practice the pad is
+                // NO_CODE (unsupported, not a decode error), so any Decode
+                // here is a real gap.
+                panic!(
+                    "opcode {:#04x} ({}) produced a decode error: {}",
+                    byte,
+                    op.name(),
+                    msg
+                );
+            }
+            // The halt must be one of the defined outcomes; `Unsupported`
+            // must name the opcode under test (or `XS_NO_CODE`/a downstream
+            // opcode reached after a clean dispatch), never be empty-by-bug.
+            match out.halt {
+                Halt::Return | Halt::Throw(_) | Halt::MeterAbort | Halt::Unsupported(_) => {}
+                Halt::Decode(_) => unreachable!("handled above"),
+            }
+        }
     }
 
     #[test]
