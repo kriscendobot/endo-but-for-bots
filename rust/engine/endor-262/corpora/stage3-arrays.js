@@ -134,6 +134,17 @@ var a=[1]; a.reverse(); a
 var a=[]; a.reverse(); a
 var a=[1,2,3,4,5]; a.reverse(); a
 var a=[9,8,7]; a.reverse(); a[0]
+var a=[1,2,3]; a.shift()
+var a=[1,2,3]; a.shift(); a
+var a=[1,2,3,4]; a.shift(); a
+var a=[5]; a.shift(); a.length
+var a=[]; a.shift()
+var a=[2,3]; a.unshift(1)
+var a=[2,3]; a.unshift(1); a
+var a=[3]; a.unshift(1,2); a
+var a=[]; a.unshift(9); a
+var a=[1,2,3]; a.unshift(0); a
+var a=[5]; a.unshift(1,2,3); a.length
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()

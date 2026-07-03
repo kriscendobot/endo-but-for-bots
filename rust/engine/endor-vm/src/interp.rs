@@ -325,6 +325,11 @@ pub const ARRAY_AT_READ_METERING: u64 = 98304;
 /// against the pin.
 pub const ARRAY_REVERSE_FRAME_METERING: u64 = 98304;
 pub const ARRAY_REVERSE_PER_SWAP_METERING: u64 = 8 << 16;
+/// `Array.prototype.unshift` fixed frame cost (`fxCheckArray` host frame),
+/// beyond the grow chunk, `mxMeterSome(length*10)`, per-arg `mxMeterSome(4)`,
+/// and closing `mxMeterSome(2)`. Measured against the pin as `2 << 14`. (shift
+/// needs no such residual — its `mxMeterSome(2+3+3+4)` fully accounts for it.)
+pub const ARRAY_UNSHIFT_FRAME_METERING: u64 = 2 << 14;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -505,6 +510,13 @@ pub enum NativeMethod {
     /// `Array.prototype.at(index)` — dense fast path (`fx_Array_prototype_at`):
     /// the element at `index` (negative counts from the end), or `undefined`.
     ArrayAt,
+    /// `Array.prototype.shift()` — dense fast path (`fx_Array_prototype_shift`):
+    /// remove and return the first element, shifting the rest down.
+    ArrayShift,
+    /// `Array.prototype.unshift(...items)` — dense fast path
+    /// (`fx_Array_prototype_unshift`): prepend the arguments, returning the new
+    /// length.
+    ArrayUnshift,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1142,6 +1154,8 @@ impl Interp {
             ("slice", NativeMethod::ArraySlice),
             ("concat", NativeMethod::ArrayConcat),
             ("at", NativeMethod::ArrayAt),
+            ("shift", NativeMethod::ArrayShift),
+            ("unshift", NativeMethod::ArrayUnshift),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4202,6 +4216,82 @@ impl Interp {
                     Slot::undefined()
                 };
                 result
+            }
+            // `Array.prototype.shift()` — dense fast path. Remove and return
+            // the first element, shifting the rest down and shrinking the item
+            // chunk. Metering: `mxMeterSome(2 + 3 + 3 + 4)` when non-empty
+            // (else 2+4), the shrink chunk, and `mxMeterSome((length-1)*10)`.
+            NativeMethod::ArrayShift => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("shift:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                self.meter.tick_builtin_some(2);
+                let result = if length > 0 {
+                    self.meter.tick_builtin_some(3);
+                    let new_len = length - 1;
+                    let removed = {
+                        let a = self.arrays.get_mut(&inst).unwrap();
+                        let first = a.items.remove(&0).unwrap_or_else(Slot::undefined);
+                        let mut shifted = std::collections::BTreeMap::new();
+                        for (&k, &v) in a.items.iter() {
+                            shifted.insert(k - 1, v);
+                        }
+                        a.items = shifted;
+                        a.length = new_len;
+                        first
+                    };
+                    self.meter.tick_raw(self.array_chunk_size_metering(new_len));
+                    self.meter.tick_builtin_some((new_len as u64) * 10);
+                    self.meter.tick_builtin_some(3);
+                    Slot::of(removed.kind, removed.value)
+                } else {
+                    Slot::undefined()
+                };
+                self.meter.tick_builtin_some(4);
+                result
+            }
+            // `Array.prototype.unshift(...items)` — dense fast path. Prepend the
+            // arguments, shifting existing elements up, and return the new
+            // length. Metering: the grow chunk, `mxMeterSome(length*10)` for the
+            // shift, `mxMeterSome(4)` per inserted argument, `mxMeterSome(2)`.
+            NativeMethod::ArrayUnshift => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("unshift:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                let c = argc as u32;
+                let args: Vec<Slot> = (0..argc)
+                    .map(|i| {
+                        self.stack
+                            .get(base + 4 + i)
+                            .copied()
+                            .unwrap_or_else(Slot::undefined)
+                    })
+                    .collect();
+                self.meter.tick_raw(ARRAY_UNSHIFT_FRAME_METERING);
+                if c > 0 {
+                    self.meter
+                        .tick_raw(self.array_chunk_size_metering(length + c));
+                    self.meter.tick_builtin_some((length as u64) * 10);
+                    let a = self.arrays.get_mut(&inst).unwrap();
+                    let mut shifted = std::collections::BTreeMap::new();
+                    for (&k, &v) in a.items.iter() {
+                        shifted.insert(k + c, v);
+                    }
+                    for (i, mut v) in args.into_iter().enumerate() {
+                        v.id = 0;
+                        v.next = crate::value::SlotIndex::NULL;
+                        shifted.insert(i as u32, v);
+                        self.meter.tick_builtin_some(4);
+                    }
+                    a.items = shifted;
+                    a.length = length + c;
+                }
+                self.meter.tick_builtin_some(2);
+                Slot::integer((length + c) as i32)
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default
