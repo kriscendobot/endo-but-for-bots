@@ -92,7 +92,8 @@ numeric/chaining opcodes, and fundamentals — the intrinsic constructors as
 first-class values, `Boolean`/`Object` native calls, the value globals
 `undefined`/`NaN`/`Infinity`, and `new` constructor calls; stage-3 arrays —
 the Array exotic object: literals with holes, computed index get/set over the
-item chunk, and the `length` accessor get/set), all bit-exact
+item chunk, the `length` accessor get/set, the dense `push`/`pop`/`indexOf`
+methods, and the `Array(...)` constructor + `Array.isArray`), all bit-exact
 (result AND computron) against the oracle. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
