@@ -507,7 +507,7 @@ pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
     let thr = small_int(&mut b);
-    match b.choice(8) {
+    match b.choice(11) {
         // forEach: accumulate the elements with an overflow-safe operator.
         0 => {
             let op = ["+", "-", "*"][b.choice(3) as usize];
@@ -526,7 +526,25 @@ pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
         // find / findIndex over a threshold predicate.
         6 => format!("{}.find(function(x){{return x>{}}})", lit, thr),
         // filter, joined.
-        _ => format!("{}.filter(function(x){{return x>{}}}).join()", lit, thr),
+        7 => format!("{}.filter(function(x){{return x>{}}}).join()", lit, thr),
+        // reduce with an initial value (safe on the empty array).
+        8 => {
+            let op = ["+", "-", "*"][b.choice(3) as usize];
+            format!(
+                "{}.reduce(function(a,x){{return a{}x}},{})",
+                lit,
+                op,
+                small_int(&mut b)
+            )
+        }
+        // reduceRight with an initial value.
+        9 => format!(
+            "{}.reduceRight(function(a,x){{return a+x}},{})",
+            lit,
+            small_int(&mut b)
+        ),
+        // findLast over a threshold predicate.
+        _ => format!("{}.findLast(function(x){{return x<{}}})", lit, thr),
     }
 }
 

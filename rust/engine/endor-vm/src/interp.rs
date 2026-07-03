@@ -370,6 +370,18 @@ pub const ARRAY_PREDICATE_TOBOOL_METERING: u64 = 0;
 /// holes included), a different per-element overhead than `fxCallThisItem`.
 pub const ARRAY_FIND_FRAME_METERING: u64 = 8;
 pub const ARRAY_FIND_PER_ELEM_METERING: u64 = 9 << 14;
+/// `Array.prototype.reduce`/`reduceRight` frame + per-fold-step
+/// `fxReduceThisItem` overhead (a 4-arg callback), beyond the callback body.
+/// Calibrated against the pin.
+pub const ARRAY_REDUCE_FRAME_METERING: u64 = 8;
+pub const ARRAY_REDUCE_PER_ELEM_METERING: u64 = 13 << 14;
+/// The seed-finding scan `reduce`/`reduceRight` runs when no initial value is
+/// given: for a dense array the accumulator seeds from the first (or last)
+/// present element in one iteration (`mxGetIndex` read), `6 << 14`.
+pub const ARRAY_REDUCE_INIT_SCAN_METERING: u64 = 6 << 14;
+/// The fixed backward-scan setup `findLast`/`findLastIndex` accrue over the
+/// forward `find`/`findIndex`. Measured against the pin as `6 << 14`.
+pub const ARRAY_FINDLAST_EXTRA_METERING: u64 = 6 << 14;
 /// `Array.prototype.join` frame cost (the host frame + `fxGetArrayLimit` + the
 /// result setup, beyond the modeled key-list/element-slot/ToString/final-chunk
 /// allocations). Calibrated against the pin for the default (",") separator; a
@@ -588,6 +600,17 @@ pub enum NativeMethod {
     /// `Array.prototype.filter(callback[, thisArg])`: a new array of the
     /// elements for which the callback is truthy.
     ArrayFilter,
+    /// `Array.prototype.reduce(callback[, initial])`: fold left with
+    /// `callback(acc, item, index, array)`.
+    ArrayReduce,
+    /// `Array.prototype.reduceRight(callback[, initial])`: fold right.
+    ArrayReduceRight,
+    /// `Array.prototype.findLast(callback[, thisArg])`: the last element for
+    /// which the callback is truthy, or `undefined`.
+    ArrayFindLast,
+    /// `Array.prototype.findLastIndex(callback[, thisArg])`: the index of the
+    /// last element for which the callback is truthy, or `-1`.
+    ArrayFindLastIndex,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1236,6 +1259,10 @@ impl Interp {
             ("find", NativeMethod::ArrayFind),
             ("findIndex", NativeMethod::ArrayFindIndex),
             ("filter", NativeMethod::ArrayFilter),
+            ("reduce", NativeMethod::ArrayReduce),
+            ("reduceRight", NativeMethod::ArrayReduceRight),
+            ("findLast", NativeMethod::ArrayFindLast),
+            ("findLastIndex", NativeMethod::ArrayFindLastIndex),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4810,6 +4837,102 @@ impl Interp {
                     a.length = total;
                 }
                 Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.reduce`/`reduceRight` — fold with
+            // `callback(acc, item, index, array)` (`this` = undefined). With no
+            // initial value the first (or last, for `reduceRight`) present
+            // element seeds the accumulator; an empty array with no initial is
+            // a TypeError (self-named). Per element: the `fxReduceThisItem`
+            // 4-arg-callback overhead + the callback body.
+            NativeMethod::ArrayReduce | NativeMethod::ArrayReduceRight => {
+                let right = m == NativeMethod::ArrayReduceRight;
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("reduce:non-dense-array")),
+                };
+                let callback = arg0;
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_REDUCE_FRAME_METERING);
+                // The present indices in fold order.
+                let order: Vec<u32> = if right {
+                    (0..length).rev().filter(|i| self.arrays[&inst].items.contains_key(i)).collect()
+                } else {
+                    (0..length).filter(|i| self.arrays[&inst].items.contains_key(i)).collect()
+                };
+                let mut it = order.into_iter();
+                let mut acc = if argc >= 2 {
+                    self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined)
+                } else {
+                    match it.next() {
+                        Some(i) => {
+                            // The seed-finding scan (one iteration for a dense
+                            // array — the first/last present element).
+                            self.meter.tick_raw(ARRAY_REDUCE_INIT_SCAN_METERING);
+                            self.arrays[&inst].items[&i]
+                        }
+                        None => return Err(Halt::Unsupported("reduce:empty-no-initial")),
+                    }
+                };
+                for i in it {
+                    let item = self.arrays[&inst].items[&i];
+                    self.meter.tick_raw(ARRAY_REDUCE_PER_ELEM_METERING);
+                    let cb_args = [acc, item, Slot::integer(i as i32), this];
+                    acc = self.run_callback(code, callback, Slot::undefined(), &cb_args)?;
+                }
+                acc
+            }
+            // `Array.prototype.findLast`/`findLastIndex` — the last element/
+            // index whose callback is truthy, scanning backward. Like
+            // `find`/`findIndex` but reversed.
+            NativeMethod::ArrayFindLast | NativeMethod::ArrayFindLastIndex => {
+                let want_index = m == NativeMethod::ArrayFindLastIndex;
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("findLast:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_FIND_FRAME_METERING);
+                // The `findLast`/`findLastIndex` backward-scan setup, a fixed
+                // cost over the forward `find`/`findIndex`.
+                self.meter.tick_raw(ARRAY_FINDLAST_EXTRA_METERING);
+                if !want_index {
+                    self.meter.tick_raw(2 << 14);
+                }
+                let mut found: Option<(u32, Slot)> = None;
+                for i in (0..length).rev() {
+                    let item = self
+                        .arrays[&inst]
+                        .items
+                        .get(&i)
+                        .copied()
+                        .unwrap_or_else(Slot::undefined);
+                    self.meter.tick_raw(ARRAY_FIND_PER_ELEM_METERING);
+                    let cb_args = [item, Slot::integer(i as i32), this];
+                    let r = self.run_callback(code, callback, this_arg, &cb_args)?;
+                    self.meter.tick_raw(ARRAY_PREDICATE_TOBOOL_METERING);
+                    if self.truthy(&r) {
+                        found = Some((i, item));
+                        break;
+                    }
+                }
+                match found {
+                    Some((i, item)) => {
+                        if want_index {
+                            Slot::integer(i as i32)
+                        } else {
+                            item
+                        }
+                    }
+                    None => {
+                        if want_index {
+                            Slot::integer(-1)
+                        } else {
+                            Slot::undefined()
+                        }
+                    }
+                }
             }
             // `Array.prototype.join([sep])` — dense fast path. Each element is
             // ToString'd into a key slot, the pieces joined by `sep` (default

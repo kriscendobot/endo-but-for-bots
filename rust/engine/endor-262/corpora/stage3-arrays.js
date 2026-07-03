@@ -263,3 +263,15 @@ var s=0; [1,2,3,4,5].forEach(function(x){s=s+x}); s
 [1,2,3,4].filter(function(x){return x>0}).join()
 [1,2,3,4].filter(function(x){return x>5}).length
 var s=0; [1,2,3].map(function(x){return x*2}).forEach(function(y){s=s+y}); s
+[1,2,3].reduce(function(a,x){return a+x})
+[1,2,3].reduce(function(a,x){return a+x},10)
+[1,2,3,4].reduce(function(a,x){return a+x})
+[5].reduce(function(a,x){return a+x})
+[1,2,3,4].reduce(function(a,x){return a+x},0)
+[1,2,3].reduceRight(function(a,x){return a-x})
+[1,2,3,4].reduceRight(function(a,x){return a+x})
+[1,2,3].findLast(function(x){return x<3})
+[1,2,3].findLast(function(x){return x<0})
+[1,2,3].findLastIndex(function(x){return x<3})
+[1,2,3].findLastIndex(function(x){return x<0})
+[1,2,3,4,5].findLast(function(x){return x<4})
