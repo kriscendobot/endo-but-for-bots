@@ -251,6 +251,18 @@ pub fn stage2b_exceptions_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage2b-exceptions.js"))
 }
 
+/// The stage-3 child-1 (language) corpus: the language opcodes and
+/// chunk-backed CESU-8 string *values* this child adds — string literals,
+/// concatenation (ToString + `fxConcatString` chunk metering), string
+/// equality/relational comparison, `typeof` over every covered kind, the
+/// numeric opcodes `increment`/`decrement`/`to_numeric`/exponentiation,
+/// `this`, `let`/`const` closures (including a loop body's per-iteration
+/// reset/refresh cells), and the `??`/`?.` chaining branches. Bit-exact
+/// (result AND computron) against the oracle.
+pub fn stage3_language_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3-language.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -674,6 +686,38 @@ mod tests {
         .expect("oracle");
         assert_eq!(two.endor_result, "1", "b's cell is independent of a's");
         assert_eq!(two.oracle_result, "1");
+    }
+
+    #[test]
+    fn stage3_language_corpus_is_bit_exact_against_oracle() {
+        // The stage-3 child-1 acceptance bar: every language program —
+        // string literals/concatenation/comparison, `typeof`,
+        // increment/decrement/exponentiation, `this`, `let`/`const`
+        // closures, and `??`/`?.` chaining — agrees with C-XS on BOTH the
+        // completion value AND the computron count. Strings are chunk-backed
+        // CESU-8 values metered at XS's `fxNewChunk`/`fxConcatString` sites;
+        // the numeric and chaining opcodes are dispatch-metered; the closure
+        // reset/refresh cells meter their `fxNewSlot`.
+        let programs = stage3_language_corpus();
+        assert!(!programs.is_empty(), "stage-3 language corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3 language bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
     }
 
     #[test]

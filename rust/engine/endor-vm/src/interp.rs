@@ -1149,16 +1149,58 @@ impl Interp {
                     }
                     pc += op.size() as usize;
                 }
-                // `var_closure #k` / `set_closure #k`: write the shared cell
-                // from the stack top **without** popping (an explicit `pop`
-                // discards it when unwanted).
+                // `var_closure #k` / `set_closure #k` / `let_closure #k` /
+                // `const_closure #k`: write the shared cell from the stack
+                // top **without** popping (an explicit `pop` discards it when
+                // unwanted). XS's `let_closure`/`const_closure`
+                // (xsRun.c:LET_CLOSURE/CONST_CLOSURE) initialize a
+                // `let`/`const` binding's cell exactly as `set_closure`
+                // writes it; the const "already initialized" guard and the
+                // DONT_SET/DONT_ENUM flags do not fire in the covered
+                // single-assignment grammar and are metering-neutral.
                 XS_CODE_VAR_CLOSURE_1
                 | XS_CODE_VAR_CLOSURE_2
                 | XS_CODE_SET_CLOSURE_1
-                | XS_CODE_SET_CLOSURE_2 => {
+                | XS_CODE_SET_CLOSURE_2
+                | XS_CODE_LET_CLOSURE_1
+                | XS_CODE_LET_CLOSURE_2
+                | XS_CODE_CONST_CLOSURE_1
+                | XS_CODE_CONST_CLOSURE_2 => {
                     let k = self.closure_index(op, code, pc);
                     let top = *self.stack.last().unwrap_or(&Slot::undefined());
                     self.write_closure_cell(k, top);
+                    pc += op.size() as usize;
+                }
+                // `reset_closure #k` (xsRun.c:RESET_CLOSURE): point scope
+                // closure `k` at a **fresh** uninitialized cell
+                // (`fxNewSlot`, metered) — a loop body's per-iteration
+                // `let` binding gets a new cell each turn.
+                XS_CODE_RESET_CLOSURE_1 | XS_CODE_RESET_CLOSURE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    let cell = self.slots.alloc(Slot::uninitialized());
+                    self.meter.tick_slot_alloc();
+                    self.repoint_closure(k, cell);
+                    pc += op.size() as usize;
+                }
+                // `refresh_closure #k` (xsRun.c:REFRESH_CLOSURE): point scope
+                // closure `k` at a fresh cell (`fxNewSlot`, metered) that
+                // **copies** the old cell's flag/kind/value — a per-iteration
+                // `let` capture that snapshots the current binding.
+                XS_CODE_REFRESH_CLOSURE_1 | XS_CODE_REFRESH_CLOSURE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    let old = self.closure_cell(k);
+                    let src = old.map(|c| *self.slots.get(c)).unwrap_or_else(Slot::uninitialized);
+                    let mut fresh = Slot::of(src.kind, src.value);
+                    fresh.flag = src.flag;
+                    let cell = self.slots.alloc(fresh);
+                    self.meter.tick_slot_alloc();
+                    self.repoint_closure(k, cell);
+                    pc += op.size() as usize;
+                }
+                // `refresh_local #k` (xsRun.c:REFRESH_LOCAL): a no-op in the
+                // run (`variable = mxEnvironment - index` then nothing);
+                // dispatch-metered only.
+                XS_CODE_REFRESH_LOCAL_1 | XS_CODE_REFRESH_LOCAL_2 => {
                     pc += op.size() as usize;
                 }
                 // `pull_closure #k`: pop and write the shared cell.
@@ -1674,6 +1716,69 @@ impl Interp {
                         pc += size as usize;
                     }
                 }
+                // `branch_coalesce` (`??`, xsRun.c:BRANCH_COALESCE): if the
+                // stack top is undefined/null, **pop** it and fall through
+                // (evaluate the right operand); otherwise keep it and branch
+                // (skip the right operand). The kept-value branch is the
+                // `mxBranch`, so it meter-checks on a backward offset.
+                XS_CODE_BRANCH_COALESCE_1
+                | XS_CODE_BRANCH_COALESCE_2
+                | XS_CODE_BRANCH_COALESCE_4 => {
+                    let off = match op {
+                        XS_CODE_BRANCH_COALESCE_1 => s1!(1),
+                        XS_CODE_BRANCH_COALESCE_2 => {
+                            i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                        }
+                        _ => i32::from_le_bytes([
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
+                            code[pc + 4],
+                        ]),
+                    };
+                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
+                    if matches!(top.kind, Kind::Undefined | Kind::Null) {
+                        let _ = self.pop();
+                        pc += size as usize;
+                    } else {
+                        if off < 0 && self.check_meter() == MeterCheck::Abort {
+                            return Halt::MeterAbort;
+                        }
+                        pc = branch_target(pc, size, off);
+                    }
+                }
+                // `branch_chain` (`?.`, xsRun.c:BRANCH_CHAIN): if the stack
+                // top is undefined/null, normalize it to undefined and branch
+                // (short-circuit the optional chain); otherwise fall through
+                // (continue the chain), keeping the value.
+                XS_CODE_BRANCH_CHAIN_1
+                | XS_CODE_BRANCH_CHAIN_2
+                | XS_CODE_BRANCH_CHAIN_4 => {
+                    let off = match op {
+                        XS_CODE_BRANCH_CHAIN_1 => s1!(1),
+                        XS_CODE_BRANCH_CHAIN_2 => {
+                            i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                        }
+                        _ => i32::from_le_bytes([
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
+                            code[pc + 4],
+                        ]),
+                    };
+                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
+                    if matches!(top.kind, Kind::Undefined | Kind::Null) {
+                        if let Some(s) = self.stack.last_mut() {
+                            *s = Slot::undefined();
+                        }
+                        if off < 0 && self.check_meter() == MeterCheck::Abort {
+                            return Halt::MeterAbort;
+                        }
+                        pc = branch_target(pc, size, off);
+                    } else {
+                        pc += size as usize;
+                    }
+                }
 
                 // ---- result / return --------------------------------
                 XS_CODE_SET_RESULT => {
@@ -2022,6 +2127,17 @@ impl Interp {
         match (s.kind, s.value) {
             (Kind::Closure, Payload::Reference(cell)) => Some(cell),
             _ => None,
+        }
+    }
+
+    /// Point closure scope slot `k` at a different heap cell (XS's
+    /// `slot->value.closure = variable`), preserving the slot's `Closure`
+    /// kind and binding id. Used by `reset_closure`/`refresh_closure` to
+    /// give a per-iteration `let` binding a fresh cell.
+    fn repoint_closure(&mut self, k: usize, cell: crate::value::SlotIndex) {
+        if let Some(i) = self.local_index(k) {
+            self.locals[i].kind = Kind::Closure;
+            self.locals[i].value = Payload::Reference(cell);
         }
     }
 
