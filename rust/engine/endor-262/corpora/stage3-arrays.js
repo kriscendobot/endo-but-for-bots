@@ -297,3 +297,8 @@ var a=[1,2,3,4,5]; a.splice(2)
 [1,[2,[3,4]]].flat(2).join()
 [[1],[2]].flat().length
 [1,2,3,4].flat().length
+[1,2,3].flatMap(function(x){return x*2}).length
+[1,2,3].flatMap(function(x){return [x,x]}).length
+[1,2].flatMap(function(x){return [x]}).length
+[1,2,3].flatMap(function(x){return [x,x]}).join()
+[5].flatMap(function(x){return [x,x,x]}).length

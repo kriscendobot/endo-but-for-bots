@@ -366,6 +366,10 @@ pub const ARRAY_SPLICE_FRAME_METERING: u64 = 377344;
 pub const ARRAY_FLAT_FRAME_METERING: u64 = 377344;
 pub const ARRAY_FLAT_PER_LEAF_METERING: u64 = 9 << 14;
 pub const ARRAY_FLAT_PER_ARRAY_METERING: u64 = 11 << 14;
+/// The per-source-element callback overhead of `flatMap` (`fxCallThisItem` in
+/// `flatAux`'s function branch), beyond the callback body and the result
+/// flattening (which reuses the `flat` constants). Calibrated against the pin.
+pub const ARRAY_FLATMAP_CALLBACK_METERING: u64 = 6 << 14;
 /// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
 /// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
 /// callback body's own metering. Calibrated against the pin.
@@ -637,6 +641,9 @@ pub enum NativeMethod {
     /// `Array.prototype.flat([depth])` (`fx_Array_prototype_flat`): a new array
     /// with sub-array elements flattened to `depth` (default 1).
     ArrayFlat,
+    /// `Array.prototype.flatMap(callback[, thisArg])`
+    /// (`fx_Array_prototype_flatMap`): map then flatten by one level.
+    ArrayFlatMap,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1292,6 +1299,7 @@ impl Interp {
             ("toReversed", NativeMethod::ArrayToReversed),
             ("splice", NativeMethod::ArraySplice),
             ("flat", NativeMethod::ArrayFlat),
+            ("flatMap", NativeMethod::ArrayFlatMap),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -5103,6 +5111,61 @@ impl Interp {
                 self.meter.tick_raw(ARRAY_FLAT_FRAME_METERING);
                 let mut out: Vec<Slot> = Vec::new();
                 self.flat_into(inst, length, depth, &mut out);
+                let result = self.new_array_unmetered();
+                let total = out.len() as u32;
+                {
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, s) in out.into_iter().enumerate() {
+                        a.items.insert(i as u32, Slot::of(s.kind, s.value));
+                    }
+                    a.length = total;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.flatMap(callback[, thisArg])` — call
+            // `callback(item, index, array)` per element, then flatten the
+            // results by one level. Re-entrant (uses `run_callback`); the
+            // result flattening reuses `flat`'s per-leaf/per-array constants,
+            // plus a per-source callback overhead.
+            NativeMethod::ArrayFlatMap => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("flatMap:non-dense-array")),
+                };
+                let callback = arg0;
+                let this_arg = self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined);
+                let length = self.arrays[&inst].length;
+                self.meter.tick_raw(ARRAY_FLAT_FRAME_METERING);
+                let mut out: Vec<Slot> = Vec::new();
+                for i in 0..length {
+                    let item = self.arrays[&inst].items.get(&i).copied();
+                    if let Some(item) = item {
+                        self.meter.tick_raw(ARRAY_FLATMAP_CALLBACK_METERING);
+                        let cb_args = [item, Slot::integer(i as i32), this];
+                        let r = self.run_callback(code, callback, this_arg, &cb_args)?;
+                        // Flatten the result by one level.
+                        let is_array = matches!(r.value, Payload::Reference(x) if self.arrays.contains_key(&x));
+                        if is_array {
+                            let sub = match r.value {
+                                Payload::Reference(x) => x,
+                                _ => unreachable!(),
+                            };
+                            self.meter.tick_raw(ARRAY_FLAT_PER_ARRAY_METERING);
+                            let sub_len = self.arrays[&sub].length;
+                            for k in 0..sub_len {
+                                if let Some(e) = self.arrays[&sub].items.get(&k).copied() {
+                                    self.meter.tick_raw(ARRAY_FLAT_PER_LEAF_METERING);
+                                    self.meter.tick_raw(self.array_item_grow_metering(out.len() as u64));
+                                    out.push(e);
+                                }
+                            }
+                        } else {
+                            self.meter.tick_raw(ARRAY_FLAT_PER_LEAF_METERING);
+                            self.meter.tick_raw(self.array_item_grow_metering(out.len() as u64));
+                            out.push(r);
+                        }
+                    }
+                }
                 let result = self.new_array_unmetered();
                 let total = out.len() as u32;
                 {

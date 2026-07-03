@@ -535,7 +535,7 @@ pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
     let thr = small_int(&mut b);
-    match b.choice(11) {
+    match b.choice(12) {
         // forEach: accumulate the elements with an overflow-safe operator.
         0 => {
             let op = ["+", "-", "*"][b.choice(3) as usize];
@@ -572,7 +572,15 @@ pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
             small_int(&mut b)
         ),
         // findLast over a threshold predicate.
-        _ => format!("{}.findLast(function(x){{return x<{}}})", lit, thr),
+        10 => format!("{}.findLast(function(x){{return x<{}}})", lit, thr),
+        // flatMap: return a small array per element, flattened + joined.
+        _ => {
+            if b.choice(2) == 0 {
+                format!("{}.flatMap(function(x){{return [x,x]}}).join()", lit)
+            } else {
+                format!("{}.flatMap(function(x){{return x+{}}}).join()", lit, thr)
+            }
+        }
     }
 }
 
