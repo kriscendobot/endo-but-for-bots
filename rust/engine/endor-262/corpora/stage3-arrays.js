@@ -280,3 +280,12 @@ var s=0; [1,2,3].map(function(x){return x*2}).forEach(function(y){s=s+y}); s
 [5].toReversed()[0]
 [].toReversed().length
 var a=[1,2,3]; a.toReversed(); a
+var a=[1,2,3,4,5]; a.splice(1,2)
+var a=[1,2,3,4,5]; a.splice(1,2); a.join()
+var a=[1,2,3]; a.splice(1,0,9); a.join()
+var a=[1,2,3]; a.splice(1,1,9,10); a.join()
+var a=[1,2,3]; a.splice(1); a.join()
+var a=[1,2,3]; a.splice(0,0); a.join()
+var a=[1,2,3,4]; a.splice(1,2,7,8,9); a.join()
+var a=[1,2,3]; a.splice(0,3); a.join()
+var a=[1,2,3,4,5]; a.splice(2)

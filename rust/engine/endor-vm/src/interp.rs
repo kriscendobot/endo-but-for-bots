@@ -353,6 +353,10 @@ pub const ARRAY_WITH_PER_ELEM_METERING: u64 = 10 << 14;
 /// `Array.prototype.toReversed` frame cost (the same copy loop as `with`, one
 /// code unit more of setup). Measured against the pin as 131584.
 pub const ARRAY_TOREVERSED_FRAME_METERING: u64 = 131584;
+/// `Array.prototype.splice` frame cost (`fxCreateArraySpecies` + host frame),
+/// beyond the modeled result chunk, tail-shift, per-item, and per-`mxMeterSome`
+/// costs. Calibrated against the pin.
+pub const ARRAY_SPLICE_FRAME_METERING: u64 = 377344;
 /// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
 /// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
 /// callback body's own metering. Calibrated against the pin.
@@ -617,6 +621,10 @@ pub enum NativeMethod {
     /// `Array.prototype.toReversed()` (`fx_Array_prototype_toReversed`): a new
     /// array with the receiver's elements reversed (non-mutating).
     ArrayToReversed,
+    /// `Array.prototype.splice(start[, deleteCount, ...items])`
+    /// (`fx_Array_prototype_splice`): remove `deleteCount` elements at `start`
+    /// and insert `items`, returning a new array of the removed elements.
+    ArraySplice,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1270,6 +1278,7 @@ impl Interp {
             ("findLast", NativeMethod::ArrayFindLast),
             ("findLastIndex", NativeMethod::ArrayFindLastIndex),
             ("toReversed", NativeMethod::ArrayToReversed),
+            ("splice", NativeMethod::ArraySplice),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -4971,6 +4980,88 @@ impl Interp {
                         a.items.insert(to as u32, Slot::of(s.kind, s.value));
                     }
                     a.length = length;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Array.prototype.splice(start[, deleteCount, ...items])` — dense
+            // fast path. Remove `deleteCount` elements at `start` and insert
+            // `items`, returning a new array of the removed elements. Metering
+            // models the result chunk + `mxMeterSome(deletions*10 + 4)`, the
+            // tail shift + array resize, `mxMeterSome(5)` per inserted item, and
+            // a closing `mxMeterSome(4)`, plus a frame constant.
+            NativeMethod::ArraySplice => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("splice:non-dense-array")),
+                };
+                let length = self.arrays[&inst].length;
+                let start = self.arg_to_index(base, 0, 0, length);
+                let (insertions, deletions): (u32, u32) = if argc == 0 {
+                    (0, 0)
+                } else if argc == 1 {
+                    (0, length - start)
+                } else {
+                    let ins = (argc - 2) as u32;
+                    // deleteCount clamped to [0, length - start].
+                    let dc = match numeric_of(&self.stack.get(base + 4 + 1).copied().unwrap_or_else(Slot::undefined)) {
+                        Some(n) if n.is_nan() || n < 0.0 => 0,
+                        Some(n) if n > (length - start) as f64 => length - start,
+                        Some(n) => n.trunc() as u32,
+                        None => 0,
+                    };
+                    (ins, dc)
+                };
+                self.meter.tick_raw(ARRAY_SPLICE_FRAME_METERING);
+                // The removed-elements result array.
+                let result = self.new_array_unmetered();
+                if deletions > 0 {
+                    self.meter.tick_raw(self.array_chunk_size_metering(deletions));
+                }
+                self.meter.tick_builtin_some((deletions as u64) * 10);
+                self.meter.tick_builtin_some(4);
+                let tail_len = length - (start + deletions);
+                if insertions < deletions {
+                    self.meter.tick_builtin_some((tail_len as u64) * 10);
+                    self.meter.tick_builtin_some(((deletions - insertions) as u64) * 4);
+                    let new_len = length - (deletions - insertions);
+                    if new_len > 0 {
+                        self.meter.tick_raw(self.array_chunk_size_metering(new_len));
+                    }
+                } else if insertions > deletions {
+                    let new_len = length + (insertions - deletions);
+                    self.meter.tick_raw(self.array_chunk_size_metering(new_len));
+                    self.meter.tick_builtin_some((tail_len as u64) * 10);
+                }
+                for _ in 0..insertions {
+                    self.meter.tick_builtin_some(5);
+                }
+                self.meter.tick_builtin_some(4);
+                // Perform the splice on a dense element vector.
+                let cur: Vec<Slot> = (0..length)
+                    .map(|i| self.arrays[&inst].items.get(&i).copied().unwrap_or_else(Slot::undefined))
+                    .collect();
+                let removed: Vec<Slot> = cur[start as usize..(start + deletions) as usize].to_vec();
+                let inserted: Vec<Slot> = (0..insertions)
+                    .map(|k| self.stack.get(base + 4 + 2 + k as usize).copied().unwrap_or_else(Slot::undefined))
+                    .collect();
+                let mut rebuilt: Vec<Slot> = Vec::new();
+                rebuilt.extend_from_slice(&cur[..start as usize]);
+                rebuilt.extend(inserted);
+                rebuilt.extend_from_slice(&cur[(start + deletions) as usize..]);
+                {
+                    let a = self.arrays.get_mut(&inst).unwrap();
+                    a.items.clear();
+                    for (i, s) in rebuilt.into_iter().enumerate() {
+                        a.items.insert(i as u32, Slot::of(s.kind, s.value));
+                    }
+                    a.length = length - deletions + insertions;
+                }
+                {
+                    let a = self.arrays.get_mut(&result).unwrap();
+                    for (i, s) in removed.into_iter().enumerate() {
+                        a.items.insert(i as u32, Slot::of(s.kind, s.value));
+                    }
+                    a.length = deletions;
                 }
                 Slot::of(Kind::Reference, Payload::Reference(result))
             }
