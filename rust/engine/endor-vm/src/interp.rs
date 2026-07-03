@@ -18,19 +18,25 @@
 //! the bitwise ops, NaN-aware comparison, and the scope-slot addressing
 //! `mxEnvironment - index`.
 //!
-//! **Metering scope (stage-2 finding).** Computrons are bit-exact for
-//! programs that do not allocate at run time (the stage-1 corpus, pure
-//! expressions): the count is `dispatched + `[`PROGRAM_INVOCATION_COMPUTRONS`].
-//! A program that allocates during the run (a `var` environment, an
-//! object literal, a closure cell) also accrues slot- and
-//! chunk-allocation metering (`XS_SLOT_ALLOCATION_METERING` = 1<<8 per
-//! `fxNewSlot`, 1 per chunk byte) plus a built-in step per property set
-//! — see [`crate::meter`]. Reproducing those bit-exactly requires the
-//! allocation-faithful object heap, which is the remaining stage-2
-//! body; this interpreter computes the correct *results* for the scope/
-//! control-flow subset but does not yet reproduce their computron
-//! counts, so those programs are exercised as *result-agreement* tests,
-//! not added to the bit-exact corpus.
+//! **Allocation-faithful metering (stage 2b).** Computrons are bit-exact
+//! for programs that allocate at run time, not only for pure
+//! expressions. The meter accrues, in raw 16.16 units so they compose
+//! through the carry into computrons:
+//!  - **per dispatched opcode** `XS_CODE_METERING` (1<<16), as `mxBreak`;
+//!  - **the program overhead** once at `BEGIN_*`: the invocation baseline
+//!    ([`PROGRAM_INVOCATION_COMPUTRONS`] dispatches in the caller frame)
+//!    plus the eval-environment setup aggregate
+//!    ([`PROGRAM_ENV_SETUP_METERING`], measured against the pin);
+//!  - **per slot allocation** `XS_SLOT_ALLOCATION_METERING` (1<<8) where
+//!    `fxNewSlot` runs — a top-level `var` hoisted onto the global object
+//!    at `EVAL_ENVIRONMENT`, or a sloppy global created at
+//!    `SET_VARIABLE`;
+//!  - **per property store** one built-in step
+//!    `XS_BUILTIN_METERING` (1<<14, `mxMeterOne`) at `SET_VARIABLE`.
+//! The upshot is the "16920 per var" the 2a differential probe measured
+//! is now *reproduced* (536 allocation + 16384 store), and the stage-2
+//! var/loop corpus graduates into the bit-exact bar. `GET_VARIABLE`
+//! reads meter no built-in step, matching the oracle.
 //!
 //! No JIT, no code generation, no execution-count-dependent behavior
 //! (requirement 4): a straight `match` LLVM lowers to a jump table.
@@ -47,6 +53,32 @@ use crate::value::{number_to_ecma_string, to_int32, ChunkArena, Kind, Payload, S
 /// the eval harness (identical on both engines), asserted for every
 /// corpus entry by the differential harness.
 pub const PROGRAM_INVOCATION_COMPUTRONS: u64 = 3;
+
+/// The raw 16.16-fixed-point aggregate C-XS accrues building the
+/// program's environment instance and frame during program entry
+/// (`fxRunEvalEnvironment` and the frame setup: a bundle of `fxNewSlot`
+/// allocations for the program environment). Measured against the pin
+/// `48ee02d8cfe0`: every top-level program — even `1` — carries exactly
+/// this fractional remainder (`meterIndex & 0xFFFF == 17688` on a
+/// pure-expression program, verified via the oracle's raw meter). It is
+/// under one computron (< 1<<16), so the stage-1 pure-expression corpus
+/// never observes a carry from it (which is why stage 1 was bit-exact
+/// without modeling it); a program that also allocates at run time
+/// (§ Allocation-faithful metering) accrues on top of it and *does*
+/// carry, which is the stage-2b crux. Accrued once, at the `BEGIN_*`
+/// program-frame-entry opcode.
+pub const PROGRAM_ENV_SETUP_METERING: u64 = 17688;
+
+/// The raw 16.16 cost C-XS accrues materializing one new own property on
+/// the global object (`mxBehaviorSetProperty` creating a property:
+/// `fxNewSlot` for the property slot plus the property-table growth and
+/// interned-key `fxNewSlot`/`fxNewChunk`). Measured against the pin as
+/// 536 = one modeled property-slot allocation
+/// ([`crate::meter::SLOT_ALLOCATION_METERING`], 1<<8 = 256) plus
+/// [`GLOBAL_PROPERTY_CREATE_REMAINDER`]. Accrued where the property is
+/// first created: at `EVAL_ENVIRONMENT` for a hoisted `var`, or at the
+/// first `SET_VARIABLE` to an undeclared (sloppy-created) global.
+pub const GLOBAL_PROPERTY_CREATE_REMAINDER: u64 = 280;
 
 /// Why a run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,9 +149,24 @@ pub struct Interp {
     /// slot (XS aliases the frame locals through the environment
     /// instance; this map is the behavioral equivalent).
     id_map: std::collections::HashMap<u16, usize>,
-    /// Bindings a name resolves to when it is not a frame local: the
-    /// global object's properties, keyed by id.
-    globals: std::collections::HashMap<u16, Slot>,
+    /// The global object instance in the slot arena (§ Value and heap
+    /// model). Its `next` chains its property slots; a top-level `var`
+    /// hoists onto it (`fxRunEvalEnvironment` — top-level vars are global
+    /// properties), and a sloppy assignment to an undeclared name creates
+    /// one. This makes the global object a real arena object whose
+    /// properties are real arena slots, so their allocation meters
+    /// faithfully and the GC traces them.
+    global_obj: crate::value::SlotIndex,
+    /// `id -> property slot index` for the global object's own
+    /// properties, the fast index into [`Self::global_obj`]'s property
+    /// list. Presence marks that the property has been materialized (so
+    /// its creation cost is metered exactly once). For a name that is
+    /// also a declared frame local, the frame scope slot holds the
+    /// working value (XS aliases the two through a closure cell — the
+    /// closure-cell unification is child 2 of the stage-2b
+    /// orchestration); the global property slot is materialized for
+    /// allocation faithfulness and GC shape.
+    global_props: std::collections::HashMap<u16, crate::value::SlotIndex>,
     result: Slot,
     /// Whether the frame runs in strict mode (`BEGIN_STRICT*`). Recorded
     /// for the exception/`this` semantics that observe it; the covered
@@ -137,6 +184,12 @@ pub struct Interp {
     pub slots: SlotArena,
     /// The machine chunk heap (CESU-8 strings and later data).
     pub chunks: ChunkArena,
+    /// Count of bytecode opcodes dispatched, before the invocation
+    /// baseline — the raw dispatch count the differential harness reports
+    /// for isolating a metering divergence. Distinct from the meter's
+    /// computron count, which now also folds in the program overhead and
+    /// the allocation metering.
+    n_dispatched: u64,
 }
 
 impl Default for Interp {
@@ -147,17 +200,25 @@ impl Default for Interp {
 
 impl Interp {
     pub fn new() -> Interp {
+        let mut slots = SlotArena::new();
+        // The global object is a real arena instance with a null
+        // prototype (the intrinsic %Object.prototype% wiring lands with
+        // the intrinsics seam); its allocation predates metering, so it
+        // is not metered.
+        let global_obj = slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
         Interp {
             stack: Vec::with_capacity(64),
             locals: Vec::new(),
             id_map: std::collections::HashMap::new(),
-            globals: std::collections::HashMap::new(),
+            global_obj,
+            global_props: std::collections::HashMap::new(),
             result: Slot::undefined(),
             strict: false,
             meter: Meter::new(),
             meter_host: None,
-            slots: SlotArena::new(),
+            slots,
             chunks: ChunkArena::new(),
+            n_dispatched: 0,
         }
     }
 
@@ -167,15 +228,50 @@ impl Interp {
     /// [`crate::compartment::Compartment::evaluate`] to bind the
     /// compartment's own globals before running.
     pub fn define_global_id(&mut self, id: u16, value: Slot) {
-        self.globals.insert(id, value);
+        // Seeding a compartment global happens before the run, so it is
+        // not metered (it is not a guest allocation the meter counts).
+        self.create_global_property(id, (value.kind, value.value));
     }
 
-    /// Arm metering (`fxBeginMetering`): install a check `interval` and
-    /// the `host` callback the loop-closing check points consult with
-    /// `meterIndex >> 16` ("computrons"). This does **not** change the
-    /// index accumulation or the un-metered default — a fresh `Interp`
-    /// never checks — so the differential harness (which never arms) is
-    /// unaffected. On host refusal, the run halts with
+    /// Allocate a property slot for global key `id`, link it into the
+    /// global object's property list, and record it in [`Self::global_props`].
+    /// Does **not** meter — callers add the allocation metering at the
+    /// faithful opcode site. Returns the property slot index.
+    fn create_global_property(&mut self, id: u16, value: (Kind, Payload)) -> crate::value::SlotIndex {
+        let mut prop = Slot::property(id, value.1);
+        prop.kind = value.0;
+        // Insert at the head of the global object's property list.
+        let head = self.slots.get(self.global_obj).next;
+        prop.next = head;
+        let idx = self.slots.alloc(prop);
+        self.slots.get_mut(self.global_obj).next = idx;
+        self.global_props.insert(id, idx);
+        idx
+    }
+
+    /// Materialize a new own global property at run time (a hoisted
+    /// `var`, or a sloppy assignment creating a global), metering the
+    /// allocation exactly where `fxNewSlot`/`fxNewChunk` run:
+    /// [`crate::meter::SLOT_ALLOCATION_METERING`] for the property slot
+    /// plus the measured [`GLOBAL_PROPERTY_CREATE_REMAINDER`] (the
+    /// property-table growth and interned-key allocation not yet modeled
+    /// as individual slots) — 536 raw total against the pin. Initialized
+    /// undefined; a following `SET_VARIABLE` assigns and meters its own
+    /// built-in step.
+    fn materialize_global_property(&mut self, id: u16) -> crate::value::SlotIndex {
+        self.meter.tick_slot_alloc();
+        self.meter.tick_raw(GLOBAL_PROPERTY_CREATE_REMAINDER);
+        self.create_global_property(id, (Kind::Undefined, Payload::None))
+    }
+
+    /// Arm metering (`fxBeginMetering`): install a check `interval` — a
+    /// **computron** count, as the xsnap embedder passes — and the `host`
+    /// callback the loop-closing check points consult with
+    /// `meterIndex >> 16` ("computrons"). Per `fxBeginMetering` this
+    /// scales `interval <<16` and resets the index to 0 (finding 2), so
+    /// arm before running. The un-metered default is unchanged — a fresh
+    /// `Interp` never arms and never checks, so the differential harness
+    /// is unaffected. On host refusal, the run halts with
     /// [`Halt::MeterAbort`].
     pub fn arm_meter(&mut self, interval: u64, host: Box<dyn FnMut(u64) -> bool>) {
         self.meter.begin(interval);
@@ -190,6 +286,38 @@ impl Interp {
         match self.meter_host.as_mut() {
             Some(host) => self.meter.check(host),
             None => MeterCheck::Continue,
+        }
+    }
+
+    /// Accrue the program-frame + eval-environment setup overhead, once,
+    /// at the `BEGIN_*` program-entry opcode: the invocation baseline
+    /// ([`PROGRAM_INVOCATION_COMPUTRONS`] dispatches C-XS meters in the
+    /// caller frame before the captured bytecode) plus the measured
+    /// environment-setup aggregate ([`PROGRAM_ENV_SETUP_METERING`]). Both
+    /// are raw 16.16 units so they compose with the allocation metering
+    /// through the carry into computrons. Synthetic bytecode that never
+    /// executes a `BEGIN_*` (the meter unit tests) never accrues it.
+    #[inline]
+    fn tick_program_overhead(&mut self) {
+        self.meter
+            .tick_raw(PROGRAM_INVOCATION_COMPUTRONS * crate::meter::CODE_METERING);
+        self.meter.tick_raw(PROGRAM_ENV_SETUP_METERING);
+    }
+
+    /// `fxRunEvalEnvironment`'s global-hoist branch: each declared
+    /// top-level `var` (a `NEW_LOCAL` name) becomes an own property of
+    /// the global object. Materialize each not-yet-present name's global
+    /// property in declaration order, metering the allocation. Idempotent
+    /// across a re-declared name (its property is created once).
+    fn hoist_vars_to_global(&mut self) {
+        // Declaration order = the `locals` index the name maps to.
+        let mut names: Vec<(usize, u16)> =
+            self.id_map.iter().map(|(&id, &i)| (i, id)).collect();
+        names.sort_unstable();
+        for (_, id) in names {
+            if !self.global_props.contains_key(&id) {
+                self.materialize_global_property(id);
+            }
         }
     }
 
@@ -214,8 +342,14 @@ impl Interp {
         RunOutcome {
             completed,
             result,
-            computrons: self.meter.computrons() + PROGRAM_INVOCATION_COMPUTRONS,
-            dispatched: self.meter.computrons(),
+            // The meter now accrues everything C-XS's `meterIndex` does:
+            // the per-opcode dispatch metering, the program-frame +
+            // eval-environment setup overhead (at `BEGIN_*`, folding in
+            // the invocation baseline), and the run-time allocation
+            // metering (§ Allocation-faithful metering). Computrons are
+            // `meterIndex >> 16`, directly comparable with the oracle.
+            computrons: self.meter.computrons(),
+            dispatched: self.n_dispatched,
             halt,
         }
     }
@@ -257,6 +391,7 @@ impl Interp {
             // Every dispatched opcode meters one code unit (mxBreak /
             // the switch-path `meterIndex += XS_CODE_METERING`).
             self.meter.tick_code();
+            self.n_dispatched += 1;
 
             let size = op.size();
             // The resolved instruction length (fixed size, or the
@@ -293,6 +428,7 @@ impl Interp {
                     // realm global for the covered subset. Operand byte
                     // is the frame's scope count. No observable effect
                     // until `this`/method calls land.
+                    self.tick_program_overhead();
                     pc += size as usize;
                 }
                 XS_CODE_BEGIN_STRICT
@@ -300,6 +436,7 @@ impl Interp {
                 | XS_CODE_BEGIN_STRICT_DERIVED
                 | XS_CODE_BEGIN_STRICT_FIELD => {
                     self.strict = true;
+                    self.tick_program_overhead();
                     pc += size as usize;
                 }
                 // The environment opcodes establish/refer to the frame's
@@ -311,6 +448,14 @@ impl Interp {
                 // against — the frame scope when the id is a declared
                 // local, else the global object.
                 XS_CODE_EVAL_ENVIRONMENT | XS_CODE_PROGRAM_ENVIRONMENT => {
+                    // `fxRunEvalEnvironment`: a top-level program's `var`
+                    // bindings hoist onto the global object as own
+                    // properties (varEnvironment is null, so the global
+                    // branch runs). Materialize each declared name's
+                    // global property here — that is where XS allocates
+                    // it — metering the allocation faithfully. The frame
+                    // scope slot still holds the working value.
+                    self.hoist_vars_to_global();
                     pc += size as usize;
                 }
                 XS_CODE_EVAL_REFERENCE | XS_CODE_PROGRAM_REFERENCE => {
@@ -409,7 +554,22 @@ impl Interp {
                     // reference and leaves the assigned value).
                     let value = self.pop();
                     let _envref = self.pop();
+                    // A frame-local var writes its scope slot; an
+                    // undeclared name resolves to the global object,
+                    // creating the property (a sloppy global) if absent —
+                    // metered as one property creation exactly where
+                    // `mxBehaviorSetProperty` allocates it.
+                    if !self.id_map.contains_key(&name)
+                        && !self.global_props.contains_key(&name)
+                    {
+                        self.materialize_global_property(name);
+                    }
                     self.resolve_set(name, value);
+                    // The property store itself is one built-in step
+                    // (`mxMeterOne`, `XS_BUILTIN_METERING` = 1<<14),
+                    // metered on every `SET_VARIABLE` whether the property
+                    // pre-existed or was just created.
+                    self.meter.tick_builtin();
                     self.push(value);
                     pc += ilen;
                 }
@@ -678,11 +838,19 @@ impl Interp {
                     pc += size as usize;
                 }
                 XS_CODE_RETURN | XS_CODE_END => {
-                    // C-XS checks the meter at returns (the frame-pop
-                    // reaches its caller's `mxFirstCode`/`mxCheckMeter`).
-                    if self.check_meter() == MeterCheck::Abort {
-                        return Halt::MeterAbort;
-                    }
+                    // The top-level program frame's caller is the C caller
+                    // (the eval harness). Per the pin's `xsRun.c`
+                    // (1080-1092 RETURN; 1069-1078 END), C-XS runs **no**
+                    // meter check when the frame exits to a C caller — the
+                    // END path checks (via `mxFirstCode`) only when
+                    // resuming a *JS* caller, and RETURN never checks.
+                    // Checking here would let an armed endor abort a crank
+                    // C-XS completes — the abort-point-determinism fault
+                    // this program exists to prevent (stage-2a review
+                    // finding 1). The check therefore lives at the
+                    // `mxFirstCode` sites (call entry, return-into-JS,
+                    // catch resume) that arrive with the call/return frame
+                    // machinery (child 2), not at the exit-to-host END.
                     return Halt::Return;
                 }
 
@@ -731,7 +899,7 @@ impl Interp {
     }
 
     /// Resolve a name for reading: a frame local when declared (unless
-    /// uninitialized), else a global binding.
+    /// uninitialized), else the global object's property.
     fn resolve_get(&self, name: u16) -> Option<Slot> {
         if let Some(&i) = self.id_map.get(&name) {
             let s = self.locals[i];
@@ -740,19 +908,25 @@ impl Interp {
             } else {
                 Some(s)
             }
+        } else if let Some(&idx) = self.global_props.get(&name) {
+            let p = self.slots.get(idx);
+            Some(Slot::of(p.kind, p.value))
         } else {
-            self.globals.get(&name).copied()
+            None
         }
     }
 
-    /// Resolve a name for writing: a frame local when declared, else a
-    /// global binding (created if absent, as sloppy assignment does).
+    /// Resolve a name for writing: a frame local when declared, else the
+    /// global object's property slot (which must already exist — the
+    /// caller materializes it and meters the creation first).
     fn resolve_set(&mut self, name: u16, value: Slot) {
         if let Some(&i) = self.id_map.get(&name) {
             self.locals[i].kind = value.kind;
             self.locals[i].value = value.value;
-        } else {
-            self.globals.insert(name, value);
+        } else if let Some(&idx) = self.global_props.get(&name) {
+            let p = self.slots.get_mut(idx);
+            p.kind = value.kind;
+            p.value = value.value;
         }
     }
 
@@ -1016,14 +1190,21 @@ mod tests {
         // A tight infinite backward-`BRANCH_1` self-loop: `BRANCH_1 -2`
         // jumps to itself (target = pc + size(2) + (-2) = pc). It only
         // terminates because the armed meter refuses more computation.
+        // No `BEGIN_*` here, so the program-setup overhead is not
+        // accrued — this exercises the meter in isolation.
         let code = [b(Opcode::XS_CODE_BRANCH_1), 0xFE]; // -2
 
         // Record every computron value the host is shown; refuse at 5.
         let seen = Rc::new(RefCell::new(Vec::new()));
         let seen_cb = Rc::clone(&seen);
         let mut interp = Interp::new();
-        // interval 1 (raw fixed-point): the check fires every iteration,
-        // so the host sees computrons 1, 2, 3, ... one per dispatch.
+        // interval 1 computron (finding 2: `fxBeginMetering` scales it
+        // <<16). Each backward branch dispatches one opcode = one
+        // computron; `fxCheckMetering` fires when `meterIndex >
+        // meterCount` and then advances the window by the interval, so
+        // with a one-computron window and one-computron opcodes the host
+        // is consulted at computrons 2, 4, 6, ... — exactly C-XS's
+        // check cadence (the fire is one opcode after the window opens).
         interp.arm_meter(
             1,
             Box::new(move |computrons| {
@@ -1035,14 +1216,11 @@ mod tests {
 
         assert_eq!(out.halt, Halt::MeterAbort, "armed meter must abort the loop");
         assert!(!out.completed);
-        // Aborted on the 5th backward branch: 5 dispatched opcodes.
-        assert_eq!(out.dispatched, 5, "abort at the expected computron threshold");
-        assert_eq!(out.computrons, 5 + PROGRAM_INVOCATION_COMPUTRONS);
-        assert_eq!(
-            *seen.borrow(),
-            vec![1, 2, 3, 4, 5],
-            "host consulted once per backward branch until refusal"
-        );
+        // Consulted at 2, 4, 6; refuses at 6 (6 >= 5). Six dispatched
+        // backward branches; computrons = meterIndex >> 16 = 6.
+        assert_eq!(*seen.borrow(), vec![2, 4, 6], "host consulted on C-XS's cadence");
+        assert_eq!(out.dispatched, 6, "aborts on the branch that crosses the refusal");
+        assert_eq!(out.computrons, 6);
     }
 
     #[test]

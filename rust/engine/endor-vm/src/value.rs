@@ -54,6 +54,21 @@ pub enum Kind {
     /// String data living in the chunk arena (CESU-8, resolved
     /// question 4). Payload holds a `ChunkOffset`.
     String = 5,
+    /// An object instance living in the slot arena (XS's
+    /// `XS_INSTANCE_KIND`). The instance's own slot is the head of its
+    /// property list: `next` points to the first property slot (a
+    /// [`Kind::Property`]), or [`SlotIndex::NULL`] for a property-less
+    /// object. The payload's `Reference` names the instance's prototype
+    /// instance, or [`SlotIndex::NULL`] for a null prototype. This is the
+    /// allocation-faithful object heap the stage-2b design calls for:
+    /// the global object and every object literal is a real arena
+    /// instance whose properties are real arena slots.
+    Instance = 6,
+    /// A named own property of an instance (XS's property slot in the
+    /// `next`-linked property list). `id` is the property key (an
+    /// interned name id), `value` the property value, and `next` the
+    /// following property in the owner's list.
+    Property = 7,
     /// Reference to a heap instance (slot arena). Payload holds a
     /// `SlotIndex`.
     Reference = 10,
@@ -121,6 +136,21 @@ impl Slot {
     #[inline]
     pub fn uninitialized() -> Slot {
         Slot::of(Kind::Uninitialized, Payload::None)
+    }
+    /// An object instance whose prototype is `prototype` (or
+    /// [`SlotIndex::NULL`] for a null prototype) and whose property list
+    /// starts empty (`next == NULL`). Properties are appended by linking
+    /// [`Kind::Property`] slots through `next`.
+    #[inline]
+    pub fn instance(prototype: SlotIndex) -> Slot {
+        Slot::of(Kind::Instance, Payload::Reference(prototype))
+    }
+    /// A named own property slot: key `id`, value `value`, no successor.
+    #[inline]
+    pub fn property(id: u16, value: Payload) -> Slot {
+        let mut s = Slot::of(Kind::Property, value);
+        s.id = id;
+        s
     }
     #[inline]
     pub fn of(kind: Kind, value: Payload) -> Slot {

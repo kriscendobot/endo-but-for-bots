@@ -83,10 +83,18 @@ impl Meter {
         }
     }
 
-    /// `fxBeginMetering`: install an interval and arm the first check.
+    /// `fxBeginMetering` (`xsRun.c:4459`): install an interval and arm
+    /// the first check. C-XS scales the host's interval by `<<16`
+    /// (computrons to raw 16.16 units), resets `meterIndex` to 0, and
+    /// sets `meterCount = meterInterval = interval << 16`. `interval` is
+    /// therefore a **computron** count, matching the xsnap embedder API;
+    /// a caller that wants a raw-unit window must scale it itself
+    /// (stage-2a review finding 2).
     pub fn begin(&mut self, interval: u64) {
-        self.interval = interval;
-        self.count = interval;
+        let scaled = interval << 16;
+        self.interval = scaled;
+        self.count = scaled;
+        self.index = 0;
     }
 
     /// Reset the raw index to zero (the oracle shim does this after
@@ -137,6 +145,19 @@ impl Meter {
     #[inline]
     pub fn tick_chunk_alloc(&mut self, size: u64) {
         self.index += size * CHUNK_ALLOCATION_METERING;
+    }
+
+    /// Accrue `n` raw 16.16-fixed-point units directly. Used for the
+    /// program-frame + eval-environment setup aggregate C-XS meters
+    /// during program entry (a bundle of `fxNewSlot`/`fxNewChunk`
+    /// allocations building the program's environment instance and frame
+    /// that this stage models as a measured constant rather than
+    /// individually — see [`crate::interp`] § Allocation-faithful
+    /// metering), and by the callers that meter a property-creation slot
+    /// cluster.
+    #[inline]
+    pub fn tick_raw(&mut self, n: u64) {
+        self.index += n;
     }
 
     /// Raw fixed-point index (`the->meterIndex`).
@@ -203,14 +224,27 @@ mod tests {
     }
 
     #[test]
+    fn begin_scales_and_resets_like_fx_begin_metering() {
+        // `fxBeginMetering` (xsRun.c:4459) scales the host's computron
+        // interval `<<16` and resets the index (stage-2a review finding
+        // 2): begin(1) arms a one-computron window in raw units.
+        let mut m = Meter::new();
+        m.tick_code(); // dirty the index first, to prove begin resets it
+        m.begin(1);
+        assert_eq!(m.index, 0, "begin resets meterIndex to 0");
+        assert_eq!(m.interval, 1 << 16, "interval scaled to raw units");
+        assert_eq!(m.count, 1 << 16, "count armed at interval<<16");
+    }
+
+    #[test]
     fn check_wrap_guard_restarts_window() {
         // Force `meterCount` to wrap: with the index already past the
         // count so the check fires, an interval large enough that
         // `index + interval` overflows u64 must reset the window to
         // `interval` rather than leave `count` below `index`.
         let mut m = Meter::new();
-        m.begin(4);
         m.index = 8; // index(8) > count(4): the check fires
+        m.count = 4;
         m.interval = u64::MAX - 2; // advancing count by this overflows u64
         let out = m.check(&mut |_| true);
         assert_eq!(out, MeterCheck::Continue);
@@ -221,8 +255,9 @@ mod tests {
     #[test]
     fn check_advances_window_without_wrap() {
         let mut m = Meter::new();
-        m.begin(2);
         m.index = 3; // > count(2): fires
+        m.count = 2;
+        m.interval = 2;
         let out = m.check(&mut |_| true);
         assert_eq!(out, MeterCheck::Continue);
         assert_eq!(m.count, 5, "count advances by interval: 3 + 2");

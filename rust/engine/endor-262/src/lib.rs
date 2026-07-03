@@ -136,17 +136,16 @@ pub fn stage1_corpus() -> Vec<String> {
     all
 }
 
-/// The stage-2 **behavioral** corpus: programs that exercise the
-/// program frame, scope slots, `var` bindings, and backward-branch
-/// control flow (loops) over compiler-emitted bytecode. These run
-/// bit-exactly on *results* but not yet on *computrons*: once a program
-/// allocates at run time (a `var` environment), its computron count
-/// depends on the engine's slot/chunk allocations, which reproducing
-/// bit-exactly requires the allocation-faithful object heap (the
-/// remaining stage-2 body — see `endor_vm::interp` § Metering scope).
-/// So they are asserted for *result agreement*, and are deliberately
-/// **not** in [`stage1_corpus`], which must stay bit-exact.
-pub fn stage2_behavioral_corpus() -> Vec<String> {
+/// The stage-2 corpus: programs that exercise the program frame, scope
+/// slots, `var` bindings, backward-branch control flow (loops), and
+/// object/property literals over compiler-emitted bytecode. As of stage
+/// 2b these are **bit-exact** (result AND computron) against the oracle:
+/// the allocation-faithful object heap reproduces the slot/chunk
+/// allocation metering a run-time-allocating program accrues
+/// (`endor_vm::interp` § Allocation-faithful metering), so the "16920
+/// per var" the differential probe measured in 2a is now reproduced.
+/// They **graduate** into the bit-exact bar alongside [`stage1_corpus`].
+pub fn stage2_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage2-behavioral.js"))
 }
 
@@ -280,33 +279,33 @@ mod tests {
     }
 
     #[test]
-    fn stage2_behavioral_corpus_agrees_on_results() {
-        // The frame/scope/loop interpreter must compute the SAME
-        // completion value as C-XS for every program that exercises
-        // var bindings and backward-branch control flow. (Computron
-        // parity for these awaits the allocation-faithful heap; asserted
-        // separately so the result-correctness of the frame machine is
-        // independently verified.)
-        let programs = stage2_behavioral_corpus();
-        assert!(!programs.is_empty(), "behavioral corpus must be non-empty");
-        let mut agreed = 0usize;
-        for p in &programs {
-            let r = dual_run(p).expect("oracle machine starts");
-            assert!(
-                matches!(r.agreement, Agreement::BothComplete),
-                "both engines complete {:?}: agreement={:?} endor_halt={:?}",
-                p,
-                r.agreement,
-                r.endor_halt,
-            );
-            assert!(
-                r.result_agrees,
-                "result mismatch on {:?}: oracle={:?} endor={:?}",
-                p, r.oracle_result, r.endor_result,
-            );
-            agreed += 1;
+    fn stage2_corpus_is_bit_exact_against_oracle() {
+        // The graduation bar (stage 2b): every stage-2 program — var
+        // bindings, loops, object/property literals — must agree with
+        // C-XS on BOTH the completion value AND the computron count. The
+        // computron half is what the allocation-faithful object heap
+        // buys: a run-time-allocating program's count depends on its
+        // exact slot/chunk allocations, which endor now reproduces
+        // (the "16920 per var" is reproduced, not measured).
+        let programs = stage2_corpus();
+        assert!(!programs.is_empty(), "stage-2 corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={})\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.endor_halt, r.bytecode,
+                );
+            }
         }
-        assert_eq!(agreed, programs.len(), "all behavioral programs agree on results");
+        assert!(
+            summary.met_bar(),
+            "stage-2 bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
     }
 
     #[test]

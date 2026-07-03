@@ -71,8 +71,9 @@ fn main() {
         match endor_oracle::run(&src) {
             Some(o) => {
                 println!(
-                    "SRC {:?}\n  ok={} result={:?} comp={} nbytes={}",
-                    src, o.completed, o.result, o.computrons, o.bytecode.len()
+                    "SRC {:?}\n  ok={} result={:?} comp={} raw={} frac={} nbytes={}",
+                    src, o.completed, o.result, o.computrons, o.meter_raw,
+                    o.meter_raw as i64 - (o.computrons as i64) * 65536, o.bytecode.len()
                 );
                 print!("{}", disasm(&o.bytecode));
             }

@@ -1,8 +1,10 @@
-// Stage-2 BEHAVIORAL corpus (result agreement, not yet computron-exact).
-// Exercises the program frame, scope slots, var bindings, and
+// Stage-2 corpus: program frame, scope slots, var bindings, and
 // backward-branch control flow (loops) over compiler-emitted bytecode.
-// See endor_262::stage2_behavioral_corpus for why these are result-only.
-// One program per line; the last expression is the completion value.
+// As of stage 2b these are BIT-EXACT (result AND computron) against the
+// C-XS oracle: the allocation-faithful object heap reproduces the
+// slot/chunk allocation metering (the "16920 per var"). See
+// endor_262::stage2_corpus. One program per line; the last expression is
+// the completion value.
 
 // --- var bindings and scope ---
 var x = 5; x + 1
