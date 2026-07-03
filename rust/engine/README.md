@@ -147,7 +147,39 @@ remaining work — **`JSON.parse`** and **structured `JSON.stringify`** (the
 object/array serializer is implemented and its RESULT is correct, but the
 per-node allocation metering — the keys instance, per-key strings, and
 recursive property frames — is not yet modeled to a clean constant, so it
-self-names rather than ship a computron divergence). The stage-3 built-ins reach
+self-names rather than ship a computron divergence). The stage-3
+**keyed-collections** child binds `Map`/`Set`/`WeakMap`/`WeakSet` as intrinsics
+(modeled in a per-instance side table like the exotic Array): construction, the
+core `set`/`add`/`get`/`has`/`delete`/`size` methods, and — the stage-3b
+remainder — the **iteration protocol** (`forEach`, `entries`/`keys`/`values`,
+and `for-of` / spread over a Map or Set), all bit-exact (result AND computron)
+against the pin. Metering is purely allocation-driven (xsMapSet.c calls no
+`mxMeter`): the construct path's four `fxNewSlot`s + initial
+`fxNewChunk(mxTableMinLength*8)`; the per-linked-slot residual (`1<<15` per entry
+slot beyond the first) an inserting `fxSetEntry`/`fxSetWeakEntry` charges; the
+`fxResizeEntries` rehash chunk on XS's exact power-of-two table boundaries;
+SameValueZero key equality (`NaN` equals `NaN`, `-0` normalized to `+0`). The
+stage-3b iteration adds the Map/Set Iterator (`fxNewMap/SetIteratorInstance`,
+reusing the array-iterator dispatch) whose creation cluster is calibrated
+computron-exact, an entries-yield's `fxConstructArrayEntry` pair (a `2<<14` frame
+residual over the modeled two-element chunk; keys/values yields carry no
+residual), and `forEach`'s per-entry call frame (`2<<16` per live entry, over the
+callback body the nested dispatch meters; a Map's native frame is 8 raw units
+over a Set's — Map walks a key→value slot pair per entry, Set a single slot). The
+four collection dual-run sections agree bit-exactly with **zero divergence**,
+every skip named:
+`built-ins/Map total=144 covered=22 divergent=0 skipped=122`,
+`built-ins/Set total=188 covered=34 divergent=0 skipped=154`,
+`built-ins/WeakMap total=88 covered=11 divergent=0 skipped=77`,
+`built-ins/WeakSet total=75 covered=9 divergent=0 skipped=66`
+(and `MapIteratorPrototype`/`SetIteratorPrototype` `divergent=0`, covered=0 —
+their tests exercise `Symbol.toStringTag` / direct-prototype corners endor
+honestly skips). The deferred collection paths are honest **named skips**: the
+copy-constructor iterable argument (`new Map([[k,v]])`), `clear`, a WeakMap/
+WeakSet primitive key (a TypeError in XS), mid-iteration structural mutation, and
+the ES2025 Set combinators (`union`/`intersection`/…) — each self-names
+`Halt::Unsupported` rather than resolve to a wrong value or a computron
+divergence. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic

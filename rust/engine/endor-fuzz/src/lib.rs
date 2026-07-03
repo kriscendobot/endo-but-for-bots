@@ -705,6 +705,79 @@ pub fn gen_stage3_reentrant_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for the **stage-3b keyed-collection iteration**
+/// surface — Map/Set `forEach`, `entries`/`keys`/`values` iterators, and
+/// `for-of` / spread over a Map or Set, every emitted program bit-exact (result
+/// AND computron) against the pin. Builds a small Map or Set of distinct small
+/// integer entries (so the covered `SameValueZero` / allocation path is
+/// exercised without a mid-iteration mutation), then draws one observation:
+/// a `forEach` accumulation, a stepped iterator, a `for-of` reduce/count, or a
+/// spread length. Rides [`differential_check_with_symbols`] (the collection
+/// intrinsics relink by name).
+pub fn gen_stage3_collections_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let is_set = b.choice(2) == 0;
+    let n = (b.next() % 5) as usize; // 0..=4 distinct entries
+    // Distinct integer keys 0..n so no in-place update perturbs the count; a
+    // Map pairs each key with a small value.
+    let ctor = if is_set { "Set" } else { "Map" };
+    let mut build = format!("var c=new {}();", ctor);
+    for i in 0..n {
+        if is_set {
+            build.push_str(&format!(" c.add({});", i));
+        } else {
+            build.push_str(&format!(" c.set({},{});", i, small_int(&mut b)));
+        }
+    }
+    match b.choice(5) {
+        // forEach: accumulate the values with an overflow-safe operator.
+        0 => {
+            let op = small_op(&mut b);
+            let seed = small_int(&mut b);
+            format!("{} var s={}; c.forEach(function(v){{s=s{}v;}}); s", build, seed, op)
+        }
+        // forEach: count the entries.
+        1 => format!("{} var k=0; c.forEach(function(){{k=k+1;}}); k", build),
+        // A stepped iterator (values/keys/entries), observing value or done.
+        2 => {
+            let method = ["values", "keys", "entries"][b.choice(3) as usize];
+            let advances = 1 + (b.next() as usize % (n + 2));
+            let entries = method == "entries";
+            let mut s = format!("{} var it=c.{}();", build, method);
+            for i in 0..advances {
+                if i + 1 < advances {
+                    s.push_str(" it.next();");
+                } else if entries {
+                    // The entries yield is a `[k,v]` (Set: `[v,v]`) pair; read
+                    // an element or `done`.
+                    if b.choice(2) == 0 && n > 0 {
+                        s.push_str(" var r=it.next(); r.done?-1:r.value[0]");
+                    } else {
+                        s.push_str(" it.next().done");
+                    }
+                } else if b.choice(2) == 0 {
+                    s.push_str(" it.next().value");
+                } else {
+                    s.push_str(" it.next().done");
+                }
+            }
+            s
+        }
+        // for-of: reduce or count (a Map yields `[k,v]` pairs).
+        3 => {
+            if is_set {
+                let op = small_op(&mut b);
+                let seed = small_int(&mut b);
+                format!("{} var s={}; for (var x of c) s=s{}x; s", build, seed, op)
+            } else {
+                format!("{} var s=0; for (var e of c) s=s+e[0]+e[1]; s", build)
+            }
+        }
+        // spread over the collection, observing the resulting array's length.
+        _ => format!("{} var a=[...c]; a.length", build),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -1243,6 +1316,44 @@ mod tests {
         assert!(distinct.len() > 20, "re-entrant sweep too uniform: {} distinct", distinct.len());
         for (i, s) in shapes.iter().enumerate() {
             assert!(*s, "re-entrant shape {} never generated", i);
+        }
+    }
+
+    #[test]
+    fn generated_stage3_collections_programs_agree_bit_exact() {
+        // Map/Set forEach, entries/keys/values iterators, for-of, and spread —
+        // the stage-3b keyed-collection iteration surface, bit-exact (result
+        // AND computron). Sweep a spread of seeds over Map vs Set, a range of
+        // entry counts (including empty), and every observation shape.
+        let mut checked = 0;
+        let mut kinds = [false; 2]; // Set, Map
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(29))
+                        .wrapping_add((seed as u8).wrapping_mul(4)),
+                );
+            }
+            let prog = gen_stage3_collections_program(&buf);
+            distinct.insert(prog.clone());
+            if prog.contains("new Set") {
+                kinds[0] = true;
+            } else {
+                kinds[1] = true;
+            }
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3 collections differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 20, "collections sweep too uniform: {} distinct", distinct.len());
+        for (i, k) in kinds.iter().enumerate() {
+            assert!(*k, "collections kind {} never generated", i);
         }
     }
 
