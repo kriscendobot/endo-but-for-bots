@@ -302,6 +302,16 @@ pub const ARRAY_POP_FRAME_METERING: u64 = 0;
 /// (scanning stops at the first strict-equal match).
 pub const ARRAY_METHOD_INDEXOF_FRAME_METERING: u64 = 2 << 14;
 pub const ARRAY_INDEXOF_PER_STEP: u64 = 5 << 14;
+/// `Array.prototype.includes` frame + per-element scan step. Calibrated
+/// against the pin `48ee02d8cfe0` via the completed-call raw-gap.
+pub const ARRAY_INCLUDES_FRAME_METERING: u64 = 2 << 14;
+pub const ARRAY_INCLUDES_PER_STEP: u64 = 3 << 14;
+/// `Array.prototype.lastIndexOf` frame + per-element (backward) scan step.
+pub const ARRAY_LASTINDEXOF_FRAME_METERING: u64 = 2 << 14;
+pub const ARRAY_LASTINDEXOF_PER_STEP: u64 = 5 << 14;
+/// `Array.prototype.fill` frame cost (the full-fill chunk realloc and the
+/// per-element `mxMeterSome(5)` are metered separately). Calibrated.
+pub const ARRAY_FILL_FRAME_METERING: u64 = 2 << 14;
 
 /// The constant raw 16.16 cost of an `Array(...)` / `new Array(...)` call
 /// beyond the element item-chunk allocation: the native host frame,
@@ -444,6 +454,22 @@ pub enum NativeMethod {
     /// (`fx_Array_prototype_join`): the elements stringified and joined by
     /// `sep` (default `","`), holes/`undefined`/`null` contributing empty.
     ArrayJoin,
+    /// `Array.prototype.includes(value[, from])` — dense fast path
+    /// (`fx_Array_prototype_includes`): whether `value` is an element (by
+    /// SameValueZero), scanning from `from`.
+    ArrayIncludes,
+    /// `Array.prototype.lastIndexOf(value[, from])` — dense fast path: the last
+    /// index at which `value` is found (strict equality) scanning backward, or
+    /// `-1`.
+    ArrayLastIndexOf,
+    /// `Array.prototype.fill(value[, start[, end]])` — dense fast path
+    /// (`fx_Array_prototype_fill`): set `[start, end)` to `value`, returning
+    /// the array.
+    ArrayFill,
+    /// `Array.prototype.reverse()` — dense fast path
+    /// (`fx_Array_prototype_reverse`): reverse the elements in place, returning
+    /// the array.
+    ArrayReverse,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1071,6 +1097,10 @@ impl Interp {
             ("values", NativeMethod::ArrayValues),
             ("keys", NativeMethod::ArrayKeys),
             ("entries", NativeMethod::ArrayEntries),
+            ("includes", NativeMethod::ArrayIncludes),
+            ("lastIndexOf", NativeMethod::ArrayLastIndexOf),
+            ("fill", NativeMethod::ArrayFill),
+            ("reverse", NativeMethod::ArrayReverse),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -3946,6 +3976,99 @@ impl Interp {
                 self.meter.tick_raw(steps * ARRAY_INDEXOF_PER_STEP);
                 Slot::integer(found)
             }
+            // `Array.prototype.includes(value[, from])` — dense fast path. Scan
+            // from `from` (default 0) by SameValueZero; `true` on the first
+            // match, else `false`. Metered like `indexOf` (a frame constant +
+            // per-element scan step), calibrated against the pin.
+            NativeMethod::ArrayIncludes => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("includes:non-dense-array")),
+                };
+                let target = arg0;
+                let from = self.arg_to_index(base, 1, 0, self.arrays[&inst].length);
+                let (found, steps) = {
+                    let a = &self.arrays[&inst];
+                    let mut found = false;
+                    let mut steps: u64 = 0;
+                    for i in from..a.length {
+                        steps += 1;
+                        let item = a.items.get(&i).copied().unwrap_or_else(Slot::undefined);
+                        if self.same_value_zero(&item, &target) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    (found, steps)
+                };
+                self.meter.tick_raw(ARRAY_INCLUDES_FRAME_METERING);
+                self.meter.tick_raw(steps * ARRAY_INCLUDES_PER_STEP);
+                Slot::boolean(found)
+            }
+            // `Array.prototype.lastIndexOf(value[, from])` — dense fast path.
+            // Scan backward from the end by strict equality; the last matching
+            // index, or `-1`.
+            NativeMethod::ArrayLastIndexOf => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("lastIndexOf:non-dense-array")),
+                };
+                let target = arg0;
+                let length = self.arrays[&inst].length;
+                let (found, steps) = {
+                    let a = &self.arrays[&inst];
+                    let mut found: i32 = -1;
+                    let mut steps: u64 = 0;
+                    let mut i = length;
+                    while i > 0 {
+                        i -= 1;
+                        steps += 1;
+                        if let Some(item) = a.items.get(&i) {
+                            if self.strict_equal(item, &target) {
+                                found = i as i32;
+                                break;
+                            }
+                        }
+                    }
+                    (found, steps)
+                };
+                self.meter.tick_raw(ARRAY_LASTINDEXOF_FRAME_METERING);
+                self.meter.tick_raw(steps * ARRAY_LASTINDEXOF_PER_STEP);
+                Slot::integer(found)
+            }
+            // `Array.prototype.fill(value[, start[, end]])` — dense fast path.
+            // Set `[start, end)` to `value` and return the array. A full fill
+            // (`start == 0 && end == length`) reallocs the item chunk
+            // (`fxSetIndexSize`); each written element meters `mxMeterSome(5)`.
+            NativeMethod::ArrayFill => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("fill:non-dense-array")),
+                };
+                let value = if argc > 0 { arg0 } else { Slot::undefined() };
+                let length = self.arrays[&inst].length;
+                let start = self.arg_to_index(base, 1, 0, length);
+                let end = self.arg_to_index(base, 2, length, length);
+                self.meter.tick_raw(ARRAY_FILL_FRAME_METERING);
+                // A full fill runs `fxSetIndexSize(length)`, but for an
+                // already-dense array the chunk is already that size, so the
+                // resize is a no-op and meters nothing.
+                let _ = (start, end, length);
+                let mut v = value;
+                v.id = 0;
+                v.next = crate::value::SlotIndex::NULL;
+                for i in start..end {
+                    self.arrays.get_mut(&inst).unwrap().items.insert(i, v);
+                    self.meter.tick_builtin_some(5);
+                }
+                this
+            }
+            // `Array.prototype.reverse()` — reverses via the generic
+            // `mxHasAt`/`mxGetAt`/`mxSetAt` path, whose per-swap metering endor
+            // does not yet model; honest skip.
+            NativeMethod::ArrayReverse => {
+                return Err(Halt::Unsupported("reverse:at-metering"));
+            }
             // `Array.prototype.join([sep])` — the per-element `ToString`
             // allocation metering (each number element renders through
             // `fxNumberToString` into its own chunk) is a later increment, so
@@ -4259,6 +4382,49 @@ impl Interp {
                 self.str_content(x) == self.str_content(y)
             }
             _ => strict_equals(a, b),
+        }
+    }
+
+    /// SameValueZero (`includes`): strict equality except `NaN` equals `NaN`
+    /// (and `+0`/`-0` are equal, which strict equality already gives).
+    fn same_value_zero(&self, a: &Slot, b: &Slot) -> bool {
+        if let (Some(x), Some(y)) = (numeric_of(a), numeric_of(b)) {
+            if x.is_nan() && y.is_nan() {
+                return true;
+            }
+        }
+        self.strict_equal(a, b)
+    }
+
+    /// `fxArgToIndex`: the argument at `base`+`argi` coerced to a relative
+    /// index in `[0, length]` (negative counts from the end, clamped). Absent
+    /// or `undefined` uses `default`. The covered grammar passes small
+    /// non-negative integers.
+    fn arg_to_index(&self, base: usize, argi: usize, default: u32, length: u32) -> u32 {
+        let a = self.stack.get(base + 4 + argi).copied();
+        let n = match a {
+            None => return default,
+            Some(s) if s.kind == Kind::Undefined => return default,
+            Some(s) => match numeric_of(&s) {
+                Some(n) => n,
+                None => return default,
+            },
+        };
+        if n.is_nan() {
+            return 0;
+        }
+        let t = n.trunc();
+        if t < 0.0 {
+            let from_end = length as f64 + t;
+            if from_end < 0.0 {
+                0
+            } else {
+                from_end as u32
+            }
+        } else if t > length as f64 {
+            length
+        } else {
+            t as u32
         }
     }
 

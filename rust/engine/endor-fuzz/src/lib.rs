@@ -288,7 +288,7 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(6) {
+    match b.choice(9) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -305,7 +305,21 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
         // pop, observe the resulting array and length.
         4 => format!("var a={}; a.pop(); a.length", lit),
         // indexOf a value that may or may not be present.
-        _ => format!("var a={}; a.indexOf({})", lit, small_int(&mut b)),
+        5 => format!("var a={}; a.indexOf({})", lit, small_int(&mut b)),
+        // includes a value that may or may not be present.
+        6 => format!("var a={}; a.includes({})", lit, small_int(&mut b)),
+        // lastIndexOf a value that may or may not be present.
+        7 => format!("var a={}; a.lastIndexOf({})", lit, small_int(&mut b)),
+        // fill a (possibly bounded) range, observe the result.
+        _ => {
+            let v = small_int(&mut b);
+            if b.choice(2) == 0 {
+                format!("var a={}; a.fill({}); a", lit, v)
+            } else {
+                let s = (b.next() as usize) % (n + 1);
+                format!("var a={}; a.fill({},{}); a", lit, v, s)
+            }
+        }
     }
 }
 

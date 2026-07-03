@@ -90,6 +90,20 @@ var a=[1,2,3]; a.indexOf(3)
 var a=[]; a.indexOf(1)
 var a=[10,20,30]; a.indexOf(20)
 var a=["x","y","z"]; a.indexOf("z")
+var a=[1,2,3]; a.includes(2)
+var a=[1,2,3]; a.includes(9)
+var a=[1,2,3]; a.includes(1)
+var a=[5,6,7]; a.includes(7)
+var a=[]; a.includes(1)
+var a=[1,2,3]; a.lastIndexOf(2)
+var a=[1,2,3]; a.lastIndexOf(9)
+var a=[1,2,3,2]; a.lastIndexOf(2)
+var a=[1,2,3]; a.lastIndexOf(3)
+var a=[1,2,3]; a.fill(0); a
+var a=[1,2,3,4]; a.fill(0); a
+var a=[1,2,3]; a.fill(9,1); a
+var a=[1,2,3,4]; a.fill(7,1,3); a
+var a=[1,2,3]; a.fill(5); a.length
 
 // --- Array constructor + statics (fx_Array; call and construct forms) ---
 Array()
