@@ -39,6 +39,9 @@ fn main() {
                 r.oracle_meter_raw, r.endor_meter_raw,
                 r.oracle_meter_raw as i64 - r.endor_meter_raw as i64);
         }
+        if std::env::var("ENDOR_SHOW_BYTECODE").is_ok() {
+            println!("    bytecode[{}]={:02x?}", r.bytecode.len(), r.bytecode);
+        }
         if !r.is_bit_exact() {
             println!("    oracle_result={:?} endor_result={:?} endor_dispatched={} halt={:?}",
                 r.oracle_result, r.endor_result, r.endor_dispatched, r.endor_halt);

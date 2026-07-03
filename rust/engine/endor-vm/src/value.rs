@@ -82,6 +82,17 @@ pub enum Kind {
     /// "kind < 0" sentinel a `let`/`const`/`this` binding carries before
     /// its initializer runs; reading it is a TDZ ReferenceError).
     Uninitialized = 11,
+    /// A closure scope slot (XS's `XS_CLOSURE_KIND`): a scope cell that
+    /// indirects to a **shared heap cell** rather than holding the value
+    /// inline. The payload's `Reference` names the cell slot (a heap slot
+    /// holding the actual value); `id` is the captured binding's name. This
+    /// is what makes a captured variable shared between the defining frame
+    /// and the closures that captured it — reads/writes go through the one
+    /// cell, so a mutation in one is visible in all (`new_closure` allocates
+    /// the cell; `store` captures it into a closure environment; `retrieve`
+    /// imports it into a callee frame; `get`/`set`/`var`/`pull_closure`
+    /// read/write through it).
+    Closure = 9,
     /// An environment/reference sentinel produced by `EVAL_REFERENCE`
     /// and friends and consumed by `GET_VARIABLE`/`SET_VARIABLE`. The
     /// payload's `Reference` names the environment the variable resolves

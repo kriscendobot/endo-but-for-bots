@@ -852,16 +852,20 @@ impl Interp {
                 }
                 // `function_environment` (`fxNewEnvironmentInstance`): the
                 // function captures its defining scope through a fresh
-                // closure environment instance. Pushes an `undefined` (XS's
-                // scratch slot) that the following `pop` discards; the
-                // function is one below the top.
+                // closure environment instance whose prototype is the
+                // defining frame's environment. XS pushes the env reference
+                // on top of the function (net +1 slot); the following
+                // `store` opcodes append captured closure cells to it, then
+                // a `pop` discards it. (For a non-capturing function no
+                // `store` follows and the `pop` discards the env directly.)
                 XS_CODE_FUNCTION_ENVIRONMENT => {
                     let env = self.new_environment();
-                    let below = self.stack.len().checked_sub(1).map(|i| self.stack[i].value);
-                    if let Some(Payload::Reference(f)) = below {
+                    // The function is the current top; record its captured
+                    // environment before pushing the env reference.
+                    if let Some(&Slot { value: Payload::Reference(f), .. }) = self.stack.last() {
                         self.functions.entry(f).or_default().closures = env;
                     }
-                    self.push(Slot::undefined());
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(env)));
                     pc += size as usize;
                 }
 
@@ -916,6 +920,74 @@ impl Interp {
                     let v = self.args.get(i).copied().unwrap_or_else(Slot::undefined);
                     self.push(v);
                     pc += size as usize;
+                }
+
+                // ---- closures (captured variables via heap cells) ---
+                // `new_closure id` (`XS_CODE_NEW_CLOSURE`): declare a
+                // captured binding. Allocate a heap cell (`fxNewSlot`,
+                // metered) initialized uninitialized, and append a
+                // closure-kind scope slot pointing at it. The cell is what
+                // the capturing closures share.
+                XS_CODE_NEW_CLOSURE => {
+                    let name = id!(1);
+                    let cell = self.slots.alloc(Slot::uninitialized());
+                    self.meter.tick_slot_alloc(); // fxNewSlot for the cell
+                    let mut slot = Slot::of(Kind::Closure, Payload::Reference(cell));
+                    slot.id = name;
+                    self.locals.push(slot);
+                    self.id_map.insert(name, self.locals.len() - 1);
+                    pc += ilen;
+                }
+                // `get_closure #k`: read the shared cell of scope closure k.
+                XS_CODE_GET_CLOSURE_1 | XS_CODE_GET_CLOSURE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    match self.closure_cell(k) {
+                        Some(cell) => {
+                            let s = *self.slots.get(cell);
+                            if s.kind == Kind::Uninitialized {
+                                return Halt::Throw("get closure: not initialized yet".into());
+                            }
+                            self.push(Slot::of(s.kind, s.value));
+                        }
+                        None => return Halt::Throw("get closure: no cell".into()),
+                    }
+                    pc += op.size() as usize;
+                }
+                // `var_closure #k` / `set_closure #k`: write the shared cell
+                // from the stack top **without** popping (an explicit `pop`
+                // discards it when unwanted).
+                XS_CODE_VAR_CLOSURE_1
+                | XS_CODE_VAR_CLOSURE_2
+                | XS_CODE_SET_CLOSURE_1
+                | XS_CODE_SET_CLOSURE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    let top = *self.stack.last().unwrap_or(&Slot::undefined());
+                    self.write_closure_cell(k, top);
+                    pc += op.size() as usize;
+                }
+                // `pull_closure #k`: pop and write the shared cell.
+                XS_CODE_PULL_CLOSURE_1 | XS_CODE_PULL_CLOSURE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    let v = self.pop();
+                    self.write_closure_cell(k, v);
+                    pc += op.size() as usize;
+                }
+                // `retrieve #k` (`XS_CODE_RETRIEVE_*`): import the callee's
+                // `k` captured closures from its closure environment into
+                // the frame scope (copying the closure-kind slots, which
+                // point at the shared cells — no allocation).
+                XS_CODE_RETRIEVE_1 | XS_CODE_RETRIEVE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    self.retrieve_closures(k);
+                    pc += op.size() as usize;
+                }
+                // `store #k` / `store_arrow` (`XS_CODE_STORE_*`): capture the
+                // scope closure `k` into the top-of-stack environment,
+                // appending a shared-cell reference (`fxNewSlot`, metered).
+                XS_CODE_STORE_1 | XS_CODE_STORE_2 => {
+                    let k = self.closure_index(op, code, pc);
+                    self.store_closure(k);
+                    pc += op.size() as usize;
                 }
 
                 // ---- literals ---------------------------------------
@@ -1263,7 +1335,18 @@ impl Interp {
     /// instance so its captured cells are GC-traced.
     fn new_environment(&mut self) -> crate::value::SlotIndex {
         self.meter.tick_raw(FUNCTION_ENVIRONMENT_METERING);
-        self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL))
+        // `fxNewEnvironmentInstance` allocates the instance plus one
+        // internal behavior slot (`XS_ENVIRONMENT_BEHAVIOR`); captured
+        // closures (`store`) append after it, and `retrieve` reads them at
+        // `env.next.next`. The two-slot cost is folded into
+        // [`FUNCTION_DEFINE_METERING`] (calibrated on a function whose
+        // `function_environment` runs), so it is not metered again here.
+        let env = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        let behavior = self
+            .slots
+            .alloc(Slot::of(Kind::Uninitialized, Payload::None));
+        self.slots.get_mut(env).next = behavior;
+        env
     }
 
     /// `XS_CODE_RUN`'s inline argument count (pushed as an integer just
@@ -1338,6 +1421,108 @@ impl Interp {
         self.this_val = caller.this_val;
         self.cur_func = caller.cur_func;
         caller.ret_pc
+    }
+
+    /// Read a `*_CLOSURE_*`/`retrieve`/`store` opcode's 1-based scope index
+    /// operand (`mxEnvironment - index`): a `u8` for the `_1` variant, a
+    /// little-endian `u16` for `_2`.
+    fn closure_index(&self, op: Opcode, code: &[u8], pc: usize) -> usize {
+        if op.size() == 2 {
+            code[pc + 1] as usize
+        } else {
+            u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize
+        }
+    }
+
+    /// The shared heap cell a closure scope slot `k` (1-based) indirects
+    /// to, or `None` if the slot is out of range or not a closure.
+    fn closure_cell(&self, k: usize) -> Option<crate::value::SlotIndex> {
+        let i = self.local_index(k)?;
+        let s = self.locals[i];
+        match (s.kind, s.value) {
+            (Kind::Closure, Payload::Reference(cell)) => Some(cell),
+            _ => None,
+        }
+    }
+
+    /// Write value `v` through closure scope slot `k` into its shared cell
+    /// (all closures capturing the binding observe the mutation).
+    fn write_closure_cell(&mut self, k: usize, v: Slot) {
+        if let Some(cell) = self.closure_cell(k) {
+            let c = self.slots.get_mut(cell);
+            c.kind = v.kind;
+            c.value = v.value;
+        }
+    }
+
+    /// `XS_CODE_RETRIEVE`: import the running function's `k` captured
+    /// closures from its closure environment (`functions[cur_func].closures`,
+    /// whose stored closures live at `env.next.next` onward) into the frame
+    /// scope, copying the closure-kind slots so they point at the same
+    /// shared cells. No allocation (the cells already exist).
+    fn retrieve_closures(&mut self, k: usize) {
+        let env = self
+            .functions
+            .get(&self.cur_func)
+            .map(|f| f.closures)
+            .unwrap_or(crate::value::SlotIndex::NULL);
+        if env.is_null() {
+            return;
+        }
+        // env.next = behavior slot; behavior.next = first stored closure.
+        let behavior = self.slots.get(env).next;
+        let mut cur = if behavior.is_null() {
+            crate::value::SlotIndex::NULL
+        } else {
+            self.slots.get(behavior).next
+        };
+        for _ in 0..k {
+            if cur.is_null() {
+                break;
+            }
+            let s = *self.slots.get(cur);
+            let mut copy = Slot::of(s.kind, s.value);
+            copy.id = s.id;
+            copy.flag = s.flag;
+            self.locals.push(copy);
+            if s.id != 0 {
+                self.id_map.insert(s.id, self.locals.len() - 1);
+            }
+            cur = s.next;
+        }
+    }
+
+    /// `XS_CODE_STORE`: capture scope closure `k` into the top-of-stack
+    /// closure environment, appending a shared-cell reference to the
+    /// environment's property list (`fxNewSlot`, metered). The stored slot
+    /// keeps the same cell reference, so the captured closure and the
+    /// defining frame share one cell.
+    fn store_closure(&mut self, k: usize) {
+        let env = match self.stack.last() {
+            Some(&Slot { value: Payload::Reference(e), .. }) => e,
+            _ => return,
+        };
+        let i = match self.local_index(k) {
+            Some(i) => i,
+            None => return,
+        };
+        let src = self.locals[i];
+        // fxNewSlot for the appended closure slot.
+        self.meter.tick_slot_alloc();
+        let mut stored = Slot::of(src.kind, src.value);
+        stored.id = src.id;
+        stored.flag = src.flag;
+        let idx = self.slots.alloc(stored);
+        // Append to the end of the environment's property chain.
+        let mut tail = env;
+        loop {
+            let next = self.slots.get(tail).next;
+            if next.is_null() {
+                break;
+            }
+            tail = next;
+        }
+        self.slots.get_mut(tail).next = idx;
     }
 
     /// `XS_CODE_BEGIN_SLOPPY`'s `this` binding: an `undefined`/`null` `this`
@@ -1891,6 +2076,36 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "1");
         assert_eq!(out.computrons, 36, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn closure_capture_and_mutation_run_and_meter_bit_exact() {
+        // The exact C-XS bytecode for
+        // `var mk=function(){var c=0; return function(){c=c+1; return c}};
+        //  var f=mk(); f(); f()` (captured from the oracle), run
+        // oracle-free: the closure machinery
+        // (`new_closure`/`store`/`function_environment`/`retrieve`/
+        // `get_closure`/`pull_closure`) shares one heap cell between the
+        // factory frame and the returned closure, so the two `f()` calls
+        // mutate `c` to `2`, and the computron count matches C-XS's `87` —
+        // a standing lock on the cell-allocation metering without linking C.
+        let code: [u8; 131] = [
+            0x0b, 0x00, 0x9e, 0x02, 0x86, 0x02, 0x00, 0xe0, 0xe6, 0x01, 0x92, 0x86, 0x03, 0x00,
+            0xe0, 0xe6, 0x02, 0x92, 0x4b, 0x4d, 0x03, 0x00, 0x38, 0x03, 0x00, 0x2e, 0x33, 0x0b,
+            0x00, 0x9e, 0x01, 0x85, 0x01, 0x00, 0xe0, 0xe4, 0x01, 0x92, 0x72, 0x00, 0xe4, 0x01,
+            0x92, 0x38, 0x00, 0x00, 0x2e, 0x11, 0x0b, 0x00, 0x9e, 0x01, 0xa5, 0x01, 0x5a, 0x01,
+            0x72, 0x01, 0x01, 0x95, 0x01, 0x5a, 0x01, 0xbb, 0x44, 0x58, 0xc4, 0x01, 0x92, 0x42,
+            0xe0, 0x89, 0x04, 0x00, 0x72, 0x04, 0xbb, 0x44, 0x58, 0x92, 0x42, 0xe0, 0x89, 0x04,
+            0x00, 0x72, 0x04, 0xbf, 0x03, 0x00, 0x92, 0x4d, 0x02, 0x00, 0xe0, 0x4d, 0x03, 0x00,
+            0x66, 0x03, 0x00, 0x28, 0xab, 0x00, 0xbf, 0x02, 0x00, 0x92, 0xe0, 0x4d, 0x02, 0x00,
+            0x66, 0x02, 0x00, 0x28, 0xab, 0x00, 0xbb, 0xe0, 0x4d, 0x02, 0x00, 0x66, 0x02, 0x00,
+            0x28, 0xab, 0x00, 0xbb, 0xa9,
+        ];
+        let out = Interp::new().run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "2", "the shared closure cell mutates across the two f() calls");
+        assert_eq!(out.computrons, 87, "bit-exact computrons vs C-XS");
     }
 
     #[test]

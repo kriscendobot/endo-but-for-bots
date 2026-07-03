@@ -179,6 +179,20 @@ pub fn stage2b_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage2b-functions.js"))
 }
 
+/// The stage-2b closure corpus (child 2 of the stage-2b orchestration):
+/// closures via heap cells — capture AND mutation, across returned inner
+/// functions, curried functions, captured parameters, multiple captured
+/// cells, and independent cells per activation. Bit-exact (result AND
+/// computron) against the oracle. The captured binding is a shared heap
+/// cell (`new_closure` allocates it, `store` captures it into the closure
+/// environment, `retrieve` imports it into the callee frame), so a
+/// mutation persists across calls and is visible to every capturer, and
+/// distinct activations get distinct cells (`endor_vm::interp` §
+/// closures).
+pub fn stage2b_closures_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage2b-closures.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -461,6 +475,59 @@ mod tests {
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
+    }
+
+    #[test]
+    fn stage2b_closures_corpus_is_bit_exact_against_oracle() {
+        // The child-2 closure acceptance bar: every closure program —
+        // counters (capture + mutation), captured parameters, curried
+        // functions, multiple captured cells, closures used within the
+        // enclosing scope, and independent-activation counters that must
+        // not alias — agrees with C-XS on BOTH the completion value AND the
+        // computron count. The result follows from the shared-heap-cell
+        // model (`new_closure`/`store`/`retrieve`/`get`/`pull_closure`); the
+        // computrons follow from metering the cell `fxNewSlot`s at
+        // `new_closure` and `store` where C-XS allocates them.
+        let programs = stage2b_closures_corpus();
+        assert!(!programs.is_empty(), "stage-2b closure corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-2b closure bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn closure_mutation_persists_and_activations_do_not_alias() {
+        // Behavioural spot-checks decoupled from metering: a counter
+        // closure's cell mutates across calls, and two counters built from
+        // separate activations of the same factory keep independent cells.
+        let one = dual_run(
+            "var mk=function(){var c=0; return function(){c=c+1; return c}}; var f=mk(); f(); f()",
+        )
+        .expect("oracle");
+        assert_eq!(one.endor_result, "2", "the shared cell mutates across calls");
+        assert_eq!(one.oracle_result, "2");
+
+        let two = dual_run(
+            "var mk=function(){var n=0; return function(){return n=n+1}}; var a=mk(),b=mk(); a(); a(); b()",
+        )
+        .expect("oracle");
+        assert_eq!(two.endor_result, "1", "b's cell is independent of a's");
+        assert_eq!(two.oracle_result, "1");
     }
 
     #[test]
