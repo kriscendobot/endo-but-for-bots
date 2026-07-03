@@ -115,6 +115,15 @@ pub enum Kind {
     /// XS_NO_ID` with the array index. A transient stack value only (never
     /// stored in a property slot or snapshotted), so it needs no GC edge.
     At = 13,
+    /// A BigInt primitive (XS's `XS_BIGINT_KIND`). The payload's
+    /// [`Payload::BigInt`] names a chunk holding the arbitrary-precision
+    /// value: one sign byte (`0` positive, `1` negative) followed by the
+    /// magnitude as little-endian `u32` digits (XS's `txU4` limbs), least
+    /// significant first, trailing-zero-trimmed — so the digit count (the
+    /// chunk's `(len - 1) / 4`) is XS's `bigint.size`, the quantity
+    /// `XS_BIGINT_METERING` charges per arithmetic step. `typeof` is
+    /// `"bigint"`.
+    BigInt = 14,
 }
 
 /// The 16-byte value payload (XS's value union arm subset for stage 1).
@@ -131,6 +140,9 @@ pub enum Payload {
     /// XS_NO_ID` means an integer array index (`index`); a non-zero `id`
     /// names a symbol/string key (`index` unused).
     At(u16, u32),
+    /// A BigInt (`Kind::BigInt`): the chunk holding `[sign: u8][LE u32
+    /// digits]`. Relocated by the slide-compactor like a `String`.
+    BigInt(ChunkOffset),
 }
 
 /// One 32-byte slot record. The struct is deliberately compact; the
@@ -222,6 +234,7 @@ impl Slot {
     pub fn chunk_ref(&self) -> Option<ChunkOffset> {
         match self.value {
             Payload::String(o) => Some(o),
+            Payload::BigInt(o) => Some(o),
             _ => None,
         }
     }
@@ -230,8 +243,10 @@ impl Slot {
     /// a slot that holds no chunk offset.
     #[inline]
     pub fn set_chunk_ref(&mut self, off: ChunkOffset) {
-        if let Payload::String(_) = self.value {
-            self.value = Payload::String(off);
+        match self.value {
+            Payload::String(_) => self.value = Payload::String(off),
+            Payload::BigInt(_) => self.value = Payload::BigInt(off),
+            _ => {}
         }
     }
 

@@ -612,6 +612,25 @@ pub const COLLECTION_CLEAR_FRAME_METERING: u64 = 0;
 /// carries no residual (its base host-frame cost is folded into the dispatch,
 /// measured zero against the pin). Calibrated computron-exact against the pin.
 pub const COLLECTION_ITERATOR_ENTRY_METERING: u64 = 2 << 14;
+/// The native residual of a BigInt **literal** (`XS_CODE_BIGINT_1/2` →
+/// `fxNewBigInt`) beyond the `RUN` dispatch and the digit-chunk allocation
+/// (`fxNewChunk(size * 4)`, charged in [`Interp::make_bigint`]): one builtin
+/// step (`fxNewBigInt`'s residual). Calibrated raw-exact against the pin
+/// `48ee02d8cfe0`.
+pub const BIGINT_LITERAL_METERING: u64 = 1 << 14;
+/// The native residual of a BigInt **arithmetic** op (`+`/`-`/`*`) beyond the
+/// `RUN` dispatch, the `mxBigInt_meter((result_size - 1) * XS_BIGINT_METERING)`
+/// digit step, and the result digit-chunk allocation. XS's binary path
+/// (`fxToNumericNumberBinary` → `gxTypeBigInt._add/_sub/_mul`) coerces both
+/// operands (each already a BigInt in a well-typed program — mixed BigInt/Number
+/// arithmetic is a TypeError) through `fxToNumericNumber` and frames the op:
+/// measured `1 << 14` raw-exact against the pin `48ee02d8cfe0`.
+pub const BIGINT_ARITH_FRAME_METERING: u64 = 1 << 14;
+/// The native residual of a BigInt **unary minus** (`XS_CODE_MINUS` →
+/// `fxToNumericNumberUnary` → `gxTypeBigInt._neg`) beyond the `RUN` dispatch and
+/// the negated-copy digit chunk (`fxBigInt_neg` → `fxBigInt_alloc`, charged in
+/// [`Interp::make_bigint`]). Measured `1 << 14` raw-exact against the pin.
+pub const BIGINT_NEG_FRAME_METERING: u64 = 1 << 14;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -1509,6 +1528,7 @@ struct StaticStrings {
     string: crate::value::ChunkOffset,
     function: crate::value::ChunkOffset,
     symbol: crate::value::ChunkOffset,
+    bigint: crate::value::ChunkOffset,
 }
 
 /// A suspended activation: the caller's scope and resume point, saved by
@@ -1574,6 +1594,7 @@ impl Interp {
             string: chunks.alloc(b"string"),
             function: chunks.alloc(b"function"),
             symbol: chunks.alloc(b"symbol"),
+            bigint: chunks.alloc(b"bigint"),
         };
         let mut interp = Interp {
             stack: Vec::with_capacity(64),
@@ -2447,6 +2468,12 @@ impl Interp {
         match s.value {
             Payload::String(off) => {
                 String::from_utf8_lossy(self.str_content(off)).into_owned()
+            }
+            // A BigInt completion renders as its decimal magnitude (XS's
+            // `String(aBigInt)`), no `n` suffix.
+            Payload::BigInt(off) => {
+                let (neg, mag) = self.read_bigint(off);
+                bi_to_decimal(neg, &mag)
             }
             Payload::Reference(r) => {
                 // An Error instance stringifies through `Error.prototype.
@@ -3510,6 +3537,41 @@ impl Interp {
                     self.push(Slot::of(Kind::String, Payload::String(off)));
                     pc += ilen;
                 }
+                // `bigint` (XS_CODE_BIGINT_1/2, xsRun.c): a BigInt literal. The
+                // operand is a length-prefixed run of the magnitude's
+                // little-endian bytes (a literal is always non-negative — a
+                // `-1n` is unary minus over `1n`). `fxNewBigInt` copies them
+                // into a fresh digit chunk (`make_bigint` meters the
+                // `fxNewChunk(size * 4)`), plus the measured literal residual.
+                XS_CODE_BIGINT_1 | XS_CODE_BIGINT_2 => {
+                    let (n, data) = match op {
+                        XS_CODE_BIGINT_1 => (code[pc + 1] as usize, pc + 2),
+                        _ => (
+                            u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize,
+                            pc + 3,
+                        ),
+                    };
+                    let mut limbs = Vec::with_capacity(n / 4 + 1);
+                    let bytes = &code[data..data + n];
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        let mut w = [0u8; 4];
+                        for (k, wk) in w.iter_mut().enumerate() {
+                            if i + k < bytes.len() {
+                                *wk = bytes[i + k];
+                            }
+                        }
+                        limbs.push(u32::from_le_bytes(w));
+                        i += 4;
+                    }
+                    if limbs.is_empty() {
+                        limbs.push(0);
+                    }
+                    self.meter.tick_raw(BIGINT_LITERAL_METERING);
+                    let v = self.make_bigint(false, limbs);
+                    self.push(v);
+                    pc += ilen;
+                }
                 // `typeof` (XS_CODE_TYPEOF, xsRun.c:4162): replace the stack
                 // top with the interned type-name string. A reference is a
                 // "function" when it is a callable instance (endor tracks
@@ -3530,9 +3592,9 @@ impl Interp {
                             _ => self.static_str.object,
                         },
                         Kind::Symbol => self.static_str.symbol,
+                        Kind::BigInt => self.static_str.bigint,
                         // Closure/EnvReference/Uninitialized are never live
-                        // stack *values*; a bigint would need its own interned
-                        // name (later stages).
+                        // stack *values*.
                         _ => return Halt::Unsupported(op.name()),
                     };
                     if let Some(s) = self.stack.last_mut() {
@@ -3676,7 +3738,19 @@ impl Interp {
                     if a.kind == Kind::String {
                         return Halt::Unsupported(op.name());
                     }
-                    self.push(unary_minus(&a));
+                    // `-aBigInt` (XS_CODE_MINUS general path →
+                    // `fxToNumericNumberUnary(the, a, gxTypeBigInt._neg)`):
+                    // `fxBigInt_neg` copies the magnitude into a fresh chunk
+                    // (charged by `make_bigint`) with the sign flipped; `-0n`
+                    // stays `+0n`. Frame residual measured against the pin.
+                    if let Payload::BigInt(off) = a.value {
+                        let (neg, mag) = self.read_bigint(off);
+                        self.meter.tick_raw(BIGINT_NEG_FRAME_METERING);
+                        let v = self.make_bigint(!neg, mag);
+                        self.push(v);
+                    } else {
+                        self.push(unary_minus(&a));
+                    }
                     pc += size as usize;
                 }
                 XS_CODE_PLUS => {
@@ -7853,6 +7927,14 @@ impl Interp {
             (Payload::String(x), Payload::String(y)) => {
                 self.str_content(x) == self.str_content(y)
             }
+            // `bigint === bigint`: equal iff same sign and magnitude. A BigInt
+            // is never `===` a non-BigInt (distinct type), which
+            // `strict_equals` already gives.
+            (Payload::BigInt(x), Payload::BigInt(y)) => {
+                let (nx, mx) = self.read_bigint(x);
+                let (ny, my) = self.read_bigint(y);
+                nx == ny && mx == my
+            }
             _ => strict_equals(a, b),
         }
     }
@@ -8738,6 +8820,11 @@ impl Interp {
     fn truthy(&self, s: &Slot) -> bool {
         match s.value {
             Payload::String(off) => !self.str_content(off).is_empty(),
+            // ToBoolean(bigint): `0n` is falsy, every other BigInt truthy.
+            Payload::BigInt(off) => {
+                let (_, mag) = self.read_bigint(off);
+                !bi_is_zero(&mag)
+            }
             _ => to_boolean(s),
         }
     }
@@ -8753,6 +8840,18 @@ impl Interp {
         let b = self.pop();
         let a = self.pop();
         if a.kind == Kind::String || b.kind == Kind::String {
+            return Err(());
+        }
+        // BigInt `-`/`*` (both BigInt); `/`/`%` and any mixed BigInt/number
+        // self-name (the caller reports the skip / TypeError).
+        if a.kind == Kind::BigInt || b.kind == Kind::BigInt {
+            match self.try_bigint_binop(op, a, b)? {
+                Some(r) => {
+                    self.push(r);
+                    return Ok(());
+                }
+                None => {}
+            }
             return Err(());
         }
         self.push(apply_arith(op, &a, &b));
@@ -8816,6 +8915,28 @@ impl Interp {
         if a.kind == Kind::String || b.kind == Kind::String {
             return Err(());
         }
+        // BigInt relational (`<`/`<=`/`>`/`>=` → `fxBigIntCompare` with the
+        // less/equal/more flags). Both BigInt: sign+magnitude order, no residual
+        // beyond dispatch (the compare neither allocates nor meters a digit
+        // step). A BigInt mixed with a Number/Boolean needs XS's fractional-
+        // delta tie-break path (unmodeled) — an honest named skip.
+        if a.kind == Kind::BigInt || b.kind == Kind::BigInt {
+            if let (Payload::BigInt(x), Payload::BigInt(y)) = (a.value, b.value) {
+                let (nx, mx) = self.read_bigint(x);
+                let (ny, my) = self.read_bigint(y);
+                let ord = bi_cmp(nx, &mx, ny, &my);
+                use std::cmp::Ordering;
+                let r = match op {
+                    RelOp::Less => ord == Ordering::Less,
+                    RelOp::LessEqual => ord != Ordering::Greater,
+                    RelOp::More => ord == Ordering::Greater,
+                    RelOp::MoreEqual => ord != Ordering::Less,
+                };
+                self.push(Slot::boolean(r));
+                return Ok(());
+            }
+            return Err(());
+        }
         let x = to_number(&a);
         let y = to_number(&b);
         let r = if x.is_nan() || y.is_nan() {
@@ -8860,6 +8981,45 @@ impl Interp {
                     return Err(()); // `==` needs ToNumber(string)
                 }
             }
+            // BigInt `===`/`==`. Both BigInt: compare sign+magnitude
+            // (`fxBigIntCompare` → `fxBigInt_comp`). The compare itself neither
+            // allocates nor meters a digit step, so beyond the opcode dispatch
+            // it carries no residual (measured raw-exact against the pin).
+            (Kind::BigInt, Kind::BigInt) => self.strict_equal(&a, &b),
+            // BigInt mixed with a Number/Integer. `===` across types is always
+            // false with no residual (XS's strict path falls to `offset = 0`).
+            // Loose `==` coerces the number to a BigInt (`fxNumberToBigInt`,
+            // its digit chunk metered faithfully) and compares mathematical
+            // values — a non-integral or non-finite Number is never equal.
+            (Kind::BigInt, Kind::Integer) | (Kind::BigInt, Kind::Number) => {
+                if strict {
+                    false
+                } else {
+                    self.bigint_num_loose_eq(a, b)
+                }
+            }
+            (Kind::Integer, Kind::BigInt) | (Kind::Number, Kind::BigInt) => {
+                if strict {
+                    false
+                } else {
+                    self.bigint_num_loose_eq(b, a)
+                }
+            }
+            // BigInt is never `==`/`===` null/undefined.
+            (Kind::BigInt, Kind::Null)
+            | (Kind::Null, Kind::BigInt)
+            | (Kind::BigInt, Kind::Undefined)
+            | (Kind::Undefined, Kind::BigInt) => false,
+            // BigInt vs Boolean/Symbol/Reference under loose `==` needs a
+            // ToNumber/ToPrimitive coercion this stage does not model — an
+            // honest named skip rather than a wrong value. `===` is false.
+            (Kind::BigInt, _) | (_, Kind::BigInt) => {
+                if strict {
+                    false
+                } else {
+                    return Err(());
+                }
+            }
             _ => {
                 if strict {
                     strict_equals(&a, &b)
@@ -8885,6 +9045,17 @@ impl Interp {
         let a = self.stack[n - 2];
         let b = self.stack[n - 1];
         if a.kind == Kind::Reference || b.kind == Kind::Reference {
+            return Err(());
+        }
+        // BigInt `+` (both BigInt); a BigInt mixed with a non-BigInt — including
+        // a string, whose concat metering over a BigInt is not yet modeled —
+        // self-names.
+        if a.kind == Kind::BigInt || b.kind == Kind::BigInt {
+            if let Some(r) = self.try_bigint_binop(ArithOp::Add, a, b)? {
+                self.stack.truncate(n - 2);
+                self.push(r);
+                return Ok(());
+            }
             return Err(());
         }
         if a.kind == Kind::String || b.kind == Kind::String {
@@ -8947,6 +9118,159 @@ impl Interp {
             },
             Payload::Reference(_) => Vec::new(), // unreachable: op_add rejects references
             Payload::At(..) => Vec::new(),        // unreachable: not a primitive value
+            // `String(aBigInt)` — the decimal magnitude with a leading `-`.
+            // `fxBigIntToString` renders into a fresh chunk; metered as a
+            // number's ToString is (one built-in step + the result chunk).
+            Payload::BigInt(off) => {
+                let (neg, mag) = self.read_bigint(off);
+                let r = bi_to_decimal(neg, &mag).into_bytes();
+                self.meter.tick_builtin();
+                self.meter.tick_chunk_new((r.len() + 1) as u64);
+                r
+            }
+        }
+    }
+
+    /// Read a BigInt chunk into `(negative, little-endian u32 limbs)`.
+    fn read_bigint(&self, off: crate::value::ChunkOffset) -> (bool, Vec<u32>) {
+        let bytes = self.chunks.payload(off);
+        let neg = bytes.first().copied().unwrap_or(0) == 1;
+        let mut mag = Vec::with_capacity(bytes.len() / 4);
+        let mut i = 1;
+        while i + 4 <= bytes.len() {
+            mag.push(u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]));
+            i += 4;
+        }
+        if mag.is_empty() {
+            mag.push(0);
+        }
+        (neg, bi_trim(mag))
+    }
+
+    /// Build a BigInt value from `(negative, limbs)`, allocating the digit
+    /// chunk `[sign: u8][LE u32 limbs]` (trimmed; a `-0` normalizes to `+0`)
+    /// and charging the allocation at the value's own size
+    /// (`fxNewChunk(size * 4)`). Used where XS allocates exactly `bigint.size`
+    /// limbs — a literal (`fxNewBigInt`) and a negation (`fxBigInt_neg` →
+    /// `fxBigInt_alloc(a->size)`). An arithmetic result instead allocates its
+    /// (pre-trim) working size and meters the chunk itself
+    /// ([`Self::store_bigint`]).
+    fn make_bigint(&mut self, neg: bool, mag: Vec<u32>) -> Slot {
+        let mag = bi_trim(mag);
+        self.meter.tick_chunk_new((mag.len() * 4) as u64);
+        self.store_bigint(neg, mag)
+    }
+
+    /// Build a BigInt value without metering the chunk allocation (the caller
+    /// meters it — at XS's allocation size, which for an arithmetic result is
+    /// the pre-trim working size rather than the trimmed `bigint.size`).
+    fn store_bigint(&mut self, neg: bool, mag: Vec<u32>) -> Slot {
+        let mag = bi_trim(mag);
+        let neg = if bi_is_zero(&mag) { false } else { neg };
+        let mut bytes = Vec::with_capacity(1 + mag.len() * 4);
+        bytes.push(neg as u8);
+        for limb in &mag {
+            bytes.extend_from_slice(&limb.to_le_bytes());
+        }
+        let off = self.chunks.alloc(&bytes);
+        Slot::of(Kind::BigInt, Payload::BigInt(off))
+    }
+
+    /// Loose `==`/`!=` between a BigInt (`big`) and a Number/Integer (`num`),
+    /// XS's `fxBigIntCompare` number path: a finite Number is coerced to a
+    /// BigInt (`fxNumberToBigInt`, its `fxNewChunk(size*4)` the only metered
+    /// residual) then compared by mathematical value, so a non-integral Number
+    /// is never equal; a non-finite Number (`NaN`/`±Infinity`) is never equal
+    /// and allocates no chunk. Returns the equality boolean.
+    fn bigint_num_loose_eq(&mut self, big: Slot, num: Slot) -> bool {
+        let n = match num.value {
+            Payload::Integer(v) => v as f64,
+            Payload::Number(v) => v,
+            _ => return false,
+        };
+        if !n.is_finite() {
+            return false;
+        }
+        let (nneg, nmag) = number_to_bigint(n);
+        // fxNumberToBigInt allocates `size` limbs regardless of the fraction.
+        self.meter.tick_chunk_new((nmag.len() * 4) as u64);
+        if n.trunc() != n {
+            return false; // a fractional Number is never == a BigInt
+        }
+        let off = match big.value {
+            Payload::BigInt(o) => o,
+            _ => return false,
+        };
+        let (bneg, bmag) = self.read_bigint(off);
+        bneg == nneg && bmag == nmag
+    }
+
+    /// BigInt `+`/`-`/`*` (`fxBigInt_add`/`_sub`/`_mul`). Meters, in XS's order:
+    /// the result digit chunk at XS's **allocation** size (`fxBigInt_alloc`,
+    /// pre-trim) — a magnitude add allocates `max(a,b)+1` limbs, a magnitude
+    /// subtract `max(a,b)`, a multiply `a.size+b.size`; then the digit step
+    /// `mxBigInt_meter(result_size)` = `(result_size - 1) * XS_BIGINT_METERING`
+    /// over the trimmed result size (XS trims `rr->size` in `uadd`/`usub`/
+    /// `umul`); then the calibrated frame residual. `/`/`%`/`**` are not modeled
+    /// (their long-division / repeated-squaring metering is a later increment) —
+    /// the caller self-names them.
+    fn bigint_arith(
+        &mut self,
+        op: ArithOp,
+        a_off: crate::value::ChunkOffset,
+        b_off: crate::value::ChunkOffset,
+    ) -> Result<Slot, ()> {
+        let (na, ma) = self.read_bigint(a_off);
+        let (nb, mb) = self.read_bigint(b_off);
+        let (neg, mag) = match op {
+            ArithOp::Add => bi_add(na, &ma, nb, &mb),
+            ArithOp::Sub => bi_add(na, &ma, !nb, &mb),
+            ArithOp::Mul => bi_mul(na, &ma, nb, &mb),
+            ArithOp::Div | ArithOp::Mod => return Err(()),
+        };
+        // XS's per-op allocation size (`fxBigInt_alloc` limb count), which is
+        // what `fxNewChunk` meters — distinct from the trimmed `bigint.size`.
+        let max = ma.len().max(mb.len()) as u64;
+        let alloc_limbs = match op {
+            // `a + b`: magnitudes add when the signs agree (`uadd`, max+1), else
+            // subtract (`usub`, max). `a - b`: the reverse.
+            ArithOp::Add => {
+                if na == nb {
+                    max + 1
+                } else {
+                    max
+                }
+            }
+            ArithOp::Sub => {
+                if na != nb {
+                    max + 1
+                } else {
+                    max
+                }
+            }
+            ArithOp::Mul => (ma.len() + mb.len()) as u64,
+            ArithOp::Div | ArithOp::Mod => unreachable!(),
+        };
+        self.meter.tick_chunk_new(alloc_limbs * 4);
+        let size = mag.len() as u64; // trimmed to XS's post-op `rr->size`
+        self.meter.tick_raw((size - 1) * crate::meter::BIGINT_METERING);
+        self.meter.tick_raw(BIGINT_ARITH_FRAME_METERING);
+        Ok(self.store_bigint(neg, mag))
+    }
+
+    /// If `a`/`b` involve a BigInt, dispatch the op: both BigInt → the BigInt
+    /// arithmetic; a BigInt mixed with any non-BigInt → `Err` (a TypeError in
+    /// JS, self-named as an honest skip). Returns `Ok(None)` when neither is a
+    /// BigInt (the caller takes its numeric path).
+    fn try_bigint_binop(&mut self, op: ArithOp, a: Slot, b: Slot) -> Result<Option<Slot>, ()> {
+        if a.kind != Kind::BigInt && b.kind != Kind::BigInt {
+            return Ok(None);
+        }
+        match (a.value, b.value) {
+            (Payload::BigInt(x), Payload::BigInt(y)) => {
+                Ok(Some(self.bigint_arith(op, x, y)?))
+            }
+            _ => Err(()),
         }
     }
 }
@@ -9085,6 +9409,10 @@ fn to_boolean(s: &Slot) -> bool {
         Payload::String(_) => true, // non-empty; stage-1 strings are results only
         Payload::Reference(_) => true,
         Payload::At(..) => true, // a transient key is never ToBoolean'd
+        // A BigInt's zero-ness needs the digit chunk; [`Interp::truthy`]
+        // handles a BigInt operand before delegating here, so this arm is
+        // reached only defensively.
+        Payload::BigInt(_) => true,
     }
 }
 
@@ -10066,6 +10394,199 @@ mod tests {
     }
 }
 
+// ---- BigInt limb arithmetic (xsBigInt.c: txU4 little-endian digits) ----
+//
+// A BigInt magnitude is a little-endian `Vec<u32>` (limb 0 least significant),
+// trimmed so the most-significant limb is non-zero — except zero, which is the
+// single limb `[0]` (XS's `size == 1`, `data[0] == 0`). `size()` is the limb
+// count, XS's `bigint.size`, the quantity `XS_BIGINT_METERING` charges per
+// arithmetic step.
+
+/// Trim trailing (most-significant) zero limbs, leaving at least one limb.
+fn bi_trim(mut mag: Vec<u32>) -> Vec<u32> {
+    while mag.len() > 1 && *mag.last().unwrap() == 0 {
+        mag.pop();
+    }
+    if mag.is_empty() {
+        mag.push(0);
+    }
+    mag
+}
+
+fn bi_is_zero(mag: &[u32]) -> bool {
+    mag.iter().all(|&d| d == 0)
+}
+
+/// Compare two magnitudes (already trimmed): Ordering of `a` vs `b`.
+fn bi_cmp_mag(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a.len() != b.len() {
+        return a.len().cmp(&b.len());
+    }
+    for i in (0..a.len()).rev() {
+        if a[i] != b[i] {
+            return a[i].cmp(&b[i]);
+        }
+    }
+    Ordering::Equal
+}
+
+/// `a + b` (magnitudes), trimmed.
+fn bi_add_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let n = a.len().max(b.len());
+    let mut out = Vec::with_capacity(n + 1);
+    let mut carry: u64 = 0;
+    for i in 0..n {
+        let x = *a.get(i).unwrap_or(&0) as u64;
+        let y = *b.get(i).unwrap_or(&0) as u64;
+        let s = x + y + carry;
+        out.push((s & 0xFFFF_FFFF) as u32);
+        carry = s >> 32;
+    }
+    if carry != 0 {
+        out.push(carry as u32);
+    }
+    bi_trim(out)
+}
+
+/// `a - b` (magnitudes), requires `a >= b`, trimmed.
+fn bi_sub_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow: i64 = 0;
+    for i in 0..a.len() {
+        let x = a[i] as i64;
+        let y = *b.get(i).unwrap_or(&0) as i64;
+        let mut d = x - y - borrow;
+        if d < 0 {
+            d += 1 << 32;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(d as u32);
+    }
+    bi_trim(out)
+}
+
+/// `a * b` (magnitudes), trimmed (schoolbook, XS's `fxBigInt_umul`).
+fn bi_mul_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    if bi_is_zero(a) || bi_is_zero(b) {
+        return vec![0];
+    }
+    let mut out = vec![0u32; a.len() + b.len()];
+    for (i, &ai) in a.iter().enumerate() {
+        let mut carry: u64 = 0;
+        for (j, &bj) in b.iter().enumerate() {
+            let idx = i + j;
+            let cur = out[idx] as u64 + (ai as u64) * (bj as u64) + carry;
+            out[idx] = (cur & 0xFFFF_FFFF) as u32;
+            carry = cur >> 32;
+        }
+        out[i + b.len()] = (out[i + b.len()] as u64 + carry) as u32;
+    }
+    bi_trim(out)
+}
+
+/// Signed add of `(neg_a, a) + (neg_b, b)` → `(neg, mag)`, trimmed. A `-0`
+/// result is normalized to `+0`.
+fn bi_add(neg_a: bool, a: &[u32], neg_b: bool, b: &[u32]) -> (bool, Vec<u32>) {
+    use std::cmp::Ordering;
+    let (neg, mag) = if neg_a == neg_b {
+        (neg_a, bi_add_mag(a, b))
+    } else {
+        match bi_cmp_mag(a, b) {
+            Ordering::Equal => (false, vec![0]),
+            Ordering::Greater => (neg_a, bi_sub_mag(a, b)),
+            Ordering::Less => (neg_b, bi_sub_mag(b, a)),
+        }
+    };
+    if bi_is_zero(&mag) {
+        (false, mag)
+    } else {
+        (neg, mag)
+    }
+}
+
+/// Signed multiply.
+fn bi_mul(neg_a: bool, a: &[u32], neg_b: bool, b: &[u32]) -> (bool, Vec<u32>) {
+    let mag = bi_mul_mag(a, b);
+    if bi_is_zero(&mag) {
+        (false, mag)
+    } else {
+        (neg_a != neg_b, mag)
+    }
+}
+
+/// Decompose a finite JS Number into a BigInt `(negative, little-endian
+/// limbs)`, replicating XS's `fxNumberToBigInt`: truncate toward zero, size the
+/// magnitude by repeated division by `2^32`, then peel the limbs
+/// most-significant first through the fractional carry. The limb count is XS's
+/// allocated `bigint.size` (the `fxNewChunk(size*4)` the caller meters).
+fn number_to_bigint(number: f64) -> (bool, Vec<u32>) {
+    let sign = number < 0.0;
+    let mut number = if sign { -number } else { number };
+    let limit = 4294967296.0_f64; // 2^32
+    let mut size: usize = 1;
+    // XS divides `number` itself down into `[0, 2^32)` while sizing, so the
+    // fill loop below peels the reduced value most-significant limb first.
+    while number >= limit {
+        size += 1;
+        number /= limit;
+    }
+    let mut data = vec![0u32; size];
+    let mut i = size;
+    while i > 0 {
+        let part = number as u32; // (txU4)number: the top limb's integer part
+        number -= part as f64;
+        i -= 1;
+        data[i] = part;
+        number *= limit;
+    }
+    (sign, bi_trim(data))
+}
+
+/// Signed compare `(neg_a, a)` vs `(neg_b, b)`.
+fn bi_cmp(neg_a: bool, a: &[u32], neg_b: bool, b: &[u32]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (neg_a, neg_b) {
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+        (false, false) => bi_cmp_mag(a, b),
+        (true, true) => bi_cmp_mag(b, a),
+    }
+}
+
+/// Decimal string of `(neg, mag)` (XS's `fxBigInt` decimal formatting): the
+/// magnitude in base 10 with a leading `-` when negative and non-zero.
+fn bi_to_decimal(neg: bool, mag: &[u32]) -> String {
+    if bi_is_zero(mag) {
+        return "0".to_string();
+    }
+    // Repeated division of the magnitude by 1e9, collecting base-1e9 chunks.
+    let mut limbs = mag.to_vec();
+    let mut chunks: Vec<u32> = Vec::new();
+    while !bi_is_zero(&limbs) {
+        let mut rem: u64 = 0;
+        for i in (0..limbs.len()).rev() {
+            let cur = (rem << 32) | limbs[i] as u64;
+            limbs[i] = (cur / 1_000_000_000) as u32;
+            rem = cur % 1_000_000_000;
+        }
+        limbs = bi_trim(limbs);
+        chunks.push(rem as u32);
+    }
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    // Most-significant chunk without padding, the rest zero-padded to 9.
+    out.push_str(&chunks.last().unwrap().to_string());
+    for c in chunks.iter().rev().skip(1) {
+        out.push_str(&format!("{:09}", c));
+    }
+    out
+}
+
 /// Render a completion value the way JS `String()` does.
 pub fn slot_to_ecma_string(s: &Slot) -> String {
     match s.value {
@@ -10079,6 +10600,9 @@ pub fn slot_to_ecma_string(s: &Slot) -> String {
         Payload::String(_) => String::new(), // stage-1 strings not produced
         Payload::Reference(_) => "[object Object]".to_string(),
         Payload::At(..) => String::new(), // a transient computed key, never rendered
+        // A BigInt's decimal needs the digit chunk (arena-bound); the
+        // arena-aware [`Interp::render`] handles it before falling here.
+        Payload::BigInt(_) => String::new(),
     }
 }
 
