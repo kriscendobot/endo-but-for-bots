@@ -600,17 +600,23 @@ impl Interp {
     /// the guest run exactly as XS's do, so no allocation is charged.
     pub fn link_intrinsics(&mut self, names: &[String]) {
         for (k, name) in names.iter().enumerate() {
+            let id = (k + 1) as u16;
+            if self.global_props.contains_key(&id) {
+                continue;
+            }
             if let Some(&func) = self.intrinsics.get(name.as_str()) {
-                let id = (k + 1) as u16;
-                if self.global_props.contains_key(&id) {
-                    continue;
-                }
                 // The global binding is an own property whose value is a
                 // **reference** to the intrinsic function instance, exactly
                 // like any other global property (so `get_variable` /
                 // `get_this_variable` resolve a `Reference`, and `typeof`
                 // sees a callable). Not metered — a pre-existing global.
                 self.create_global_property(id, (Kind::Reference, Payload::Reference(func)));
+            } else if let Some(v) = value_global(name) {
+                // The primitive value globals `undefined`/`NaN`/`Infinity`
+                // (XS's non-writable realm globals): bound as ordinary global
+                // properties holding the value, so a reference reads it with
+                // no built-in step (pure dispatch, bit-exact against the pin).
+                self.create_global_property(id, (v.kind, v.value));
             }
         }
     }
@@ -2883,6 +2889,19 @@ impl Interp {
     }
 }
 
+/// The primitive value globals XS's realm exposes by name (non-writable,
+/// non-configurable): a reference reads the value with no allocation, so
+/// binding them is metering-neutral. Returns the slot value for a known
+/// name, else `None` (leaving the name to resolve as an ordinary global).
+fn value_global(name: &str) -> Option<Slot> {
+    match name {
+        "undefined" => Some(Slot::undefined()),
+        "NaN" => Some(Slot::number(f64::NAN)),
+        "Infinity" => Some(Slot::number(f64::INFINITY)),
+        _ => None,
+    }
+}
+
 /// A `&'static str` naming an unmodeled native **call** for
 /// [`Halt::Unsupported`], so the differential runner records the skip
 /// attributed to the specific built-in (never a silent mis-execution).
@@ -3440,6 +3459,23 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "true");
         assert_eq!(out.computrons, 13, "bit-exact computrons vs C-XS");
+    }
+
+    #[test]
+    fn value_global_undefined_resolves_pure_dispatch() {
+        // The exact C-XS bytecode for `undefined` (captured from the
+        // oracle): the value global resolves to `undefined` at C-XS's 9
+        // computrons (pure dispatch — a global read meters no built-in step).
+        let code: [u8; 11] = [
+            0x0b, 0x00, 0x4b, 0x4d, 0x01, 0x00, 0x67, 0x01, 0x00, 0xbb, 0xa9,
+        ];
+        let mut interp = Interp::new();
+        interp.link_intrinsics(&["undefined".to_string()]);
+        let out = interp.run(&code);
+        assert_eq!(out.halt, Halt::Return);
+        assert!(out.completed);
+        assert_eq!(out.result, "undefined");
+        assert_eq!(out.computrons, 9);
     }
 
     #[test]

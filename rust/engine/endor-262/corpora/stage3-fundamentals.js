@@ -45,6 +45,20 @@ Boolean(2 > 1)
 Boolean(3 < 1)
 Boolean(Boolean(1))
 
+// The primitive value globals — undefined/NaN/Infinity — read with no
+// built-in step (pure dispatch).
+undefined
+NaN
+Infinity
+typeof undefined
+typeof NaN
+typeof Infinity
+-Infinity
+NaN !== NaN
+undefined === undefined
+Boolean(undefined)
+Boolean(NaN)
+
 // Boolean results compose through the covered primitive grammar.
 !Boolean(0)
 !!Boolean('')

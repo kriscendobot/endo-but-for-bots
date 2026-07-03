@@ -32,7 +32,10 @@ fn main() {
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("language");
-    let base = if sub.starts_with("language") {
+    // A subtree under the test root: `language/…` and `built-ins/…` (the
+    // stage-3 built-ins sections — Boolean, Error, Object, …) are addressed
+    // from the root; a bare path defaults under `language/` for back-compat.
+    let base = if sub.starts_with("language") || sub.starts_with("built-ins") {
         root.join(sub)
     } else {
         root.join("language").join(sub)
