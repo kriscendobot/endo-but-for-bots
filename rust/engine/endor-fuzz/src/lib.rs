@@ -288,7 +288,9 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
     let n = (b.next() % 5) as usize; // 0..=4 dense elements
     let elems: Vec<String> = (0..n).map(|_| small_int(&mut b).to_string()).collect();
     let lit = format!("[{}]", elems.join(","));
-    match b.choice(17) {
+    // `with` requires a non-empty array (out-of-range is a RangeError), so
+    // restrict its shape to n>=1 by folding into copyWithin when empty.
+    match b.choice(18) {
         // push one, observe the new length (its return value).
         0 => format!("var a={}; a.push({})", lit, small_int(&mut b)),
         // push one, observe the resulting array.
@@ -372,10 +374,20 @@ pub fn gen_stage3_array_methods_program(data: &[u8]) -> String {
             ),
         },
         // copyWithin a block in place, observe the result.
-        _ => {
+        16 => {
             let t = (b.next() as usize) % (n + 1);
             let s = (b.next() as usize) % (n + 1);
             format!("var a={}; a.copyWithin({},{}); a", lit, t, s)
+        }
+        // with: replace an in-range index into a new array (n>=1; else fall
+        // back to a copyWithin so the index is always valid).
+        _ => {
+            if n == 0 {
+                format!("var a={}; a.copyWithin(0,0); a", lit)
+            } else {
+                let i = (b.next() as usize) % n;
+                format!("var a={}; a.with({},{}); a", lit, i, small_int(&mut b))
+            }
         }
     }
 }
