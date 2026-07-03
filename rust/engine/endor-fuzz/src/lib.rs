@@ -117,6 +117,108 @@ pub fn gen_statement_program(data: &[u8]) -> String {
     s
 }
 
+/// Structure-aware generator for the **stage-2b surface**: valid,
+/// terminating programs that exercise the object model, user-function
+/// calls, closures, and thrown-and-caught exceptions — the machinery this
+/// stage made **bit-exact** (result AND computron), so the generated
+/// programs are driven by the full [`differential_check`], not the
+/// result-only variant. Every branch stays inside the small-integer domain
+/// (values bounded, only `+`/`-`/`*`, no division) so results and their
+/// `String()` renderings are unambiguous and the loop/closure/recursion
+/// counts are bounded.
+pub fn gen_stage2b_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    match b.choice(4) {
+        0 => gen_object_program(&mut b),
+        1 => gen_call_program(&mut b),
+        2 => gen_closure_program(&mut b),
+        _ => gen_exception_program(&mut b),
+    }
+}
+
+/// A small non-negative integer literal (0..=9), keeping generated values
+/// bounded so repeated `+`/`-`/`*` never overflows the integer fast path
+/// or produces a magnitude whose `String()` differs between the engines
+/// (they agree regardless, but small values keep the corpus legible).
+fn small_int(b: &mut Bytes) -> i32 {
+    (b.next() % 10) as i32
+}
+
+/// One of the overflow-safe, throw-free binary operators.
+fn small_op(b: &mut Bytes) -> &'static str {
+    ["+", "-", "*"][b.choice(3) as usize]
+}
+
+/// Object model: an object literal or a `{}`-plus-dynamic-property build,
+/// then two own-property reads combined. Exercises `OBJECT`,
+/// `NEW_PROPERTY`/`SET_PROPERTY`, and `GET_PROPERTY`.
+fn gen_object_program(b: &mut Bytes) -> String {
+    let x = small_int(b);
+    let y = small_int(b);
+    let op = small_op(b);
+    if b.choice(2) == 0 {
+        format!("var o = {{a: {}, b: {}}}; o.a {} o.b", x, y, op)
+    } else {
+        format!("var o = {{}}; o.x = {}; o.y = {}; o.x {} o.y", x, y, op)
+    }
+}
+
+/// User functions: an IIFE or a function stored in a var, called with one
+/// or two arguments. Exercises `constructor_function`/`function`/`code`/
+/// `call`/`run`/`argument`/`end` frame switching.
+fn gen_call_program(b: &mut Bytes) -> String {
+    let x = small_int(b);
+    let y = small_int(b);
+    let op = small_op(b);
+    match b.choice(3) {
+        0 => format!("(function(p){{return p {} {}}})({})", op, y, x),
+        1 => format!("(function(p,q){{return p {} q}})({}, {})", op, x, y),
+        _ => format!("var f = function(p){{return p {} {}}}; f({})", op, y, x),
+    }
+}
+
+/// Closures: a counter factory whose returned inner function mutates a
+/// captured cell across a bounded number of calls, or a curried two-stage
+/// adder. Exercises `new_closure`/`store`/`retrieve`/`get_closure`/
+/// `pull_closure` and the shared-cell model.
+fn gen_closure_program(b: &mut Bytes) -> String {
+    let seed = small_int(b);
+    let step = small_int(b);
+    if b.choice(2) == 0 {
+        let calls = 1 + (b.next() % 3) as usize; // 1..=3 calls
+        let mut s = format!(
+            "var mk = function(){{var c = {}; return function(){{c = c + {}; return c}}}}; var f = mk();",
+            seed, step
+        );
+        for i in 0..calls {
+            s.push_str(if i + 1 < calls { " f();" } else { " f()" });
+        }
+        s
+    } else {
+        let x = small_int(b);
+        let y = small_int(b);
+        format!("var add = function(a){{return function(c){{return a + c}}}}; add({})({})", x, y)
+    }
+}
+
+/// Thrown-and-caught exceptions: a caught throw whose value is used, a try
+/// with no throw, or a try/catch/finally that observes both paths.
+/// Exercises `catch`/`throw`/`exception`/`uncatch` and the finally
+/// status-temporary skeleton — all caught (so `BothComplete`, bit-exact).
+fn gen_exception_program(b: &mut Bytes) -> String {
+    let n = small_int(b);
+    let m = small_int(b);
+    let op = small_op(b);
+    match b.choice(3) {
+        0 => format!("try {{ throw {} }} catch(e) {{ e {} {} }}", n, op, m),
+        1 => format!("try {{ {} {} {} }} catch(e) {{ {} }}", n, op, m, m),
+        _ => format!(
+            "var r = 0; try {{ throw {} }} catch(e) {{ r = e }} finally {{ r = r + {} }} r",
+            n, m
+        ),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -281,6 +383,39 @@ mod tests {
             }
         }
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn generated_stage2b_programs_agree_bit_exact() {
+        // The stage-2b generator's object / call / closure / exception
+        // programs must ALL agree with C-XS bit-for-bit (result AND
+        // computron) — the object model, call frames, closure cells, and
+        // the exception jump-chain are metered faithfully, so unlike the
+        // stage-2 result-only surface these ride the full
+        // `differential_check`. Sweep a spread of seeds so every branch of
+        // the grammar (both object shapes, all three call shapes, both
+        // closure shapes, all three exception shapes) is exercised.
+        let mut checked = 0;
+        let mut kinds = [0usize; 4];
+        for seed in 0u32..400 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(6 + (seed % 14)) {
+                buf.push(data[(k as usize) % 4].wrapping_add(k as u8 * 5));
+            }
+            kinds[(buf[0] % 4) as usize] += 1;
+            let prog = gen_stage2b_program(&buf);
+            match differential_check(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-2b differential divergence: {:?}", d),
+            }
+        }
+        assert!(checked > 0);
+        // Every grammar family must have been generated at least once, so
+        // the sweep is real coverage, not one branch 400 times.
+        for (i, c) in kinds.iter().enumerate() {
+            assert!(*c > 0, "grammar family {} never generated", i);
+        }
     }
 
     #[test]

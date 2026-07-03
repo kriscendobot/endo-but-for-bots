@@ -28,5 +28,11 @@ path = "fuzz_targets/bytecode_decoder.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "differential_stage2b"
+path = "fuzz_targets/differential_stage2b.rs"
+test = false
+doc = false
+
 [workspace]
 # Own workspace: cargo-fuzz builds this tree in isolation.
