@@ -107,6 +107,14 @@ pub enum Kind {
     /// against (the global instance, or `SlotIndex::NULL` for the
     /// active frame's own scope).
     EnvReference = 12,
+    /// A computed property key produced by `XS_CODE_AT`/`AT_2` (XS's
+    /// `XS_AT_KIND`) and consumed by `GET_PROPERTY_AT`/`SET_PROPERTY_AT`/
+    /// `NEW_PROPERTY_AT`/`DELETE_PROPERTY_AT`. The payload's [`Payload::At`]
+    /// carries the resolved `(id, index)`: a named key sets `id` (a symbol
+    /// id) with `index == 0`; an integer/number index key sets `id ==
+    /// XS_NO_ID` with the array index. A transient stack value only (never
+    /// stored in a property slot or snapshotted), so it needs no GC edge.
+    At = 13,
 }
 
 /// The 16-byte value payload (XS's value union arm subset for stage 1).
@@ -119,6 +127,10 @@ pub enum Payload {
     Number(f64),
     String(ChunkOffset),
     Reference(SlotIndex),
+    /// A computed property key (`Kind::At`): `(id, index)`. `id ==
+    /// XS_NO_ID` means an integer array index (`index`); a non-zero `id`
+    /// names a symbol/string key (`index` unused).
+    At(u16, u32),
 }
 
 /// One 32-byte slot record. The struct is deliberately compact; the

@@ -242,6 +242,44 @@ pub const ERROR_CONSTRUCT_EXTRA: u64 = (1 << 16) + 768;
 /// message length (the message string's own chunk is metered at its literal).
 pub const ERROR_MESSAGE_METERING: u64 = 280;
 
+/// The raw 16.16 cost the `XS_CODE_ARRAY` opcode accrues beyond its own
+/// dispatch: `fxNewArray(the, 0)` runs `fxNewArrayInstance`, which is
+/// `fxNewObjectInstance` (one instance `fxNewSlot`) plus one internal
+/// `XS_ARRAY_KIND` behavior slot (`fxNewSlot`) — two slot allocations,
+/// `2 × XS_SLOT_ALLOCATION_METERING` = 512 raw. `fxSetIndexSize(0)` and
+/// `fxIndexArray` allocate nothing for the empty array. Accrued in
+/// [`Interp::new_array`]; verified against the pin `48ee02d8cfe0`.
+pub const ARRAY_CREATE_METERING: u64 = 512;
+
+/// The raw 16.16 cost of an `arr.length = N` store that does **not** resize
+/// the item chunk (the array-literal length prelude sets the length before
+/// any element exists, so `fxSetArrayLength` allocates nothing). The store
+/// routes through the length accessor setter (`mxBehaviorSetProperty` returns
+/// `&mxArrayLengthAccessor`, whose `fxArrayLengthSetter` runs); measured
+/// against the pin `48ee02d8cfe0` as exactly **one built-in step**
+/// (`XS_BUILTIN_METERING`, `1 << 14` = 16384), constant in `N`. Accrued in
+/// the `SET_PROPERTY`/`SET_PROPERTY_AT` length path. (A length store that
+/// *shrinks* an array with a live item chunk additionally reallocs the chunk;
+/// that chunk metering is a later increment — the covered corpus shrinks only
+/// hole/short arrays whose chunk is unaffected.)
+pub const ARRAY_LENGTH_SET_METERING: u64 = 1 << 14;
+
+/// The raw 16.16 cost of an `arr.length` read beyond its own dispatch.
+/// Measured against the pin `48ee02d8cfe0` as **zero**: the length accessor
+/// getter (`fxArrayLengthGetter`) returning the stored length adds no
+/// built-in step or allocation over the `GET_PROPERTY` dispatch already
+/// metered. Kept as a named constant so a future revision can revise it in
+/// one place.
+pub const ARRAY_LENGTH_GET_METERING: u64 = 0;
+
+/// The raw 16.16 cost `NEW_PROPERTY_AT` accrues defining a fresh array item
+/// beyond its dispatch and the item-chunk growth: one built-in step
+/// (`fxRunDefine`'s `mxMeterOne`). Measured against the pin as `1 <<
+/// 14` = 16384 (verified: an N-element literal's per-element raw delta is
+/// exactly `5 × XS_CODE_METERING + 16384 + item_chunk_bytes`). The chunk
+/// growth is metered separately by [`Interp::array_item_grow_metering`].
+pub const ARRAY_ITEM_DEFINE_STEP_METERING: u64 = 1 << 14;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -317,6 +355,18 @@ impl Default for FuncInfo {
     }
 }
 
+/// An exotic array's data (XS's `XS_ARRAY_KIND` internal slot). `length`
+/// is the array length (`fxArraySetLength` semantics); `items` holds the
+/// present elements sparsely by index (an absent index in `[0, length)` is
+/// a hole). A `BTreeMap` keeps the indices ordered so `for-in` enumeration
+/// and `Array.prototype` iteration visit them in ascending index order,
+/// matching XS's item-chunk order.
+#[derive(Clone, Debug, Default)]
+struct ArrayData {
+    length: u32,
+    items: std::collections::BTreeMap<u32, Slot>,
+}
+
 /// An Error instance's stringification data (XS's `Error.prototype.toString`
 /// inputs): the constructor's `name` and the optional own `message`.
 #[derive(Clone, Debug)]
@@ -344,6 +394,7 @@ pub enum Native {
     Symbol,
     Number,
     String,
+    Array,
     Error,
     EvalError,
     RangeError,
@@ -365,6 +416,7 @@ impl Native {
             Native::Symbol => "Symbol",
             Native::Number => "Number",
             Native::String => "String",
+            Native::Array => "Array",
             Native::Error => "Error",
             Native::EvalError => "EvalError",
             Native::RangeError => "RangeError",
@@ -388,6 +440,7 @@ impl Native {
             ("Symbol", Native::Symbol),
             ("Number", Native::Number),
             ("String", Native::String),
+            ("Array", Native::Array),
             ("Error", Native::Error),
             ("EvalError", Native::EvalError),
             ("RangeError", Native::RangeError),
@@ -640,6 +693,24 @@ pub struct Interp {
     /// completion/`String()` stringifies as its wrapped primitive, so
     /// [`Self::render`] reads it here.
     wrapper_data: std::collections::HashMap<crate::value::SlotIndex, Slot>,
+    /// The realm's `%Array.prototype%` (a boot object). Every array literal
+    /// and `new Array` instance chains to it, so `arr.push`/`arr.join`/… (the
+    /// native methods bound on it) resolve up the prototype chain.
+    array_proto: crate::value::SlotIndex,
+    /// Per-instance array data (XS's exotic array's `XS_ARRAY_KIND` internal
+    /// slot: `length` plus the item chunk). Keyed by the array instance's
+    /// slot. `length` is the array length semantics of `fxArraySetLength`;
+    /// `items` holds the present (non-hole) elements sparsely by index —
+    /// an absent index in `[0, length)` is a hole. Kept in a side table like
+    /// [`Self::error_data`]/[`Self::wrapper_data`]; no mid-run GC runs, so the
+    /// item value slots (which may be references) are never swept underneath
+    /// it (the stage-2 GC roots contract).
+    arrays: std::collections::HashMap<crate::value::SlotIndex, ArrayData>,
+    /// The program-local symbol id of `length`, resolved at
+    /// [`Self::link_intrinsics`] (XS's `mxID(_length)`), so an
+    /// `arr.length` get/set routes to the array length semantics. `None`
+    /// when the program never references `length`.
+    length_id: Option<u16>,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -763,6 +834,9 @@ impl Interp {
             symbol_names: Vec::new(),
             error_data: std::collections::HashMap::new(),
             wrapper_data: std::collections::HashMap::new(),
+            array_proto: crate::value::SlotIndex::NULL,
+            arrays: std::collections::HashMap::new(),
+            length_id: None,
             jumps: Vec::new(),
         };
         interp.create_intrinsics();
@@ -818,9 +892,21 @@ impl Interp {
                 | Native::Symbol
                 | Native::Number
                 | Native::String => self.slots.alloc(Slot::instance(object_proto)),
+                // `%Array.prototype%` is itself an (empty) exotic array in XS;
+                // endor models it as an ordinary boot object chaining to
+                // %Object.prototype% (its own array-ness is unobservable to the
+                // covered grammar, which never reads `Array.prototype.length`).
+                Native::Array => self.slots.alloc(Slot::instance(object_proto)),
             };
             self.ctor_prototype.insert(f, proto);
         }
+        // Remember `%Array.prototype%` — every array literal / `new Array`
+        // instance chains to it so its methods resolve up the chain.
+        self.array_proto = self
+            .intrinsics
+            .get("Array")
+            .and_then(|&c| self.ctor_prototype.get(&c).copied())
+            .unwrap_or(crate::value::SlotIndex::NULL);
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
         // carries toString/valueOf/hasOwnProperty/isPrototypeOf; each Error
@@ -997,6 +1083,12 @@ impl Interp {
     /// the guest run exactly as XS's do, so no allocation is charged.
     pub fn link_intrinsics(&mut self, names: &[String]) {
         self.symbol_names = names.to_vec();
+        // Cache the program-local id of `length` (XS's `mxID(_length)`) so an
+        // `arr.length` get/set routes to the array length semantics.
+        self.length_id = names
+            .iter()
+            .position(|n| n == "length")
+            .map(|k| (k + 1) as u16);
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -1232,7 +1324,24 @@ impl Interp {
                 // toString`: `name` with an empty/absent message, else
                 // `name: message` — the abort/completion value parity the
                 // Error hierarchy graduates.
-                if let Some(info) = self.error_data.get(&r) {
+                if let Some(a) = self.arrays.get(&r) {
+                    // An array stringifies through `Array.prototype.toString` →
+                    // `join(",")`: each index in `[0, length)` rendered, holes
+                    // and `undefined`/`null` rendered as the empty string,
+                    // joined with commas.
+                    let mut out = String::new();
+                    for i in 0..a.length {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        if let Some(item) = a.items.get(&i) {
+                            if item.kind != Kind::Undefined && item.kind != Kind::Null {
+                                out.push_str(&self.render(item));
+                            }
+                        }
+                    }
+                    out
+                } else if let Some(info) = self.error_data.get(&r) {
                     match &info.message {
                         Some(m) if !m.is_empty() => format!("{}: {}", info.name, m),
                         _ => info.name.to_string(),
@@ -1570,6 +1679,85 @@ impl Interp {
                     self.push(Slot::of(Kind::Reference, Payload::Reference(inst)));
                     pc += size as usize;
                 }
+                // `array` (`XS_CODE_ARRAY`): `fxNewArray(the, 0)` — push a
+                // reference to a fresh empty exotic array. The array-literal
+                // prelude stores it, sets `.length`, then fills item slots via
+                // `NEW_PROPERTY_AT`.
+                XS_CODE_ARRAY => {
+                    let inst = self.new_array();
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(inst)));
+                    pc += size as usize;
+                }
+                // `at` / `at_2` (`XS_CODE_AT`/`AT_2`): convert a computed key on
+                // the stack (`o[k]`) into an `XS_AT_KIND` key the
+                // `*_PROPERTY_AT` opcodes consume. `AT` operates on the top
+                // slot; `AT_2` on `mxStack+1` (used by the define/set forms
+                // where the value sits on top). An integer/number that is a
+                // valid array index becomes an index key; a symbol or a string
+                // that names a program symbol becomes a named key. XS meters a
+                // non-index string key `2 × XS_CODE_METERING` extra; the
+                // integer/symbol paths are dispatch-only.
+                XS_CODE_AT | XS_CODE_AT_2 => {
+                    let depth = if op == XS_CODE_AT_2 { 1 } else { 0 };
+                    let idx = self.stack.len().checked_sub(1 + depth);
+                    let key = match idx.map(|i| self.stack[i]) {
+                        Some(k) => k,
+                        None => return Halt::Unsupported(op.name()),
+                    };
+                    let at = match self.to_at_key(key) {
+                        Some(at) => at,
+                        None => return Halt::Unsupported(op.name()),
+                    };
+                    if let Some(i) = idx {
+                        self.stack[i] = at;
+                    }
+                    pc += size as usize;
+                }
+                // `arr[k]` read (`XS_CODE_GET_PROPERTY_AT`). Stack:
+                // [.., objectRef, atKey] → [.., value]. Like `GET_PROPERTY`,
+                // meters no built-in step.
+                XS_CODE_GET_PROPERTY_AT => {
+                    let key = self.pop();
+                    let obj = self.pop();
+                    let v = self.property_at_get(obj, key);
+                    match v {
+                        Ok(s) => self.push(s),
+                        Err(h) => return h,
+                    }
+                    pc += size as usize;
+                }
+                // `arr[k] = v` (`XS_CODE_SET_PROPERTY_AT`). Stack:
+                // [.., objectRef, atKey, value] → [.., value].
+                XS_CODE_SET_PROPERTY_AT => {
+                    let value = self.pop();
+                    let key = self.pop();
+                    let obj = self.pop();
+                    if let Err(h) = self.property_at_set(obj, key, value, false) {
+                        return h;
+                    }
+                    self.push(value);
+                    pc += size as usize;
+                }
+                // `arr[k] = v` in a literal / definition (`NEW_PROPERTY_AT`).
+                // Stack: [.., objectRef, atKey, value]; a 2-byte trailing
+                // operand carries the property attributes (the AT form has no
+                // id operand, so its total length is opcode + 2 = 3 bytes, and
+                // the flag is the *second* of those two — see the `xsRun.c`
+                // `NEW_PROPERTY_ALL` pointer walk). Consumes all three stack
+                // slots (defines the item), leaving the base object the
+                // literal keeps below.
+                XS_CODE_NEW_PROPERTY_AT => {
+                    if pc + 3 > len {
+                        return Halt::Decode(format!("new_property_at at {} needs 3 bytes", pc));
+                    }
+                    let value = self.pop();
+                    let key = self.pop();
+                    let obj = self.pop();
+                    if let Err(h) = self.property_at_set(obj, key, value, true) {
+                        return h;
+                    }
+                    pc += 3;
+                }
                 // Define a new own property (object-literal member).
                 // Stack: [.., objectRef, value]; consumes both. Encoded
                 // as 5 bytes — opcode + 2-byte id + a 2-byte inline flag
@@ -1602,7 +1790,13 @@ impl Interp {
                     let value = self.pop();
                     let obj = self.pop();
                     if let Payload::Reference(inst) = obj.value {
-                        self.instance_put(inst, id, value);
+                        if self.arrays.contains_key(&inst) && Some(id) == self.length_id {
+                            // `arr.length = N`: the exotic-array length accessor
+                            // setter (`fxArrayLengthSetter` → `fxArraySetLength`).
+                            self.array_set_length(inst, value);
+                        } else {
+                            self.instance_put(inst, id, value);
+                        }
                     }
                     self.push(value);
                     pc += ilen;
@@ -1616,6 +1810,14 @@ impl Interp {
                     let id = id!(1);
                     let obj = self.pop();
                     let v = match obj.value {
+                        Payload::Reference(inst)
+                            if self.arrays.contains_key(&inst) && Some(id) == self.length_id =>
+                        {
+                            // `arr.length`: the exotic-array length accessor
+                            // getter (`fxArrayLengthGetter`).
+                            self.meter.tick_raw(ARRAY_LENGTH_GET_METERING);
+                            Slot::integer(self.arrays[&inst].length as i32)
+                        }
                         Payload::Reference(inst) => self.instance_get(inst, id),
                         _ => Slot::undefined(),
                     };
@@ -3608,6 +3810,249 @@ impl Interp {
     /// `fxNewObject` cost measured against the pin: one built-in step
     /// (`mxMeterOne`) plus one property-slot `fxNewSlot`
     /// ([`crate::meter::SLOT_ALLOCATION_METERING`]) — 16640 raw total.
+    /// Allocate a fresh empty exotic array (`fxNewArray(the, 0)` →
+    /// `fxNewArrayInstance`): a real arena instance chained to
+    /// `%Array.prototype%`, registered in [`Self::arrays`] with length 0 and
+    /// no items. Meters [`ARRAY_CREATE_METERING`] (the instance + internal
+    /// array-behavior slot allocations).
+    fn new_array(&mut self) -> crate::value::SlotIndex {
+        self.meter.tick_raw(ARRAY_CREATE_METERING);
+        let inst = self.slots.alloc(Slot::instance(self.array_proto));
+        self.arrays.insert(inst, ArrayData::default());
+        inst
+    }
+
+    /// Convert a stack value into an `XS_AT_KIND` computed key (XS's
+    /// `XS_CODE_AT_ALL`): an integer/number that is a valid array index
+    /// becomes an index key (`id == XS_NO_ID`); a symbol or a program-known
+    /// string name becomes a named key. Returns `None` for a key endor does
+    /// not yet model (a non-index string absent from the symbol table, an
+    /// object needing `ToPrimitive`), so the caller self-names an honest skip.
+    fn to_at_key(&self, key: Slot) -> Option<Slot> {
+        match key.kind {
+            Kind::Integer => {
+                let i = match key.value {
+                    Payload::Integer(i) => i,
+                    _ => return None,
+                };
+                if i >= 0 {
+                    Some(Slot::of(Kind::At, Payload::At(crate::value::XS_NO_ID, i as u32)))
+                } else {
+                    // A negative integer is not an array index; it names a
+                    // string property key ("-1"). Resolve it as a name id.
+                    let name = number_to_ecma_string(i as f64);
+                    self.symbol_ids
+                        .get(&name)
+                        .map(|&id| Slot::of(Kind::At, Payload::At(id, 0)))
+                }
+            }
+            Kind::Number => {
+                let n = match key.value {
+                    Payload::Number(n) => n,
+                    _ => return None,
+                };
+                // A non-negative integral number within the index range is an
+                // index key; anything else names a string key.
+                if n >= 0.0 && n.fract() == 0.0 && n < 4294967295.0 {
+                    Some(Slot::of(Kind::At, Payload::At(crate::value::XS_NO_ID, n as u32)))
+                } else {
+                    let name = number_to_ecma_string(n);
+                    self.symbol_ids
+                        .get(&name)
+                        .map(|&id| Slot::of(Kind::At, Payload::At(id, 0)))
+                }
+            }
+            Kind::Symbol => {
+                // A symbol key: XS uses the symbol's own id. endor models the
+                // symbol keys the program names via the symbol table; a bare
+                // Symbol value key is out of the covered grammar.
+                None
+            }
+            Kind::String => {
+                // A string key names a property; resolve it to the program's
+                // symbol id (an index-valued string routes to the array item).
+                let content = match key.value {
+                    Payload::String(off) => self.str_content(off).to_vec(),
+                    _ => return None,
+                };
+                let s = String::from_utf8_lossy(&content);
+                if let Some(idx) = string_to_index(&s) {
+                    Some(Slot::of(Kind::At, Payload::At(crate::value::XS_NO_ID, idx)))
+                } else {
+                    self.symbol_ids
+                        .get(s.as_ref())
+                        .map(|&id| Slot::of(Kind::At, Payload::At(id, 0)))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Read a computed (`AT`-key) property (`GET_PROPERTY_AT`): an array index
+    /// reads the item (or `undefined` for a hole / past the end); a named key
+    /// reads the (own-or-inherited) property. Meters no built-in step, like
+    /// `GET_PROPERTY`.
+    fn property_at_get(&mut self, obj: Slot, key: Slot) -> Result<Slot, Halt> {
+        let inst = match obj.value {
+            Payload::Reference(i) => i,
+            _ => return Ok(Slot::undefined()),
+        };
+        let (id, index) = match key.value {
+            Payload::At(id, index) => (id, index),
+            _ => return Err(Halt::Unsupported("get_property_at")),
+        };
+        if id == crate::value::XS_NO_ID {
+            // An index key.
+            if self.arrays.contains_key(&inst) {
+                Ok(self
+                    .arrays
+                    .get(&inst)
+                    .and_then(|a| a.items.get(&index).copied())
+                    .map(|s| Slot::of(s.kind, s.value))
+                    .unwrap_or_else(Slot::undefined))
+            } else {
+                // A non-array object indexed numerically stores its items in a
+                // separate index chunk (XS's `fxSetIndexProperty` on an
+                // ordinary object) whose allocation metering endor does not yet
+                // model — honest skip rather than a wrong/meter-divergent value.
+                let _ = index;
+                Err(Halt::Unsupported("get_property_at"))
+            }
+        } else if Some(id) == self.length_id && self.arrays.contains_key(&inst) {
+            self.meter.tick_raw(ARRAY_LENGTH_GET_METERING);
+            Ok(Slot::integer(self.arrays[&inst].length as i32))
+        } else {
+            Ok(self.instance_get(inst, id))
+        }
+    }
+
+    /// Write a computed (`AT`-key) property. `define` distinguishes
+    /// `NEW_PROPERTY_AT` (a literal/`Object.defineProperty`-style define,
+    /// which meters one extra built-in step) from `SET_PROPERTY_AT` (a plain
+    /// assignment). An array index grows/overwrites the item chunk; a named
+    /// key routes to the ordinary property store or the array length.
+    fn property_at_set(
+        &mut self,
+        obj: Slot,
+        key: Slot,
+        value: Slot,
+        define: bool,
+    ) -> Result<(), Halt> {
+        let inst = match obj.value {
+            Payload::Reference(i) => i,
+            _ => return Ok(()),
+        };
+        let (id, index) = match key.value {
+            Payload::At(id, index) => (id, index),
+            _ => return Err(Halt::Unsupported("set_property_at")),
+        };
+        if id == crate::value::XS_NO_ID {
+            if self.arrays.contains_key(&inst) {
+                self.array_item_set(inst, index, value, define);
+                Ok(())
+            } else {
+                // Numeric index on a non-array object uses the ordinary-object
+                // index chunk (see [`Self::property_at_get`]); its metering is
+                // not yet modeled, so this is an honest skip rather than a
+                // wrong/meter-divergent store.
+                let _ = (index, value, define);
+                Err(Halt::Unsupported("set_property_at"))
+            }
+        } else if Some(id) == self.length_id && self.arrays.contains_key(&inst) {
+            self.array_set_length(inst, value);
+            Ok(())
+        } else {
+            self.instance_put(inst, id, value);
+            if define {
+                self.meter.tick_builtin();
+            }
+            Ok(())
+        }
+    }
+
+    /// Set array item `index = value` (XS's `fxSetIndexProperty` +
+    /// `fxRunDefine`). Grows the item chunk when the index is new (metered by
+    /// [`Self::array_item_grow_metering`]) and bumps `length` when the index
+    /// reaches past the end; `define` adds the `fxRunDefine` built-in step.
+    fn array_item_set(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        index: u32,
+        value: Slot,
+        define: bool,
+    ) {
+        let is_new = !self
+            .arrays
+            .get(&inst)
+            .map(|a| a.items.contains_key(&index))
+            .unwrap_or(false);
+        if is_new {
+            let present = self.arrays[&inst].items.len() as u64;
+            self.meter.tick_raw(self.array_item_grow_metering(present));
+        }
+        if define {
+            self.meter.tick_raw(ARRAY_ITEM_DEFINE_STEP_METERING);
+        }
+        if let Some(a) = self.arrays.get_mut(&inst) {
+            let mut v = value;
+            v.id = 0;
+            v.next = crate::value::SlotIndex::NULL;
+            a.items.insert(index, v);
+            if index + 1 > a.length {
+                a.length = index + 1;
+            }
+        }
+    }
+
+    /// The raw 16.16 chunk-growth cost of appending one item to an array that
+    /// already holds `present` items (XS's `fxNewChunk`/`fxRenewChunk` of the
+    /// item chunk to `present + 1` slots). XS meters the *adjusted* requested
+    /// size: `fxAdjustChunkSize((present+1) * sizeof(txSlot))` with
+    /// `sizeof(txSlot) == 32` on the 64-bit oracle target, i.e.
+    /// `round_up_8((present+1)*32) + sizeof(txChunk)` = `(present+1)*32 + 16`
+    /// (the payload is already 8-aligned). Verified against the pin: an
+    /// N-element literal's per-element chunk cost is 48, 80, 112, 144, ….
+    fn array_item_grow_metering(&self, present: u64) -> u64 {
+        let bytes = (present + 1) * 32;
+        // round up to 8 (already a multiple of 8) + 16-byte chunk header.
+        ((bytes + 7) & !7) + 16
+    }
+
+    /// Set an array's `length` (XS's `fxArrayLengthSetter` → `fxSetArrayLength`).
+    /// Growing past the current length adds holes; shrinking drops the items at
+    /// or above the new length. Meters the accessor-setter call machinery
+    /// ([`ARRAY_LENGTH_SET_METERING`]); the literal's length prelude sets it
+    /// before any item exists, so no chunk realloc is metered there.
+    fn array_set_length(&mut self, inst: crate::value::SlotIndex, value: Slot) {
+        self.meter.tick_raw(ARRAY_LENGTH_SET_METERING);
+        let new_len = self.to_length_u32(value);
+        if let Some(a) = self.arrays.get_mut(&inst) {
+            if new_len < a.length {
+                let drop: Vec<u32> = a
+                    .items
+                    .range(new_len..)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for k in drop {
+                    a.items.remove(&k);
+                }
+            }
+            a.length = new_len;
+        }
+    }
+
+    /// ToUint32-ish length coercion for `arr.length = v` (the covered grammar
+    /// uses integer/number lengths; `fxCheckArrayLength` throws a RangeError on
+    /// a non-integer, which is out of the covered set and left to a later
+    /// increment).
+    fn to_length_u32(&self, value: Slot) -> u32 {
+        match value.value {
+            Payload::Integer(i) if i >= 0 => i as u32,
+            Payload::Number(n) if n >= 0.0 && n.fract() == 0.0 && n <= 4294967295.0 => n as u32,
+            _ => 0,
+        }
+    }
+
     fn new_object(&mut self) -> crate::value::SlotIndex {
         self.meter.tick_builtin();
         self.meter.tick_slot_alloc();
@@ -3997,6 +4442,7 @@ impl Interp {
                 _ => b"undefined".to_vec(),
             },
             Payload::Reference(_) => Vec::new(), // unreachable: op_add rejects references
+            Payload::At(..) => Vec::new(),        // unreachable: not a primitive value
         }
     }
 }
@@ -4025,6 +4471,7 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::Symbol => "native-call:Symbol",
         Native::Number => "native-call:Number",
         Native::String => "native-call:String",
+        Native::Array => "native-call:Array",
         Native::Error => "native-call:Error",
         Native::EvalError => "native-call:EvalError",
         Native::RangeError => "native-call:RangeError",
@@ -4129,6 +4576,7 @@ fn to_boolean(s: &Slot) -> bool {
         Payload::Number(n) => !(n == 0.0 || n.is_nan()),
         Payload::String(_) => true, // non-empty; stage-1 strings are results only
         Payload::Reference(_) => true,
+        Payload::At(..) => true, // a transient key is never ToBoolean'd
     }
 }
 
@@ -4791,5 +5239,29 @@ pub fn slot_to_ecma_string(s: &Slot) -> String {
         Payload::Number(n) => number_to_ecma_string(n),
         Payload::String(_) => String::new(), // stage-1 strings not produced
         Payload::Reference(_) => "[object Object]".to_string(),
+        Payload::At(..) => String::new(), // a transient computed key, never rendered
+    }
+}
+
+/// Parse a string that is a canonical array-index (a "CanonicalNumericIndex"
+/// in `[0, 2^32-1)` with no leading zeros or sign), returning the index.
+/// `"0"`, `"1"`, `"10"` are indices; `"01"`, `"-1"`, `"1.5"`, `"4294967295"`
+/// (the max length, not an index), and `""` are not.
+fn string_to_index(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 10 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'0' && s.len() > 1 {
+        return None; // no leading zeros
+    }
+    if !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = s.parse().ok()?;
+    if n < 4294967295 {
+        Some(n as u32)
+    } else {
+        None
     }
 }

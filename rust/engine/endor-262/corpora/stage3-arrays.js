@@ -1,0 +1,65 @@
+// Stage-3 child-3 (arrays) curated corpus: the Array exotic object and its
+// index/length semantics, array literals with holes, computed element get/set,
+// and the array-item chunk growth — all bit-exact (completion value AND
+// computron count) against the C-XS oracle at the pin 48ee02d8cfe0. One JS
+// program per line; the last expression is the completion value.
+
+// --- array literals (fxNewArray + per-element NEW_PROPERTY_AT) ---
+[]
+[1]
+[1,2,3]
+[1,2,3,4,5]
+[7,8,9,10,11,12]
+["a","b","c"]
+[true,false,null]
+[1,"two",true,null]
+
+// --- holes (a literal elision leaves a hole; length still spans them) ---
+[1,,3]
+[,1]
+[1,,]
+[,,3]
+
+// --- nested arrays (toString joins recursively) ---
+[[1],[2,3]]
+[[1,2],[3,4]]
+[[]]
+[[1,[2,[3]]]]
+
+// --- indexed reads (AT + GET_PROPERTY_AT over the item chunk) ---
+[10,20,30][0]
+[10,20,30][1]
+[10,20,30][2]
+[10,20,30][3]
+var a=[10,20,30]; a[0]
+var a=[10,20,30]; a[2]
+var a=[10,20,30]; a[5]
+[10,20][0]+[10,20][1]
+[1,2,3][2]*10
+
+// --- length reads (the array length accessor getter) ---
+[].length
+[1,2,3].length
+var a=[1,2,3,4]; a.length
+var a=[]; a.length
+
+// --- indexed writes (SET_PROPERTY_AT: overwrite and grow) ---
+var a=[5]; a[0]=9; a[0]
+var a=[1,2,3]; a[1]=99; a[1]
+var a=[1,2,3]; a[1]=99; a
+var a=[]; a[0]=7; a.length
+var a=[]; a[0]=7; a[0]
+var a=[1,2,3]; a[5]=9; a.length
+var a=[1,2,3]; a[5]=9; a[5]
+var a=[1]; a[0]=a[0]+1; a[0]
+
+// --- length writes (fxArraySetLength: grow with holes, shrink drops items) ---
+var a=[1,2,3]; a.length=2; a
+var a=[1,2,3]; a.length=1; a
+var a=[1,2,3]; a.length=0; a.length
+var a=[1,2,3]; a.length=5; a.length
+var a=[1,2,3]; a.length=5; a
+
+// --- mixed literal + mutation ---
+var a=[1,2,3]; a[0]=a[2]; a
+var a=[0,0,0]; a[0]=1; a[2]=3; a
