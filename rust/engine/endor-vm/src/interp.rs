@@ -376,6 +376,10 @@ pub const ARRAY_FLATMAP_CALLBACK_METERING: u64 = 6 << 14;
 /// plus a trailing `4`). Non-mutating: the receiver is untouched. Calibrated
 /// against the pin.
 pub const ARRAY_TOSPLICED_FRAME_METERING: u64 = 131584;
+/// `Array.prototype.toString` prelude cost beyond the delegated `join` body:
+/// the `mxThis`/`mxDub`/`mxGetID(_join)` lookup plus the `mxCall`/`mxRunCount(0)`
+/// call-frame setup that invokes `join`. Calibrated against the pin.
+pub const ARRAY_TOSTRING_PRELUDE_METERING: u64 = 114688;
 /// `Array.prototype.forEach` frame cost + the per-element `fxCallThisItem`
 /// overhead (`mxGetIndex` + the callback call-frame setup), beyond the
 /// callback body's own metering. Calibrated against the pin.
@@ -653,6 +657,27 @@ pub enum NativeMethod {
     /// `Array.prototype.toSpliced(start, deleteCount, ...items)`
     /// (`fx_Array_prototype_toSpliced`): a non-mutating splice into a new array.
     ArrayToSpliced,
+    /// `Array.prototype.toString()` (`fx_Array_prototype_toString`): delegates
+    /// to `this.join()` with the default separator (spec 23.1.3.36).
+    ArrayToString,
+    /// `Array.prototype.sort([cmp])` — an honest named skip: the quicksort's
+    /// comparison count (and thus its metering) is data- and comparator-
+    /// dependent, so it is not modeled to a clean constant this stage.
+    ArraySort,
+    /// `Array.prototype.toSorted([cmp])` — an honest named skip for the same
+    /// data-dependent-comparison reason as `sort`.
+    ArrayToSorted,
+    /// `Array.prototype.toLocaleString()` — an honest named skip (locale-aware
+    /// element stringification is out of this stage's scope).
+    ArrayToLocaleString,
+    /// `Array.from(iterable[, mapFn[, thisArg]])` — an honest named skip: the
+    /// C-level `fxGetIterator`/`fxIteratorNext` protocol metering (routing
+    /// through `%ArrayIteratorPrototype%.next` via `mxRunCount`) is not modeled
+    /// to a clean per-element constant this stage.
+    ArrayFrom,
+    /// `Array.fromAsync(...)` — an honest named skip (returns a Promise; async
+    /// iteration is stage-4+ territory).
+    ArrayFromAsync,
     /// `Array.isArray(v)` — a static on the `Array` constructor: whether `v`
     /// is an array exotic object.
     ArrayIsArray,
@@ -1310,6 +1335,13 @@ impl Interp {
             ("flat", NativeMethod::ArrayFlat),
             ("flatMap", NativeMethod::ArrayFlatMap),
             ("toSpliced", NativeMethod::ArrayToSpliced),
+            ("toString", NativeMethod::ArrayToString),
+            // Recognized-but-unimplemented methods, bound so a reference is an
+            // honest NAMED skip (`Halt::Unsupported`) rather than a completion
+            // divergence (`this.M is not a function`) or a wrong value.
+            ("sort", NativeMethod::ArraySort),
+            ("toSorted", NativeMethod::ArrayToSorted),
+            ("toLocaleString", NativeMethod::ArrayToLocaleString),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.array_proto, name, mf));
@@ -1328,6 +1360,11 @@ impl Interp {
             self.proto_methods.push((array_ctor, "isArray", mf));
             let of = self.alloc_method(NativeMethod::ArrayOf);
             self.proto_methods.push((array_ctor, "of", of));
+            // Recognized-but-unimplemented statics (honest named skips).
+            let from = self.alloc_method(NativeMethod::ArrayFrom);
+            self.proto_methods.push((array_ctor, "from", from));
+            let from_async = self.alloc_method(NativeMethod::ArrayFromAsync);
+            self.proto_methods.push((array_ctor, "fromAsync", from_async));
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -5297,6 +5334,70 @@ impl Interp {
                 self.meter.tick_chunk_new((out.len() + 1) as u64);
                 let off = self.chunks.alloc(&out);
                 Slot::of(Kind::String, Payload::String(off))
+            }
+            // `Array.prototype.toString()` delegates to `this.join()` with the
+            // default separator: it meters a small prelude (the `join` lookup +
+            // the `mxRunCount(0)` call-frame setup) and then the identical join
+            // body (frame + per-element read + the result chunk). Modeled by
+            // running the default-separator join and adding the prelude.
+            NativeMethod::ArrayToString => {
+                let inst = match self.dense_array_this(this) {
+                    Some(i) => i,
+                    None => return Err(Halt::Unsupported("toString:non-dense-array")),
+                };
+                self.meter.tick_raw(ARRAY_TOSTRING_PRELUDE_METERING);
+                let length = self.arrays[&inst].length;
+                let items: Vec<Option<Slot>> = {
+                    let a = &self.arrays[&inst];
+                    (0..length).map(|i| a.items.get(&i).copied()).collect()
+                };
+                self.meter.tick_raw(ARRAY_JOIN_FRAME_METERING);
+                self.meter.tick_slot_alloc();
+                let mut out: Vec<u8> = Vec::new();
+                for (i, item) in items.into_iter().enumerate() {
+                    self.meter.tick_raw(ARRAY_JOIN_PER_ELEMENT_METERING);
+                    if i > 0 {
+                        self.meter.tick_slot_alloc();
+                        out.push(b',');
+                    }
+                    match item {
+                        Some(s) if s.kind != Kind::Undefined && s.kind != Kind::Null => {
+                            if s.kind == Kind::Reference {
+                                return Err(Halt::Unsupported("toString:reference-element"));
+                            }
+                            self.meter.tick_slot_alloc();
+                            let bytes = self.to_string_bytes_metered(s);
+                            out.extend_from_slice(&bytes);
+                        }
+                        _ => {}
+                    }
+                }
+                self.meter.tick_chunk_new((out.len() + 1) as u64);
+                let off = self.chunks.alloc(&out);
+                Slot::of(Kind::String, Payload::String(off))
+            }
+            // Recognized-but-unimplemented Array methods and statics: honest
+            // NAMED skips, so a reference is `Halt::Unsupported` (never a
+            // completion divergence or a wrong value). See each variant's doc.
+            NativeMethod::ArraySort => {
+                let _ = (base, argc);
+                return Err(Halt::Unsupported("Array.prototype.sort:data-dependent-comparison-metering"));
+            }
+            NativeMethod::ArrayToSorted => {
+                let _ = (base, argc);
+                return Err(Halt::Unsupported("Array.prototype.toSorted:data-dependent-comparison-metering"));
+            }
+            NativeMethod::ArrayToLocaleString => {
+                let _ = (base, argc);
+                return Err(Halt::Unsupported("Array.prototype.toLocaleString:locale-stringification"));
+            }
+            NativeMethod::ArrayFrom => {
+                let _ = (base, argc);
+                return Err(Halt::Unsupported("Array.from:iterator-protocol-metering"));
+            }
+            NativeMethod::ArrayFromAsync => {
+                let _ = (base, argc);
+                return Err(Halt::Unsupported("Array.fromAsync:async-iteration"));
             }
             // `Array.isArray(v)`: whether `v` is an array exotic object.
             NativeMethod::ArrayIsArray => {
