@@ -985,6 +985,121 @@ pub fn gen_stage3b_binary_program(data: &[u8]) -> String {
     }
 }
 
+/// Stage-3b fundamentals-followup grammar (child 4/9): the post-arrays
+/// fundamentals surfaces that are **bit-exact** (result AND computron) vs
+/// C-XS — a user function's `.length`/`.name`, `Function.prototype.bind`
+/// (create + call), `Function.prototype.apply` with a dense array,
+/// `Symbol.prototype.toString`/`String(symbol)`/`Symbol.for`/`keyFor`, and
+/// `AggregateError`. Every arm is a valid, always-bit-exact program (the
+/// honest-skip corners — `new boundFn`, a primitive `this`, a sparse array,
+/// a non-array apply argument, a bound-of-bound *call* — are deliberately not
+/// generated). Rides [`differential_check_with_symbols`] (the built-ins and
+/// property names relink by program symbol).
+pub fn gen_stage3b_fundamentals_followup_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    // A small non-negative integer literal for bound/call/apply arguments.
+    let n = |b: &mut Bytes| -> i32 { (b.next() % 20) as i32 };
+    // A short identifier-safe key string for the Symbol registry.
+    let key = |b: &mut Bytes| -> String {
+        const K: &[&str] = &["k", "a", "reg", "sym", "x1", "hello"];
+        K[(b.next() as usize) % K.len()].to_string()
+    };
+    match b.choice(9) {
+        // A user function's `.length` (its declared arity).
+        0 => {
+            let arity = (b.next() % 6) as usize;
+            let params: Vec<String> = (0..arity).map(|i| format!("p{}", i)).collect();
+            format!("function f({}){{return 0}} f.length", params.join(","))
+        }
+        // A user function's `.name` (declaration and var-initializer forms).
+        1 => {
+            if b.choice(2) == 0 {
+                "function namedFn(a){return a} namedFn.name".to_string()
+            } else {
+                "var vf = function(x,y){return x}; vf.name".to_string()
+            }
+        }
+        // `Function.prototype.bind` — create then call (0..2 bound args).
+        2 => {
+            let nb = (b.next() % 3) as usize;
+            let bound: Vec<String> = (0..nb).map(|_| n(&mut b).to_string()).collect();
+            let call: Vec<String> = (0..(1 + b.next() % 3))
+                .map(|_| n(&mut b).to_string())
+                .collect();
+            let bound_list = if bound.is_empty() {
+                "undefined".to_string()
+            } else {
+                format!("undefined,{}", bound.join(","))
+            };
+            format!(
+                "function ft(a,b,c){{return a+b+c}} var g = ft.bind({}); g({})",
+                bound_list,
+                call.join(",")
+            )
+        }
+        // `bind`'s bound `.length` / `.name`.
+        3 => {
+            let nb = (b.next() % 4) as usize;
+            let bound: Vec<String> = (0..nb).map(|_| n(&mut b).to_string()).collect();
+            let bound_list = if bound.is_empty() {
+                "undefined".to_string()
+            } else {
+                format!("undefined,{}", bound.join(","))
+            };
+            let acc = if b.choice(2) == 0 { "length" } else { "name" };
+            format!(
+                "function fq(a,b,c,d){{return 0}} fq.bind({}).{}",
+                bound_list, acc
+            )
+        }
+        // `Function.prototype.apply` with a dense array argument.
+        4 => {
+            let cnt = 1 + (b.next() % 4) as usize;
+            let elems: Vec<String> = (0..cnt).map(|_| n(&mut b).to_string()).collect();
+            format!(
+                "function fa(a,b,c){{return a+b+c}} fa.apply(undefined,[{}])",
+                elems.join(",")
+            )
+        }
+        // `Symbol.prototype.toString` / `String(symbol)`.
+        5 => {
+            let desc = key(&mut b);
+            match b.choice(3) {
+                0 => format!("Symbol(\"{}\").toString()", desc),
+                1 => "Symbol().toString()".to_string(),
+                _ => format!("String(Symbol(\"{}\"))", desc),
+            }
+        }
+        // `Symbol.for` / `Symbol.keyFor` (the registry).
+        6 => {
+            let k = key(&mut b);
+            match b.choice(3) {
+                0 => format!("Symbol.for(\"{}\")===Symbol.for(\"{}\")", k, k),
+                1 => format!("Symbol.keyFor(Symbol.for(\"{}\"))", k),
+                _ => format!("typeof Symbol.keyFor(Symbol(\"{}\"))", k),
+            }
+        }
+        // `AggregateError` (dense-array errors form).
+        7 => {
+            let cnt = (b.next() % 4) as usize;
+            let elems: Vec<String> = (0..cnt).map(|_| n(&mut b).to_string()).collect();
+            match b.choice(3) {
+                0 => format!("new AggregateError([{}]).errors.length", elems.join(",")),
+                1 => "new AggregateError([], \"boom\").message".to_string(),
+                _ => format!("new AggregateError([{}]).name", elems.join(",")),
+            }
+        }
+        // A bind round-trip through `this`.
+        _ => {
+            let v = n(&mut b);
+            format!(
+                "function fthis(){{return this.v}} var o = {{v: {}}}; var g = fthis.bind(o); g()",
+                v
+            )
+        }
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -1649,6 +1764,63 @@ mod tests {
         assert!(saw_element, "element write/read arm never generated");
         assert!(saw_loop, "fill-loop arm never generated");
         assert!(saw_dataview, "DataView arm never generated");
+    }
+
+    #[test]
+    fn generated_stage3b_fundamentals_followup_programs_agree_bit_exact() {
+        // The stage-3b fundamentals-followup grammar — a function's
+        // `.length`/`.name`, `Function.prototype.bind` (create + call),
+        // `apply` with a dense array, `Symbol.prototype.toString`/
+        // `String(symbol)`/`Symbol.for`/`keyFor`, and `AggregateError` — every
+        // generated program bit-exact (result AND computron) vs C-XS. Rides
+        // the symbol-linking differential check (the built-ins + property
+        // names are program symbols).
+        let mut checked = 0;
+        let mut saw_length = false;
+        let mut saw_name = false;
+        let mut saw_bind = false;
+        let mut saw_apply = false;
+        let mut saw_symbol = false;
+        let mut saw_aggregate = false;
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..1200 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(29))
+                        .wrapping_add((seed as u8).wrapping_mul(4)),
+                );
+            }
+            let prog = gen_stage3b_fundamentals_followup_program(&buf);
+            distinct.insert(prog.clone());
+            saw_length |= prog.contains(".length");
+            saw_name |= prog.contains(".name");
+            saw_bind |= prog.contains(".bind(");
+            saw_apply |= prog.contains(".apply(");
+            saw_symbol |= prog.contains("Symbol");
+            saw_aggregate |= prog.contains("AggregateError");
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!(
+                    "stage-3b fundamentals-followup differential divergence on {:?}: {:?}",
+                    prog, d
+                ),
+            }
+        }
+        assert!(checked > 0);
+        assert!(
+            distinct.len() > 40,
+            "followup sweep too uniform: {} distinct",
+            distinct.len()
+        );
+        assert!(saw_length, ".length arm never generated");
+        assert!(saw_name, ".name arm never generated");
+        assert!(saw_bind, "bind arm never generated");
+        assert!(saw_apply, "apply arm never generated");
+        assert!(saw_symbol, "Symbol arm never generated");
+        assert!(saw_aggregate, "AggregateError arm never generated");
     }
 
     #[test]
