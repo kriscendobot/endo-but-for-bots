@@ -1100,6 +1100,86 @@ pub fn gen_stage3b_fundamentals_followup_program(data: &[u8]) -> String {
     }
 }
 
+/// Stage-3b object-statics + intern-table differential arm (child 5/9): a
+/// random small ordinary object exercised through `hasOwnProperty`,
+/// `Object.keys`, and `Object.getOwnPropertyDescriptor` over both present
+/// (program-symbol) keys and absent keys — the genuinely-novel and the
+/// pre-interned-default-key forms — so the arm rides the intern table's
+/// metering split (a novel key meters one `fxNewSlot`; a default key none) and
+/// the descriptor build. Rides the full symbol-linking
+/// [`differential_check_with_symbols`] (result AND computron).
+pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    // The property-name pool: program-symbol keys used in the object literal.
+    const PRESENT: &[&str] = &["a", "b", "c", "foo", "bar", "q"];
+    // Keys that are NOT in the literal: a genuinely-novel name and pre-interned
+    // default keys (well-known inherited names) — both absent as OWN properties.
+    const ABSENT: &[&str] = &["zzz", "missing", "toString", "valueOf", "hasOwnProperty"];
+    // Build an object literal with 0..4 distinct present keys.
+    let count = (b.next() % 5) as usize;
+    let mut keys: Vec<&str> = Vec::new();
+    for _ in 0..count {
+        let k = PRESENT[(b.next() as usize) % PRESENT.len()];
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    let fields: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("{}:{}", k, i + 1))
+        .collect();
+    let obj = format!("{{{}}}", fields.join(","));
+    // Pick a present key (if any) or fall back to an absent probe.
+    let present_key = keys
+        .get((b.next() as usize).wrapping_rem(keys.len().max(1)))
+        .copied();
+    let absent_key = ABSENT[(b.next() as usize) % ABSENT.len()];
+    match b.choice(6) {
+        // hasOwnProperty over a present key.
+        0 => match present_key {
+            Some(k) => format!("var o={}; o.hasOwnProperty(\"{}\")", obj, k),
+            None => format!("var o={}; o.hasOwnProperty(\"{}\")", obj, absent_key),
+        },
+        // hasOwnProperty over an absent key (novel or default).
+        1 => format!("var o={}; o.hasOwnProperty(\"{}\")", obj, absent_key),
+        // Object.keys length.
+        2 => format!("var o={}; Object.keys(o).length", obj),
+        // Object.keys first element (or length when empty).
+        3 => {
+            if keys.is_empty() {
+                format!("var o={}; Object.keys(o).length", obj)
+            } else {
+                format!("var o={}; Object.keys(o)[0]", obj)
+            }
+        }
+        // getOwnPropertyDescriptor of a present key: read one attribute.
+        4 => match present_key {
+            Some(k) => {
+                let attr = match b.choice(4) {
+                    0 => "value",
+                    1 => "writable",
+                    2 => "enumerable",
+                    _ => "configurable",
+                };
+                format!(
+                    "var o={}; Object.getOwnPropertyDescriptor(o,\"{}\").{}",
+                    obj, k, attr
+                )
+            }
+            None => format!(
+                "var o={}; typeof Object.getOwnPropertyDescriptor(o,\"{}\")",
+                obj, absent_key
+            ),
+        },
+        // getOwnPropertyDescriptor of an absent key: undefined.
+        _ => format!(
+            "var o={}; typeof Object.getOwnPropertyDescriptor(o,\"{}\")",
+            obj, absent_key
+        ),
+    }
+}
+
 fn gen_atom(b: &mut Bytes) -> String {
     match b.choice(6) {
         0 => "true".to_string(),
@@ -1821,6 +1901,54 @@ mod tests {
         assert!(saw_apply, "apply arm never generated");
         assert!(saw_symbol, "Symbol arm never generated");
         assert!(saw_aggregate, "AggregateError arm never generated");
+    }
+
+    #[test]
+    fn generated_stage3b_object_statics_programs_agree_bit_exact() {
+        // The object-statics + intern-table arm: hasOwnProperty / Object.keys /
+        // getOwnPropertyDescriptor over random small ordinary objects, present
+        // and absent keys (novel + pre-interned default), all bit-exact (result
+        // AND computron) under the full symbol-linking differential check.
+        let mut checked = 0;
+        let mut saw_has = false;
+        let mut saw_keys = false;
+        let mut saw_gopd = false;
+        let mut saw_absent = false;
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..1200 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(16 + (seed % 24)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(23))
+                        .wrapping_add((seed as u8).wrapping_mul(3)),
+                );
+            }
+            let prog = gen_stage3b_object_statics_program(&buf);
+            distinct.insert(prog.clone());
+            saw_has |= prog.contains(".hasOwnProperty(");
+            saw_keys |= prog.contains("Object.keys(");
+            saw_gopd |= prog.contains("Object.getOwnPropertyDescriptor(");
+            saw_absent |= prog.contains("zzz") || prog.contains("missing");
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!(
+                    "stage-3b object-statics differential divergence on {:?}: {:?}",
+                    prog, d
+                ),
+            }
+        }
+        assert!(checked > 0);
+        assert!(
+            distinct.len() > 30,
+            "object-statics sweep too uniform: {} distinct",
+            distinct.len()
+        );
+        assert!(saw_has, "hasOwnProperty arm never generated");
+        assert!(saw_keys, "Object.keys arm never generated");
+        assert!(saw_gopd, "getOwnPropertyDescriptor arm never generated");
+        assert!(saw_absent, "absent-key arm never generated");
     }
 
     #[test]
