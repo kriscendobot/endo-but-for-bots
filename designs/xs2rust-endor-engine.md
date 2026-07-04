@@ -5,6 +5,7 @@
 | **Created** | 2026-07-02 |
 | **Author** | endolinbot (prompted) |
 | **Status** | Approved (2026-07-02, program supervisor `port-xs-to-rust-memory-safe-engine`; all ten open questions resolved, see § Resolved Questions) |
+| **Revised** | 2026-07-04 — **metering doctrine: accuracy over parity** (maintainer directive). The meter is endor's own release-versioned deterministic cost model, a proxy for real (wall-clock) execution cost, NOT a reproduction of XS's computron counts. The C-XS differential oracle is retained for **result** correctness only; computron comparison is demoted to advisory telemetry. This selects the "stated determinism-equivalence proof" branch the § Prompt already permitted. See § Metering (requirement 1a) and § Agoric consensus compatibility for the authoritative statement. |
 
 Feasibility, architecture, and a staged roadmap for porting the XS
 JavaScript engine to Rust as a crate the `endor` daemon embeds
@@ -20,22 +21,34 @@ onto the same branch and pull request as this design.
 The XS engine core is roughly 75 KLOC of C (94 KLOC counting its
 own RegExp and dtoa implementations), which puts a full port in the
 12 to 24 month range for a single sustained lane. What makes the
-project tractable rather than open-ended is that the crux
-(deterministic metering reproduced exactly against C-XS) is
-testable within weeks, not years: metering parity is a property of
-the bytecode stream and the increment points, both of which are
-small, enumerable surfaces. The roadmap below front-loads a
-differential harness that executes C-XS-compiled bytecode in both
-engines and compares results and computron counts on every commit.
-If stage 1 cannot hold (result, computron) agreement on its
-corpus, the program stops early with a cheap, informative failure
-instead of a late, expensive one.
+project tractable rather than open-ended is that the crux — a
+**result-correct** transliteration whose meter is a **deterministic,
+release-versioned cost model** — is testable within weeks, not
+years. Two sub-properties are separated (see § Metering): (a)
+*result correctness*, the semantic port, which the differential
+oracle checks against C-XS on every commit (completion kind, value,
+error identity); and (b) *meter determinism per release*, which is a
+construction guarantee — a frozen increment-point set with a frozen
+cost table means identical inputs give identical computrons on every
+host and build. The meter's *purpose* is to be the best available
+deterministic proxy for real (wall-clock) execution cost, not to
+reproduce XS's computron counts; XS-computron parity is an explicit
+non-goal. The roadmap below front-loads a differential harness that
+executes C-XS-compiled bytecode in both engines and compares
+**results** on every commit; computron counts are recorded
+alongside as advisory telemetry (a calibration and
+allocation-faithfulness signal), never a build-gating equality
+check. If stage 1 cannot hold result agreement on its corpus, or
+cannot demonstrate a reproducible per-release meter, the program
+stops early with a cheap, informative failure instead of a late,
+expensive one.
 
 Kill criteria, named up front:
 
-- Stage 1 cannot reach bit-exact computron agreement with the
-  oracle on the stage corpus after the interpreter subset is
-  complete.
+- Stage 1 cannot reach result agreement with the oracle on the
+  stage corpus after the interpreter subset is complete, or cannot
+  demonstrate a deterministic-per-release meter (identical
+  computrons across repeated runs of the same build).
 - Stage 5 cannot reach byte-identical bytecode output against the
   oracle compiler on the conformance corpus.
 - The stage 8 performance envelope (geometric mean within 2.0x of
@@ -59,8 +72,9 @@ A Rust port raises memory-safety confidence for exactly the
 component that faces untrusted input, while an interpreter-only
 design preserves the properties that make XS uniquely suited here
 and that mainstream engines cannot offer: deterministic execution,
-exact computation metering, whole-heap snapshots, and native
-Compartment support.
+deterministic and reproducible computation metering (a
+release-versioned cost model, § Metering), whole-heap snapshots, and
+native Compartment support.
 
 ## Ground Truth: What Is Being Ported
 
@@ -110,7 +124,12 @@ consensus-facing meter version is `xs-meter-37`
 consensus-breaking for Agoric because computron counts feed the
 swingset run policy (how many cranks fit in a block); divergent
 counts across validators halt the chain (agoric-sdk issues #4911,
-#5040, #6361).
+#5040, #6361). This paragraph describes XS and the current Agoric
+fleet; endor does **not** lock its own meter to these values.
+Endor's meter is its own release-versioned cost model (§ Metering),
+and its consensus story rests on every validator running the same
+endor release rather than on XS-computron parity (§ Agoric consensus
+compatibility).
 
 **Snapshots.** `xsSnapshot.c` writes a length-prefixed big-endian
 FourCC atom container: `XS_M` wrapping `VERS` (engine version, slot
@@ -169,14 +188,22 @@ test262.fyi and source inspection:
 
 The decisive observations:
 
-1. **No Rust engine has metering, and metering parity cannot be
-   retrofitted.** Requirement 1 demands computron counts
-   reproduced exactly against C-XS. Computrons are a function of
-   the bytecode stream and the per-opcode and per-builtin-step
-   increment points. A different engine has a different bytecode
-   set, so its instruction counts are incommensurable with XS's:
-   extending Boa can at best yield a *new* deterministic meter
-   (a meter-version bump), never parity with `xs-meter-N`.
+1. **No Rust engine has deterministic metering, and endor's meter
+   must be a first-class, reproducible cost model either way.**
+   Under the accuracy-over-parity doctrine (§ Metering) endor's
+   meter is a *new* release-versioned deterministic model whatever
+   engine underlies it, so metering is no longer, by itself, the
+   argument for porting XS rather than extending Boa: any base
+   would need the same purpose-built meter. What porting XS *does*
+   buy the meter is a well-understood, guest-reachable increment
+   seam (XS's per-opcode and per-builtin-step points, whose *check*
+   sites also shape observable abort behavior) that the same-ISA
+   differential oracle can validate opcode-for-opcode on **results**
+   — a seam a foreign engine with a different bytecode set does not
+   offer. The decisive reasons to port XS are the other three
+   requirements below (result-conformance semantics, native SES,
+   native snapshots); metering rides along on the same ISA rather
+   than driving the choice.
 2. **No Rust engine has Compartment, lockdown, or harden.**
    Requirement 5 would mean either running the `ses` shim on an
    engine where lockdown has never been exercised (Boa is the only
@@ -186,21 +213,29 @@ The decisive observations:
    experimental engine.** Requirement 1's snapshot surface would
    be new work in any engine.
 
-**Decision: port XS, as an oracle-locked transliteration.** The
+**Decision: port XS, as an oracle-checked transliteration.** The
 Rust engine adopts XS's bytecode ISA (the 245-opcode `XS_CODE_*`
-set), its meter increment points and weights, its two-heap object
-model semantics, its snapshot atom grammar, and its debugger
+set), its meter increment *points* (as the instrumentation seam —
+but **not** its weights, which become release-versioned calibration
+constants of endor's own cost model, § Metering), its two-heap
+object model semantics, its snapshot atom grammar, and its debugger
 protocol, while re-architecting the *implementation* for safety
 (index-based arenas instead of pointer graphs, safe Rust instead
 of C). C-XS itself, already compiled and linked by the existing
 `xsnap` crate, becomes a continuously-exercised differential
-oracle in CI: every conformance and fuzz run executes both engines
-and compares observable results and computron counts.
+oracle in CI for **result** correctness: every conformance and
+fuzz run executes both engines and compares observable results
+(completion kind, value, error identity), with computron counts
+recorded alongside as advisory telemetry rather than compared for
+equality.
 
-Considered and rejected: extending Boa. Reason: metering parity
-impossible by construction (observation 1); SES and snapshots
+Considered and rejected: extending Boa. Reason: SES and snapshots
 would be new work anyway; ~240 KLOC of foreign engine code
-replaces one audit problem with another. Considered and rejected:
+replaces one audit problem with another; and result-semantics
+fidelity (endor is a transliteration of XS behavior) is what the
+same-ISA oracle checks cheaply. (Metering is no longer a reason
+either way — observation 1 — since endor's meter is a purpose-built
+release-versioned model on any base.) Considered and rejected:
 building on Nova's data-oriented heap. Reason: conformance is 20
 points behind, RegExp is non-compliant, MPL-2.0, and the same
 metering/SES gaps apply. Considered and rejected: wrapping C-XS in
@@ -214,8 +249,10 @@ The staging is hybrid in one specific, temporary way: until the
 compiler port lands (stage 5), the Rust interpreter executes
 bytecode produced by the C-XS compiler through the oracle harness.
 This guarantees the bytecode stream is identical during the phase
-where interpreter and meter parity are being proven, and confines
-the C dependency to development and CI; no intermediate stage
+where interpreter result correctness (and the meter's
+determinism/calibration against a fixed bytecode stream) are being
+proven, and confines the C dependency to development and CI; no
+intermediate stage
 ships a mixed C/Rust engine to production.
 
 ## Architecture
@@ -302,42 +339,85 @@ that geometry.
 
 ### Metering (requirement 1a)
 
-The meter is a `u64` in 16.16 fixed point, incremented at exactly
-XS's points with exactly XS's weights:
+**Doctrine (2026-07-04, maintainer directive): accuracy over
+parity.** The meter's purpose is to be the best available
+**deterministic proxy for real (wall-clock) execution cost**, not
+to reproduce XS's computron counts. XS-computron parity is an
+explicit non-goal. Two properties are separated, and only the first
+is unconditional:
 
-| Event | Weight | XS source of truth |
+- **Determinism per release (unconditional, and the property
+  consensus needs).** Within a released endor version the meter is
+  frozen: a fixed set of increment points with a fixed per-point
+  **cost table**, so identical inputs produce identical computrons
+  on every host, architecture, and build. Any two runs of the same
+  release meter identically. This is a *construction* guarantee (a
+  pure function of the frozen table and the deterministic
+  interpreter), not a bit-exactness proven against a foreign engine
+  — which is why it is cheap and total rather than a long-tail
+  chase.
+- **Accuracy across releases (recalibrated, versioned).** The cost
+  table is a *model* of real execution cost. It is recalibrated
+  between releases as measurement improves, and every recalibration
+  is a meter-version bump (`endor-meter-N`) shipped with the
+  release — never a silent change. Better accuracy is bought at
+  release boundaries; reproducibility within a release is never
+  traded for it.
+
+The meter is a `u64` accumulator; the increment *points* are
+inherited from XS as a well-understood, guest-reachable
+instrumentation seam, but the *weights* are entries in endor's own
+release-versioned cost table, not XS's constants:
+
+| Event | Increment point (seam, from XS) | Weight |
 |---|---|---|
-| Bytecode dispatch | `XS_CODE_METERING` = 1<<16 | `mxBreak` metering variant in `xsRun.c` |
-| Built-in operation step | `XS_BUILTIN_METERING` = 1<<14 | `mxMeterOne`/`mxMeterSome` wrapping the `mx*` operation macros |
-| Parse unit | `XS_PARSE_CODE_METERING` = 1<<16 | `fxMeterSome` calls from the parser |
+| Bytecode dispatch | `mxBreak` metering variant in `xsRun.c` | cost-table entry, per opcode |
+| Built-in operation step | `mxMeterOne`/`mxMeterSome` on the `mx*` operation macros | cost-table entry, per built-in step |
+| Allocation | slot alloc (`XS_SLOT_ALLOCATION_METERING`) / chunk byte (`XS_CHUNK_ALLOCATION_METERING`) | cost-table entry |
+| Parse unit | `fxMeterSome` calls from the parser | cost-table entry |
 
-Checks happen only at XS's loop-closing points (backward branch,
-call, return, catch, generator iteration, async resume), invoking
-the host's metering callback with `meterIndex >> 16` and aborting
-the crank on refusal, so both the *count* and the *abort point*
-match C-XS. Every hand-tuned `mxMeterSome(k)` fast-path annotation
-in the C built-ins is a port obligation carried by the built-in's
-port, and the differential harness is the enforcement: test262 and
-fuzz runs compare computron counts, not just results, so a missed
-or miscounted increment is a red build, not a latent consensus
-fault.
+**Deriving and freezing the cost table.** The weights are not
+hand-copied from XS; they are calibration constants derived from the
+cost-calibration instrumentation (sibling plan
+`xs2rust-endor-meter-opcode-cost-instrumentation`), which measures
+per-opcode and per-builtin-step real cost on a named reference
+platform. The measured costs are reduced to a frozen integer weight
+table checked into the release and stamped with an `endor-meter-N`
+version. A recalibration re-runs that instrumentation and bumps the
+version; the previous table remains addressable by its version so
+old metered outcomes stay reproducible. Because the table is
+integer and frozen per release, metering is fully deterministic
+without needing to match any external reference.
 
-Parity is defined against a named oracle: the `c/moddable`
-submodule pin, upstream XS metering semantics. The agoric-sdk
-fleet currently runs a different metering scheme (XS 13.3 fork,
-integer per-bytecode weights, `xs-meter-37`), so bit-exact parity
-with *that* fleet is a distinct target requiring a distinct oracle
-pin; and the meter-version precedent (`xs-meter-N` bumps at
-coordinated chain upgrades) already sanctions the fallback where
-endor enters a consensus fleet as `endor-meter-1` at an upgrade
-boundary rather than mid-flight. This is the determinism-
-equivalence framing requirement 1 allows: what must hold
-unconditionally is that endor is *internally* deterministic
-(identical inputs give identical computrons on every host,
-architecture, and build), which the differential harness plus
-cross-platform CI proves; *cross-engine* equality with a given
-C-XS build is proven against the pinned oracle and versioned like
-any other meter change.
+**Check points and abort.** Checks happen at XS's loop-closing
+points (backward branch, call, return, catch, generator iteration,
+async resume): the accumulator is compared against the crank limit
+and the crank aborts on refusal. The *points* are inherited because
+they shape observable abort behavior; the *point at which* a given
+program aborts is an endor-release-defined outcome (a function of
+the endor cost table), deterministic per release, and is **not**
+required to coincide with XS's abort point. A metering-limit abort
+is therefore an endor-meter outcome, not an oracle-checked parity
+fact.
+
+**The oracle is result-only; computrons are advisory telemetry.**
+The differential harness compares **results** (completion kind,
+value, error identity) between endor and C-XS, and a result
+divergence is a red build. Computron counts from both engines are
+recorded *alongside*, as a comparative/calibration signal and as an
+allocation-faithfulness canary (a large, unexpected computron drift
+often means the allocation sequence diverged, which is itself a
+*result*-relevant bug worth surfacing) — but computron **equality**
+with C-XS is never an acceptance gate. XS's hand-tuned
+`mxMeterSome(k)` fast-path annotations are consequently no longer a
+parity obligation the port must reproduce weight-for-weight; where a
+built-in's port keeps them, it is to preserve the meter's *internal*
+consistency across fast and slow paths within an endor release, not
+to match XS. What must hold unconditionally is that endor is
+*internally* deterministic per release (the differential harness
+plus cross-platform CI verify computron stability across runs and
+platforms); cross-engine computron equality with C-XS is neither
+required nor pursued.
 
 The `Machine` metering API (`begin_metering`, `end_metering`,
 `current_meter`, `current_computrons`, `set_meter`,
@@ -347,6 +427,55 @@ envelopes of the [metering design](daemon-xs-worker-metering.md)
 carry over without supervisor changes; the C callback and
 thread-local `CRANK_LIMIT` become a safe closure and a machine
 field.
+
+### Agoric consensus compatibility (the doctrine's binding question)
+
+Agoric metering is consensus-critical: computron counts drive
+gas/fees and must be identical across all validators, or the chain
+halts. "Accuracy over XS-parity" is safe for consensus **iff endor's
+meter is itself the consensus meter and every validator runs the
+same endor release** — which is exactly the *determinism per release*
+property above: same release ⇒ same frozen cost table ⇒ identical
+computrons ⇒ consensus holds. The doctrine does not weaken consensus
+determinism; it relocates the reference from "XS's counts" to "this
+endor release's counts."
+
+**Decision — (b): endor ships its own release-versioned native meter
+that consumers, Agoric included, adopt at a coordinated upgrade
+boundary.** This is the same shape every XS meter change has ever
+shipped as — an `xs-meter-N` bump at a coordinated chain upgrade
+(§ Ground Truth) — restated for endor as `endor-meter-N`. It aligns
+with, and is now load-bearing for, resolved questions 1 and 2: the
+oracle is the `c/moddable` pin (for *results*), and consensus entry
+is by coordinated upgrade, never mixed-fleet operation. A
+bit-for-bit **XS-computron-compatible meter mode (option a) is not a
+build-phase goal**, and pursuing one would re-impose the very parity
+the maintainer declared a non-goal — freezing endor's meter to a
+2023-era fork's weights, worse for accuracy and heavier to maintain,
+to buy a continuity the coordinated-upgrade mechanism already
+provides.
+
+**The door to (a) stays open as a versioned meter, not a doctrine
+change (conditional (c)).** Because the meter is release-versioned by
+construction, an XS-computron-compatible table *can* be added later
+as one more named meter version (`endor-meter-xs13compat`, say) if —
+and only if — a concrete consensus consumer needs bit-for-bit
+continuity with today's XS metering *without* a governance-approved
+gas re-pricing at the switchover. That would be a bounded, optional
+compatibility surface gated on a real consumer, its own design
+amendment, with its own oracle pin against the agoric-labs fork; it
+is explicitly out of scope now and is not what the accuracy-mode
+meter is calibrated against.
+
+**Consequence for consumers.** Switching a live chain's meter changes
+gas costs, so adoption is a chain-governance / migration event, not a
+drop-in. Endor therefore targets **(b) — a new endor-native metered
+release consumers opt into at an upgrade boundary** — with (a)
+available only as the conditional, versioned compatibility mode
+above. This choice bounds the whole doctrine: endor's accuracy-mode
+meter is free to model wall-clock cost as well as it can, precisely
+because it is never asked to be simultaneously bit-compatible with a
+legacy meter on a running fleet.
 
 ### Snapshots (requirement 1c)
 
@@ -453,16 +582,22 @@ compromised daemon.
 ### test262 conformance (requirement 6)
 
 `endor-262` is a dual-run harness: it executes each test on endor
-and on the oracle, recording four-valued agreement (both pass,
-both fail, endor-only fail, oracle-only fail) plus computron
-agreement when metering is enabled. The acceptance bar for the
-build phase is **parity with C-XS**, stated precisely: on the
-pinned test262 revision, endor's pass vector equals the oracle's
-pass vector on the language and built-ins sections (XS deliberately
-omits Intl; endor omits it identically), and computron counts are
-equal on every test both engines pass. Matching the *fail* vector
-matters as much as the pass vector: a test endor passes that C-XS
-fails is a semantic divergence with metering consequences and gets
+and on the oracle, recording four-valued **result** agreement (both
+pass, both fail, endor-only fail, oracle-only fail), and — when
+metering is enabled — the two engines' computron counts *alongside*
+as advisory telemetry. The acceptance bar for the build phase is
+**result parity with C-XS**, stated precisely: on the pinned test262
+revision, endor's pass vector equals the oracle's pass vector on the
+language and built-ins sections (XS deliberately omits Intl; endor
+omits it identically). Computron counts are **not** part of the
+acceptance bar: they are reported for calibration and as an
+allocation-faithfulness canary, but a computron difference against
+C-XS is not, by itself, a failing test (per the accuracy-over-parity
+doctrine, § Metering). Endor's own metering acceptance is
+*determinism*: the harness re-runs metered tests and confirms
+identical computrons across runs and platforms for the same build.
+Matching the *fail* vector matters as much as the pass vector: a
+test endor passes that C-XS fails is a semantic divergence and gets
 an exceptions-ledger entry or a fix, never a silent "improvement".
 
 Coverage bootstraps by section, tracking the stage ladder:
@@ -480,8 +615,9 @@ JavaScript tests) and a `test262-harness`-driven runner that today
 proves XS↔Node HardenedJS parity by running the tests marked with
 the `ses-xs-parity` feature on both the `xst` (C-XS) and `node`
 hosts against a SES prelude. endor-262 drives its endor↔C-XS
-`(pass-vector, computron)` parity off that **same** tree and the
-**same** `ses-xs-parity` feature markers rather than pinning a
+**pass-vector (result) parity** off that **same** tree and the
+**same** `ses-xs-parity` feature markers (recording computrons as
+advisory telemetry, § Metering) rather than pinning a
 second, independent test262 submodule. The two parity axes then
 share one corpus and one feature convention: `test262-runner`
 compares XS against Node at the SES surface, and endor-262 adds
@@ -506,9 +642,14 @@ cargo-fuzz (libFuzzer) targets, in the `endor-fuzz` crate:
    aware JavaScript generator (grammar-based, `arbitrary`-driven,
    with corpus splicing in the Fuzzilli style) feeds identical
    source to endor and the oracle; the comparator checks
-   completion kind, result string, error identity, computron
-   count, and heap counts. Any divergence is a crash-equivalent
-   finding.
+   completion kind, result string, and error identity. A **result**
+   divergence is a crash-equivalent finding. Computron and heap
+   counts are collected as advisory signals, not equality
+   assertions (per § Metering): a large or structured computron/heap
+   divergence is triaged as a likely allocation-faithfulness or
+   calibration issue — and escalated to a finding only when it
+   points at a *result*-affecting bug — rather than failing the run
+   for a mere weight difference against C-XS.
 2. **Bytecode decoder fuzzing**: malformed and truncated bytecode
    against the loader's validity envelope (XS treats bytecode as
    trusted; endor's loader still must not panic on corrupt input
@@ -538,7 +679,7 @@ platform selection (the `spawn` verb's `platform` field) gains an
 orthogonal engine axis surfaced through the existing `-e` flag of
 `endor worker` and `endor run` (`-e xs` today; `-e endor-rs`
 selects the Rust engine), letting both engines coexist through
-the whole parity campaign.
+the whole result-parity campaign.
 
 Reconciliation with the design cluster, per document:
 
@@ -583,19 +724,38 @@ the Compartment seam, and bootstraps test262, before any breadth.
 
 | Stage | Deliverable | Acceptance bar |
 |---|---|---|
-| 1. Thin slice: interpreter core + meter + oracle harness | `endor-vm` arenas and value model; interpreter for the arithmetic/logic/branch/call/stack opcode subset; meter with XS weights and check points; `endor-oracle` compiling source with C-XS and executing bytecode on both engines; a primordial `Compartment.evaluate` (fresh globals, shared intrinsics seam, no modules); `endor-262` dual-run skeleton with the stage corpus; fuzz targets 1 and 2 | Bit-exact (result, computron) agreement with the oracle on the stage corpus; `forbid(unsafe_code)` holds outside `endor-oracle` |
+| 1. Thin slice: interpreter core + meter + oracle harness | `endor-vm` arenas and value model; interpreter for the arithmetic/logic/branch/call/stack opcode subset; meter with the release-versioned cost table and XS check points; `endor-oracle` compiling source with C-XS and executing bytecode on both engines; a primordial `Compartment.evaluate` (fresh globals, shared intrinsics seam, no modules); `endor-262` dual-run skeleton with the stage corpus; fuzz targets 1 and 2 | **Result** agreement with the oracle on the stage corpus; meter deterministic per release (identical computrons across repeated runs of the same build); computron-vs-C-XS recorded as advisory telemetry only; `forbid(unsafe_code)` holds outside `endor-oracle` |
 | 2. Object model and control flow | Objects, prototypes, property ops, closures, exceptions (jump-chain with JS/host flags), full 245-opcode coverage (built-ins stubbed); GC v1 (mark-sweep + chunk compaction) | test262 `language/` dual-run agreement on the covered grammar; GC test suite under Miri |
-| 3. Built-ins | Object/Array/String (CESU-8)/Math (canonical NaN)/JSON/Map/Set/TypedArray/BigInt; promises and job queue with the pump-loop latch semantics; RegExp port decision executed (resolved question 6: port `xsre`) | Built-ins sections dual-run agreement including computrons (the `mxMeterSome` fast-path annotations land here) |
+| 3. Built-ins | Object/Array/String (CESU-8)/Math (canonical NaN)/JSON/Map/Set/TypedArray/BigInt; promises and job queue with the pump-loop latch semantics; RegExp port decision executed (resolved question 6: port `xsre`) | Built-ins sections dual-run **result** agreement; meter deterministic per release (computron-vs-C-XS advisory); the `mxMeterSome` fast-path annotations, where kept, preserve the meter's internal fast/slow-path consistency within an endor release rather than matching XS |
 | 4. Hardened JavaScript | `lockdown`, `harden`, `petrify`, `mutabilities`; full native `Compartment` + module machinery (ModuleSource, module maps); async/generators complete | The endor daemon boot bundles (`polyfills.js`, `ses_boot.js`, HandledPromise) run identically on both engines; SES conformance suites pass |
-| 5. Compiler port | `endor-compile`: lexer, parser, scoper, coder replacing the oracle compiler; parse metering | Byte-identical bytecode versus the oracle compiler on the full conformance corpus; parse computrons agree; parser fuzz target armed |
+| 5. Compiler port | `endor-compile`: lexer, parser, scoper, coder replacing the oracle compiler; parse metering | Byte-identical bytecode versus the oracle compiler on the full conformance corpus; parse metering deterministic per release (parse computrons stable across runs; computron-vs-C-XS advisory); parser fuzz target armed |
 | 6. Snapshots | `endor-snapshot` atom writer/reader; `Machine` snapshot surface; suspend/resume through the supervisor; meter state across suspend | Round-trip invariance under fuzzing; supervisor suspend/resume integration test passes on `-e endor-rs` |
 | 7. Debugger | xsbug protocol; `DebugTransport` over the envelope bus; instruments; break-on-uncaught | The existing 11 Rust debug-protocol tests and 16 CapTP debugger tests pass unmodified against endor; xsbug connects |
-| 8. Parity closure and hardening | test262 parity per the requirement 6 bar; nightly differential fuzzing at full breadth; performance pass to the envelope; fourth benchmark variant wired; engine selection documented | Pass-vector equality with the oracle; computron equality on the shared pass set; envelope met |
-| 9. Ecosystem validation (fork-scoped) | Differential replay of real workload corpora: endo daemon integration suites, and agoric contract corpora on the `kriscendobot/agoric-sdk` fork tooling only (no upstream interaction) | Zero result or computron divergence on the corpora; divergences triaged to the exceptions ledger or fixed |
+| 8. Parity closure and hardening | test262 result-parity per the requirement 6 bar; nightly differential fuzzing at full breadth; performance pass to the envelope; fourth benchmark variant wired; engine selection documented | Pass-vector (result) equality with the oracle; meter determinism verified across runs and platforms; computron-vs-C-XS characterized as calibration telemetry, not gated; envelope met |
+| 9. Ecosystem validation (fork-scoped) | Differential replay of real workload corpora: endo daemon integration suites, and agoric contract corpora on the `kriscendobot/agoric-sdk` fork tooling only (no upstream interaction) | Zero **result** divergence on the corpora (computron divergence recorded as calibration telemetry, not a failure); divergences triaged to the exceptions ledger or fixed |
 
 Stages 1 through 4 keep the oracle compiler in the loop, which is
-deliberate: interpreter parity and compiler parity are separated
-so a computron divergence always has exactly one suspect.
+deliberate: interpreter behavior and compiler behavior are separated
+so a *result* divergence (or a flagged advisory computron/allocation
+drift) always has exactly one suspect.
+
+**Doctrine-transition note (2026-07-04).** The acceptance bars above
+are restated to **result agreement + a deterministic-per-release
+meter**, per the accuracy-over-parity doctrine (§ Metering),
+superseding the earlier "(result, computron) parity against C-XS"
+framing. The landed-stage records below (stage 2a, stage 2b, and the
+in-flight stage 3) were built and accepted under the *superseded*
+parity doctrine, and did in fact achieve bit-exact computron
+agreement with C-XS on their covered grammars. That evidence is
+**retained** — as a strong *result*-correctness and
+allocation-faithfulness signal and as free calibration data — but it
+is no longer the bar: those stages already satisfy, a fortiori, the
+weaker result-agreement bar, and future stages are held only to
+result agreement plus meter determinism. No landed work is
+invalidated by the doctrine change; the historical amendment prose
+below is preserved as written, with its "bit-exact computron parity"
+language read as the (now advisory) evidence it produced, not as a
+standing requirement.
 
 **Stage-2 amendment (supervisor, 2026-07-02).** Stage 2 executes as two
 sub-stages on this PR, because the stage-2 build established — and the
@@ -653,8 +813,11 @@ monolith-sized — larger than the stage-2 monolith that twice overran the
 2400s handler wall-clock — so it executes as a **seven-child serial
 orchestration** (`xs2rust-endor-build-stage3`), each child independently
 green on this PR against the design's stage-3 bar (built-ins sections
-dual-run agreement **including computrons**; the `mxMeterSome` fast-path
-annotations land here):
+dual-run **result** agreement with a deterministic-per-release meter,
+per the accuracy-over-parity doctrine; computron-vs-C-XS is advisory
+telemetry, not gated — the doctrine-transition note above governs;
+the `mxMeterSome` fast-path annotations land here, kept for the
+meter's internal fast/slow-path consistency within a release):
 1. **language** — chunk-backed CESU-8 string *values* (literals, concat
    with `XS_STRING_METERING`, comparison), the `global` opcode, and the
    remaining language opcodes the `language/` sweeps name as top skip
@@ -694,9 +857,13 @@ allocation path MUST pass a root set covering the interpreter's side
 tables — `functions[*].closures` environments, saved `CallerState`
 activations, `CatchJump` snapshots, and `global_props` — not just the
 value stack and scope, or arena-index reuse corrupts silently. The
-trigger points must also be deterministic (XS collects on allocation
-pressure at fixed thresholds), so collection scheduling cannot perturb
-metering parity.
+trigger points must also be deterministic (collection fires on
+allocation pressure at fixed thresholds), so that within an endor
+release collection scheduling cannot perturb the meter — i.e., it
+preserves determinism per release (§ Metering). If GC-driven
+allocation is a metered event in the cost table, its scheduling must
+be a pure function of the release's fixed thresholds, not of
+wall-clock or host state.
 
 ## Dependencies
 
@@ -712,12 +879,14 @@ metering parity.
 
 ## Design Decisions
 
-1. **Oracle-locked transliteration over engine adoption.** Same
-   ISA, meter points, heap semantics, and protocols as XS; safety
-   re-architecture in the implementation; C-XS as a permanent
-   differential oracle in CI. This is the only approach under
-   which requirement 1's "exactly versus C-XS" is achievable at
-   all.
+1. **Oracle-checked transliteration over engine adoption.** Same
+   ISA, meter *points* (as the instrumentation seam), heap
+   semantics, and protocols as XS; safety re-architecture in the
+   implementation; C-XS as a permanent differential oracle in CI
+   **for result correctness**. This realizes requirement 1's
+   "stated determinism-equivalence proof" branch: endor's meter is
+   internally deterministic per release, and the oracle certifies
+   result semantics rather than computron parity.
 2. **Index arenas over pointer graphs.** `SlotIndex`/`ChunkOffset`
    arenas give a safe GC, a nearly structural snapshot format, and
    `forbid(unsafe_code)` engine crates, at the cost of an index
@@ -726,13 +895,18 @@ metering parity.
    promised.** The budget is a `forbid` attribute plus a
    design-amendment process, not a count to creep.
 4. **Compiler ported last, behind a byte-identity bar.** Bytecode
-   identity separates interpreter parity from compiler parity and
-   keeps the metering crux isolated while it is being proven.
-5. **Meter parity defined against a named oracle pin, with the
-   meter-version escape hatch stated.** Internal determinism is
-   unconditional; cross-engine equality is proven against
-   `c/moddable`'s pin and versioned like every `xs-meter-N` bump
-   the agoric-sdk precedent already sanctions.
+   identity separates interpreter behavior from compiler behavior
+   and keeps the result-correctness crux isolated while it is being
+   proven.
+5. **Meter is a release-versioned accuracy model, not XS-parity
+   (accuracy over parity, 2026-07-04).** The meter's purpose is to
+   be the best available deterministic proxy for real wall-clock
+   cost. Determinism is *per release* (a frozen, versioned cost
+   table); the table is calibrated for accuracy and recalibrated
+   across releases as an `endor-meter-N` bump. Internal determinism
+   is unconditional; XS-computron parity is a non-goal; the
+   `c/moddable` oracle checks *results*, with computrons kept as
+   advisory telemetry (§ Metering).
 6. **Rust-native snapshots first; C-XS import as optional bounded
    work.** No live-heap migration need exists in endo or agoric
    practice; the atom grammar is shared so the importer stays
@@ -743,8 +917,16 @@ metering parity.
    design is preserved wholesale.
 8. **Both engines selectable through the whole campaign.** The
    `-e` engine flag and the four-variant benchmark keep C-XS and
-   endor running side by side until parity is demonstrated, and
-   after, for as long as the differential oracle earns its keep.
+   endor running side by side until result parity is demonstrated,
+   and after, for as long as the differential oracle earns its keep.
+9. **Agoric consensus by coordinated endor-native upgrade, option
+   (b).** Endor's own release-versioned meter is the consensus meter
+   (every validator on the same release meters identically); Agoric
+   adopts it at a coordinated upgrade boundary, exactly as every
+   `xs-meter-N` bump has shipped. No XS-computron-compatible mode is
+   a build-phase goal; one can be added later only as a conditional,
+   versioned compatibility meter gated on a real consumer needing
+   mid-flight continuity (§ Agoric consensus compatibility).
 
 ## Resolved Questions
 
@@ -755,15 +937,27 @@ Each entry states the decision and its grounds; the decisions are
 binding on the build stages, and reopening one is a design
 amendment, not a code-review discussion.
 
-1. **Parity oracle: the in-tree `c/moddable` submodule pin**
-   (upstream metering, 16.16 fixed point), not the agoric-labs
-   fork (XS 13.3, integer meter, `xs-meter-37`). Grounds: the
-   oracle must be the engine endor actually replaces, and the
-   endor daemon compiles the in-tree pin today; pinning the port
-   to a 2023-era fork would trade the whole program's modernity
-   for a bit-exactness the meter-version mechanism (question 2)
-   makes unnecessary. Agoric-fleet meter parity is a separate
-   later target with its own oracle pin and its own program.
+**Amended 2026-07-04 by the accuracy-over-parity doctrine
+(§ Metering, § Agoric consensus compatibility).** That maintainer
+directive is itself the design amendment; it revises the metering
+framing of questions 1, 2, 4, and 6 below (the oracle is
+result-only; the meter is release-versioned, not XS-locked). The
+annotations inline mark exactly what changed.
+
+1. **Result oracle: the in-tree `c/moddable` submodule pin**
+   (upstream XS semantics), not the agoric-labs fork (XS 13.3,
+   integer meter, `xs-meter-37`). Grounds: the oracle must be the
+   engine endor actually replaces, and the endor daemon compiles
+   the in-tree pin today. *(Amended 2026-07-04: the oracle checks
+   **result** correctness, not computron parity — accuracy over
+   parity, § Metering. Endor's meter is its own release-versioned
+   model, so no oracle pin is a "parity" target; computron
+   comparison against this pin is advisory telemetry only. The
+   16.16-fixed-point detail of the pin's meter is no longer
+   inherited: endor uses an integer cost-table accumulator of its
+   own.)* Agoric-fleet meter compatibility, if ever needed, is a
+   separate later target with its own oracle pin and program
+   (§ Agoric consensus compatibility, option (a)).
 2. **Consensus entry is by coordinated upgrade (`endor-meter-1`),
    not mixed-fleet operation.** Endor is not required to run
    alongside C-XS validators under the same `xs-meter-N`. Grounds:
@@ -771,8 +965,15 @@ amendment, not a code-review discussion.
    `xs-meter-N` bump at a chain upgrade; mixed-fleet bit-exactness
    would force decision 1 onto the divergent fork oracle and make
    the strictly harder target load-bearing for no operational
-   gain. What remains unconditional is internal determinism plus
-   the published equivalence corpus against the pinned oracle.
+   gain. What remains unconditional is internal determinism per
+   release. *(Reinforced 2026-07-04: this question is now
+   load-bearing for the accuracy-over-parity doctrine — it is the
+   mechanism (option (b)) by which "accuracy over XS-parity" stays
+   consensus-safe. The former "published equivalence corpus against
+   the pinned oracle" is demoted from an obligation to advisory
+   calibration telemetry; the consensus guarantee is same-release
+   determinism, not cross-engine equivalence. See § Agoric consensus
+   compatibility.)*
 3. **The C-XS snapshot importer is out of scope for the build
    phase.** No endor or agoric use case migrates a live C-XS
    heap (workers restart from durable persistence; chains replay
@@ -782,21 +983,38 @@ amendment, not a code-review discussion.
    actual migration need, as its own design amendment.
 4. **Internal string encoding is CESU-8.** The endor build
    already sets `mxCESU8`, the xsnap crate already carries the
-   codec, and snapshot content plus allocation observability stay
-   comparable with the oracle. UTF-8 boundary conversion would
-   perturb chunk sizes and therefore heap accounting.
+   codec, and snapshot content stays comparable with the oracle.
+   *(Amended 2026-07-04: this question's original grounds leaned
+   partly on parity — "UTF-8 boundary conversion would perturb
+   chunk sizes and therefore heap accounting" — which the
+   accuracy-over-parity doctrine no longer treats as a constraint,
+   since endor's meter is not pinned to XS's allocation-derived
+   computrons. The encoding choice is therefore reopened as an
+   **accuracy/simplicity** question and delegated to the sibling
+   plan `xs2rust-endor-strings-utf16-replace-cesu8`, which may
+   re-base string metering (and possibly the encoding) for accuracy;
+   snapshot-content compatibility with the oracle remains a genuine
+   consideration there, but heap-accounting parity does not. Until
+   that plan lands, CESU-8 stands.)*
 5. **The 32-byte slot-record layout holds.** Kind + flag + ID +
    next-index + 16-byte payload fits in 32 bytes; holding it keeps
    `currentHeapCount` semantics and snapshot slot images aligned
    with the oracle. A roomier Rust enum is not worth divergent
    heap accounting.
 6. **RegExp: port `xsre`.** RegExp execution is metered and
-   guest-reachable, so it sits inside the computron-parity bar;
-   an off-the-shelf engine such as `regress` has different
-   internals, hence different metering and subtle semantic drift.
-   The 11.6 KLOC cost lands in stage 3 per the roadmap, with the
-   differential fuzz target (item 5 of § Fuzzability) as its
-   enforcement.
+   guest-reachable, and an off-the-shelf engine such as `regress`
+   has different internals, hence subtle **semantic** drift and a
+   different, un-modeled cost profile. *(Amended 2026-07-04: the
+   original grounds cited the "computron-parity bar"; under accuracy
+   over parity the decisive reasons are instead (i) **result**
+   semantics — `xsre`'s match behavior is what the differential
+   oracle checks against C-XS — and (ii) that a ported `xsre` gives
+   endor's own cost model a RegExp cost surface it can calibrate,
+   whereas a foreign engine's internals would be an un-modeled,
+   hard-to-calibrate cost. Parity of RegExp computrons with C-XS is
+   not required.)* The 11.6 KLOC cost lands in stage 3 per the
+   roadmap, with the differential fuzz target (item 5 of
+   § Fuzzability) as its result-level enforcement.
 7. **Naming as proposed: workspace at `rust/engine/`, crates
    `endor-vm`, `endor-oracle`, `endor-262`, `endor-fuzz` (later
    `endor-compile`, `endor-ses`, `endor-snapshot`, `endor-debug`),
