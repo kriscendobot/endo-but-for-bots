@@ -283,7 +283,40 @@ primitive `this` to its wrapper while a strict callee keeps it, a
 meter-affecting distinction not knowable until the callee's `begin`, so a
 primitive `thisArg` self-names `Halt::Unsupported` rather than answer a
 `this`-dependent test wrongly (kept per the charter's "if calibratable within
-budget; else keep the honest named skip"). The stage-3 built-ins reach
+budget; else keep the honest named skip"). The stage-3b **object-statics +
+intern-table** child (5/9) lands the program-level cross-child dependency both
+child-1 and child-2 named: a **global runtime string→id intern table** (XS's
+`fxNewNameX`/`fxAt`) reconciled at one point with the C-XS compiler's program
+symbols and XS's boot-time default keys (`gxIDStrings`, carried in
+`endor-vm::default_keys`). `intern_key` returns an already-interned name's id
+with **no** allocation — a program symbol, a prior runtime key, or a
+pre-interned default key — and meters exactly one `fxNewSlot` key slot for a
+genuinely-novel name, the metering difference measured against the pin (a
+genuinely-novel `o["zzz"]`-style key costs one slot; a well-known
+`o["toString"]`-style name costs none). On that substrate three surfaces land
+bit-exact (result AND computron): **`Object.prototype.hasOwnProperty`** answers
+*any* string key soundly (own-only, no prototype walk — an own key true, a
+novel/inherited name false), **`Object.keys`** returns a fresh `Array` of an
+ordinary object's own enumerable string keys in creation order (metering
+calibrated raw-exact via the isolated `B(n)−A(n)` gap: a fixed native-body
+residual + the result array's item chunk grown once + one `fxNewSlot` per key;
+confirmed key-name-length independent, XS referencing the interned key string),
+and **`Object.getOwnPropertyDescriptor`** yields the full data descriptor
+(`{value, writable, enumerable, configurable}` in XS's field order) for a
+present ordinary data property or `undefined` when absent — the descriptor
+field names routed through the same intern table so `descriptor.value` reads
+back under the id the program's `.value` access uses. `built-ins/Object`
+dual-run grows to `covered=48 divergent=0` (from ~0 before the child — the
+verifyProperty-shaped `getOwnPropertyDescriptor` tests now covered). The honest
+**named skips** are: `Object.keys`/`getOwnPropertyDescriptor` over an exotic
+receiver (array/typed-array/collection/wrapper/error — whose own-key set
+includes indices/length or internal names) or over an accessor / non-standard-
+flagged property, an index-string key, and — deferred to the child's remaining
+increment — **`Object.defineProperty`** and answering `in`-false / a
+non-symbol-named `o["k"]` inherited read, which need the attribute-aware
+property model (`writable`/`enumerable`/`configurable` flag bits rippling
+through `keys`/`getOwnPropertyDescriptor`/enumeration) and the complete
+`%Object.prototype%` member set, respectively. The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic
