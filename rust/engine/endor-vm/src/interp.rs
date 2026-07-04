@@ -1723,6 +1723,17 @@ pub struct Interp {
     /// against, exactly as the intrinsic constructors relink by name. A name
     /// the program never references has no id (and no read of it occurs).
     symbol_ids: std::collections::HashMap<String, u16>,
+    /// XS's boot-time default key names (`gxIDStrings`). A runtime string
+    /// property key equal to one of these is already interned in XS's global
+    /// symbol table, so re-interning it allocates **no** key slot; a name
+    /// outside this set (and not a program symbol / not previously seen) is
+    /// genuinely novel and meters one `fxNewSlot`. See [`Self::intern_key`].
+    default_keys: std::collections::HashSet<&'static str>,
+    /// The next id [`Self::intern_key`] hands out for a genuinely-novel
+    /// runtime property name. Seeded past the compiler's program-symbol ids
+    /// (`link_intrinsics`), so a runtime-interned key never collides with a
+    /// program symbol or a linked intrinsic property.
+    next_intern_id: u16,
     /// The program's symbol names indexed by `id - 1` (the decoded symbols
     /// atom, verbatim), so a function definition can recover its own name
     /// string for `Function.prototype.toString`.
@@ -1978,6 +1989,8 @@ impl Interp {
             proto_data: Vec::new(),
             well_known_symbols: Vec::new(),
             symbol_ids: std::collections::HashMap::new(),
+            default_keys: crate::default_keys::DEFAULT_KEYS.iter().copied().collect(),
+            next_intern_id: 1,
             symbol_names: Vec::new(),
             error_data: std::collections::HashMap::new(),
             wrapper_data: std::collections::HashMap::new(),
@@ -2679,6 +2692,10 @@ impl Interp {
     /// the guest run exactly as XS's do, so no allocation is charged.
     pub fn link_intrinsics(&mut self, names: &[String]) {
         self.symbol_names = names.to_vec();
+        // Runtime-interned keys number past the compiler's program symbols
+        // (ids `1..=names.len()`), so a novel runtime key can never collide
+        // with a program symbol or the intrinsic properties linked under one.
+        self.next_intern_id = (names.len() as u16).saturating_add(1);
         // Cache the program-local id of `length` (XS's `mxID(_length)`) so an
         // `arr.length` get/set routes to the array length semantics.
         self.length_id = names
@@ -6191,23 +6208,29 @@ impl Interp {
             // (own keys are interned symbol ids) ⇒ `false` — safe, unlike
             // `in`, because this never consults the prototype chain.
             NativeMethod::ObjectHasOwnProperty => {
-                // Only a key that is already a program symbol is answered:
-                // find it among the receiver's OWN properties (never the
-                // prototype chain), bit-exact. A string-literal key that is
-                // not a program symbol self-names — endor's per-program symbol
-                // table cannot tell a genuinely-absent key from a
-                // native-created own property under a global id (an error's
-                // `message`), nor whether interning it costs `fxNewName`.
-                let (o, id) = match (this.value, arg0.value) {
+                // `hasOwnProperty` checks only the receiver's OWN properties
+                // (never the prototype chain), so it is sound for *any* string
+                // key once the key is resolved through the global intern table
+                // (XS's `fxAt` → `fxNewNameX`): a name that is a program symbol
+                // or a pre-interned default key resolves with no allocation; a
+                // genuinely-novel name interns one metered key slot. Either
+                // way the own-property check answers `false`/`true` exactly,
+                // and a well-known inherited name (`"toString"`) is correctly
+                // `false` because it is not an own property.
+                let (o, key) = match (this.value, arg0.value) {
                     (Payload::Reference(o), Payload::String(off)) => {
-                        let key = String::from_utf8_lossy(self.str_content(off)).into_owned();
-                        match self.symbol_ids.get(&key) {
-                            Some(&id) => (o, id),
-                            None => return Err(Halt::Unsupported("hasOwnProperty:non-symbol-key")),
-                        }
+                        (o, String::from_utf8_lossy(self.str_content(off)).into_owned())
                     }
                     _ => return Err(Halt::Unsupported("hasOwnProperty:non-string-key")),
                 };
+                // An index-valued string key routes to the exotic index
+                // `[[GetOwnProperty]]` (an array's item chunk / an ordinary
+                // object's index chunk), whose own-check + metering endor does
+                // not model here — honest skip rather than a wrong answer.
+                if string_to_index(&key).is_some() {
+                    return Err(Halt::Unsupported("hasOwnProperty:index-key"));
+                }
+                let id = self.intern_key(&key);
                 self.meter.tick_raw(METHOD_HAS_OWN_PROPERTY_METERING);
                 Slot::boolean(self.find_property(o, id).is_some())
             }
@@ -9752,6 +9775,38 @@ impl Interp {
         let inst = self.slots.alloc(Slot::instance(self.array_proto));
         self.arrays.insert(inst, ArrayData::default());
         inst
+    }
+
+    /// Intern a runtime string property name into the global key table
+    /// (XS's `fxNewNameX`/`fxAt`), returning its stable id. The table is the
+    /// one reconciliation point the program symbols, XS's boot-time default
+    /// keys, and runtime-created names all share:
+    ///
+    /// * A name already interned — a program symbol (in `symbol_ids` from the
+    ///   compiler's atom) or a previously-seen runtime key — returns its id
+    ///   with **no** allocation.
+    /// * A name that is one of XS's boot-time default keys (`gxIDStrings`) is
+    ///   pre-interned at machine creation, so it too returns an id with no
+    ///   allocation — it is merely assigned endor's next program-local id the
+    ///   first time it is seen (endor numbers ids program-locally, so the id
+    ///   value itself is arbitrary; only its stability and the metering
+    ///   matter).
+    /// * A genuinely-novel name allocates one key slot (`fxFindKey` →
+    ///   `fxNewSlot`), metered as one slot allocation (`XS_SLOT_ALLOCATION_
+    ///   METERING`), exactly as XS charges when the name misses the table.
+    fn intern_key(&mut self, name: &str) -> u16 {
+        if let Some(&id) = self.symbol_ids.get(name) {
+            return id;
+        }
+        let id = self.next_intern_id;
+        self.next_intern_id = self.next_intern_id.saturating_add(1);
+        self.symbol_ids.insert(name.to_string(), id);
+        if !self.default_keys.contains(name) {
+            // A name absent from XS's boot key table misses `nameTable`, so
+            // `fxNewNameX` calls `fxFindKey` → `fxNewSlot`: one metered slot.
+            self.meter.tick_slot_alloc();
+        }
+        id
     }
 
     /// Convert a stack value into an `XS_AT_KIND` computed key (XS's
