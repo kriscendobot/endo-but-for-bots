@@ -39,3 +39,21 @@ var k = Object.keys({x:1,y:2,z:3}); k.length;
 var k = Object.keys({longkeyname:1, s:2}); k[0];
 // Object.keys and hasOwnProperty compose over the same object.
 var o = {p:1, q:2}; Object.keys(o).length === 2 && o.hasOwnProperty("p");
+
+// --- Object.getOwnPropertyDescriptor: the verifyProperty machinery ---
+// A present ordinary data property yields a full data descriptor.
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.value;
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.writable;
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.enumerable;
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.configurable;
+// Fields render in XS's value/writable/enumerable/configurable order.
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"a"); var s=""; s+=d.value; s+=d.writable; s+=d.enumerable; s+=d.configurable; s;
+// A literal's own data property is writable, enumerable, and configurable.
+var o={a:7}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.value===7 && d.writable===true && d.enumerable===true && d.configurable===true;
+// An absent key yields undefined (the interned-but-not-own case).
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"b"); typeof d;
+var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"zzz"); d===undefined;
+// A string-valued property's descriptor references the value (no re-copy).
+var o={a:"hello"}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.value;
+// The verifyProperty shape: hasOwnProperty + descriptor attributes agree.
+var o={k:42}; var d=Object.getOwnPropertyDescriptor(o,"k"); o.hasOwnProperty("k") && d.enumerable && d.configurable && d.writable;

@@ -204,6 +204,18 @@ pub const METHOD_HAS_OWN_PROPERTY_METERING: u64 = 1 << 16;
 /// measurement folds in those ~9 dispatch computrons, which are removed
 /// here): `655872 - 9<<16 = 66048`.
 pub const OBJECT_KEYS_FRAME_METERING: u64 = 66048;
+/// `Object.getOwnPropertyDescriptor(o, k)` native-body residual for a present
+/// ordinary data property: the whole `fxFromPropertyDescriptor` build (the
+/// descriptor object instance + its four `value`/`writable`/`enumerable`/
+/// `configurable` own data properties), beyond the call-dispatch opcodes the
+/// interpreter loop already meters. The descriptor object is built with its
+/// per-allocation metering folded into this one measured constant (the
+/// isolated `B - A` raw-gap minus the shared call dispatch); a novel key's
+/// intern slot is metered separately by [`Interp::intern_key`].
+pub const GOPD_PRESENT_RESIDUAL_METERING: u64 = 99608;
+/// `Object.getOwnPropertyDescriptor(o, k)` native-body residual for an absent
+/// key: the lookup returns `undefined`, no descriptor is built.
+pub const GOPD_ABSENT_RESIDUAL_METERING: u64 = 65560;
 /// The fixed re-dispatch overhead `Function.prototype.call` accrues beyond
 /// the visible `.call` opcodes and the callee body (measured as `2<<16`),
 /// plus one built-in step ([`CALL_TRAMPOLINE_PER_ARG`]) per forwarded
@@ -892,6 +904,10 @@ pub enum NativeMethod {
     /// `Object.keys(o)` — the own enumerable string-keyed property names, in
     /// property-creation order, as a fresh `Array` of interned key strings.
     ObjectKeys,
+    /// `Object.getOwnPropertyDescriptor(o, k)` — the fully-populated data
+    /// descriptor object (`{value, writable, enumerable, configurable}`) for
+    /// `o`'s own property `k`, or `undefined` when absent.
+    ObjectGetOwnPropertyDescriptor,
     FunctionToString,
     /// `Function.prototype.call` — a re-entrant trampoline: invoke the
     /// receiver function with the first argument as `this` and the rest as
@@ -2373,6 +2389,9 @@ impl Interp {
         if let Some(&object_ctor) = self.intrinsics.get("Object") {
             let keys = self.alloc_method(NativeMethod::ObjectKeys);
             self.proto_methods.push((object_ctor, "keys", keys));
+            let gopd = self.alloc_method(NativeMethod::ObjectGetOwnPropertyDescriptor);
+            self.proto_methods
+                .push((object_ctor, "getOwnPropertyDescriptor", gopd));
         }
         let fp_tostring = self.alloc_method(NativeMethod::FunctionToString);
         self.proto_methods.push((func_proto, "toString", fp_tostring));
@@ -6322,6 +6341,68 @@ impl Interp {
                 self.arrays.insert(result, data);
                 Slot::of(Kind::Reference, Payload::Reference(result))
             }
+            // `Object.getOwnPropertyDescriptor(o, k)`: the data descriptor
+            // object for `o`'s own property `k`, or `undefined` if absent.
+            // Ordinary objects with ordinary data properties only; an exotic
+            // receiver or an accessor / non-standard-flagged property skips.
+            NativeMethod::ObjectGetOwnPropertyDescriptor => {
+                let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                let inst = match arg0.value {
+                    Payload::Reference(o) => o,
+                    _ => return Err(Halt::Unsupported("getOwnPropertyDescriptor:non-object")),
+                };
+                if self.arrays.contains_key(&inst)
+                    || self.collections.contains_key(&inst)
+                    || self.typed_arrays.contains_key(&inst)
+                    || self.array_buffers.contains_key(&inst)
+                    || self.data_views.contains_key(&inst)
+                    || self.wrapper_data.contains_key(&inst)
+                    || self.error_data.contains_key(&inst)
+                {
+                    return Err(Halt::Unsupported("getOwnPropertyDescriptor:exotic-object"));
+                }
+                let key = match arg1.value {
+                    Payload::String(off) => {
+                        String::from_utf8_lossy(self.str_content(off)).into_owned()
+                    }
+                    _ => return Err(Halt::Unsupported("getOwnPropertyDescriptor:non-string-key")),
+                };
+                if string_to_index(&key).is_some() {
+                    return Err(Halt::Unsupported("getOwnPropertyDescriptor:index-key"));
+                }
+                let id = self.intern_key(&key);
+                match self.find_property(inst, id) {
+                    Some(p) => {
+                        let prop = *self.slots.get(p);
+                        // An accessor / non-enumerable / internal-flagged own
+                        // property needs the accessor-descriptor shape or the
+                        // exact non-standard attributes — honest skip.
+                        if prop.flag != 0 {
+                            return Err(Halt::Unsupported(
+                                "getOwnPropertyDescriptor:non-data-property",
+                            ));
+                        }
+                        // The whole `fxFromPropertyDescriptor` build, folded
+                        // into one measured residual; the descriptor object is
+                        // constructed with its per-allocation metering
+                        // suppressed (accounted by the constant).
+                        self.meter.tick_raw(GOPD_PRESENT_RESIDUAL_METERING);
+                        let value = Slot::of(prop.kind, prop.value);
+                        let desc = self.slots.alloc(Slot::instance(self.object_proto));
+                        // Insert value → writable → enumerable → configurable;
+                        // the chain (prepended) then reverses to XS's key order.
+                        self.define_descriptor_field(desc, "value", value);
+                        self.define_descriptor_field(desc, "writable", Slot::boolean(true));
+                        self.define_descriptor_field(desc, "enumerable", Slot::boolean(true));
+                        self.define_descriptor_field(desc, "configurable", Slot::boolean(true));
+                        Slot::of(Kind::Reference, Payload::Reference(desc))
+                    }
+                    None => {
+                        self.meter.tick_raw(GOPD_ABSENT_RESIDUAL_METERING);
+                        Slot::undefined()
+                    }
+                }
+            }
             // `Array.prototype.push(...items)` — dense fast path only.
             NativeMethod::ArrayPush => {
                 let inst = match self.dense_array_this(this) {
@@ -10232,6 +10313,28 @@ impl Interp {
         // `Object.keys` yields keys in creation order, so reverse.
         ids.reverse();
         Some(ids)
+    }
+
+    /// Add one field of a synthesized property descriptor object (an own
+    /// enumerable data property `name = value`) **without** metering — its
+    /// allocation cost is folded into the descriptor build's single measured
+    /// residual (`GOPD_PRESENT_RESIDUAL_METERING`). The field name resolves
+    /// through the global intern table so `descriptor.value` (etc.) reads back
+    /// under the same id the program's `.value` access uses.
+    fn define_descriptor_field(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        name: &str,
+        value: Slot,
+    ) {
+        let id = self.intern_key(name);
+        let head = self.slots.get(inst).next;
+        let mut prop = value;
+        prop.id = id;
+        prop.flag = 0;
+        prop.next = head;
+        let idx = self.slots.alloc(prop);
+        self.slots.get_mut(inst).next = idx;
     }
 
     /// Define/set an own property `id = value` on instance `inst`,
