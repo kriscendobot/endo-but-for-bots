@@ -188,6 +188,22 @@ pub const METHOD_OBJECT_TOSTRING_METERING: u64 = 49216;
 pub const METHOD_FUNCTION_TOSTRING_METERING: u64 = 131176;
 pub const METHOD_ERROR_TOSTRING_METERING: u64 = 98360;
 pub const METHOD_HAS_OWN_PROPERTY_METERING: u64 = 1 << 16;
+/// `Object.keys(o)` fixed base: the native-method frame plus the
+/// `fxNewArray(0)` result-instance allocation and the `fxOwnKeys` walk setup,
+/// for an object with **no** enumerable keys (the empty-result case).
+/// Measured against the pin via the isolated raw-gap (`B(0) - A(0)` over a
+/// fixed empty object). The per-key cost is added on top: the result array's
+/// item chunk grown once to hold all `n` keys ([`Interp::array_chunk_size_metering`])
+/// plus one `fxNewSlot` (a string slot for the key name) per key. The key
+/// name itself references the interned key string (XS_STRING_X_KIND), so it
+/// allocates **no** chunk — `Object.keys` metering is independent of the key
+/// name lengths, as the pin confirms.
+///
+/// This is the native-body residual *beyond* the `.keys` call-dispatch
+/// opcodes the interpreter loop already meters (the isolated `B(0) - A(0)`
+/// measurement folds in those ~9 dispatch computrons, which are removed
+/// here): `655872 - 9<<16 = 66048`.
+pub const OBJECT_KEYS_FRAME_METERING: u64 = 66048;
 /// The fixed re-dispatch overhead `Function.prototype.call` accrues beyond
 /// the visible `.call` opcodes and the callee body (measured as `2<<16`),
 /// plus one built-in step ([`CALL_TRAMPOLINE_PER_ARG`]) per forwarded
@@ -873,6 +889,9 @@ pub enum NativeMethod {
     ObjectHasOwnProperty,
     ObjectValueOf,
     ObjectIsPrototypeOf,
+    /// `Object.keys(o)` — the own enumerable string-keyed property names, in
+    /// property-creation order, as a fresh `Array` of interned key strings.
+    ObjectKeys,
     FunctionToString,
     /// `Function.prototype.call` — a re-entrant trampoline: invoke the
     /// receiver function with the first argument as `this` and the rest as
@@ -2347,6 +2366,13 @@ impl Interp {
         for (name, m) in obj_methods {
             let mf = self.alloc_method(m);
             self.proto_methods.push((object_proto, name, mf));
+        }
+        // `Object.*` statics — own methods of the `Object` constructor
+        // instance (not the prototype), bound at link time only when the
+        // program references the name.
+        if let Some(&object_ctor) = self.intrinsics.get("Object") {
+            let keys = self.alloc_method(NativeMethod::ObjectKeys);
+            self.proto_methods.push((object_ctor, "keys", keys));
         }
         let fp_tostring = self.alloc_method(NativeMethod::FunctionToString);
         self.proto_methods.push((func_proto, "toString", fp_tostring));
@@ -6246,6 +6272,56 @@ impl Interp {
                 self.meter.tick_raw(METHOD_HAS_OWN_PROPERTY_METERING);
                 Slot::boolean(r)
             }
+            // `Object.keys(o)`: a fresh `Array` of `o`'s own enumerable
+            // string-keyed property names, in creation order (XS's
+            // `fxOwnKeys` filtered to enumerable string keys, then wrapped in
+            // an array). Covered for ordinary objects; an exotic receiver
+            // (array/typed-array/collection/wrapper/error — whose own-key set
+            // includes indices/length or internal names) honest-skips.
+            NativeMethod::ObjectKeys => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) => o,
+                    _ => return Err(Halt::Unsupported("Object.keys:non-object")),
+                };
+                if self.arrays.contains_key(&inst)
+                    || self.collections.contains_key(&inst)
+                    || self.typed_arrays.contains_key(&inst)
+                    || self.array_buffers.contains_key(&inst)
+                    || self.data_views.contains_key(&inst)
+                    || self.wrapper_data.contains_key(&inst)
+                    || self.error_data.contains_key(&inst)
+                {
+                    return Err(Halt::Unsupported("Object.keys:exotic-object"));
+                }
+                let ids = match self.own_enumerable_ids(inst) {
+                    Some(v) => v,
+                    None => return Err(Halt::Unsupported("Object.keys:unclassified-property")),
+                };
+                let n = ids.len() as u32;
+                // The fixed native frame + `fxNewArray(0)` base, the result
+                // array's item chunk grown once to hold `n` slots, and one
+                // `fxNewSlot` (the key-name string slot) per key. The key name
+                // references the interned key string (XS_STRING_X_KIND), so it
+                // allocates no chunk — metering is key-name-length independent.
+                self.meter.tick_raw(OBJECT_KEYS_FRAME_METERING);
+                self.meter.tick_raw(self.array_chunk_size_metering(n));
+                for _ in 0..n {
+                    self.meter.tick_slot_alloc();
+                }
+                let result = self.slots.alloc(Slot::instance(self.array_proto));
+                let mut data = ArrayData::default();
+                data.length = n;
+                for (i, &id) in ids.iter().enumerate() {
+                    let name = self.symbol_names[(id - 1) as usize].clone();
+                    let mut buf = name.into_bytes();
+                    buf.push(0);
+                    let off = self.chunks.alloc(&buf);
+                    data.items
+                        .insert(i as u32, Slot::of(Kind::String, Payload::String(off)));
+                }
+                self.arrays.insert(result, data);
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
             // `Array.prototype.push(...items)` — dense fast path only.
             NativeMethod::ArrayPush => {
                 let inst = match self.dense_array_this(this) {
@@ -10125,6 +10201,37 @@ impl Interp {
             cur = s.next;
         }
         None
+    }
+
+    /// The ids of `inst`'s own enumerable string-keyed data properties, in
+    /// property-creation (insertion) order — XS's `fxOwnKeys` ordering for an
+    /// ordinary object with no integer-index keys. Returns `None` if the
+    /// object carries a property endor cannot classify for enumeration (a
+    /// non-zero property flag — a non-enumerable / accessor / internal slot —
+    /// or an id with no program-symbol name), so the caller honest-skips
+    /// rather than emit a wrong key set.
+    fn own_enumerable_ids(&self, inst: crate::value::SlotIndex) -> Option<Vec<u16>> {
+        let mut ids = Vec::new();
+        let mut cur = self.slots.get(inst).next;
+        while !cur.is_null() {
+            let s = self.slots.get(cur);
+            if s.flag != 0 {
+                return None;
+            }
+            // Every own key of a covered object literal is a program symbol;
+            // an id outside the program-symbol range (a runtime-interned novel
+            // key or an internal id) can't be rendered to its name here.
+            let name_idx = (s.id as usize).checked_sub(1)?;
+            if name_idx >= self.symbol_names.len() {
+                return None;
+            }
+            ids.push(s.id);
+            cur = s.next;
+        }
+        // The own-property chain is newest-first (`instance_put` prepends);
+        // `Object.keys` yields keys in creation order, so reverse.
+        ids.reverse();
+        Some(ids)
     }
 
     /// Define/set an own property `id = value` on instance `inst`,
