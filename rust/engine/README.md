@@ -240,7 +240,50 @@ the set (three built-in steps — the value coercer's two plus the setter's
 covered=62 divergent=0 skipped=393`. The deferred DataView paths are honest named
 skips: the `getBigInt64`/`setBigInt64`/`getBigUint64`/`setBigUint64` (BigInt
 coercion), an object value needing `ToPrimitive`, and the resizable-buffer corner.
-The stage-3 built-ins reach
+The stage-3b **fundamentals-followup** child (4/9) lands the post-arrays
+fundamentals deferrals now unblocked by the Array machinery, all bit-exact
+(result AND computron) against the pin. A **user function's `.length`** (its
+declared arity, set from `begin`'s parameter-count operand at the `code` opcode,
+mirroring XS's `fxNewFunctionLength(the, variable, *(code+1))`) and **`.name`**
+(its own name, inferred at compile time for a `var f = function(){}` initializer)
+read back as first-class own data properties — both allocated at definition
+(folded into `FUNCTION_DEFINE_METERING`), so reading them meters nothing beyond
+the `GET_PROPERTY` dispatch. **`Function.prototype.bind`** creates a bound
+function (recorded in a `bound_functions` side table: target + bound `this` +
+bound args) whose `.length` is `max(0, target.length - boundArgs)` and `.name`
+is `"bound "+name`; calling it trampolines into the target with the bound `this`
+and bound args prepended (`fx_Function_prototype_bound`). Its metering is
+calibrated raw-exact: a constant creation cluster (`BIND_CREATE_METERING`, plus
+a `BIND_CREATE_ARGS_ARRAY` + per-arg cost when bound args exist and the args
+Array is built) and a call trampoline (`BIND_CALL_METERING` + `1<<14` per
+forwarded argument). **`Function.prototype.apply`** now forwards a real **dense
+Array** argument's elements (the array-read setup + per-element `mxGetIndex` +
+forward, `APPLY_ARRAY_BASE_METERING` + `APPLY_ARRAY_PER_ELEMENT_METERING`),
+graduating past the no-array subset. **`Symbol.prototype.toString`** →
+`Symbol(<description>)` (a primitive-symbol receiver boxing to
+`%Symbol.prototype%`), **`valueOf`**, the explicit **`String(symbol)`**
+coercion, and the **`Symbol.for`/`keyFor`** global registry (registry-interned
+identity, so `Symbol.for(k) === Symbol.for(k)`) land the residue after the
+Kind::Symbol + 13 well-knowns. **`AggregateError(errors, message)`** builds the
+base error (message from arg 1, chaining to `%AggregateError.prototype%`) plus
+an own `errors` Array from a dense-array argument (the `fxGetIterator`/
+`fxIteratorNext` walk metered as `AGGREGATE_ERROR_EXTRA` +
+`AGGREGATE_ERROR_PER_ELEMENT`). The dual-run sections grow with **zero
+divergence**: `built-ins/Function total=511 covered=39 divergent=0` (from 23 —
+`prototype/bind` 11, `prototype/apply` 5), `built-ins/Symbol covered=6
+divergent=0`, and `built-ins/AggregateError divergent=0` (its tests need
+`.at`/`String` features to be *covered*, but correctness is proven by the
+curated corpus). The honest **named skips** are: `new (boundFn)` (the
+construct-target frame geometry), a non-user-function/native `bind` target and
+a bound-of-bound **call** (`.length`/`.name` on it still read), a sparse array
+or non-array argument to `apply`/`AggregateError`, a non-string `Symbol.for`
+key, and — deferred as documented — **sloppy primitive-`this` boxing**
+(`fxToInstance`) in `.call`/`.apply`/bound calls: a sloppy callee boxes a
+primitive `this` to its wrapper while a strict callee keeps it, a
+meter-affecting distinction not knowable until the callee's `begin`, so a
+primitive `thisArg` self-names `Halt::Unsupported` rather than answer a
+`this`-dependent test wrongly (kept per the charter's "if calibratable within
+budget; else keep the honest named skip"). The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic
