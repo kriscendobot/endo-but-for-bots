@@ -63,3 +63,18 @@ Symbol.for("x").toString()
 var gg=Symbol.for("gg"); Symbol.keyFor(gg)
 String(Symbol.for("k"))
 Symbol("a")===Symbol("a")
+
+// --- AggregateError -------------------------------------------------
+// AggregateError(errors, message): the base error (message from arg 1)
+// plus an own `errors` Array built by iterating arg 0 (dense-array form).
+new AggregateError([]).name
+new AggregateError([], "oops").message
+new AggregateError([]).errors.length
+var errs3=[1,2,3]; new AggregateError(errs3).errors.length
+var errs2=[10,20]; var ae=new AggregateError(errs2,"m"); ae.errors.length
+new AggregateError([]) instanceof Error
+new AggregateError([1,2]) instanceof AggregateError
+var aef=new AggregateError([7,8,9]); aef.errors[0]+aef.errors[2]
+AggregateError([], "x").message
+var ae1=new AggregateError([5]); ae1.errors[0]
+new AggregateError([], "boom").name

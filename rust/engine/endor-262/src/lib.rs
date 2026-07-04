@@ -363,7 +363,8 @@ pub fn stage3b_binary_corpus() -> Vec<String> {
 /// inferred for a `var f = function(){}` initializer) as first-class own
 /// data-property reads; `Function.prototype.apply` with a real (dense) array
 /// argument; `Symbol.prototype.toString`/`valueOf`, `String(symbol)`
-/// coercion, and the `Symbol.for`/`keyFor` registry. Bit-exact (result AND
+/// coercion, the `Symbol.for`/`keyFor` registry, and `AggregateError`
+/// (base error + the `errors` Array from a dense-array argument). Bit-exact (result AND
 /// computron) against the oracle: `.length`/`.name` are own properties
 /// allocated at definition (folded into [`crate::interp`]'s
 /// `FUNCTION_DEFINE_METERING`), so reading them meters nothing beyond the

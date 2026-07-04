@@ -272,6 +272,20 @@ pub const ERROR_CONSTRUCT_EXTRA: u64 = (1 << 16) + 768;
 /// message length (the message string's own chunk is metered at its literal).
 pub const ERROR_MESSAGE_METERING: u64 = 280;
 
+/// `AggregateError(errors, message)` beyond the base error
+/// ([`ERROR_CONSTRUCT_EXTRA`] + the message): the `errors` Array instance
+/// (`fxNewArrayInstance` + `fxCacheArray`) plus the `fxGetIterator` +
+/// `fxIteratorNext` loop over the iterable, and the `errors` own property.
+/// [`AGGREGATE_ERROR_EXTRA`] is the fixed part (array + get-iterator + the
+/// final `done` next + the property); [`AGGREGATE_ERROR_PER_ELEMENT`] is the
+/// per-element `fxIteratorNext` (the iterator `.next()` call + its result's
+/// `value`/`done` reads) plus the `fxNewSlot` copy into the errors array.
+/// Calibrated against the pin via the raw-gap (a ≤~24-raw sub-computron
+/// item-chunk-alignment residual as the errors length varies stays below one
+/// computron).
+pub const AGGREGATE_ERROR_EXTRA: u64 = 461568;
+pub const AGGREGATE_ERROR_PER_ELEMENT: u64 = 246048;
+
 /// The raw 16.16 cost the `XS_CODE_ARRAY` opcode accrues beyond its own
 /// dispatch: `fxNewArray(the, 0)` runs `fxNewArrayInstance`
 /// (`fxNewObjectInstance` — one instance `fxNewSlot` — plus one internal
@@ -5177,6 +5191,12 @@ impl Interp {
             Native::SyntaxError => self.build_error("SyntaxError", base, argc),
             Native::TypeError => self.build_error("TypeError", base, argc),
             Native::URIError => self.build_error("URIError", base, argc),
+            // `new AggregateError(errors, message)` (`fx_AggregateError`):
+            // the base error (name "AggregateError", message from arg **1**),
+            // plus an own `errors` Array built by iterating arg 0. Only a dense
+            // Array errors argument is modeled; any other iterable drives the
+            // general `fxGetIterator` protocol and self-names an honest skip.
+            Native::AggregateError => self.build_aggregate_error(base, argc)?,
             // `Symbol([description])`: a fresh unique symbol. Its descriptor
             // slot holds the description (or `undefined`), and its identity is
             // that slot — so `Symbol('a') !== Symbol('a')`. Metering-neutral,
@@ -5560,6 +5580,90 @@ impl Interp {
             }
         }
         Slot::of(Kind::Reference, Payload::Reference(inst))
+    }
+
+    /// `new AggregateError(errors, message)` (`fx_AggregateError`): the base
+    /// error (name "AggregateError", message from arg **1**), plus an own
+    /// `errors` Array built by iterating arg 0. XS builds the base with
+    /// `fx_Error_aux(..., 1)`, then a fresh Array instance whose elements are
+    /// copied from the `fxGetIterator`/`fxIteratorNext` walk of arg 0. endor
+    /// models the common **dense Array** errors argument (reading its elements
+    /// directly); any other iterable drives the general iterator protocol and
+    /// self-names an honest skip.
+    fn build_aggregate_error(&mut self, base: usize, argc: usize) -> Result<Slot, Halt> {
+        // The errors argument (arg 0) must be a dense Array; anything else
+        // (a non-array iterable, or a sparse array) self-names.
+        let errors_slot = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        let err_elems: Vec<Slot> = match errors_slot.value {
+            Payload::Reference(arr) if self.arrays.contains_key(&arr) => {
+                let data = &self.arrays[&arr];
+                let len = data.length;
+                if (0..len).any(|i| !data.items.contains_key(&i)) {
+                    return Err(Halt::Unsupported("native-call:AggregateError:sparse-errors"));
+                }
+                (0..len).map(|i| data.items[&i]).collect()
+            }
+            _ => return Err(Halt::Unsupported("native-call:AggregateError:iterable-errors")),
+        };
+        // The base error (identical to `build_error` but the message is arg 1,
+        // XS's `fx_Error_aux(..., 1)`).
+        self.meter.tick_builtin();
+        let inst = self.new_object();
+        self.meter.tick_raw(ERROR_CONSTRUCT_EXTRA);
+        if let Some(proto) = self
+            .intrinsics
+            .get("AggregateError")
+            .and_then(|&c| self.prototype_of(c))
+        {
+            self.slots.get_mut(inst).value = Payload::Reference(proto);
+        }
+        let message: Option<String> = if argc >= 2 {
+            let a = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+            if a.kind == Kind::Undefined {
+                None
+            } else {
+                let bytes = self.to_string_bytes_metered(a);
+                self.meter.tick_raw(ERROR_MESSAGE_METERING);
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        } else {
+            None
+        };
+        self.error_data.insert(
+            inst,
+            ErrorInfo {
+                name: "AggregateError",
+                message: message.clone(),
+            },
+        );
+        if let Some(text) = message {
+            if let Some(&mid) = self.symbol_ids.get("message") {
+                let off = self.chunks.alloc(text.as_bytes());
+                self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
+            }
+        }
+        // The `errors` Array (`fxNewArrayInstance` + the copied elements +
+        // `fxCacheArray`) plus the `fxGetIterator`/`fxIteratorNext` walk cost.
+        let n = err_elems.len() as u64;
+        self.meter
+            .tick_raw(AGGREGATE_ERROR_EXTRA + n * AGGREGATE_ERROR_PER_ELEMENT);
+        let arr_inst = self.slots.alloc(Slot::instance(self.array_proto));
+        let mut arr_data = ArrayData::default();
+        for (i, mut v) in err_elems.into_iter().enumerate() {
+            v.id = 0;
+            v.next = crate::value::SlotIndex::NULL;
+            arr_data.items.insert(i as u32, v);
+        }
+        arr_data.length = n as u32;
+        self.arrays.insert(arr_inst, arr_data);
+        if let Some(&eid) = self.symbol_ids.get("errors") {
+            self.set_own_unmetered(
+                inst,
+                eid,
+                Slot::of(Kind::Reference, Payload::Reference(arr_inst)),
+            );
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
     }
 
     /// Build a primitive-wrapper object (`new Boolean`/`Number`/`String`)
