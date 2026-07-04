@@ -24,3 +24,19 @@ var g3=function(x,y,z){}; g3.name
 function add2(a,b){return a+b} add2.name
 function rec(n){return n} rec.name
 function both(a,b){} var n=both.name; var l=both.length; l
+
+// --- Function.prototype.apply with a real (dense) array argument -----
+// XS reads the array's `length` (`mxGetID`), then each element
+// (`mxGetIndex`), and forwards them as the call arguments; the array-path
+// setup + per-element read/forward is the measured
+// APPLY_ARRAY_BASE_METERING + n * APPLY_ARRAY_PER_ELEMENT_METERING.
+function add(a,b){return a+b} add.apply(undefined,[3,4])
+function add3(a,b,c){return a+b+c} add3.apply(null,[1,2,3])
+function first(a){return a} first.apply(undefined,[42])
+function none(){return 7} none.apply(undefined,[])
+function sum4(a,b,c,d){return a+b+c+d} sum4.apply(undefined,[1,2,3,4])
+function mul(a,b){return a*b} var args=[6,7]; mul.apply(undefined,args)
+function sub3(a,b,c){return a-b-c} sub3.apply(undefined,[10,2,3])
+function extra(a,b){return b} extra.apply(undefined,[1,2,3])
+function pick5(a,b,c,d,e){return a+e} pick5.apply(undefined,[1,2,3,4,5])
+function id1(a){return a} var arr=[9]; id1.apply(null,arr)

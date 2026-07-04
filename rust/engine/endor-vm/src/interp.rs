@@ -195,6 +195,23 @@ pub const METHOD_HAS_OWN_PROPERTY_METERING: u64 = 1 << 16;
 pub const CALL_TRAMPOLINE_METERING: u64 = 2 << 16;
 pub const CALL_TRAMPOLINE_PER_ARG: u64 = 1 << 14;
 
+/// `Function.prototype.apply(thisArg, argArray)` with a real (dense) array
+/// argument: the extra host cost `fx_Function_prototype_apply` accrues over
+/// the no-array subset (whose base folds into [`CALL_TRAMPOLINE_METERING`]).
+/// [`APPLY_ARRAY_BASE_METERING`] is the fixed setup the array path adds — the
+/// `fxToInstance`/`fxToLength` of the array-like, the `mxGetID(_length)` read
+/// (one `mxMeterOne`), and the tail-call re-dispatch cluster — beyond
+/// `CALL_TRAMPOLINE_METERING`; [`APPLY_ARRAY_PER_ELEMENT_METERING`] is the
+/// per-element cost (the `mxGetIndex(i)` read plus the forwarded-argument copy
+/// through the tail-call). Both calibrated against the pin via the raw-gap:
+/// with a fixed callee, each element grows the run by exactly `3 << 14` and
+/// the array-argument base by a constant `98040` beyond
+/// `CALL_TRAMPOLINE_METERING` (a small ≤~272-raw context residual — the same
+/// sub-computron literal/var chunk-alignment noise the array corpus carries —
+/// stays below one computron).
+pub const APPLY_ARRAY_BASE_METERING: u64 = 98040;
+pub const APPLY_ARRAY_PER_ELEMENT_METERING: u64 = 3 << 14;
+
 /// The raw 16.16 cost the `instanceof` operator accrues beyond its own
 /// dispatch for the `Symbol.hasInstance` host-frame call itself
 /// (`fxRunInstanceOf` → `fxOrdinaryHasInstance`), measured against the pin
@@ -5585,20 +5602,49 @@ impl Interp {
         ) {
             return Err(Halt::Unsupported("apply:primitive-this-boxing"));
         }
-        // The arguments array (the second argument): only absent/undefined/null
-        // is the no-array subset; a real array self-names (child-3 Array read).
+        // The arguments array (the second argument). Absent/undefined/null is
+        // the no-array subset (zero args). A **dense** Array instance forwards
+        // its elements as the call arguments (XS reads `length` then each
+        // element). A non-array object (an array-like / `arguments`) or a
+        // sparse array (holes read through the prototype) self-names — XS's
+        // `mxGetIndex` walk through a hole is not yet modeled.
         let arg_array = self.stack.get(base + 5).copied();
-        match arg_array.map(|s| s.kind) {
-            None | Some(Kind::Undefined) | Some(Kind::Null) => {}
+        let (real_args, array_read_meter) = match arg_array.map(|s| (s.kind, s.value)) {
+            None | Some((Kind::Undefined, _)) | Some((Kind::Null, _)) => (Vec::new(), 0),
+            Some((Kind::Reference, Payload::Reference(arr)))
+                if self.arrays.contains_key(&arr) =>
+            {
+                let data = &self.arrays[&arr];
+                let len = data.length;
+                // Dense only: every index in `[0, length)` must be a present
+                // element (no holes), else the read walks the prototype.
+                if (0..len).any(|i| !data.items.contains_key(&i)) {
+                    return Err(Halt::Unsupported("apply:sparse-arguments-array"));
+                }
+                let args: Vec<Slot> = (0..len).map(|i| data.items[&i]).collect();
+                // The array path's fixed setup plus the per-element read +
+                // forwarding (`mxGetID(_length)` + `mxGetIndex(i)` + copy).
+                let meter = APPLY_ARRAY_BASE_METERING
+                    + len as u64 * APPLY_ARRAY_PER_ELEMENT_METERING;
+                (args, meter)
+            }
             _ => return Err(Halt::Unsupported("apply:arguments-array")),
-        }
+        };
+        let n = real_args.len();
         self.stack.truncate(base);
         self.stack.push(this_arg); // THIS
         self.stack.push(f); // FUNCTION (the receiver)
         self.stack.push(Slot::undefined()); // RESULT
         self.stack.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
-        self.meter.tick_raw(CALL_TRAMPOLINE_METERING);
-        self.enter_call(0, ret_pc, false)
+        for a in real_args {
+            self.stack.push(a);
+        }
+        // The no-array base ([`CALL_TRAMPOLINE_METERING`]) plus the array
+        // path's extra (`array_read_meter`); the per-element forwarding is
+        // already folded into [`APPLY_ARRAY_PER_ELEMENT_METERING`].
+        self.meter
+            .tick_raw(CALL_TRAMPOLINE_METERING + array_read_meter);
+        self.enter_call(n, ret_pc, false)
     }
 
     /// Dispatch a native prototype **method** call (`obj.toString()`,
