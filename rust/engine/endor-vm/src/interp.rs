@@ -728,6 +728,19 @@ struct FuncInfo {
     /// The function's own name (for `Function.prototype.toString`), an empty
     /// string for an anonymous function.
     name: String,
+    /// The function's `.length` — its declared arity. XS sets this from the
+    /// second byte of the body chunk (`begin`'s parameter-count operand) in
+    /// the `code` opcode (`fxNewFunctionLength(the, variable, *(code+1))`,
+    /// `xsRun.c`); an own `length` data property (`XS_DONT_ENUM|XS_DONT_SET`)
+    /// created at `fxNewFunctionInstance` and updated there. Filled in at
+    /// `code`; `0` until then (a native's arity is set when it is bound).
+    arity: u32,
+    /// The interned chunk of the function's `.name` string, so a `f.name`
+    /// read returns the own `name` property without re-allocating (XS's
+    /// `name` chunk is built once at `fxNewFunctionName`, folded into the
+    /// definition metering, and read for free thereafter). `NULL` until the
+    /// name is interned at definition.
+    name_chunk: crate::value::ChunkOffset,
 }
 
 /// The `Math` static functions endor models (`xsMath.c`). Each is a
@@ -1119,6 +1132,8 @@ impl Default for FuncInfo {
             native: None,
             method: None,
             name: String::new(),
+            arity: 0,
+            name_chunk: crate::value::ChunkOffset::NULL,
         }
     }
 }
@@ -1685,6 +1700,10 @@ pub struct Interp {
     /// `arr.length` get/set routes to the array length semantics. `None`
     /// when the program never references `length`.
     length_id: Option<u16>,
+    /// The program-local symbol id of `name` (XS's `mxID(_name)`), so a
+    /// `f.name` read routes to the function's own `name` property. `None`
+    /// when the program never references `name`.
+    name_id: Option<u16>,
     /// The realm's `%Array Iterator.prototype%` (a boot object) — the
     /// prototype of the iterators `arr.values()`/`keys()`/`entries()` and
     /// `arr[Symbol.iterator]()` produce. Carries `next` and a
@@ -1863,6 +1882,7 @@ impl Interp {
             dataview_proto: crate::value::SlotIndex::NULL,
             size_id: None,
             length_id: None,
+            name_id: None,
             array_iterator_proto: crate::value::SlotIndex::NULL,
             math_object: crate::value::SlotIndex::NULL,
             string_proto: crate::value::SlotIndex::NULL,
@@ -2533,6 +2553,7 @@ impl Interp {
                 .position(|n| n == want)
                 .map(|k| (k + 1) as u16)
         };
+        self.name_id = id_of("name");
         self.value_id = id_of("value");
         self.done_id = id_of("done");
         self.size_id = id_of("size");
@@ -3454,6 +3475,28 @@ impl Interp {
                                 self.instance_get(inst, id)
                             }
                         }
+                        Payload::Reference(inst)
+                            if (Some(id) == self.length_id || Some(id) == self.name_id)
+                                && self
+                                    .functions
+                                    .get(&inst)
+                                    .map(|fi| fi.native.is_none() && fi.method.is_none())
+                                    .unwrap_or(false) =>
+                        {
+                            // A user function's own `length`/`name` data
+                            // properties (`XS_DONT_ENUM|XS_DONT_SET`), created
+                            // at `fxNewFunctionInstance` and filled in at `code`
+                            // (`length`) / `fxNewFunctionName` (`name`). Reading
+                            // them is a plain own-property read — no built-in
+                            // step, no allocation (the value/chunk already
+                            // exist), so metering is unchanged, exactly as XS.
+                            let fi = &self.functions[&inst];
+                            if Some(id) == self.length_id {
+                                Slot::integer(fi.arity as i32)
+                            } else {
+                                Slot::of(Kind::String, Payload::String(fi.name_chunk))
+                            }
+                        }
                         Payload::Reference(inst) => self.instance_get(inst, id),
                         // A primitive string boxes to `%String.prototype%`
                         // (XS's `fxCoerceToString`/string behavior): `.length`
@@ -3547,9 +3590,18 @@ impl Interp {
                     self.meter
                         .tick_raw(FUNCTION_LOCAL_METERING * locals as u64);
                     if let Payload::Reference(f) = self.stack.last().map(|s| s.value).unwrap_or(Payload::None) {
+                        // `fxNewFunctionLength(the, variable, *(code+1))`: XS
+                        // sets the function's `.length` from the second byte of
+                        // the body chunk — `begin`'s declared-parameter-count
+                        // operand. (No metering: the `length` own property was
+                        // allocated at `fxNewFunctionInstance`, folded into
+                        // [`FUNCTION_DEFINE_METERING`]; this only updates its
+                        // integer value.)
+                        let arity = code.get(body_start + 1).copied().unwrap_or(0) as u32;
                         let info = self.functions.entry(f).or_default();
                         info.body_start = body_start;
                         info.body_len = n;
+                        info.arity = arity;
                     }
                     pc = body_start + n;
                 }
@@ -4708,10 +4760,16 @@ impl Interp {
         } else {
             String::new()
         };
+        // Intern the `.name` chunk once, unmetered: XS builds the function's
+        // `name` string chunk at `fxNewFunctionName` (folded into the measured
+        // [`FUNCTION_DEFINE_METERING`] cluster), so a later `f.name` read is a
+        // free own-property read — endor mirrors that by pre-interning here.
+        let name_chunk = self.chunks.alloc(fname.as_bytes());
         self.functions.insert(
             f,
             FuncInfo {
                 name: fname,
+                name_chunk,
                 ..FuncInfo::default()
             },
         );

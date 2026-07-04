@@ -356,6 +356,19 @@ pub fn stage3b_binary_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3b-binary.js"))
 }
 
+/// The stage-3b fundamentals-followup corpus (child 4/9): the post-arrays
+/// fundamentals follow-up unblocked by the landed Array machinery — a user
+/// function's `.length` (its declared arity, set from `begin`'s
+/// parameter-count operand at the `code` opcode) and `.name` (its own name,
+/// inferred for a `var f = function(){}` initializer) as first-class own
+/// data-property reads. Bit-exact (result AND computron) against the oracle:
+/// `.length`/`.name` are own properties allocated at definition (folded into
+/// [`crate::interp`]'s `FUNCTION_DEFINE_METERING`), so reading them meters
+/// nothing beyond the `GET_PROPERTY` dispatch.
+pub fn stage3b_fundamentals_followup_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3b-fundamentals-followup.js"))
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -1021,6 +1034,39 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3b binary bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3b_fundamentals_followup_corpus_is_bit_exact_against_oracle() {
+        // The stage-3b fundamentals-followup acceptance bar (child 4/9):
+        // every program reading a user function's `.length` (declared arity)
+        // or `.name` (own name) agrees with C-XS on BOTH the completion value
+        // AND the computron count. These are own data properties allocated at
+        // definition (folded into `FUNCTION_DEFINE_METERING`), so reading them
+        // meters nothing beyond the GET_PROPERTY dispatch.
+        let programs = stage3b_fundamentals_followup_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-3b fundamentals-followup corpus must be non-empty"
+        );
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3b fundamentals-followup bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
