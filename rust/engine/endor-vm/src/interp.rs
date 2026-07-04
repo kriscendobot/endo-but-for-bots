@@ -212,6 +212,27 @@ pub const CALL_TRAMPOLINE_PER_ARG: u64 = 1 << 14;
 pub const APPLY_ARRAY_BASE_METERING: u64 = 98040;
 pub const APPLY_ARRAY_PER_ELEMENT_METERING: u64 = 3 << 14;
 
+/// `Function.prototype.bind` creation (`fx_Function_prototype_bind`): the
+/// bound-function instance + its CODE/HOME slots + the `_boundFunction`/
+/// `_boundThis`/`_boundArguments` internal properties + the bound `length`
+/// and `name` (`"bound "+name`) properties. [`BIND_CREATE_METERING`] is the
+/// fixed cluster with **no** bound arguments (`_boundArguments` is `null`).
+/// When bound arguments exist, XS builds an Array instead
+/// ([`BIND_CREATE_ARGS_ARRAY`] for the `fxNewArrayInstance` + `fxCacheArray`)
+/// with [`BIND_CREATE_PER_ARG`] per copied argument. Calibrated against the
+/// pin via the raw-gap.
+pub const BIND_CREATE_METERING: u64 = 198696;
+pub const BIND_CREATE_ARGS_ARRAY: u64 = 33296;
+pub const BIND_CREATE_PER_ARG: u64 = 288;
+
+/// The bound-function call trampoline (`fx_Function_prototype_bound`): the
+/// re-dispatch cost beyond the target's body, plus one built-in step
+/// ([`BIND_CALL_PER_ARG`] = `1<<14`) per forwarded argument (bound + call).
+/// Calibrated via the raw-gap: with a fixed target, each forwarded argument
+/// grows the run by exactly `1<<14` and the base is a constant `180216`.
+pub const BIND_CALL_METERING: u64 = 180216;
+pub const BIND_CALL_PER_ARG: u64 = 1 << 14;
+
 /// The raw 16.16 cost the `instanceof` operator accrues beyond its own
 /// dispatch for the `Symbol.hasInstance` host-frame call itself
 /// (`fxRunInstanceOf` → `fxOrdinaryHasInstance`), measured against the pin
@@ -748,6 +769,17 @@ pub const BIGINT_NEG_FRAME_METERING: u64 = 1 << 14;
 /// object stays a real arena instance whose own properties (`.prototype`,
 /// `.length`, `.name`, and user-defined) are real arena slots the GC
 /// traces, while the non-value-slot body/closure metadata rides alongside.
+/// A bound function's metadata (`Function.prototype.bind`): the target
+/// function instance to invoke, the bound `this`, and the bound leading
+/// arguments prepended to each call (XS's `_boundFunction`/`_boundThis`/
+/// `_boundArguments` internal slots).
+#[derive(Clone, Debug)]
+struct BoundData {
+    target: crate::value::SlotIndex,
+    this_arg: Slot,
+    args: Vec<Slot>,
+}
+
 #[derive(Clone, Debug)]
 struct FuncInfo {
     /// Start offset of the function body in the program code buffer (the
@@ -853,6 +885,16 @@ pub enum NativeMethod {
     /// arguments; an actual arguments array self-names (the Array read is
     /// child-3 machinery).
     FunctionApply,
+    /// `Function.prototype.bind(thisArg, ...boundArgs)`
+    /// (`fx_Function_prototype_bind`): create a **bound function** — a fresh
+    /// callable whose `.length` is the target's own `.length` minus the bound
+    /// arg count (floored at 0), `.name` is `"bound "` + the target's name,
+    /// and which, when called, invokes the target with the bound `this` and
+    /// the bound args prepended to the call args (`fx_Function_prototype_
+    /// bound`). Handled in `call_native_method` (creation); the bound
+    /// function's later invocation is a separate trampoline in the `run`
+    /// dispatch.
+    FunctionBind,
     ErrorToString,
     /// A primitive wrapper's `valueOf` (returns the wrapped primitive).
     WrapperValueOf,
@@ -1580,6 +1622,12 @@ pub struct Interp {
     /// closures), keyed by the function instance's slot index. See
     /// [`FuncInfo`].
     functions: std::collections::HashMap<crate::value::SlotIndex, FuncInfo>,
+    /// Side table of bound-function metadata (`Function.prototype.bind`),
+    /// keyed by the bound function's slot index: the target to invoke, the
+    /// bound `this`, and the bound leading arguments. A callee found here in
+    /// the `run` dispatch trampolines into the target (XS's
+    /// `fx_Function_prototype_bound`).
+    bound_functions: std::collections::HashMap<crate::value::SlotIndex, BoundData>,
     /// The saved caller states of the active call chain (design §
     /// Interpreter and dispatch: "frames are stack slots ... fixed offsets
     /// for result/function/this"). The top-level program is the base
@@ -1914,6 +1962,7 @@ impl Interp {
             static_str,
             n_dispatched: 0,
             functions: std::collections::HashMap::new(),
+            bound_functions: std::collections::HashMap::new(),
             call_stack: Vec::new(),
             args: Vec::new(),
             this_val: Slot::undefined(),
@@ -2292,6 +2341,8 @@ impl Interp {
         self.proto_methods.push((func_proto, "call", fp_call));
         let fp_apply = self.alloc_method(NativeMethod::FunctionApply);
         self.proto_methods.push((func_proto, "apply", fp_apply));
+        let fp_bind = self.alloc_method(NativeMethod::FunctionBind);
+        self.proto_methods.push((func_proto, "bind", fp_bind));
         // Every Error prototype (base + each subtype) gets `toString`.
         let error_protos: Vec<crate::value::SlotIndex> = {
             let mut v = vec![error_proto];
@@ -3810,6 +3861,13 @@ impl Interp {
                     });
                     let callee = func_ref.and_then(|(f, base)| self.native_of(f).map(|n| (n, base)));
                     let method = func_ref.and_then(|(f, base)| self.method_of(f).map(|m| (m, base)));
+                    let bound = func_ref.and_then(|(f, base)| {
+                        if self.bound_functions.contains_key(&f) {
+                            Some((f, base))
+                        } else {
+                            None
+                        }
+                    });
                     if let Some((native, base)) = callee {
                         // A native (intrinsic) constructor callee.
                         match self.call_native(native, base, argc, has_target) {
@@ -3858,6 +3916,24 @@ impl Interp {
                                     return Halt::MeterAbort;
                                 }
                                 pc = ret_pc;
+                            }
+                            Err(h) => return h,
+                        }
+                    } else if let Some((bf, base)) = bound {
+                        // A bound function (`fx_Function_prototype_bound`):
+                        // re-enter the target with the bound `this` and the
+                        // bound args prepended to the call args. `new boundF()`
+                        // needs the construct-target geometry — a later
+                        // increment, so it self-names.
+                        if has_target {
+                            return Halt::Unsupported("bind:new-bound");
+                        }
+                        match self.enter_call_bound(bf, base, argc, ret_pc) {
+                            Ok(body_start) => {
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = body_start;
                             }
                             Err(h) => return h,
                         }
@@ -5666,6 +5742,80 @@ impl Interp {
         Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
     }
 
+    /// `Function.prototype.bind(thisArg, ...boundArgs)`
+    /// (`fx_Function_prototype_bind`): create a bound function. The receiver
+    /// (`this`, at `base`) must be a user function; `thisArg` is arg 0 and the
+    /// bound arguments are args `1..argc`. The bound function's `.length` is
+    /// the target's own `.length` minus the bound-arg count (floored at 0),
+    /// its `.name` is `"bound "` + the target's name; calling it invokes the
+    /// target with the bound `this` + bound args prepended (the `run`
+    /// trampoline via [`Self::enter_call_bound`]).
+    fn make_bound_function(&mut self, base: usize, argc: usize) -> Result<Slot, Halt> {
+        let this = self.stack.get(base).copied().unwrap_or_else(Slot::undefined);
+        // The target must be a plain user function (a native/method/already-
+        // bound target's trampoline geometry is a later increment).
+        let target = match this.value {
+            Payload::Reference(r)
+                if self
+                    .functions
+                    .get(&r)
+                    .map_or(false, |fi| fi.native.is_none() && fi.method.is_none()) =>
+            {
+                r
+            }
+            _ => return Err(Halt::Unsupported("bind:non-user-function-receiver")),
+        };
+        let this_arg = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        // Bound leading arguments: args 1..argc (arg 0 is `thisArg`).
+        let bound_args: Vec<Slot> = if argc >= 2 {
+            (1..argc)
+                .map(|i| self.stack.get(base + 4 + i).copied().unwrap_or_else(Slot::undefined))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let nbound = bound_args.len() as u32;
+        // Bound `.length` = max(0, target.length - boundArgs) and bound `.name`
+        // = "bound " + target.name (XS reads the target's own `length`/`name`).
+        let target_arity = self.functions.get(&target).map(|fi| fi.arity).unwrap_or(0);
+        let bound_len = target_arity.saturating_sub(nbound);
+        let target_name = self.functions.get(&target).map(|fi| fi.name.clone()).unwrap_or_default();
+        let bound_name = format!("bound {}", target_name);
+        // The bound-function creation cluster (instance + CODE/HOME + the three
+        // internal property slots + the length/name properties). When there
+        // are bound arguments, XS additionally builds an Array for them
+        // (`fxNewArrayInstance` + a `fxNewSlot` per arg + `fxCacheArray`);
+        // with none, `_boundArguments` is a null property (no array).
+        let args_meter = if nbound >= 1 {
+            BIND_CREATE_ARGS_ARRAY + nbound as u64 * BIND_CREATE_PER_ARG
+        } else {
+            0
+        };
+        self.meter.tick_raw(BIND_CREATE_METERING + args_meter);
+        let inst = self.slots.alloc(Slot::instance(self.function_proto));
+        let name_chunk = self.chunks.alloc(bound_name.as_bytes());
+        // Register in `functions` (native/method None) so `.length`/`.name`
+        // read back the bound values through the ordinary GET_PROPERTY arm.
+        self.functions.insert(
+            inst,
+            FuncInfo {
+                name: bound_name,
+                name_chunk,
+                arity: bound_len,
+                ..FuncInfo::default()
+            },
+        );
+        self.bound_functions.insert(
+            inst,
+            BoundData {
+                target,
+                this_arg,
+                args: bound_args,
+            },
+        );
+        Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
+    }
+
     /// Build a primitive-wrapper object (`new Boolean`/`Number`/`String`)
     /// around the already-computed primitive `prim`. Meters the native
     /// `Object` empty-object cost plus [`WRAPPER_CONSTRUCT_EXTRA`], chains the
@@ -5842,6 +5992,55 @@ impl Interp {
         self.enter_call(n, ret_pc, false)
     }
 
+    /// A bound function's call (`fx_Function_prototype_bound`): re-enter the
+    /// target frame with the bound `this` and the bound leading arguments
+    /// prepended to the call arguments. The stack at `base` holds the bound
+    /// call's frame `[THIS, FUNCTION(bound), RESULT, FRAME, callArgs...]`;
+    /// reshape it to the target's `[boundThis, target, RESULT, FRAME,
+    /// boundArgs..., callArgs...]` and enter. `bf` is the bound function's
+    /// instance slot (its [`BoundData`] holds the target/this/args).
+    fn enter_call_bound(
+        &mut self,
+        bf: crate::value::SlotIndex,
+        base: usize,
+        argc: usize,
+        ret_pc: usize,
+    ) -> Result<usize, Halt> {
+        let data = self.bound_functions[&bf].clone();
+        // A bound function whose target is itself bound needs the trampoline to
+        // re-dispatch through the target's own bound handler (XS's `mxRunCount`
+        // does this naturally); endor's `enter_call` does not re-check, so a
+        // bound-of-bound *call* self-names (its `.length`/`.name` still read).
+        if self.bound_functions.contains_key(&data.target) {
+            return Err(Halt::Unsupported("bind:bound-target-call"));
+        }
+        let target = Slot::of(Kind::Reference, Payload::Reference(data.target));
+        // The call arguments follow the frame (`base + 4 ..`).
+        let call_args: Vec<Slot> = if argc >= 1 {
+            self.stack[base + 4..base + 4 + argc].to_vec()
+        } else {
+            Vec::new()
+        };
+        let nbound = data.args.len();
+        let total = nbound + call_args.len();
+        self.stack.truncate(base);
+        self.stack.push(data.this_arg); // THIS (the bound `this`)
+        self.stack.push(target); // FUNCTION (the target)
+        self.stack.push(Slot::undefined()); // RESULT
+        self.stack.push(Slot::of(Kind::Uninitialized, Payload::None)); // FRAME
+        for a in data.args {
+            self.stack.push(a); // bound args first
+        }
+        for a in call_args {
+            self.stack.push(a); // then the call args
+        }
+        // The bound-call re-dispatch overhead plus one step per forwarded
+        // argument (bound + call), calibrated against the pin via the raw-gap.
+        self.meter
+            .tick_raw(BIND_CALL_METERING + total as u64 * BIND_CALL_PER_ARG);
+        self.enter_call(total, ret_pc, false)
+    }
+
     /// Dispatch a native prototype **method** call (`obj.toString()`,
     /// `obj.hasOwnProperty(k)`, `wrapper.valueOf()`, …). The value stack holds
     /// the call frame `[THIS, FUNCTION, RESULT, FRAME]` from `base`; `THIS` is
@@ -5922,6 +6121,9 @@ impl Interp {
                 let off = self.chunks.alloc(&bytes);
                 Slot::of(Kind::String, Payload::String(off))
             }
+            // `Function.prototype.bind(thisArg, ...boundArgs)`: create a bound
+            // function (its creation; the bound call is a `run` trampoline).
+            NativeMethod::FunctionBind => self.make_bound_function(base, argc)?,
             // `Symbol.prototype.toString()` → `Symbol(<description>)`
             // (`fxSymbolToString`: `fxStringX("Symbol(")` + the description +
             // `")"`). The receiver must be a symbol; a non-symbol self-names.

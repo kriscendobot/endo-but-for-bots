@@ -78,3 +78,19 @@ var aef=new AggregateError([7,8,9]); aef.errors[0]+aef.errors[2]
 AggregateError([], "x").message
 var ae1=new AggregateError([5]); ae1.errors[0]
 new AggregateError([], "boom").name
+
+// --- Function.prototype.bind ----------------------------------------
+// bind creates a bound function: .length = max(0, target.length - bound),
+// .name = "bound "+name; calling it prepends the bound this + bound args.
+function fb2(a,b){return a+b} var gb0=fb2.bind(undefined); gb0(3,4)
+function fb2b(a,b){return a+b} var gb1=fb2b.bind(undefined,10); gb1(5)
+function fb3(a,b,c){return a+b+c} var gb2=fb3.bind(null,1,2); gb2(3)
+function flen(a,b){return a+b} flen.bind(undefined).length
+function flen2(a,b){return a} flen2.bind(undefined,9).length
+function fname(a){} fname.bind(undefined).name
+function fthis(){return this.v} var ov={v:42}; var gt=fthis.bind(ov); gt()
+function fadd(x,y,z){return x+y+z} var ga=fadd.bind(null); ga(1,2,3)
+function f4(a,b,c,d){return a+b+c+d} var g4=f4.bind(undefined,1,2,3,4); g4()
+function f5(a,b,c,d,e){return 0} f5.bind(undefined,1,2).length
+function fmul(a,b){return a*b} var gm=fmul.bind(null,6); gm(7)
+function fd(a){return a} var gd=fd.bind(undefined,5); var hd=gd.bind(undefined); hd.name

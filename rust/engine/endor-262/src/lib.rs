@@ -361,8 +361,10 @@ pub fn stage3b_binary_corpus() -> Vec<String> {
 /// function's `.length` (its declared arity, set from `begin`'s
 /// parameter-count operand at the `code` opcode) and `.name` (its own name,
 /// inferred for a `var f = function(){}` initializer) as first-class own
-/// data-property reads; `Function.prototype.apply` with a real (dense) array
-/// argument; `Symbol.prototype.toString`/`valueOf`, `String(symbol)`
+/// data-property reads; `Function.prototype.bind` (bound-function repr with the
+/// bound `length`/`name` and the call trampoline); `Function.prototype.apply`
+/// with a real (dense) array argument; `Symbol.prototype.toString`/`valueOf`,
+/// `String(symbol)`
 /// coercion, the `Symbol.for`/`keyFor` registry, and `AggregateError`
 /// (base error + the `errors` Array from a dense-array argument). Bit-exact (result AND
 /// computron) against the oracle: `.length`/`.name` are own properties
