@@ -244,6 +244,19 @@ pub const WRAPPER_CONSTRUCT_EXTRA: u64 = (1 << 16) + 256;
 /// as 33792 raw, independent of the description. Accrued per `Symbol()` call.
 pub const SYMBOL_CREATE_METERING: u64 = 33792;
 
+/// The raw 16.16 cost of `Symbol.prototype.toString()` (`fx_Symbol_prototype_
+/// toString` → `fxCheckSymbol` + `fxSymbolToString`: the host-frame check plus
+/// the incremental `fxStringX("Symbol(")`/`fxConcatString`/`fxConcatStringC`
+/// build) beyond the method dispatch. Calibrated against the pin via the
+/// raw-gap as a constant `33368` (a ≤~24-raw sub-computron chunk-alignment
+/// residual as the description length varies stays below one computron). The
+/// `String(sym)` coercion path (`Native::String`) folds this into the native
+/// call and needs no residual. `Symbol.for`/`keyFor` meter nothing beyond
+/// their dispatch and result-chunk allocation (verified bit-exact).
+pub const SYMBOL_TO_STRING_METERING: u64 = 33368;
+pub const SYMBOL_FOR_METERING: u64 = 0;
+pub const SYMBOL_KEYFOR_METERING: u64 = 0;
+
 /// The raw 16.16 cost an Error constructor accrues over the native `Object`
 /// constructor's empty-object cost: the extra internal slots and steps an
 /// error instance carries (`fx_Error`/`fxNewErrorInstance` — the stack-trace
@@ -831,6 +844,19 @@ pub enum NativeMethod {
     WrapperValueOf,
     /// A primitive wrapper's `toString` (stringifies the wrapped primitive).
     WrapperToString,
+    /// `Symbol.prototype.toString()` (`fx_Symbol_prototype_toString` →
+    /// `fxSymbolToString`): the descriptive string `Symbol(<description>)`.
+    SymbolToString,
+    /// `Symbol.prototype.valueOf()` (`fx_Symbol_prototype_valueOf`): the
+    /// symbol primitive itself (unwrapping a Symbol wrapper object, though
+    /// endor's covered grammar has only the primitive receiver).
+    SymbolValueOf,
+    /// `Symbol.for(key)` (`fx_Symbol_for`): the shared registry symbol for
+    /// `key` — the same symbol on repeat calls (registry-interned identity).
+    SymbolFor,
+    /// `Symbol.keyFor(sym)` (`fx_Symbol_keyFor`): the registry key a
+    /// registered symbol was interned under, or `undefined`.
+    SymbolKeyFor,
     /// `Array.prototype.push(...items)` — the **dense** fast path
     /// (`fx_Array_prototype_push` with `fxCheckArray` succeeding): append the
     /// arguments and return the new length. A sparse receiver (holes) takes
@@ -1741,6 +1767,16 @@ pub struct Interp {
     /// The realm's `%Number.prototype%` (a boot object) — the box target for a
     /// primitive number's method access (`(42).toString(2)`, …).
     number_proto: crate::value::SlotIndex,
+    /// The realm's `%Symbol.prototype%` (a boot object) — the box target for a
+    /// primitive symbol's method access (`Symbol("x").toString()`, …).
+    symbol_proto: crate::value::SlotIndex,
+    /// The global symbol registry (`Symbol.for`/`keyFor`, XS's `symbolTable`):
+    /// the registry key → the canonical symbol-description slot that is the
+    /// registered symbol's identity, so `Symbol.for(k) === Symbol.for(k)`.
+    symbol_registry: std::collections::HashMap<Vec<u8>, crate::value::SlotIndex>,
+    /// The reverse of [`Self::symbol_registry`]: a registered symbol's
+    /// identity slot → its registry key, so `Symbol.keyFor(sym)` recovers it.
+    symbol_registry_keys: std::collections::HashMap<crate::value::SlotIndex, Vec<u8>>,
     /// Native prototype/namespace **numeric** data properties to bind at link
     /// time: `(owner instance, property name, value)`. Used for `Math.PI` &co.
     /// (the `Math` constants) and `Number.MAX_VALUE` &co.; bound only when the
@@ -1904,6 +1940,9 @@ impl Interp {
             math_object: crate::value::SlotIndex::NULL,
             string_proto: crate::value::SlotIndex::NULL,
             number_proto: crate::value::SlotIndex::NULL,
+            symbol_proto: crate::value::SlotIndex::NULL,
+            symbol_registry: std::collections::HashMap::new(),
+            symbol_registry_keys: std::collections::HashMap::new(),
             proto_value_data: Vec::new(),
             iterators: std::collections::HashMap::new(),
             value_id: None,
@@ -2075,6 +2114,23 @@ impl Interp {
             self.proto_methods.push((array_ctor, "from", from));
             let from_async = self.alloc_method(NativeMethod::ArrayFromAsync);
             self.proto_methods.push((array_ctor, "fromAsync", from_async));
+        }
+        // `%Symbol.prototype%`: the box target for a primitive symbol's method
+        // access (`Symbol("x").toString()`), carrying `toString`/`valueOf`;
+        // and the `Symbol.for`/`keyFor` registry statics on the constructor
+        // instance. Bound at link time only for the names the program uses.
+        if let Some(&symbol_ctor) = self.intrinsics.get("Symbol") {
+            if let Some(p) = self.prototype_of(symbol_ctor) {
+                self.symbol_proto = p;
+                let t = self.alloc_method(NativeMethod::SymbolToString);
+                self.proto_methods.push((p, "toString", t));
+                let v = self.alloc_method(NativeMethod::SymbolValueOf);
+                self.proto_methods.push((p, "valueOf", v));
+            }
+            let f = self.alloc_method(NativeMethod::SymbolFor);
+            self.proto_methods.push((symbol_ctor, "for", f));
+            let k = self.alloc_method(NativeMethod::SymbolKeyFor);
+            self.proto_methods.push((symbol_ctor, "keyFor", k));
         }
         // The collection prototypes (`%Map.prototype%` &co.), remembered so a
         // `new Map()`/`new Set()`/… instance chains to the right one and its
@@ -2877,6 +2933,21 @@ impl Interp {
         }
     }
 
+    /// The descriptive string of a symbol value (XS's `fxSymbolToString`):
+    /// `Symbol(` + the description (empty when the description is `undefined`)
+    /// + `)`. A symbol carries `Payload::Reference(desc)`, the description slot
+    /// (a `String` or `undefined`).
+    fn symbol_descriptive_bytes(&self, sym: Slot) -> Vec<u8> {
+        let mut out = b"Symbol(".to_vec();
+        if let Payload::Reference(d) = sym.value {
+            if let Payload::String(off) = self.slots.get(d).value {
+                out.extend_from_slice(self.str_content(off));
+            }
+        }
+        out.push(b')');
+        out
+    }
+
     /// Run a program bytecode buffer to completion.
     pub fn run(&mut self, code: &[u8]) -> RunOutcome {
         let mut halt = self.dispatch(code);
@@ -3513,6 +3584,17 @@ impl Interp {
                             } else {
                                 Slot::of(Kind::String, Payload::String(fi.name_chunk))
                             }
+                        }
+                        // A primitive symbol boxes to `%Symbol.prototype%`
+                        // (XS's symbol behavior): `sym.toString`/`valueOf`
+                        // resolve the inherited method up the prototype chain.
+                        // (A symbol value carries `Payload::Reference(desc)`,
+                        // so this must precede the generic reference arm and be
+                        // gated on `Kind::Symbol`.)
+                        Payload::Reference(_)
+                            if obj.kind == Kind::Symbol && !self.symbol_proto.is_null() =>
+                        {
+                            self.instance_get(self.symbol_proto, id)
                         }
                         Payload::Reference(inst) => self.instance_get(inst, id),
                         // A primitive string boxes to `%String.prototype%`
@@ -5021,6 +5103,15 @@ impl Interp {
                     let a = arg(0);
                     match a.kind {
                         Kind::String => a,
+                        // `String(sym)` — the one explicit symbol→string
+                        // coercion the spec allows (`SymbolDescriptiveString`):
+                        // `Symbol(<description>)`. (Implicit coercion still
+                        // throws — that path stays in [`Self::run`].)
+                        Kind::Symbol => {
+                            let bytes = self.symbol_descriptive_bytes(a);
+                            let off = self.chunks.alloc(&bytes);
+                            Slot::of(Kind::String, Payload::String(off))
+                        }
                         Kind::Reference => {
                             return Err(Halt::Unsupported(native_unsupported_name(native)))
                         }
@@ -5726,6 +5817,68 @@ impl Interp {
                 let bytes = self.to_string_bytes_metered(prim);
                 let off = self.chunks.alloc(&bytes);
                 Slot::of(Kind::String, Payload::String(off))
+            }
+            // `Symbol.prototype.toString()` → `Symbol(<description>)`
+            // (`fxSymbolToString`: `fxStringX("Symbol(")` + the description +
+            // `")"`). The receiver must be a symbol; a non-symbol self-names.
+            NativeMethod::SymbolToString => {
+                if this.kind != Kind::Symbol {
+                    return Err(Halt::Unsupported("Symbol.prototype.toString:non-symbol"));
+                }
+                let bytes = self.symbol_descriptive_bytes(this);
+                self.meter.tick_raw(SYMBOL_TO_STRING_METERING);
+                let off = self.chunks.alloc(&bytes);
+                Slot::of(Kind::String, Payload::String(off))
+            }
+            // `Symbol.prototype.valueOf()`: the symbol primitive itself.
+            NativeMethod::SymbolValueOf => {
+                if this.kind != Kind::Symbol {
+                    return Err(Halt::Unsupported("Symbol.prototype.valueOf:non-symbol"));
+                }
+                this
+            }
+            // `Symbol.for(key)`: the registry symbol for `key` — the same
+            // symbol identity on repeat calls. `key` must be a string in the
+            // covered grammar (a non-string ToString is a later increment).
+            NativeMethod::SymbolFor => {
+                let key = match arg0.value {
+                    Payload::String(off) => self.str_content(off).to_vec(),
+                    _ => return Err(Halt::Unsupported("Symbol.for:non-string-key")),
+                };
+                self.meter.tick_raw(SYMBOL_FOR_METERING);
+                let d = if let Some(&d) = self.symbol_registry.get(&key) {
+                    d
+                } else {
+                    // Intern the key as the registered symbol's description
+                    // slot (its identity); `Symbol.for(k)` returns this same
+                    // slot forever after, so `=== ` holds.
+                    let desc_off = self.chunks.alloc(&key);
+                    let d = self
+                        .slots
+                        .alloc(Slot::of(Kind::String, Payload::String(desc_off)));
+                    self.symbol_registry.insert(key.clone(), d);
+                    self.symbol_registry_keys.insert(d, key);
+                    d
+                };
+                Slot::of(Kind::Symbol, Payload::Reference(d))
+            }
+            // `Symbol.keyFor(sym)`: the registry key a registered symbol was
+            // interned under, or `undefined` for a non-registered symbol.
+            NativeMethod::SymbolKeyFor => {
+                if arg0.kind != Kind::Symbol {
+                    return Err(Halt::Unsupported("Symbol.keyFor:non-symbol"));
+                }
+                self.meter.tick_raw(SYMBOL_KEYFOR_METERING);
+                match arg0.value {
+                    Payload::Reference(d) => match self.symbol_registry_keys.get(&d) {
+                        Some(key) => {
+                            let off = self.chunks.alloc(&key.clone());
+                            Slot::of(Kind::String, Payload::String(off))
+                        }
+                        None => Slot::undefined(),
+                    },
+                    _ => Slot::undefined(),
+                }
             }
             // `Object.prototype.hasOwnProperty(k)`: is `k` an OWN property.
             // A key that is not a program symbol cannot be an own property

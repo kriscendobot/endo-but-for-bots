@@ -361,10 +361,14 @@ pub fn stage3b_binary_corpus() -> Vec<String> {
 /// function's `.length` (its declared arity, set from `begin`'s
 /// parameter-count operand at the `code` opcode) and `.name` (its own name,
 /// inferred for a `var f = function(){}` initializer) as first-class own
-/// data-property reads. Bit-exact (result AND computron) against the oracle:
-/// `.length`/`.name` are own properties allocated at definition (folded into
-/// [`crate::interp`]'s `FUNCTION_DEFINE_METERING`), so reading them meters
-/// nothing beyond the `GET_PROPERTY` dispatch.
+/// data-property reads; `Function.prototype.apply` with a real (dense) array
+/// argument; `Symbol.prototype.toString`/`valueOf`, `String(symbol)`
+/// coercion, and the `Symbol.for`/`keyFor` registry. Bit-exact (result AND
+/// computron) against the oracle: `.length`/`.name` are own properties
+/// allocated at definition (folded into [`crate::interp`]'s
+/// `FUNCTION_DEFINE_METERING`), so reading them meters nothing beyond the
+/// `GET_PROPERTY` dispatch; the apply and Symbol paths carry constants
+/// calibrated against the pin via the raw-gap.
 pub fn stage3b_fundamentals_followup_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3b-fundamentals-followup.js"))
 }

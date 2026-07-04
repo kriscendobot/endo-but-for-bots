@@ -40,3 +40,26 @@ function sub3(a,b,c){return a-b-c} sub3.apply(undefined,[10,2,3])
 function extra(a,b){return b} extra.apply(undefined,[1,2,3])
 function pick5(a,b,c,d,e){return a+e} pick5.apply(undefined,[1,2,3,4,5])
 function id1(a){return a} var arr=[9]; id1.apply(null,arr)
+
+// --- Symbol.prototype.toString + String(symbol) coercion ------------
+// fxSymbolToString builds "Symbol(" + description + ")"; String(sym) is
+// the one explicit symbol->string coercion the spec allows.
+Symbol("d").toString()
+Symbol().toString()
+var sym=Symbol("hi"); sym.toString()
+Symbol("abcdefgh").toString()
+String(Symbol("y"))
+String(Symbol())
+var z=Symbol("z"); z.valueOf()===z
+
+// --- Symbol.for / Symbol.keyFor (the global registry) ---------------
+// Symbol.for(k) returns the same symbol identity on repeat calls;
+// keyFor recovers a registered symbol's key, or undefined for a local.
+Symbol.for("k")===Symbol.for("k")
+Symbol.for("a")===Symbol.for("b")
+Symbol.keyFor(Symbol.for("registered"))
+typeof Symbol.keyFor(Symbol("local"))
+Symbol.for("x").toString()
+var gg=Symbol.for("gg"); Symbol.keyFor(gg)
+String(Symbol.for("k"))
+Symbol("a")===Symbol("a")
