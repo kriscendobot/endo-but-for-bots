@@ -143,11 +143,37 @@ a multi-character partial-then-full match over-counts), `Number.prototype.
 toString` at a non-decimal radix, non-ASCII case/trim and astral offset math, a
 String method result consumed *directly* (without an intervening variable) as a
 receiver/argument (an extra temporary-lifetime residual), and — the largest
-remaining work — **`JSON.parse`** and **structured `JSON.stringify`** (the
-object/array serializer is implemented and its RESULT is correct, but the
-per-node allocation metering — the keys instance, per-key strings, and
-recursive property frames — is not yet modeled to a clean constant, so it
-self-names rather than ship a computron divergence). The stage-3
+remaining work — **`JSON.parse`** (the tokenizer + per-node allocation
+metering, still an honest named skip).
+
+The stage-3b **json-metering** child closes **structured `JSON.stringify`**
+(object/array values): the recursive `fxStringifyJSONProperty` per-node metering
+is now reproduced bit-exact (result AND computron) against the pin, not fitted.
+Decomposed against `xsJSON.c`, each node charges a whole number of `mxMeterOne`
+(`1<<14`) steps plus the exact `fxNewSlot`/`fxNewChunk` allocations: an array
+node `11` steps to enter (`fxStringifyJSONChars`/`mxGetID(_length)`/
+`fxToInteger`), `+1` step for a non-empty array, `5` steps per element body; an
+object node `8` steps + one instance slot for the `fxNewInstance` keys holder,
+one `XS_AT_KIND` slot per own key, `65528` for the non-empty setup, `4` steps +
+the `fxPushKeyString` chunk (`rup8(len+1)`) per key body; primitives the `1`-step
+leaf; the wobble the child-4 measurements saw is entirely the final result
+`fxNewChunk(offset)` (output length + NUL), metered once by `new_string_metered`.
+A **callable value** (function) — whose reference branch runs an unmodeled
+`mxGetID(_toJSON)` probe — and the `toJSON`/wrapper/replacer/space corners remain
+honest named skips (`JSON.stringify:callable-value`, …), never a wrong value or a
+divergence. This lifts `built-ins/JSON` to `total=138 covered=4 divergent=0`
+(most stringify files also round-trip through the still-skipped `JSON.parse`),
+and the curated `stage3b-json-metering.js` corpus + the
+`gen_json_structured_program` differential fuzz arm both agree bit-exactly.
+
+One neighbouring **pre-existing** observation the parse child (or an object-
+literal child) should note: a *large/deep* nested **object literal**
+*construction* (e.g. `var v = {…}` with no JSON at all) accrues a sub-computron
+raw drift in endor vs the oracle that can occasionally tip one computron
+boundary — visible on the bare literal, independent of the JSON surface. The
+json-structured fuzz arm bounds depth/breadth to stay inside the
+construction-exact regime so it remains a clean test of the *stringify* metering
+itself; the literal-construction drift is a separate object-literal issue. The stage-3
 **keyed-collections** child binds `Map`/`Set`/`WeakMap`/`WeakSet` as intrinsics
 (modeled in a per-instance side table like the exotic Array): construction, the
 core `set`/`add`/`get`/`has`/`delete`/`size` methods, and — the stage-3b
