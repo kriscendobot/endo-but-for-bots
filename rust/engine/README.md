@@ -410,25 +410,18 @@ promise jobs but does not run them, so BOTH sides pump the queue after the
 script settles — the oracle shim gained a post-`fxRunScript` `fxRunPromiseJobs`
 loop (metering still accumulating) and `endor-vm::run` drains its own job queue
 the same way, so the metered computrons include the whole crank (message
-delivery plus its microtask drain), the unit an xsnap/Agoric crank meters.
-**Native-promise thenable adoption** is covered too: resolving a promise with
-(or a reaction returning) a native promise adopts its state via an
-`fxOnThenable` job — the adopting promise's resolve/reject functions register as
-reactions on the inner promise and fire when it settles, chaining through the
-drain bit-exact (`Promise.resolve(nativePromise)` is instead the identity fast
-path). The curated `stage3b-promises.js` corpus and the
-`gen_stage3b_promise_program` fulfilled-chain fuzz arm agree bit-exactly, and
-`built-ins/Promise` dual-run grows to `total=474 covered=9 divergent=0` (from ~0
-before this child — the constructor bound as a value but no machinery). The
-honest **named skips** are: a **user thenable object** (a plain object with a
-callable `.then` — endor covers only the native-promise thenable), a
-**self-resolving** promise (a TypeError), a reaction **handler that throws** (the
-thrown value's capture out of the re-entrant frame is a later increment),
-`.finally`, the `all`/`race`/`allSettled`/`any` **combinators**, a
-non-user-function executor, and — stage 4's charter — **async functions / await**
-(the `structural:async-or-can-block` skip dominating the section); each
-self-names `Halt::Unsupported` rather than answer a wrong value or a computron
-divergence.
+delivery plus its microtask drain), the unit an xsnap/Agoric crank meters. The
+curated `stage3b-promises.js` corpus and the `gen_stage3b_promise_program`
+fulfilled-chain fuzz arm agree bit-exactly, and `built-ins/Promise` dual-run
+grows to `total=474 covered=7 divergent=0` (from ~0 before this child — the
+constructor bound as a value but no machinery). The honest **named skips** are:
+**thenable adoption** (`resolve` with a reference / `Promise.resolve(object)` /
+a reaction returning a promise), a reaction **handler that throws** (the thrown
+value's capture out of the re-entrant frame is a later increment), `.finally`,
+the `all`/`race`/`allSettled`/`any` **combinators**, a non-user-function
+executor, and — stage 4's charter — **async functions / await** (the
+`structural:async-or-can-block` skip dominating the section); each self-names
+`Halt::Unsupported` rather than answer a wrong value or a computron divergence.
 
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by

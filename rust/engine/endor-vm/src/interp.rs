@@ -950,9 +950,8 @@ pub const PROMISE_SETTLE_GUARDED_METERING: u64 = 0;
 pub const PROMISE_CAPABILITY_METERING: u64 = 261888;
 /// The native residual of `Promise.resolve(v)` when `v` is already a native
 /// promise — the identity fast path returns `v` (`fx_Promise_resolveAux`'s
-/// `mxGetID(_constructor)` + `fxIsSameValue`). Calibrated against the pin
-/// (`163840` = 2.5 `XS_CODE_METERING`).
-pub const PROMISE_RESOLVE_SAME_METERING: u64 = 163840;
+/// `mxGetID(_constructor)` + `fxIsSameValue`). Calibrated against the pin.
+pub const PROMISE_RESOLVE_SAME_METERING: u64 = 0;
 /// The native residual of `fx_Promise_prototype_then` BEYOND the capability
 /// ([`PROMISE_CAPABILITY_METERING`]) and the reaction registration
 /// ([`PROMISE_REACTION_METERING`]): the frame, `mxGetID(_constructor)`, and
@@ -989,23 +988,6 @@ pub const PROMISE_JOB_FRAME_METERING: u64 = 393752;
 /// handler call). `98304` (1.5 `XS_CODE_METERING`) less than the with-handler
 /// frame. Calibrated raw-exact against the pin.
 pub const PROMISE_JOB_PASSTHROUGH_FRAME_METERING: u64 = 295448;
-/// The native residual of `fxResolvePromise`'s **thenable-adoption** branch
-/// (resolving a promise with a native-promise value) BEYOND the fresh
-/// resolving pair ([`Interp::make_resolving_functions`], 13 slots) and the
-/// `fxQueueJob(count=3)` slots: the `mxGetID(_then)` probe, `fxIsCallable`, and
-/// the `mxPush(mxOnThenableFunction)`/`mxCall` framing. A thenable resolution
-/// pairs this settle-side branch with exactly one `fxOnThenable` drain job, so
-/// its framing is folded into [`PROMISE_ON_THENABLE_FRAME_METERING`] (the two
-/// co-occur 1:1); measured zero here. Calibrated raw-exact against the pin.
-pub const PROMISE_RESOLVE_THENABLE_METERING: u64 = 0;
-/// The native frame residual of one native-promise thenable adoption BEYOND
-/// the fresh resolving pair, the `fxQueueJob(count=3)` slots, and the
-/// `inner.then(resolve, reject)` call (metered by
-/// [`Interp::promise_then_with`]): the `fxResolvePromise` thenable-branch probe
-/// framing plus `fxRunPromiseJobs`'s `mxRunCount` and the `fxOnThenable`
-/// trampoline (`mxCall`/`mxRunCount(2)` around the `.then`). Charged once per
-/// adoption at the `fxOnThenable` drain. Calibrated raw-exact against the pin.
-pub const PROMISE_ON_THENABLE_FRAME_METERING: u64 = 1722080;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -1705,29 +1687,19 @@ struct PromiseFnData {
 }
 
 /// A queued microtask (XS's promise job, `fxQueueJob` onto `mxPendingJobs`).
-/// FIFO-ordered in [`Interp::promise_jobs`]; drained by
-/// [`Interp::run_promise_jobs`] after the script settles (the pump-loop latch).
+/// A reaction job runs `on_fulfilled`/`on_rejected` against `value` and
+/// settles the derived promise via the captured capability, exactly as
+/// `fxOnResolvedPromise`/`fxOnRejectedPromise` do. FIFO-ordered in
+/// [`Interp::promise_jobs`]; drained by [`Interp::run_promise_jobs`] after
+/// the script settles (the pump-loop latch).
 #[derive(Copy, Clone, Debug)]
-enum PromiseJob {
-    /// A reaction job (XS's `fxOnResolvedPromise`/`fxOnRejectedPromise`): run
-    /// `on_fulfilled`/`on_rejected` against `value` and settle the derived
-    /// promise via the captured capability.
-    Reaction {
-        reaction: PromiseReaction,
-        /// The settled value/reason to feed the reaction.
-        value: Slot,
-        /// `true` if the source promise rejected (run `on_rejected`).
-        rejected: bool,
-    },
-    /// A thenable-adoption job (XS's `fxOnThenable`): the promise being
-    /// resolved with a thenable `thenable` adopts its state by calling
-    /// `thenable.then(resolve, reject)`, where `resolve`/`reject` are the
-    /// resolving functions of the promise under resolution.
-    Thenable {
-        thenable: crate::value::SlotIndex,
-        resolve: Slot,
-        reject: Slot,
-    },
+#[allow(dead_code)] // fields consumed by the `.then`/job-drain increment
+struct PromiseJob {
+    reaction: PromiseReaction,
+    /// The settled value/reason to feed the reaction.
+    value: Slot,
+    /// `true` if the source promise rejected (run `on_rejected`).
+    rejected: bool,
 }
 
 /// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
@@ -6372,7 +6344,7 @@ impl Interp {
                 // Already settled: queue the reaction as a job immediately.
                 let value = self.promises[&promise].result;
                 let rejected = state == PromiseState::Rejected;
-                self.queue_promise_job(PromiseJob::Reaction {
+                self.queue_promise_job(PromiseJob {
                     reaction,
                     value,
                     rejected,
@@ -6427,42 +6399,11 @@ impl Interp {
             }
             None => return Err(Halt::Unsupported("promise:settle-non-promise")),
         }
-        // Resolving with a reference probes it for `.then` (thenable
-        // adoption). endor models the native-promise thenable (the reachable
-        // resolution-chain case): the promise adopts the inner promise's state
-        // via an `fxOnThenable` job. A **self-resolution** (`resolve(promise)`
-        // with the same promise) is a TypeError, and a non-promise reference (a
-        // user thenable object, or a plain object with no callable `.then`)
-        // needs the general `.then`-get + callable probe — both self-name.
+        // Resolving with an object/function requires the `.then` probe
+        // (thenable adoption) — deferred; only a primitive resolve value and
+        // any rejection reason settle synchronously here.
         if !reject && value.kind == Kind::Reference {
-            let inner = match value.value {
-                Payload::Reference(r) => r,
-                _ => return Err(Halt::Unsupported("promise:resolve-thenable")),
-            };
-            if inner == promise {
-                return Err(Halt::Unsupported("promise:resolve-self"));
-            }
-            if !self.promises.contains_key(&inner) {
-                // Not a native promise: a user thenable / plain object.
-                return Err(Halt::Unsupported("promise:resolve-thenable"));
-            }
-            // `fxResolvePromise`'s thenable branch: mark resolved, build a fresh
-            // resolving pair for THIS promise (`fxPushPromiseFunctions`), and
-            // queue an `fxOnThenable` job that will call `inner.then(resolve,
-            // reject)`. The promise stays pending until the inner settles.
-            self.promises.get_mut(&promise).unwrap().settled_guard = true;
-            let (resolve_fn, reject_fn) = self.make_resolving_functions(promise);
-            self.meter.tick_raw(PROMISE_RESOLVE_THENABLE_METERING);
-            // `fxQueueJob(the, 3, promise)`: count=3 captures two more slots
-            // than the reaction job's count=1 (`queue_promise_job` charges 6).
-            self.meter.tick_slot_alloc();
-            self.meter.tick_slot_alloc();
-            self.queue_promise_job(PromiseJob::Thenable {
-                thenable: inner,
-                resolve: resolve_fn,
-                reject: reject_fn,
-            });
-            return Ok(());
+            return Err(Halt::Unsupported("promise:resolve-thenable"));
         }
         let state = if reject {
             PromiseState::Rejected
@@ -6479,7 +6420,7 @@ impl Interp {
         // Queue one job per registered reaction (XS's `fxQueueJob` per THEN),
         // preserving registration (FIFO) order.
         for reaction in reactions {
-            self.queue_promise_job(PromiseJob::Reaction {
+            self.queue_promise_job(PromiseJob {
                 reaction,
                 value,
                 rejected: reject,
@@ -6533,41 +6474,17 @@ impl Interp {
     }
 
     /// Run one queued promise job (XS's `fxOnResolvedPromise`/
-    /// `fxOnRejectedPromise`/`fxOnThenable` trampolines).
+    /// `fxOnRejectedPromise` trampoline). The reaction's handler (if present)
+    /// runs against the settled value; the derived promise is then resolved
+    /// with the handler's result (or the pass-through value when no handler),
+    /// or rejected with the thrown value if the handler throws. A handler that
+    /// is not a modeled user function, or a resolve outcome that is a reference
+    /// (thenable adoption), self-names.
     fn run_promise_job(&mut self, code: &[u8], job: PromiseJob) -> Result<(), Halt> {
-        match job {
-            PromiseJob::Reaction {
-                reaction,
-                value,
-                rejected,
-            } => self.run_reaction_job(code, reaction, value, rejected),
-            PromiseJob::Thenable {
-                thenable,
-                resolve,
-                reject,
-            } => self.run_thenable_job(thenable, resolve, reject),
-        }
-    }
-
-    /// Run a reaction job (`fxOnResolvedPromise`/`fxOnRejectedPromise`): the
-    /// handler (if present) runs against the settled value; the derived promise
-    /// is then resolved with the handler's result (or the pass-through value
-    /// when no handler), or rejected with the thrown value if the handler
-    /// throws. The handler may be a user function (run via `run_callback`) or,
-    /// during thenable adoption, a native resolve/reject function (settled
-    /// directly). A handler that throws self-names (its thrown value is not yet
-    /// captured out of the re-entrant frame).
-    fn run_reaction_job(
-        &mut self,
-        code: &[u8],
-        reaction: PromiseReaction,
-        value: Slot,
-        rejected: bool,
-    ) -> Result<(), Halt> {
-        let handler = if rejected {
-            reaction.on_rejected
+        let handler = if job.rejected {
+            job.reaction.on_rejected
         } else {
-            reaction.on_fulfilled
+            job.reaction.on_fulfilled
         };
         // The `fxOnResolvedPromise`/`fxOnRejectedPromise` frame: a job WITH a
         // handler runs two `mxRunCount`s (the handler, modeled by
@@ -6580,63 +6497,38 @@ impl Interp {
         }
         // The derived promise the reaction settles is the promise the
         // reaction's resolve/reject functions were built for.
-        let derived = match reaction.resolve.value {
+        let (derived, resolve_is_reject) = match job.reaction.resolve.value {
             Payload::Reference(rf) => match self.promise_functions.get(&rf) {
-                Some(d) => d.promise,
+                Some(d) => (d.promise, false),
                 None => return Err(Halt::Unsupported("promise:job-bad-capability")),
             },
             _ => return Err(Halt::Unsupported("promise:job-bad-capability")),
         };
+        let _ = resolve_is_reject;
         // The default outcome: with no handler, a fulfilled job resolves the
         // derived with the value, a rejected job rejects it with the reason
         // (pass-through).
         let (settle_value, settle_reject) = if handler.kind == Kind::Undefined {
-            (value, rejected)
-        } else if let Payload::Reference(hf) = handler.value {
-            if let Some(pf) = self.promise_functions.get(&hf).copied() {
-                // A NATIVE resolve/reject function as the handler (thenable
-                // adoption: the adopted promise's `.then` runs the adopting
-                // promise's resolve/reject). Settle its promise directly with
-                // the value — this IS the `mxRunCount(1)` settle the job frame
-                // already accounts for.
-                return self.settle_promise(pf.promise, value, pf.reject, 1);
-            } else {
-                // A user-function handler: run it. Success → resolve the derived
-                // with the result; a throw → reject with the thrown value (the
-                // thrown-value capture is a later increment, so it self-names).
-                match self.run_callback(code, handler, Slot::undefined(), &[value]) {
-                    Ok(r) => (r, false),
-                    Err(Halt::Throw(_)) => {
-                        return Err(Halt::Unsupported("promise:handler-throw"))
-                    }
-                    Err(h) => return Err(h),
-                }
-            }
+            (job.value, job.rejected)
         } else {
-            return Err(Halt::Unsupported("promise:non-callable-handler"));
+            // Run the handler(value). Success → resolve the derived with the
+            // result; a throw → reject the derived with the thrown value.
+            match self.run_callback(code, handler, Slot::undefined(), &[job.value]) {
+                Ok(r) => (r, false),
+                Err(Halt::Throw(_)) => {
+                    // The thrown-value capture for a handler throw is a later
+                    // increment (it needs the exception slot threaded out of
+                    // run_callback); self-name rather than reject with a wrong
+                    // reason.
+                    return Err(Halt::Unsupported("promise:handler-throw"));
+                }
+                Err(h) => return Err(h),
+            }
         };
         // Settle the derived promise (XS calls the captured resolve/reject
-        // function). A resolve outcome that is a native promise is thenable
-        // adoption, handled inside `settle_promise`.
+        // function). A resolve outcome that is a reference is thenable
+        // adoption — deferred; `settle_promise` self-names it.
         self.settle_promise(derived, settle_value, settle_reject, 1)
-    }
-
-    /// Run a thenable-adoption job (`fxOnThenable`): the promise being resolved
-    /// adopts the state of the native-promise `thenable` by calling
-    /// `thenable.then(resolve, reject)` — registering the adopting promise's
-    /// resolve/reject functions as reactions on the thenable. When the thenable
-    /// later settles, they fire and settle the adopting promise.
-    fn run_thenable_job(
-        &mut self,
-        thenable: crate::value::SlotIndex,
-        resolve: Slot,
-        reject: Slot,
-    ) -> Result<(), Halt> {
-        self.meter.tick_raw(PROMISE_ON_THENABLE_FRAME_METERING);
-        // `thenable.then(resolve, reject)`: register the resolve/reject
-        // functions as the reaction handlers on the (native promise) thenable.
-        // The derived promise `.then` creates is discarded.
-        self.promise_then_with(thenable, resolve, reject).map(|_| ())
     }
 
     /// Build a fresh Error instance of type `name` from a native Error
