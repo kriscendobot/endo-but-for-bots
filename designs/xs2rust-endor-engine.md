@@ -606,6 +606,18 @@ grow into whole-section runs, and CI publishes the agreement
 percentage per section so progress toward parity is a monotone,
 visible number.
 
+**Completion-phase convergence (maintainer directive, 2026-07-02,
+PR #600).** Toward the completion of the port, the bespoke stage
+corpora convert into test262-style cases and this dual-run harness
+into a proper analogue of `xst` (XS's test262 runner). The sibling
+design
+[xs2rust-endor-test262-convergence](xs2rust-endor-test262-convergence.md)
+specs both halves — the case shape and `features:`-marker gating,
+the meter assertions kept out of test bodies, and the `endor-xst`
+runner that subsumes this harness with the differential oracle as
+its endor extension. That milestone is parked behind the remaining
+build stages; nothing in it changes the stage bars above.
+
 **Corpus source: the monorepo's `packages/test262-runner`, not a
 separate pinned submodule** (maintainer directive, 2026-07-03,
 PR #600 review). The repo already carries a curated, pinned
