@@ -1410,6 +1410,23 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@endo/cbor-frame@workspace:^, @endo/cbor-frame@workspace:packages/cbor-frame":
+  version: 0.0.0-use.local
+  resolution: "@endo/cbor-frame@workspace:packages/cbor-frame"
+  dependencies:
+    "@endo/eventual-send": "workspace:^"
+    "@endo/harden": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/promise-kit": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
+    "@endo/stream": "workspace:^"
+    ava: "catalog:dev"
+    c8: "catalog:dev"
+    eslint: "catalog:dev"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
 "@endo/chacha12-fast-check-test@workspace:packages/chacha12-fast-check-test":
   version: 0.0.0-use.local
   resolution: "@endo/chacha12-fast-check-test@workspace:packages/chacha12-fast-check-test"
@@ -2435,6 +2452,7 @@ __metadata:
   resolution: "@endo/ocapn@workspace:packages/ocapn"
   dependencies:
     "@endo/bytes": "workspace:^"
+    "@endo/cbor-frame": "workspace:^"
     "@endo/chacha12": "workspace:^"
     "@endo/eventual-send": "workspace:^"
     "@endo/harden": "workspace:^"
