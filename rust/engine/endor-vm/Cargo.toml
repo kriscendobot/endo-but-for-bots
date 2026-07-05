@@ -9,3 +9,13 @@ publish.workspace = true
 [lib]
 name = "endor_vm"
 path = "src/lib.rs"
+
+[features]
+# Off by default. The determinism firewall (design
+# `designs/xs2rust-endor-meter-opcode-cost-instrumentation.md` § firewall):
+# no default/release/snapshot/consensus build enables this; only the
+# dev-only calibration binary and the calibration CI job turn it on. With
+# the feature off the `CostRecorder` is a zero-sized no-op and the metered
+# hot loop is instruction-identical to the pre-instrumentation build.
+default = []
+cost-calibration = []

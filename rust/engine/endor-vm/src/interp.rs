@@ -1054,7 +1054,7 @@ struct FuncInfo {
 /// 0), so a Math call's whole computron cost is the native host frame
 /// ([`MATH_FRAME_METERING`]); the result NaN is the canonical `f64::NAN`
 /// (`C_NAN`), which the design flags consensus-critical.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MathId {
     Abs,
     Acos,
@@ -1095,7 +1095,7 @@ pub enum MathId {
 /// A native prototype method endor models (dispatched with the receiver as
 /// `this`). These compute a value from the receiver with no re-entry into
 /// user code — the `call`/`apply`/`bind` re-entrant methods are separate.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NativeMethod {
     ObjectToString,
     ObjectHasOwnProperty,
@@ -1955,6 +1955,14 @@ pub struct Interp {
     /// subset does not yet branch on it.
     strict: bool,
     meter: Meter,
+    /// Cost-calibration histogram recorder (design
+    /// `designs/xs2rust-endor-meter-opcode-cost-instrumentation.md`, stage
+    /// C1). Zero-sized and a compile-time no-op unless the `cost-calibration`
+    /// feature is on — the determinism firewall. It only *observes* dispatch
+    /// and native-call sites; it never feeds the meter, so a metered run's
+    /// computrons are identical feature-on and feature-off. See
+    /// [`crate::cost`].
+    cost: crate::cost::CostRecorder,
     /// The host metering callback, installed by [`Interp::arm_meter`].
     /// `None` is the default un-metered interpreter the differential
     /// harness uses: the check points then never consult a host and
@@ -2348,6 +2356,7 @@ impl Interp {
             result: Slot::undefined(),
             strict: false,
             meter: Meter::new(),
+            cost: crate::cost::CostRecorder::default(),
             meter_host: None,
             slots,
             chunks,
@@ -2413,6 +2422,23 @@ impl Interp {
         };
         interp.create_intrinsics();
         interp
+    }
+
+    /// The cost-calibration histogram recorder (design stage C1). Present
+    /// only under the `cost-calibration` feature — the calibration driver
+    /// (stage C2) and the histogram tests read it after a run. Returns a
+    /// borrow of the observation-only recorder; there is no `&mut` accessor,
+    /// keeping the data flow one-directional (interpreter → recorder).
+    #[cfg(feature = "cost-calibration")]
+    pub fn cost_recorder(&self) -> &crate::cost::CostRecorder {
+        &self.cost
+    }
+
+    /// The raw bytecode-dispatch count (`n_dispatched`), exposed for the C1
+    /// histogram-reconciliation check (`opcode_total()` must equal this).
+    #[cfg(feature = "cost-calibration")]
+    pub fn n_dispatched(&self) -> u64 {
+        self.n_dispatched
     }
 
     /// Materialize the intrinsic (native) constructor instances once, at
@@ -3573,6 +3599,10 @@ impl Interp {
             // the switch-path `meterIndex += XS_CODE_METERING`).
             self.meter.tick_code();
             self.n_dispatched += 1;
+            // Cost-calibration opcode histogram, at the same seam as the
+            // scalar `n_dispatched` it generalizes (so the two reconcile).
+            // Compiles away when the `cost-calibration` feature is off.
+            self.cost.on_dispatch(op);
 
             let size = op.size();
             // The resolved instruction length (fixed size, or the
@@ -6957,6 +6987,13 @@ impl Interp {
         code: &[u8],
     ) -> Result<(), Halt> {
         let _ = code; // used by the callback-taking methods (run_callback)
+        // Cost-calibration builtin histogram: one invocation per dispatched
+        // native prototype method. This is the central native-method
+        // dispatch seam (every `tick_builtin*` inside this function belongs
+        // to `m`). Compiles away when the feature is off. Step-granular (k)
+        // attribution folds in at stage C2, where the timing normalization
+        // that consumes it lands.
+        self.cost.on_builtin(m);
         let this = self.stack.get(base).copied().unwrap_or_else(Slot::undefined);
         let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
         let _ = argc;
@@ -13710,6 +13747,51 @@ mod tests {
         let out = interp.run(&code);
         assert_eq!(out.halt, Halt::Return);
         assert_eq!(out.dispatched, 3);
+    }
+
+    /// Firewall grep invariant (design § firewall): `meter.rs` must name no
+    /// cost-calibration type, so the meter can never read the recorder. This
+    /// runs in both feature configurations — the meter is recorder-free
+    /// unconditionally.
+    #[test]
+    fn meter_module_is_firewalled_from_cost() {
+        let meter_src = include_str!("meter.rs");
+        for needle in ["CostRecorder", "crate::cost", "cost::", "Recorder"] {
+            assert!(
+                !meter_src.contains(needle),
+                "meter.rs must not reference the cost recorder (found {needle:?}): \
+                 the metered path stays one-directional (interpreter → recorder)"
+            );
+        }
+    }
+
+    /// C1 acceptance: the opcode histogram total reconciles with
+    /// `n_dispatched` exactly — the histogram is that scalar generalized to a
+    /// per-opcode array, incremented at the same seam.
+    #[cfg(feature = "cost-calibration")]
+    #[test]
+    fn opcode_histogram_reconciles_with_n_dispatched() {
+        // A forward branch, an END, and a backward branch into the END:
+        // three dispatched opcodes (two BRANCH_1, one END).
+        let code = [
+            b(Opcode::XS_CODE_BRANCH_1),
+            0x01, // +1 -> pc3
+            b(Opcode::XS_CODE_END),
+            b(Opcode::XS_CODE_BRANCH_1),
+            0xFD, // -3 -> pc2 (END)
+        ];
+        let mut interp = Interp::new();
+        let out = interp.run(&code);
+        assert!(out.completed);
+        let rec = interp.cost_recorder();
+        assert_eq!(
+            rec.opcode_total(),
+            out.dispatched,
+            "opcode histogram total must equal n_dispatched"
+        );
+        assert_eq!(rec.opcode_total(), interp.n_dispatched());
+        assert_eq!(rec.opcode_count(Opcode::XS_CODE_BRANCH_1), 2);
+        assert_eq!(rec.opcode_count(Opcode::XS_CODE_END), 1);
     }
 }
 
