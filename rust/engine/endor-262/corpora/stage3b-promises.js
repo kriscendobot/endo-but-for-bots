@@ -13,11 +13,12 @@
 // loop — so a crank's cost (message delivery plus its microtask drain) is the
 // consensus-relevant unit, metered on both sides.
 //
-// Honest NAMED skips (never a wrong value, never a divergence): thenable
-// adoption (`resolve` with a reference / `Promise.resolve(object)`), a reaction
-// handler that throws or returns a reference, `.finally`, the `all`/`race`/
-// `allSettled`/`any` combinators, and — stage 4's charter — async/await. Each
-// self-names `Halt::Unsupported`.
+// Native-promise thenable adoption IS covered (resolving with / a reaction
+// returning a native promise). Honest NAMED skips (never a wrong value, never a
+// divergence): a USER thenable object (a plain object with a callable `.then`),
+// a self-resolving promise (a TypeError), a reaction handler that throws,
+// `.finally`, the `all`/`race`/`allSettled`/`any` combinators, and — stage 4's
+// charter — async/await. Each self-names `Halt::Unsupported`.
 
 // --- construct: a pending promise, executor never settles -----------------
 new Promise(function(r){})
@@ -64,3 +65,13 @@ var x = 0; Promise.reject(2).then(function(v){ x = 1; }).then(undefined, functio
 var x = 0; Promise.reject(7).catch(function(e){ x = e; }); x
 var x = 0; Promise.resolve(1).catch(function(e){ x = e; }).then(function(v){ x = v; }); x
 var x = 0; Promise.reject(2).catch(function(e){ return e + 1; }).then(function(v){ x = v; }); x
+
+// --- thenable adoption (native promise): resolving with / returning a -----
+// promise adopts its state via an fxOnThenable job (`resolve`/`reject` of the
+// adopting promise registered as reactions on the inner promise).
+var x = 0; new Promise(function(res){ res(Promise.resolve(1)); }).then(function(v){ x = v; }); x
+var x = 0; Promise.resolve(1).then(function(v){ return Promise.resolve(v + 1); }).then(function(w){ x = w; }); x
+var x = 0; Promise.resolve(1).then(function(v){ return Promise.reject(9); }).then(undefined, function(e){ x = e; }); x
+// Promise.resolve of a native promise is the identity fast path (not adoption).
+Promise.resolve(Promise.resolve(5))
+var x = 0; Promise.resolve(Promise.resolve(5)).then(function(v){ x = v; }); x

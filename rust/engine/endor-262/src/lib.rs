@@ -407,9 +407,10 @@ pub fn stage3b_object_statics_corpus() -> Vec<String> {
 /// promises, pass-through, and rejection routing — all bit-exact (result AND
 /// computron) against the oracle. The reactions run at the host-driven drain
 /// (mirrored in the oracle shim's post-`fxRunScript` `fxRunPromiseJobs` loop),
-/// so the metered computrons include the whole crank. Thenable adoption, a
-/// throwing/reference-returning handler, `.finally`, the combinators, and
-/// async/await are honest named skips.
+/// so the metered computrons include the whole crank. Native-promise thenable
+/// adoption is covered; a user thenable object, a self-resolving promise, a
+/// throwing handler, `.finally`, the combinators, and async/await are honest
+/// named skips.
 pub fn stage3b_promises_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3b-promises.js"))
 }
