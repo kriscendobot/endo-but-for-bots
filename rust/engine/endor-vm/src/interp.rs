@@ -751,6 +751,38 @@ pub const JSON_STRINGIFY_OBJECT_NONEMPTY_METERING: u64 = (4 << 14) - 8;
 /// (`65536`), exclusive of the key chunk and the recursive child cost.
 pub const JSON_STRINGIFY_OBJECT_KEY_BODY_METERING: u64 = 4 << 14;
 
+// `JSON.parse` (`fx_JSON_parse` → `fxParseJSON`/`fxParseJSONValue`/
+// `fxParseJSONArray`/`fxParseJSONObject`) metering, decomposed against the pin
+// `48ee02d8cfe0` and reconciled bit-exact against the oracle. The parse path
+// calls **no** `mxMeter` (like `xsMapSet.c`), so every unit is the native
+// frame residual plus the exact `fxNewSlot`/`fxNewChunk` allocations. Each
+// constant below reconciles across empty/flat/nested arrays and objects (see
+// the README § the JSON stage), not a fitted total.
+//
+/// The `fx_JSON_parse` native frame residual + tokenizer setup + the primitive
+/// `fxParseJSONValue` push, **over** the call trampoline the interpreter already
+/// meters on dispatch — a fixed `49152` (`3 << 14`) raw, value-independent,
+/// charged once. A produced string additionally allocates its tokenizer chunk
+/// (`fxNewChunk(size+1)`), a number/boolean/null nothing.
+pub const JSON_PARSE_SETUP_METERING: u64 = 3 << 14;
+/// Entering an **array** value: `fxNewArrayInstance` (the instance slot + the
+/// array's internal length slot) — two `fxNewSlot`s (`512`), before any
+/// element or the item cache.
+pub const JSON_PARSE_ARRAY_INSTANCE_METERING: u64 = 512;
+/// Each array element's `fxParseJSONValue` + `fxParseJSONToken` + the appended
+/// linked property `fxNewSlot`: a fixed `33024` raw, exclusive of the element's
+/// own recursive node cost and of the one-time `fxCacheArray` item chunk.
+pub const JSON_PARSE_ARRAY_ELEMENT_METERING: u64 = 33024;
+/// Entering an **object** value: `fxNewObjectInstance` — one `fxNewSlot`
+/// (`256`), before any key.
+pub const JSON_PARSE_OBJECT_INSTANCE_METERING: u64 = 256;
+/// Each object member's fixed body — the value `fxParseJSONValue`/token walk
+/// plus the member's property `fxNewSlot` (`65792 = (4<<14) + 256`), exclusive
+/// of the key-name interning slot (a novel name adds one `fxNewSlot` via
+/// [`Self::intern_key`]), the key-string tokenizer chunk (`rup8(len+1)+16`),
+/// and the value's own recursive node cost.
+pub const JSON_PARSE_OBJECT_KEY_METERING: u64 = (4 << 14) + 256;
+
 /// The raw 16.16 native-host-frame cost of a `String.prototype` method call,
 /// beyond the modeled `mxMeterSome` steps and the result chunk. Like the
 /// `Math.*` frame it calibrates against the pin `48ee02d8cfe0` to zero over
@@ -8555,8 +8587,35 @@ impl Interp {
                 }
             }
             NativeMethod::JsonParse => {
-                let _ = arg0;
-                Err(Halt::Unsupported("JSON.parse:unmodeled"))
+                // A reviver argument (2nd) re-walks the result under a callback;
+                // out of scope — self-name.
+                if argc > 1 {
+                    let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                    if arg1.kind == Kind::Reference {
+                        return Err(Halt::Unsupported("JSON.parse:reviver"));
+                    }
+                }
+                // XS coerces a non-string argument via `fxToString`; endor models
+                // only an already-string text (the coercion + its metering is a
+                // corner) — self-name otherwise.
+                let off = match arg0 {
+                    Slot { kind: Kind::String, value: Payload::String(o), .. } => o,
+                    _ => return Err(Halt::Unsupported("JSON.parse:non-string")),
+                };
+                let input = self.str_content(off).to_vec();
+                self.meter.tick_raw(JSON_PARSE_SETUP_METERING);
+                let mut pos = 0usize;
+                let mut cost: u64 = 0;
+                self.json_parse_whitespace(&input, &mut pos);
+                let value = self.json_parse_value(&input, &mut pos, &mut cost)?;
+                self.json_parse_whitespace(&input, &mut pos);
+                if pos != input.len() {
+                    // Trailing content after the value: XS's "missing EOF"
+                    // SyntaxError. Its exact partial metering is unmodeled.
+                    return Err(Halt::Unsupported("JSON.parse:syntax"));
+                }
+                self.meter.tick_raw(cost);
+                Ok(value)
             }
             _ => Err(Halt::Unsupported("json:unmodeled")),
         }
@@ -8732,6 +8791,321 @@ impl Interp {
         }
         names.reverse();
         names
+    }
+
+    /// Skip JSON whitespace (`fxParseJSONToken`'s space/tab/CR/LF cases). Never
+    /// allocates, so it is invisible to the meter.
+    fn json_parse_whitespace(&self, input: &[u8], pos: &mut usize) {
+        while *pos < input.len() {
+            match input[*pos] {
+                b' ' | b'\t' | b'\n' | b'\r' => *pos += 1,
+                _ => break,
+            }
+        }
+    }
+
+    /// Parse one JSON value at `pos` (`fxParseJSONValue`), building it in the
+    /// heap and accumulating the recursive per-node metering into `cost` (the
+    /// caller charges [`JSON_PARSE_SETUP_METERING`] once and `cost` at the end).
+    /// A malformed input self-names `JSON.parse:syntax` — endor does not model
+    /// the exact partial metering of XS's `SyntaxError`.
+    fn json_parse_value(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        cost: &mut u64,
+    ) -> Result<Slot, Halt> {
+        if *pos >= input.len() {
+            return Err(Halt::Unsupported("JSON.parse:syntax"));
+        }
+        match input[*pos] {
+            b'{' => self.json_parse_object(input, pos, cost),
+            b'[' => self.json_parse_array(input, pos, cost),
+            b'"' => {
+                let bytes = self.json_parse_string_bytes(input, pos)?;
+                // The tokenizer's `s = fxNewChunk(the, size + 1)`: always a
+                // chunk, even for the empty string (unlike an interned literal).
+                *cost += (((bytes.len() as u64 + 1) + 7) & !7) + 16;
+                let mut buf = bytes;
+                buf.push(0);
+                let off = self.chunks.alloc(&buf);
+                Ok(Slot::of(Kind::String, Payload::String(off)))
+            }
+            b't' => {
+                self.json_parse_keyword(input, pos, b"true")?;
+                Ok(Slot::of(Kind::Boolean, Payload::Boolean(true)))
+            }
+            b'f' => {
+                self.json_parse_keyword(input, pos, b"false")?;
+                Ok(Slot::of(Kind::Boolean, Payload::Boolean(false)))
+            }
+            b'n' => {
+                self.json_parse_keyword(input, pos, b"null")?;
+                Ok(Slot::null())
+            }
+            b'-' | b'0'..=b'9' => self.json_parse_number(input, pos),
+            _ => Err(Halt::Unsupported("JSON.parse:syntax")),
+        }
+    }
+
+    /// Match a bare keyword (`true`/`false`/`null`), advancing past it.
+    fn json_parse_keyword(&self, input: &[u8], pos: &mut usize, word: &[u8]) -> Result<(), Halt> {
+        if input.len() - *pos >= word.len() && &input[*pos..*pos + word.len()] == word {
+            *pos += word.len();
+            Ok(())
+        } else {
+            Err(Halt::Unsupported("JSON.parse:syntax"))
+        }
+    }
+
+    /// Parse a JSON number token (`fxParseJSONToken`'s numeric case) and
+    /// classify it exactly as XS does: an integral value in `txInteger` range
+    /// (and not zero, which XS leaves as `XS_NUMBER_KIND`) is an integer, else a
+    /// number. The number token itself allocates nothing.
+    fn json_parse_number(&self, input: &[u8], pos: &mut usize) -> Result<Slot, Halt> {
+        let start = *pos;
+        let n = input.len();
+        let mut i = *pos;
+        if i < n && input[i] == b'-' {
+            i += 1;
+        }
+        // int part: `0` alone, or [1-9][0-9]*
+        if i < n && input[i] == b'0' {
+            i += 1;
+        } else if i < n && (b'1'..=b'9').contains(&input[i]) {
+            i += 1;
+            while i < n && input[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            return Err(Halt::Unsupported("JSON.parse:syntax"));
+        }
+        // fraction
+        if i < n && input[i] == b'.' {
+            i += 1;
+            if i < n && input[i].is_ascii_digit() {
+                i += 1;
+                while i < n && input[i].is_ascii_digit() {
+                    i += 1;
+                }
+            } else {
+                return Err(Halt::Unsupported("JSON.parse:syntax"));
+            }
+        }
+        // exponent
+        if i < n && (input[i] == b'e' || input[i] == b'E') {
+            i += 1;
+            if i < n && (input[i] == b'+' || input[i] == b'-') {
+                i += 1;
+            }
+            if i < n && input[i].is_ascii_digit() {
+                i += 1;
+                while i < n && input[i].is_ascii_digit() {
+                    i += 1;
+                }
+            } else {
+                return Err(Halt::Unsupported("JSON.parse:syntax"));
+            }
+        }
+        let text = match std::str::from_utf8(&input[start..i]) {
+            Ok(t) => t,
+            Err(_) => return Err(Halt::Unsupported("JSON.parse:syntax")),
+        };
+        let value: f64 = match text.parse() {
+            Ok(v) => v,
+            Err(_) => return Err(Halt::Unsupported("JSON.parse:syntax")),
+        };
+        *pos = i;
+        // XS: INTEGER iff `number == (txInteger)number && number != 0`.
+        if value != 0.0
+            && value.fract() == 0.0
+            && value >= i32::MIN as f64
+            && value <= i32::MAX as f64
+        {
+            Ok(Slot::of(Kind::Integer, Payload::Integer(value as i32)))
+        } else {
+            Ok(Slot::of(Kind::Number, Payload::Number(value)))
+        }
+    }
+
+    /// Parse a JSON string token starting at the opening quote, returning the
+    /// unescaped content bytes. Handles the JSON escapes and BMP `\u` escapes;
+    /// a surrogate `\u` escape (astral / lone surrogate — XS's CESU-8 corner) or
+    /// a malformed escape self-names.
+    fn json_parse_string_bytes(&self, input: &[u8], pos: &mut usize) -> Result<Vec<u8>, Halt> {
+        let n = input.len();
+        let mut i = *pos + 1; // past opening quote
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            if i >= n {
+                return Err(Halt::Unsupported("JSON.parse:syntax"));
+            }
+            let c = input[i];
+            if c == b'"' {
+                i += 1;
+                break;
+            } else if c == b'\\' {
+                i += 1;
+                if i >= n {
+                    return Err(Halt::Unsupported("JSON.parse:syntax"));
+                }
+                match input[i] {
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'b' => out.push(8),
+                    b'f' => out.push(12),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'u' => {
+                        if i + 4 >= n {
+                            return Err(Halt::Unsupported("JSON.parse:syntax"));
+                        }
+                        let hex = match std::str::from_utf8(&input[i + 1..i + 5])
+                            .ok()
+                            .and_then(|h| u32::from_str_radix(h, 16).ok())
+                        {
+                            Some(v) => v,
+                            None => return Err(Halt::Unsupported("JSON.parse:syntax")),
+                        };
+                        // A surrogate half is XS's CESU-8 corner — self-name.
+                        if (0xD800..=0xDFFF).contains(&hex) {
+                            return Err(Halt::Unsupported("JSON.parse:astral"));
+                        }
+                        let ch = match char::from_u32(hex) {
+                            Some(c) => c,
+                            None => return Err(Halt::Unsupported("JSON.parse:syntax")),
+                        };
+                        let mut b = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+                        i += 4;
+                    }
+                    _ => return Err(Halt::Unsupported("JSON.parse:syntax")),
+                }
+                i += 1;
+            } else if c < 0x20 {
+                // A raw control character is a JSON syntax error.
+                return Err(Halt::Unsupported("JSON.parse:syntax"));
+            } else if c < 0x80 {
+                out.push(c);
+                i += 1;
+            } else {
+                // A raw multi-byte (non-ASCII) input byte: XS re-encodes it
+                // through its CESU-8 decoder; endor copies UTF-8 input verbatim
+                // for the BMP but self-names anything above the BMP.
+                let rest = &input[i..];
+                match std::str::from_utf8(rest).ok().and_then(|s| s.chars().next()) {
+                    Some(ch) if (ch as u32) <= 0xFFFF => {
+                        let l = ch.len_utf8();
+                        out.extend_from_slice(&input[i..i + l]);
+                        i += l;
+                    }
+                    _ => return Err(Halt::Unsupported("JSON.parse:astral")),
+                }
+            }
+        }
+        *pos = i;
+        Ok(out)
+    }
+
+    /// Parse a JSON array (`fxParseJSONArray`): the instance's two slots, one
+    /// linked slot per element, and the one-time `fxCacheArray` item chunk
+    /// (`length * sizeof(txSlot)` = `length * 32`, plus the chunk header).
+    fn json_parse_array(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        cost: &mut u64,
+    ) -> Result<Slot, Halt> {
+        *pos += 1; // past '['
+        *cost += JSON_PARSE_ARRAY_INSTANCE_METERING;
+        let inst = self.new_array_unmetered();
+        let mut length: u32 = 0;
+        self.json_parse_whitespace(input, pos);
+        if *pos < input.len() && input[*pos] == b']' {
+            *pos += 1;
+            self.arrays.get_mut(&inst).unwrap().length = 0;
+            return Ok(Slot::of(Kind::Reference, Payload::Reference(inst)));
+        }
+        loop {
+            self.json_parse_whitespace(input, pos);
+            *cost += JSON_PARSE_ARRAY_ELEMENT_METERING;
+            let v = self.json_parse_value(input, pos, cost)?;
+            self.arrays.get_mut(&inst).unwrap().items.insert(length, v);
+            length += 1;
+            self.json_parse_whitespace(input, pos);
+            match input.get(*pos) {
+                Some(b',') => {
+                    *pos += 1;
+                }
+                Some(b']') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return Err(Halt::Unsupported("JSON.parse:syntax")),
+            }
+        }
+        self.arrays.get_mut(&inst).unwrap().length = length;
+        // `fxCacheArray`: one chunk of `length * sizeof(txSlot)` bytes.
+        *cost += length as u64 * 32 + 16;
+        Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
+    }
+
+    /// Parse a JSON object (`fxParseJSONObject`): the instance slot, and per
+    /// member the fixed body, the key-name intern (a novel name allocates one
+    /// key slot), the key-string tokenizer chunk, and the value's node cost.
+    fn json_parse_object(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        cost: &mut u64,
+    ) -> Result<Slot, Halt> {
+        *pos += 1; // past '{'
+        *cost += JSON_PARSE_OBJECT_INSTANCE_METERING;
+        let inst = self.slots.alloc(Slot::instance(self.object_proto));
+        self.json_parse_whitespace(input, pos);
+        if *pos < input.len() && input[*pos] == b'}' {
+            *pos += 1;
+            return Ok(Slot::of(Kind::Reference, Payload::Reference(inst)));
+        }
+        loop {
+            self.json_parse_whitespace(input, pos);
+            if *pos >= input.len() || input[*pos] != b'"' {
+                return Err(Halt::Unsupported("JSON.parse:syntax"));
+            }
+            let key_bytes = self.json_parse_string_bytes(input, pos)?;
+            let key = match String::from_utf8(key_bytes.clone()) {
+                Ok(k) => k,
+                Err(_) => return Err(Halt::Unsupported("JSON.parse:astral")),
+            };
+            *cost += JSON_PARSE_OBJECT_KEY_METERING;
+            // The key-string tokenizer chunk (`fxNewChunk(size + 1)`).
+            *cost += (((key_bytes.len() as u64 + 1) + 7) & !7) + 16;
+            // `fxNewName` interns the key: a novel name allocates one key slot
+            // (metered directly by `intern_key`), a known name none.
+            let id = self.intern_key(&key);
+            self.json_parse_whitespace(input, pos);
+            if *pos >= input.len() || input[*pos] != b':' {
+                return Err(Halt::Unsupported("JSON.parse:syntax"));
+            }
+            *pos += 1;
+            self.json_parse_whitespace(input, pos);
+            let v = self.json_parse_value(input, pos, cost)?;
+            self.set_own_unmetered(inst, id, v);
+            self.json_parse_whitespace(input, pos);
+            match input.get(*pos) {
+                Some(b',') => {
+                    *pos += 1;
+                }
+                Some(b'}') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return Err(Halt::Unsupported("JSON.parse:syntax")),
+            }
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
     }
 
     /// The CESU-8 content bytes of a string receiver (NUL-stripped), for a
