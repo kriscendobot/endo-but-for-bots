@@ -48,10 +48,11 @@ pub fn gen_regexp(data: &[u8]) -> RegExpCase {
     let mut b = Bytes::new(data);
     let mut groups = 0u32;
     let pattern = gen_disjunction(&mut b, 3, &mut groups);
-    let flags = match b.choice(4) {
+    let flags = match b.choice(5) {
         0 => "",
         1 => "m",
         2 => "s",
+        3 => "i",
         _ => "",
     }
     .to_string();

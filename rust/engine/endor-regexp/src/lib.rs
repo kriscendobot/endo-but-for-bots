@@ -33,6 +33,7 @@
 //! string sets), `\p{}`/`\P{}`, named captures (`(?<name>)` / `\k<name>`),
 //! inline modifiers (`(?flags:)`), and astral (`> 0xFFFF`) code points.
 
+mod charcase;
 mod encoding;
 mod flags;
 mod opcode;
@@ -135,8 +136,17 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_i_flag_is_named() {
-        match compile("abc", "i") {
+    fn case_insensitive_flag() {
+        let (m, c) = caps("abc", "i", "xABCy");
+        assert!(m);
+        assert_eq!(c[0], (1, 4));
+        let (m2, _) = caps("[a-c]+", "i", "ABCabc");
+        assert!(m2);
+    }
+
+    #[test]
+    fn unsupported_u_flag_is_named() {
+        match compile("abc", "u") {
             Err(CompileError::Unsupported(_)) => {}
             other => panic!("expected named Unsupported, got {:?}", other),
         }

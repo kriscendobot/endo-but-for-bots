@@ -220,6 +220,20 @@ fn corpus() -> Vec<Case> {
     // avoids applying an unbounded quantifier to a group for the same
     // reason.
 
+    // Case-insensitive (`i`) flag — the non-u/v fold path.
+    for &s in &["ABC", "abc", "AbC", "xyz", "Hello", "HELLO"] {
+        v.push(("abc", "i", s, 0));
+        v.push(("[a-c]+", "i", s, 0));
+        v.push(("[A-C]+", "i", s, 0));
+        v.push(("hello", "i", s, 0));
+        v.push(("(h)(e)\\2", "i", s, 0));
+        v.push(("\\w+", "i", s, 0));
+        v.push(("[^a-c]", "i", s, 0));
+        v.push(("a|B|c", "i", s, 0));
+    }
+    v.push(("K", "i", "k", 0));
+    v.push(("[k]", "i", "K", 0));
+
     // Syntax errors (both must reject).
     v.push(("(", "", "x", 0));
     v.push((")", "", "x", 0));

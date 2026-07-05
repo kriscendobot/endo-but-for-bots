@@ -140,9 +140,15 @@ pub fn find_character(bytes: &[u8], offset: usize, direction: i32) -> usize {
     }
 }
 
-/// Port of `fxGetCharacter` (the non-`UV`, non-`I` branch): decode the
-/// character at `offset`. (Case canonicalization under the `i` flag is a
-/// named later increment; this codec is only reached when `I` is clear.)
-pub fn get_character(bytes: &[u8], offset: usize) -> i64 {
-    utf8_decode(bytes, offset).0
+/// Port of `fxGetCharacter` (the non-`UV` branch): decode the character
+/// at `offset`, and — under the `i` flag — fold it to its canonical code
+/// point (`fxCharCaseCanonicalize`), exactly as C-XS does before every
+/// comparison in the match loop.
+pub fn get_character(bytes: &[u8], offset: usize, flags: u32) -> i64 {
+    let c = utf8_decode(bytes, offset).0;
+    if flags & crate::flags::XS_REGEXP_I != 0 && c >= 0 {
+        crate::charcase::canonicalize(c)
+    } else {
+        c
+    }
 }

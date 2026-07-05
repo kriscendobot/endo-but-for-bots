@@ -218,7 +218,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                                 let mut g = target;
                                 let mut ok = true;
                                 while from < to {
-                                    if get_character(subject, g as usize) != get_character(subject, from as usize) {
+                                    if get_character(subject, g as usize, flags as u32) != get_character(subject, from as usize, flags as u32) {
                                         ok = false;
                                         break;
                                     }
@@ -254,7 +254,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                                 let mut g = offset;
                                 let mut ok = true;
                                 while from < to {
-                                    if get_character(subject, g as usize) != get_character(subject, from as usize) {
+                                    if get_character(subject, g as usize, flags as u32) != get_character(subject, from as usize, flags as u32) {
                                         ok = false;
                                         break;
                                     }
@@ -277,7 +277,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                         } else {
                             let e = find_character(subject, offset as usize, -1) as i32;
                             let count = code[p];
-                            if !match_character(code, p + 1, count, get_character(subject, e as usize)) {
+                            if !match_character(code, p + 1, count, get_character(subject, e as usize, flags as u32)) {
                                 pop = true;
                             } else {
                                 offset = e;
@@ -291,7 +291,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                             pop = true;
                         } else {
                             let count = code[p];
-                            if !match_character(code, p + 1, count, get_character(subject, offset as usize)) {
+                            if !match_character(code, p + 1, count, get_character(subject, offset as usize, flags as u32)) {
                                 pop = true;
                             } else {
                                 offset = find_character(subject, offset as usize, 1) as i32;
@@ -316,7 +316,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                                 &LINE_CHARACTERS,
                                 1,
                                 LINE_CHARACTERS[0],
-                                get_character(subject, find_character(subject, offset as usize, -1)),
+                                get_character(subject, find_character(subject, offset as usize, -1), flags as u32),
                             )
                         {
                             // ok
@@ -333,7 +333,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                                 &LINE_CHARACTERS,
                                 1,
                                 LINE_CHARACTERS[0],
-                                get_character(subject, offset as usize),
+                                get_character(subject, offset as usize, flags as u32),
                             )
                         {
                             // ok
@@ -426,8 +426,8 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                     }
                     CX_WORD_BREAK_STEP => {
                         step = code[p];
-                        let e = word_at(subject, offset, 0);
-                        let f = word_at(subject, offset, stop);
+                        let e = word_at(subject, offset, 0, flags);
+                        let f = word_at(subject, offset, stop, flags);
                         if e != f {
                             // ok
                         } else {
@@ -436,8 +436,8 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
                     }
                     CX_WORD_CONTINUE_STEP => {
                         step = code[p];
-                        let e = word_at(subject, offset, 0);
-                        let f = word_at(subject, offset, stop);
+                        let e = word_at(subject, offset, 0, flags);
+                        let f = word_at(subject, offset, stop, flags);
                         if e == f {
                             // ok
                         } else {
@@ -490,7 +490,7 @@ pub fn match_regexp(program: &Program, subject: &[u8], start: i32) -> MatchOutco
 /// offset`. `boundary` is `0` for the left probe (char before `offset`)
 /// and `stop` for the right probe (char at `offset`), matching the two
 /// `fxMatchCharacter` probes in `cxWordBreakStep`.
-fn word_at(subject: &[u8], offset: i32, boundary: i32) -> bool {
+fn word_at(subject: &[u8], offset: i32, boundary: i32, flags: i32) -> bool {
     if offset == boundary {
         return false;
     }
@@ -499,5 +499,5 @@ fn word_at(subject: &[u8], offset: i32, boundary: i32) -> bool {
     } else {
         offset as usize
     };
-    match_character(&WORD_CHARACTERS, 1, WORD_CHARACTERS[0], get_character(subject, at))
+    match_character(&WORD_CHARACTERS, 1, WORD_CHARACTERS[0], get_character(subject, at, flags as u32))
 }

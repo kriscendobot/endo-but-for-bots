@@ -475,10 +475,11 @@ is `steps × XS_REGEXP_METERING` — the matcher's per-step cost.
 `endor_oracle::regexp` entry point (which calls `fxCompileRegExp` +
 `fxMatchRegExp` directly and returns captures + per-phase meter). The
 `tests/parity.rs` suite is **bit-exact on the matched answer, every
-capture's byte offsets, and the per-step match meter**: `total=275
-checked=275 skipped=0 divergent=0`, covering character classes,
+capture's byte offsets, and the per-step match meter**: `total=325
+checked=325 skipped=0 divergent=0`, covering character classes,
 greedy/lazy quantifiers, groups/backreferences, anchors, alternation,
-lookahead + lookbehind, and pathological backtracking. The **match** meter
+lookahead + lookbehind, the `i`/`m`/`s` flags, and pathological
+backtracking. The **match** meter
 is the consensus-relevant number and is pinned exactly; the *compile*
 meter is deliberately not asserted against the shim, because C's compile
 number folds in `fxNewChunk`'s `XS_CHUNK_ALLOCATION_METERING` over the code
@@ -500,11 +501,20 @@ both-engines pathology, not a port divergence, so such inputs are excluded
 from the corpus and the generator never applies an unbounded quantifier to
 a group.
 
+The `i` flag's **case folding** is ported (`crate::charcase`, the
+non-`u`/`v` `fxCharCaseCanonicalize` path over the `gxCharCaseIgnore0`
+table transcribed verbatim from the pin): a single-character set is folded
+at compile time (`fxCharSetCanonicalizeSingle`), a range under `i` expands
+to the union of its folded singletons (`fxCharSetRange`), `\w` drops
+`a`..`z` (the folded subject reaches its `A`..`Z` form), and the match loop
+folds every decoded character (`fxGetCharacter`) — all pinned bit-exact.
+
 **Honest, named skips (the stage bar).** This increment ports the core
-grammar over the non-`i`/`u`/`v` subset. Every deferred surface compiles
-to a **named** `CompileError::Unsupported`, never a wrong meter or a wrong
-value: the `i` flag (case folding), the `u`/`v` flags (CESU-8 surrogate
-walk, unicode property escapes, V-mode string sets), `\p{}`/`\P{}`, named
-captures (`(?<name>)` / `\k<name>`), inline modifiers (`(?flags:)`), and
-astral (`> 0xFFFF`) code points. The crate is `#![forbid(unsafe_code)]`
-and Miri-clean (`cargo +nightly miri test -p endor-regexp --lib`).
+grammar over the non-`u`/`v` subset (the `i` flag included). Every deferred
+surface compiles to a **named** `CompileError::Unsupported`, never a wrong
+meter or a wrong value: the `u`/`v` flags (CESU-8 surrogate walk, unicode
+property escapes, V-mode string sets, and their `u`/`v` fold tables),
+`\p{}`/`\P{}`, named captures (`(?<name>)` / `\k<name>`), inline modifiers
+(`(?flags:)`), and astral (`> 0xFFFF`) code points. The crate is
+`#![forbid(unsafe_code)]` and Miri-clean
+(`cargo +nightly miri test -p endor-regexp --lib`).

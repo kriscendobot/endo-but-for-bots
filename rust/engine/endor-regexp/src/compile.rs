@@ -142,12 +142,10 @@ pub fn compile(pattern: &str, flags: &str) -> PResult<Program> {
             _ => return Err(CompileError::Syntax("invalid flags".into())),
         }
     }
-    // Honest-skip the flags whose match/compile machinery (case folding,
-    // CESU-8 surrogate walk, unicode property sets, V-mode string sets)
-    // is a named later increment.
-    if parser_flags & XS_REGEXP_I != 0 {
-        return Err(CompileError::Unsupported("i flag (case folding)"));
-    }
+    // Honest-skip the flags whose match/compile machinery (CESU-8
+    // surrogate walk, unicode property sets, V-mode string sets) is a
+    // named later increment. The `i` flag's non-`u`/`v` case folding IS
+    // ported (crate::charcase).
     if parser_flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
         return Err(CompileError::Unsupported("u/v flag (unicode)"));
     }
@@ -272,6 +270,26 @@ impl Compiler {
         })
     }
 
+    /// `fxCharSetCanonicalizeSingle`: under the `i` flag, fold a
+    /// single-character set to its canonical code point (so the compiled
+    /// charset matches both cases). A no-op unless `I` is set and the set
+    /// is exactly one code point.
+    fn charset_canonicalize_single(&mut self, id: NodeId) -> NodeId {
+        if self.flags & XS_REGEXP_I != 0 {
+            if let Kind::CharSet { chars } = &self.nodes[id].kind {
+                if chars[0] == 2 && chars[1] + 1 == chars[2] {
+                    // Non-`u`/`v` fold (flag == 0); `u`/`v` is rejected above.
+                    let c = crate::charcase::canonicalize(chars[1] as i64) as i32;
+                    if let Kind::CharSet { chars } = &mut self.nodes[id].kind {
+                        chars[1] = c;
+                        chars[2] = c + 1;
+                    }
+                }
+            }
+        }
+        id
+    }
+
     fn charset_empty(&mut self) -> NodeId {
         self.add_node(Kind::CharSet { chars: vec![0] })
     }
@@ -290,16 +308,26 @@ impl Compiler {
     }
 
     fn charset_words(&mut self) -> NodeId {
-        // Non-`i` path (the `i` path is the deferred fold increment).
-        self.add_node(Kind::CharSet {
-            chars: vec![
+        // Under `i` (non-`u`/`v`), the subject char is canonicalized to
+        // its `A`..`Z` form at match time, so `\w` drops the `a`..`z`
+        // range (fxCharSetWords, the non-UV `I` branch).
+        let chars = if self.flags & XS_REGEXP_I != 0 {
+            vec![
+                6,
+                b'0' as i32, b'9' as i32 + 1,
+                b'A' as i32, b'Z' as i32 + 1,
+                b'_' as i32, b'_' as i32 + 1,
+            ]
+        } else {
+            vec![
                 8,
                 b'0' as i32, b'9' as i32 + 1,
                 b'A' as i32, b'Z' as i32 + 1,
                 b'_' as i32, b'_' as i32 + 1,
                 b'a' as i32, b'z' as i32 + 1,
-            ],
-        })
+            ]
+        };
+        self.add_node(Kind::CharSet { chars })
     }
 
     fn charset_spaces(&mut self) -> NodeId {
@@ -405,8 +433,21 @@ impl Compiler {
         if c1[1] > c2[1] {
             return Err(self.error("invalid range"));
         }
-        // The `i`-flag fold branch is the deferred increment; `i` is
-        // rejected at compile entry, so this is the plain-range path.
+        if self.flags & XS_REGEXP_I != 0 {
+            // Fold every code point in `[begin, end]` and union the
+            // canonical singletons (fxCharSetRange, the `I` branch).
+            let begin = c1[1];
+            let end = c2[1];
+            let mut result = self.charset_empty();
+            let mut ch = begin;
+            while ch <= end {
+                let canon = crate::charcase::canonicalize(ch as i64) as i32;
+                let single = self.add_node(Kind::CharSet { chars: vec![2, canon, canon + 1] });
+                result = self.charset_combine(result, single, MX_CHARSET_UNION_OP)?;
+                ch += 1;
+            }
+            return Ok(result);
+        }
         Ok(self.add_node(Kind::CharSet { chars: vec![2, c1[1], c2[2]] }))
     }
 
@@ -593,12 +634,15 @@ impl Compiler {
             if self.character == b'-' as i64 {
                 self.next()?;
                 if self.character == b']' as i64 {
+                    result = self.charset_canonicalize_single(result);
                     let dash = self.charset_single(b'-' as i64);
                     result = self.charset_combine(result, dash, MX_CHARSET_UNION_OP)?;
                 } else {
                     let hi = self.charset_parse_item()?;
                     result = self.charset_range(result, hi)?;
                 }
+            } else {
+                result = self.charset_canonicalize_single(result);
             }
             if let Some(prev) = former {
                 result = self.charset_combine(prev, result, MX_CHARSET_UNION_OP)?;
@@ -800,6 +844,7 @@ impl Compiler {
                 }
             }
             let single = self.charset_single(self.character);
+            let single = self.charset_canonicalize_single(single);
             self.next()?;
             self.quantifier_parse(single, current_index)
         }
@@ -827,6 +872,7 @@ impl Compiler {
         } else {
             // \0, control, hex, \u, \d\w\s, identity escapes → a charset.
             let set = self.charset_parse_escape(false)?;
+            let set = self.charset_canonicalize_single(set);
             self.quantifier_parse(set, current_index)
         }
     }
