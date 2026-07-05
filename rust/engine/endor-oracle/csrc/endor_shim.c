@@ -199,3 +199,128 @@ void endor_oracle_free(EndorOracleResult *out)
 		out->symbols = C_NULL;
 	}
 }
+
+/*
+ * XSRE matcher oracle (stage-3b child 8, PR #600).
+ *
+ * The XSRE regexp engine (xsre.c) is engine-internal: it has no
+ * public Machine API, so the differential harness cannot reach it
+ * through endor_oracle_run. This shim calls fxCompileRegExp +
+ * fxMatchRegExp directly (exactly as xsRegExp.c does) and returns the
+ * matcher's own reference behavior:
+ *
+ *   1. matched / not-matched,
+ *   2. the raw capture byte-offset pairs the matcher writes into
+ *      `data` (data[2*i] = capture i from, data[2*i+1] = capture i to,
+ *      -1 for an unset capture) in the subject's UTF-8/CESU-8 byte
+ *      space — the same offset space the Rust port operates in, so the
+ *      two compare directly with no UTF-16 conversion layer (that is
+ *      child 9's JS-surface concern), and
+ *   3. two run-only computron counts: the compile meter
+ *      (XS_PARSE_REGEXP_METERING * pattern size) and the match meter
+ *      (XS_REGEXP_METERING per step dispatched), each measured over a
+ *      zeroed meterIndex so the Rust matcher's per-step metering has an
+ *      isolated reference.
+ *
+ * `the` is non-null so both the meter increments fire and code/data
+ * allocate as GC chunks; no allocation happens between compile and
+ * match, so the chunk pointers stay valid across the call.
+ */
+
+#define ENDOR_MAX_CAPTURES 64
+
+typedef struct {
+	txU4 ok;          /* 1 = compiled; 0 = pattern compile error */
+	txU4 matched;     /* 1 = matched at/after start; 0 = no match */
+	txU4 capture_count; /* code[1]: total captures incl. whole match (index 0) */
+	txU4 name_count;    /* code[2] */
+	txS4 captures[2 * ENDOR_MAX_CAPTURES]; /* from,to pairs, byte offsets, -1 unset */
+	txU4 compile_computrons; /* compile meter >> 16 */
+	txU4 compile_meter_raw;
+	txU4 match_computrons;   /* match meter >> 16 */
+	txU4 match_meter_raw;
+	char error[ENDOR_ERROR_MAX]; /* compile error message when ok == 0 */
+} EndorRegExpResult;
+
+int endor_oracle_regexp(const char *pattern, const char *modifier,
+	const char *subject, txU4 subjectLen, txS4 start, EndorRegExpResult *out)
+{
+	txMachine *the;
+	memset(out, 0, sizeof(*out));
+
+	if (!gEndorClusterReady) {
+		fxInitializeSharedCluster(C_NULL);
+		gEndorClusterReady = 1;
+	}
+
+	the = fxCreateMachine(&gEndorCreation, "endor-oracle-regexp", C_NULL, 0);
+	if (!the)
+		return -1;
+
+	the = fxBeginHost(the);
+	{
+		mxTry(the) {
+			txInteger *code = C_NULL;
+			txInteger *data = C_NULL;
+			char errorBuffer[ENDOR_ERROR_MAX];
+			txInteger before;
+			txInteger i, captureCount;
+
+			errorBuffer[0] = 0;
+			the->meterIndex = 0;
+			if (!fxCompileRegExp(the, (txString)pattern, (txString)modifier,
+					&code, &data, errorBuffer, sizeof(errorBuffer))) {
+				out->ok = 0;
+				strncpy(out->error, errorBuffer, ENDOR_ERROR_MAX - 1);
+				out->error[ENDOR_ERROR_MAX - 1] = 0;
+			}
+			else {
+				out->ok = 1;
+				out->compile_meter_raw = (txU4)the->meterIndex;
+				out->compile_computrons = the->meterIndex >> 16;
+
+				captureCount = code[1];
+				out->capture_count = (txU4)captureCount;
+				out->name_count = (txU4)code[2];
+
+				/* Silence the unused subjectLen note: the subject is a
+				 * NUL-terminated C string the matcher scans itself; the
+				 * length is kept in the ABI for a future explicit-length
+				 * subject and to let the caller assert its own view. */
+				(void)subjectLen;
+
+				the->meterIndex = 0;
+				out->matched = fxMatchRegExp(the, code, data,
+					(txString)subject, start) ? 1 : 0;
+				out->match_meter_raw = (txU4)the->meterIndex;
+				out->match_computrons = the->meterIndex >> 16;
+
+				before = captureCount;
+				if (before > ENDOR_MAX_CAPTURES)
+					before = ENDOR_MAX_CAPTURES;
+				for (i = 0; i < before; i++) {
+					out->captures[2 * i] = (txS4)data[2 * i];
+					out->captures[2 * i + 1] = (txS4)data[(2 * i) + 1];
+				}
+			}
+		}
+		mxCatch(the) {
+			/* A machine-level abort during compile/match (e.g. stack
+			 * overflow on a pathological pattern). Report as a compile
+			 * failure with a best-effort message. */
+			out->ok = 0;
+			if (mxException.kind != XS_UNDEFINED_KIND) {
+				mxPush(mxException);
+				fxToString(the, the->stack);
+				if (the->stack->value.string) {
+					strncpy(out->error, the->stack->value.string, ENDOR_ERROR_MAX - 1);
+					out->error[ENDOR_ERROR_MAX - 1] = 0;
+				}
+				mxPop();
+			}
+		}
+	}
+	fxEndHost(the);
+	fxDeleteMachine(the);
+	return 0;
+}
