@@ -8732,6 +8732,16 @@ impl Interp {
                     buf.push(b']');
                     buf
                 } else {
+                    // A runtime-interned key (a `JSON.parse`d object whose key
+                    // is neither a program symbol nor a boot default) has no
+                    // resolvable name in `symbol_names` — child-5's known
+                    // interned-key rendering gap. It would silently drop from
+                    // the key set and mis-serialize the object, so self-name
+                    // rather than emit a wrong result.
+                    if self.object_has_unnamed_own_key(inst) {
+                        visited.pop();
+                        return Err(Halt::Unsupported("JSON.stringify:interned-key"));
+                    }
                     // An ordinary object: its own enumerable string-named
                     // properties in insertion order, skipping values that
                     // serialize to nothing.
@@ -8777,6 +8787,23 @@ impl Interp {
     /// order, as `(id, name)` — the `mxBehaviorOwnKeys(XS_EACH_NAME_FLAG)`
     /// subset JSON serializes. Array-index keys and non-program symbols are
     /// excluded (JSON keys are string names).
+    /// Whether `inst` carries an own property whose id resolves to no name in
+    /// `symbol_names` — a runtime-interned key (e.g. from `JSON.parse`) that
+    /// [`Self::object_own_string_keys`] would silently drop.
+    fn object_has_unnamed_own_key(&self, inst: crate::value::SlotIndex) -> bool {
+        let mut p = self.slots.get(inst).next;
+        while !p.is_null() {
+            let s = self.slots.get(p);
+            if s.id != crate::value::XS_NO_ID
+                && self.symbol_names.get((s.id - 1) as usize).is_none()
+            {
+                return true;
+            }
+            p = s.next;
+        }
+        false
+    }
+
     fn object_own_string_keys(&self, inst: crate::value::SlotIndex) -> Vec<(u16, String)> {
         let mut names: Vec<(u16, String)> = Vec::new();
         let mut p = self.slots.get(inst).next;
