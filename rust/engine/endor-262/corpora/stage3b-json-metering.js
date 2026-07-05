@@ -58,3 +58,51 @@ JSON.stringify(["line\nbreak","ret\rurn"])
 
 // a stringify of a computed structure (the value comes from prior ops).
 JSON.stringify({sum:1+2,txt:"a".concat("b")})
+
+// === JSON.parse (fx_JSON_parse tokenizer + per-node allocation metering) ===
+// The parse path calls no mxMeter; every unit is the native frame residual
+// plus the exact fxNewSlot/fxNewChunk allocations. Bit-exact (result AND
+// computron) against the pin: the setup residual, the string tokenizer chunk,
+// fxNewArrayInstance's two slots + one linked slot per element + the
+// fxCacheArray item chunk, and fxNewObjectInstance's slot + the per-member body
+// + key intern + key chunk.
+
+// primitives — the value-independent setup; a string adds its tokenizer chunk.
+JSON.parse("1")
+JSON.parse("-42")
+JSON.parse("0")
+JSON.parse("1.5")
+JSON.parse("1e3")
+JSON.parse("3.14159e-2")
+JSON.parse("3000000000")
+JSON.parse("true")
+JSON.parse("false")
+JSON.parse("null")
+JSON.parse("\"hello\"")
+JSON.parse("\"\"")
+JSON.parse("\"tab\\tnl\\nq\\\"\"")
+JSON.parse("\"\\u0041\\u00e9\"")
+
+// arrays — instance slots + per-element linked slot + the fxCacheArray chunk.
+JSON.parse("[]")
+JSON.parse("[1]")
+JSON.parse("[1,2,3,4,5]")
+JSON.parse("[true,false,null]")
+JSON.parse("[\"a\",\"bb\",\"ccc\"]")
+JSON.parse(" [ 1 , 2 , 3 ] ")
+JSON.parse("[[],[1],[2,3]]")
+JSON.parse("[1,[2,[3,[4]]]]")
+
+// objects — instance slot + per-member body + key intern + key chunk.
+JSON.parse("{}")
+JSON.parse("{\"a\":1}")
+JSON.parse("{\"a\":1,\"b\":2,\"c\":3}")
+JSON.parse("{\"name\":\"John\",\"age\":30,\"ok\":true}")
+JSON.parse("{\"longkeyname\":1}")
+JSON.parse("{\"a\":[1,2],\"b\":{\"c\":3}}")
+JSON.parse("{\"nested\":{\"deep\":{\"x\":[1,2,3]}}}")
+
+// parse results observed by value (property access / length / arithmetic).
+JSON.parse("[10,20,30]").length
+JSON.parse("{\"x\":42}").x
+JSON.stringify(JSON.parse("[1,2,3]"))

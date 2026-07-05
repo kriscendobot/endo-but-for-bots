@@ -651,6 +651,60 @@ pub fn gen_json_structured_program(data: &[u8]) -> String {
     format!("JSON.stringify({})", mk_value(&mut b, 2))
 }
 
+/// Structure-aware generator for the **stage-3b json-metering** parse surface:
+/// `JSON.parse(text)` over well-formed JSON text built recursively from
+/// primitives, arrays, and objects — every emitted program bit-exact (result
+/// AND computron) against the pin. The JSON is emitted as a JS double-quoted
+/// string literal (the parser reads its bytes); depth/breadth can go deeper than
+/// the stringify arm because the argument is a single string literal, not a
+/// nested object literal (so the object-literal construction drift is absent).
+/// Draws only the raw-clean subset: integer/boolean/null/ASCII-string leaves,
+/// distinct ASCII keys, no astral escapes — avoiding the self-named corners
+/// (reviver, astral, malformed). Rides [`differential_check_with_symbols`].
+pub fn gen_json_parse_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    fn mk_word(b: &mut Bytes) -> String {
+        let n = 1 + (b.next() % 5) as usize;
+        (0..n).map(|_| ALPHA[(b.next() as usize) % ALPHA.len()] as char).collect()
+    }
+    // A JSON value string at the given remaining depth.
+    fn mk_json(b: &mut Bytes, depth: u8) -> String {
+        if depth == 0 || b.next() % 3 == 0 {
+            return match b.choice(5) {
+                0 => ((b.next() % 200) as i32 - 100).to_string(),
+                1 => "true".to_string(),
+                2 => "false".to_string(),
+                3 => "null".to_string(),
+                _ => format!("\"{}\"", mk_word(b)),
+            };
+        }
+        if b.next() % 2 == 0 {
+            let n = (b.next() % 4) as usize; // 0..=3 members, keys distinct by index
+            let parts: Vec<String> = (0..n)
+                .map(|i| format!("\"{}{}\":{}", mk_word(b), i, mk_json(b, depth - 1)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        } else {
+            let n = (b.next() % 4) as usize; // 0..=3 elements
+            let parts: Vec<String> = (0..n).map(|_| mk_json(b, depth - 1)).collect();
+            format!("[{}]", parts.join(","))
+        }
+    }
+    // Escape the JSON text as a JS double-quoted string literal.
+    let json = mk_json(&mut b, 3);
+    let mut lit = String::from("\"");
+    for c in json.chars() {
+        match c {
+            '"' => lit.push_str("\\\""),
+            '\\' => lit.push_str("\\\\"),
+            _ => lit.push(c),
+        }
+    }
+    lit.push('"');
+    format!("JSON.parse({})", lit)
+}
+
 /// Structure-aware generator for **array spread** (`[...arr]`) — which
 /// desugars to the for-of iterator loop appending each element. Emits a single
 /// spread of a dense literal, optionally with leading/trailing plain elements,
@@ -1803,6 +1857,40 @@ mod tests {
         assert!(checked > 0);
         assert!(distinct.len() > 40, "json-structured sweep too uniform: {} distinct", distinct.len());
         assert!(object && array && nested, "shapes reached: object={} array={} nested={}", object, array, nested);
+    }
+
+    #[test]
+    fn generated_stage3b_json_parse_programs_agree_bit_exact() {
+        // The stage-3b json-metering parse surface — JSON.parse over well-formed
+        // JSON built recursively from primitives, arrays, and objects — is
+        // bit-exact (result AND computron). Sweep a spread of seeds, reaching
+        // primitive, array, and object shapes and depth beyond one level.
+        let mut checked = 0;
+        let (mut prim, mut array, mut object) = (false, false, false);
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(24 + (seed % 40)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(11))
+                        .wrapping_add((seed as u8).wrapping_mul(7)),
+                );
+            }
+            let prog = gen_json_parse_program(&buf);
+            distinct.insert(prog.clone());
+            object |= prog.contains('{');
+            array |= prog.contains('[');
+            prim |= !prog.contains('{') && !prog.contains('[');
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3b json-parse differential divergence on {:?}: {:?}", prog, d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 40, "json-parse sweep too uniform: {} distinct", distinct.len());
+        assert!(prim && array && object, "shapes reached: prim={} array={} object={}", prim, array, object);
     }
 
     #[test]
