@@ -379,9 +379,9 @@ release-versioned cost table, not XS's constants:
 **Deriving and freezing the cost table.** The weights are not
 hand-copied from XS; they are calibration constants derived from the
 cost-calibration instrumentation (sibling plan
-`xs2rust-endor-meter-opcode-cost-instrumentation`), which measures
-per-opcode and per-builtin-step real cost on a named reference
-platform. The measured costs are reduced to a frozen integer weight
+[xs2rust-endor-meter-opcode-cost-instrumentation](xs2rust-endor-meter-opcode-cost-instrumentation.md)),
+which measures per-opcode and per-builtin-step real cost on a named
+reference platform. The measured costs are reduced to a frozen integer weight
 table checked into the release and stamped with an `endor-meter-N`
 version. A recalibration re-runs that instrumentation and bumps the
 version; the previous table remains addressable by its version so
