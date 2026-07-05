@@ -914,13 +914,14 @@ pub const PROMISE_CTOR_FRAME_METERING: u64 = 261888;
 /// `mxMeter` here. Calibrated raw-exact against the pin.
 pub const PROMISE_FUNCTIONS_METERING: u64 = 0;
 /// The native residual of `Promise.resolve(v)` (`fx_Promise_resolve` →
-/// `fx_Promise_resolveAux`) BEYOND the capability's promise instance +
-/// resolving pair and the `mxRunCount(1)` resolve call. Calibrated raw-exact
-/// against the pin.
-pub const PROMISE_RESOLVE_STATIC_METERING: u64 = 0;
+/// `fx_Promise_resolveAux`) BEYOND the capability ([`PROMISE_CAPABILITY_
+/// METERING`] + its slots) and the `mxRunCount(1)` resolve settle
+/// ([`PROMISE_RESOLVE_FN_METERING`]): the two frames plus the folded
+/// `fxNewPromiseCapability` framing. Calibrated raw-exact against the pin.
+pub const PROMISE_RESOLVE_STATIC_METERING: u64 = 377112;
 /// The native residual of `Promise.reject(reason)` (`fx_Promise_reject`).
 /// Calibrated raw-exact against the pin.
-pub const PROMISE_REJECT_STATIC_METERING: u64 = 0;
+pub const PROMISE_REJECT_STATIC_METERING: u64 = 246552;
 /// The native frame residual of a **resolve** function call
 /// (`fxResolvePromise`) BEYOND the `RUN` dispatch, when it settles a promise
 /// with a primitive value and no thenable/reactions (the path allocates
@@ -935,17 +936,53 @@ pub const PROMISE_REJECT_FN_METERING: u64 = 32488;
 /// resolve/reject function (XS returns right after the boolean check).
 /// Measured zero against the pin (a second `resolve`/`reject` adds nothing).
 pub const PROMISE_SETTLE_GUARDED_METERING: u64 = 0;
-/// The native residual of `Promise.prototype.then` (`fx_Promise_prototype_
-/// then` → `fxPromiseThen`) BEYOND the capability's derived promise +
-/// resolving pair and the reaction-instance `fxNewSlot`s. Calibrated
-/// raw-exact against the pin.
-pub const PROMISE_THEN_METERING: u64 = 0;
-/// The per-reaction residual of one queued promise job's execution
-/// (`fxQueueJob` capture + `fxRunPromiseJobs`'s `mxRunCount` +
-/// `fxOnResolvedPromise`/`fxOnRejectedPromise` trampoline) BEYOND the
-/// reaction body the nested dispatch meters and the derived promise's settle.
+/// The native residual of `fxNewPromiseCapability` BEYOND the derived promise
+/// instance + resolving pair (charged by [`Interp::new_promise_instance`] /
+/// [`Interp::make_resolving_functions`]): the capability-callback
+/// `fxNewHostFunction` (5 slots), the callback body's home object
+/// (`fxNewInstance` + 2 slots), the folded `fx_Promise` frame
+/// ([`PROMISE_CTOR_FRAME_METERING`]), and the `mxNew`/`mxRunCount(1)`
+/// executor framing. Calibrated raw-exact against the pin. Set to the folded
+/// `fx_Promise` construct frame ([`PROMISE_CTOR_FRAME_METERING`]); the
+/// `fxNewPromiseCapability` `mxNew`/`mxRunCount(1)` framing folds into each
+/// caller's own frame constant (every capability caller invokes it the same
+/// way).
+pub const PROMISE_CAPABILITY_METERING: u64 = 261888;
+/// The native residual of `Promise.resolve(v)` when `v` is already a native
+/// promise — the identity fast path returns `v` (`fx_Promise_resolveAux`'s
+/// `mxGetID(_constructor)` + `fxIsSameValue`). Calibrated against the pin.
+pub const PROMISE_RESOLVE_SAME_METERING: u64 = 0;
+/// The native residual of `fx_Promise_prototype_then` BEYOND the capability
+/// ([`PROMISE_CAPABILITY_METERING`]) and the reaction registration
+/// ([`PROMISE_REACTION_METERING`]): the frame, `mxGetID(_constructor)`, and
+/// `fxToSpeciesConstructor`, plus the folded `fxNewPromiseCapability` framing.
 /// Calibrated raw-exact against the pin.
-pub const PROMISE_JOB_METERING: u64 = 0;
+pub const PROMISE_THEN_METERING: u64 = 278536;
+/// The non-slot residual of `fxPromiseThen`'s reaction instance beyond the 6
+/// reaction `fxNewSlot`s (and, when pending, the THENS-list slot) charged
+/// explicitly in [`Interp::promise_then`]. Measured zero. Calibrated against
+/// the pin.
+pub const PROMISE_REACTION_METERING: u64 = 0;
+/// The residual of queuing one promise job (`fxQueueJob`): the job instance +
+/// the `count + 4` captured argument slots. Charged when a settled promise's
+/// reaction is queued (at `.then` on a settled promise, or at settle time for
+/// each registered reaction). The 6 `fxQueueJob` slots are charged explicitly
+/// in [`Interp::queue_promise_job`]; this is any non-slot residual (measured
+/// zero). Calibrated raw-exact against the pin.
+pub const PROMISE_QUEUE_JOB_METERING: u64 = 0;
+/// The native frame residual of running one queued job at the drain
+/// (`fxRunPromiseJobs`'s `mxRunCount` + the `fxOnResolvedPromise`/
+/// `fxOnRejectedPromise` trampoline) BEYOND the reaction handler body the
+/// nested `run_callback` meters, the derived promise's settle
+/// ([`PROMISE_RESOLVE_FN_METERING`]), and the 6 queued-job slots. Calibrated
+/// raw-exact against the pin.
+pub const PROMISE_JOB_FRAME_METERING: u64 = 393752;
+/// The native frame residual of a **pass-through** job — a reaction with no
+/// handler for the settled state, which XS's `fxOnResolvedPromise`/
+/// `fxOnRejectedPromise` runs with a single `mxRunCount` (the settle only, no
+/// handler call). `98304` (1.5 `XS_CODE_METERING`) less than the with-handler
+/// frame. Calibrated raw-exact against the pin.
+pub const PROMISE_JOB_PASSTHROUGH_FRAME_METERING: u64 = 295448;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -6188,6 +6225,88 @@ impl Interp {
         )
     }
 
+    /// Build a fresh promise **capability** (XS's `fxNewPromiseCapability`): a
+    /// derived pending promise plus its resolve/reject pair. XS routes this
+    /// through `new this.constructor(capabilityCallback)`; for the native
+    /// `Promise` the observable outcome and the allocation profile are the
+    /// derived promise ([`Self::new_promise_instance`]) + its resolving pair
+    /// ([`Self::make_resolving_functions`]) plus the capability-specific
+    /// overhead ([`PROMISE_CAPABILITY_METERING`] — the callback host function,
+    /// its home object, the folded `fx_Promise` frame, and the `mxRunCount(1)`
+    /// framing). Returns `(derived, resolve, reject)`.
+    fn new_promise_capability(&mut self) -> (crate::value::SlotIndex, Slot, Slot) {
+        // The capability-callback `fxNewHostFunction` (instance + CALLBACK +
+        // HOME + LENGTH + NAME = 5 slots) and its home object built by the
+        // callback body (`fxNewInstance` + resolve slot + reject slot = 3),
+        // plus the folded `fx_Promise` frame ([`PROMISE_CAPABILITY_METERING`]).
+        for _ in 0..8 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(PROMISE_CAPABILITY_METERING);
+        let derived = self.new_promise_instance();
+        let (resolve, reject) = self.make_resolving_functions(derived);
+        (derived, resolve, reject)
+    }
+
+    /// `Promise.prototype.then(onFulfilled, onRejected)`
+    /// (`fx_Promise_prototype_then` → `fxPromiseThen`): register the reaction
+    /// on the receiver promise and return a fresh derived promise the
+    /// reaction's outcome settles. A handler argument is "present" iff it is a
+    /// reference (XS's `mxIsReference` gate); a non-reference handler is
+    /// treated as absent (pass-through). If the receiver is already settled,
+    /// the reaction is queued as a job immediately (run at the drain);
+    /// otherwise it is appended to the promise's reaction list. Returns the
+    /// derived promise reference slot.
+    fn promise_then(&mut self, promise: crate::value::SlotIndex, base: usize) -> Result<Slot, Halt> {
+        let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+        let on_fulfilled = if arg0.kind == Kind::Reference {
+            arg0
+        } else {
+            Slot::undefined()
+        };
+        let on_rejected = if arg1.kind == Kind::Reference {
+            arg1
+        } else {
+            Slot::undefined()
+        };
+        self.meter.tick_raw(PROMISE_THEN_METERING);
+        let (derived, resolve, reject) = self.new_promise_capability();
+        // `fxPromiseThen`: the reaction instance's 6 `fxNewSlot`s (the reaction
+        // instance + resolve/reject/onFulfilled/onRejected/result slots),
+        // always built regardless of the promise's state.
+        for _ in 0..6 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(PROMISE_REACTION_METERING);
+        let reaction = PromiseReaction {
+            on_fulfilled,
+            on_rejected,
+            resolve,
+            reject,
+        };
+        let state = self.promises[&promise].state;
+        match state {
+            PromiseState::Pending => {
+                // Append to the promise's reaction list (XS's +1 THENS-list
+                // reference slot linking the reaction).
+                self.meter.tick_slot_alloc();
+                self.promises.get_mut(&promise).unwrap().reactions.push(reaction);
+            }
+            PromiseState::Fulfilled | PromiseState::Rejected => {
+                // Already settled: queue the reaction as a job immediately.
+                let value = self.promises[&promise].result;
+                let rejected = state == PromiseState::Rejected;
+                self.queue_promise_job(PromiseJob {
+                    reaction,
+                    value,
+                    rejected,
+                });
+            }
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(derived)))
+    }
+
     /// A promise resolve/reject function call (XS's `fxResolvePromise`/
     /// `fxRejectPromise`, dispatched from the `RUN` handler by a
     /// `promise_functions` lookup). Settles the bound promise with argument 0
@@ -6254,7 +6373,7 @@ impl Interp {
         // Queue one job per registered reaction (XS's `fxQueueJob` per THEN),
         // preserving registration (FIFO) order.
         for reaction in reactions {
-            self.promise_jobs.push_back(PromiseJob {
+            self.queue_promise_job(PromiseJob {
                 reaction,
                 value,
                 rejected: reject,
@@ -6270,6 +6389,17 @@ impl Interp {
             PROMISE_RESOLVE_FN_METERING
         });
         Ok(())
+    }
+
+    /// Queue one promise job (XS's `fxQueueJob`): capture the job instance and
+    /// its `count + 4` argument slots (6 `fxNewSlot`s for a one-argument
+    /// reaction job) and append it FIFO to the pending queue.
+    fn queue_promise_job(&mut self, job: PromiseJob) {
+        for _ in 0..6 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(PROMISE_QUEUE_JOB_METERING);
+        self.promise_jobs.push_back(job);
     }
 
     /// Whether any promise jobs are pending (the pump-loop latch query — XS's
@@ -6297,13 +6427,61 @@ impl Interp {
     }
 
     /// Run one queued promise job (XS's `fxOnResolvedPromise`/
-    /// `fxOnRejectedPromise` trampoline). Reactions are registered by
-    /// `.then`; the job-execution increment lands with it, so until then a
-    /// queued job self-names rather than mis-run. (No job is queued before
-    /// `.then` exists, so this is unreachable in the construct-only slice.)
+    /// `fxOnRejectedPromise` trampoline). The reaction's handler (if present)
+    /// runs against the settled value; the derived promise is then resolved
+    /// with the handler's result (or the pass-through value when no handler),
+    /// or rejected with the thrown value if the handler throws. A handler that
+    /// is not a modeled user function, or a resolve outcome that is a reference
+    /// (thenable adoption), self-names.
     fn run_promise_job(&mut self, code: &[u8], job: PromiseJob) -> Result<(), Halt> {
-        let _ = (code, job);
-        Err(Halt::Unsupported("promise:job-drain"))
+        let handler = if job.rejected {
+            job.reaction.on_rejected
+        } else {
+            job.reaction.on_fulfilled
+        };
+        // The `fxOnResolvedPromise`/`fxOnRejectedPromise` frame: a job WITH a
+        // handler runs two `mxRunCount`s (the handler, modeled by
+        // `run_callback`, then the settle); a pass-through job (no handler)
+        // runs only the settle, so it skips the handler-call framing.
+        if handler.kind == Kind::Undefined {
+            self.meter.tick_raw(PROMISE_JOB_PASSTHROUGH_FRAME_METERING);
+        } else {
+            self.meter.tick_raw(PROMISE_JOB_FRAME_METERING);
+        }
+        // The derived promise the reaction settles is the promise the
+        // reaction's resolve/reject functions were built for.
+        let (derived, resolve_is_reject) = match job.reaction.resolve.value {
+            Payload::Reference(rf) => match self.promise_functions.get(&rf) {
+                Some(d) => (d.promise, false),
+                None => return Err(Halt::Unsupported("promise:job-bad-capability")),
+            },
+            _ => return Err(Halt::Unsupported("promise:job-bad-capability")),
+        };
+        let _ = resolve_is_reject;
+        // The default outcome: with no handler, a fulfilled job resolves the
+        // derived with the value, a rejected job rejects it with the reason
+        // (pass-through).
+        let (settle_value, settle_reject) = if handler.kind == Kind::Undefined {
+            (job.value, job.rejected)
+        } else {
+            // Run the handler(value). Success → resolve the derived with the
+            // result; a throw → reject the derived with the thrown value.
+            match self.run_callback(code, handler, Slot::undefined(), &[job.value]) {
+                Ok(r) => (r, false),
+                Err(Halt::Throw(_)) => {
+                    // The thrown-value capture for a handler throw is a later
+                    // increment (it needs the exception slot threaded out of
+                    // run_callback); self-name rather than reject with a wrong
+                    // reason.
+                    return Err(Halt::Unsupported("promise:handler-throw"));
+                }
+                Err(h) => return Err(h),
+            }
+        };
+        // Settle the derived promise (XS calls the captured resolve/reject
+        // function). A resolve outcome that is a reference is thenable
+        // adoption — deferred; `settle_promise` self-names it.
+        self.settle_promise(derived, settle_value, settle_reject, 1)
     }
 
     /// Build a fresh Error instance of type `name` from a native Error
@@ -8578,11 +8756,50 @@ impl Interp {
             // this arm is reached only for the not-yet-modeled ones, an honest
             // named skip. `.then`/`resolve`/`reject` are intercepted before the
             // generic method dispatch (see `call_native_method_reentrant`).
-            NativeMethod::PromiseThen
-            | NativeMethod::PromiseCatch
+            // `Promise.prototype.then`: register the reaction and return the
+            // derived promise. The reaction runs later, at the pump-loop drain
+            // — no synchronous re-entry here, so it fits the value-returning
+            // method dispatch.
+            NativeMethod::PromiseThen => {
+                let promise = match this.value {
+                    Payload::Reference(r) if self.promises.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("then:non-promise-this")),
+                };
+                self.promise_then(promise, base)?
+            }
+            // `Promise.resolve(v)` (`fx_Promise_resolve`): a native promise
+            // whose constructor is `Promise` is returned as-is; otherwise a
+            // capability is built and its `resolve` called with `v`. Resolving
+            // with a reference (a thenable, or a foreign promise) needs the
+            // adoption probe — deferred, so it self-names.
+            NativeMethod::PromiseResolveStatic => {
+                if let Payload::Reference(r) = arg0.value {
+                    if self.promises.contains_key(&r) {
+                        // `v.constructor === Promise` for a native promise:
+                        // return `v` unchanged (the `Promise.resolve` identity
+                        // fast path, `fx_Promise_resolveAux`).
+                        self.meter.tick_raw(PROMISE_RESOLVE_SAME_METERING);
+                        arg0
+                    } else {
+                        return Err(Halt::Unsupported("Promise.resolve:thenable"));
+                    }
+                } else {
+                    self.meter.tick_raw(PROMISE_RESOLVE_STATIC_METERING);
+                    let (derived, _resolve, _reject) = self.new_promise_capability();
+                    self.settle_promise(derived, arg0, false, 1)?;
+                    Slot::of(Kind::Reference, Payload::Reference(derived))
+                }
+            }
+            // `Promise.reject(reason)` (`fx_Promise_reject`): a capability whose
+            // `reject` is called with `reason` (any value).
+            NativeMethod::PromiseRejectStatic => {
+                self.meter.tick_raw(PROMISE_REJECT_STATIC_METERING);
+                let (derived, _resolve, _reject) = self.new_promise_capability();
+                self.settle_promise(derived, arg0, true, 1)?;
+                Slot::of(Kind::Reference, Payload::Reference(derived))
+            }
+            NativeMethod::PromiseCatch
             | NativeMethod::PromiseFinally
-            | NativeMethod::PromiseResolveStatic
-            | NativeMethod::PromiseRejectStatic
             | NativeMethod::PromiseAll
             | NativeMethod::PromiseRace
             | NativeMethod::PromiseAllSettled
