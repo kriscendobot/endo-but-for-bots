@@ -318,20 +318,32 @@ cannot decide soundly — a **boot default-key name the program never referenced
 (e.g. `o["hasOwnProperty"]` / `"toString" in {}`): endor's `%Object.prototype%`
 carries a method only for program-referenced names, so it cannot tell an absent
 own read from an inherited built-in it never linked, and refuses rather than
-answer a wrong `undefined`/`false`. `built-ins/Object` dual-run grows to
-`covered=53 divergent=0` (from ~0 before the child — the verifyProperty-shaped
-`getOwnPropertyDescriptor` tests, the computed-access `at`/`at_2` unlock, and the
-`in`-false answers now covered). The honest **named skips** are:
+answer a wrong `undefined`/`false`. A fourth static, **`Object.defineProperty`**,
+lands the attribute-aware property model: `defineProperty(o, k, desc)` defines a
+new own data property on an ordinary object from the canonical four-field data
+descriptor (`{value, writable, enumerable, configurable}`, no `get`/`set` — the
+verifyProperty shape), storing the three booleans as XS's property flag byte
+(`XS_DONT_SET_FLAG`/`XS_DONT_ENUM_FLAG`/`XS_DONT_DELETE_FLAG`) so the attributes
+**ripple through** the other statics: `Object.keys` now filters non-enumerable
+properties (and still renders every enumerable one in creation order), and
+`getOwnPropertyDescriptor` reads the `writable`/`enumerable`/`configurable`
+booleans back from the flag byte. `fxDescriptorToSlot`'s six `mxHasID`/four
+`mxGetID` field reads, the three `fxToBoolean` coercions, and the
+`fxOrdinaryDefineOwnProperty` create fold into one measured raw residual
+calibrated against the pin (the novel-key intern slot metered separately).
+`built-ins/Object` dual-run grows to `covered=63 divergent=0` (from ~0 before the
+child — the verifyProperty-shaped `getOwnPropertyDescriptor`/`defineProperty`
+tests, the computed-access `at`/`at_2` unlock, and the `in`-false answers now
+covered). The honest **named skips** are:
 `Object.keys`/`getOwnPropertyDescriptor` over an exotic receiver
 (array/typed-array/collection/wrapper/error — whose own-key set includes
-indices/length or internal names) or over an accessor / non-standard-flagged
-property, an index-string key, a computed read / `in` of a boot default-key name
-the program never referenced (the incomplete `%Object.prototype%` member set),
-and — deferred to the child's remaining increment — **`Object.defineProperty`**,
-which needs the attribute-aware property model (`writable`/`enumerable`/
-`configurable` flag bits rippling through `keys`/`getOwnPropertyDescriptor`/
-enumeration) plus its per-field descriptor-read metering calibrated against the
-pin. The stage-3 built-ins reach
+indices/length or internal names) or over an accessor property, an index-string
+key, a computed read / `in` of a boot default-key name the program never
+referenced (the incomplete `%Object.prototype%` member set), a
+`defineProperty` with a partial or accessor descriptor / a redefine of an
+existing key / a non-object descriptor / a non-boolean attribute / an
+enumerable **novel** key `Object.keys` cannot render to a string. The stage-3
+built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic
