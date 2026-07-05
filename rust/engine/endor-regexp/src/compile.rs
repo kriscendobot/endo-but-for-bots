@@ -177,6 +177,17 @@ impl Compiler {
         // Named captures would set XS_REGEXP_N and force a re-parse; this
         // increment honest-skips them before reaching here.
         self.capture_index += 1;
+        // Validate numeric backreferences now that the final capture count
+        // is known — `fxCaptureReferenceMeasure` errors on an out-of-range
+        // number (e.g. `\11` with fewer than 11 groups; XS reads the whole
+        // decimal greedily and rejects, it does not fall back to `\1`).
+        for node in &self.nodes {
+            if let Kind::CaptureReference { capture_index } = &node.kind {
+                if *capture_index >= 0 && *capture_index >= self.capture_index {
+                    return Err(self.error("invalid reference number"));
+                }
+            }
+        }
         // parser->size = (5 + nameIndex) * sizeof(txInteger).
         self.size = (5 + self.name_index as i64) * 4;
         self.measure(term, 1);

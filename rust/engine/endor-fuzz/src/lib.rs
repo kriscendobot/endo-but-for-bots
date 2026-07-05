@@ -18,6 +18,11 @@
 
 use endor_vm::{disassemble, run_program};
 
+/// Stage-3b XSRE matcher fuzz arm (child 8/9): a structure-aware regexp
+/// generator + differential check of `endor-regexp` against the pin.
+pub mod regexp;
+pub use regexp::{differential_check_regexp, gen_regexp, RegExpCase};
+
 /// A cursor over fuzzer-provided bytes, used to drive the grammar
 /// deterministically (a minimal `arbitrary::Unstructured`).
 struct Bytes<'a> {
