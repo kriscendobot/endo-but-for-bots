@@ -905,6 +905,38 @@ pub const BIGINT_NEG_FRAME_METERING: u64 = 1 << 14;
 /// = 6 instance slots + 13 resolving-pair slots + this frame + the empty
 /// executor body = 32 computrons).
 pub const PROMISE_CTOR_FRAME_METERING: u64 = 261888;
+/// The native residual of `new RegExp(pattern, flags)` (`fx_RegExp` +
+/// `fxInitializeRegExp`) BEYOND the explicit `fxNewRegExpInstance` `fxNewSlot`s
+/// and the `fxCompileRegExp` compile meter the [`RegExpData`] program carries.
+/// Covers the `fx_RegExp` host frame, `fxGetPrototypeFromConstructor`, and the
+/// `mxRunCount(2)` `mxInitializeRegExpFunction` call framing. Calibrated
+/// raw-exact against the pin.
+pub const REGEXP_CTOR_FRAME_METERING: u64 = 180296;
+/// The per-source-byte residual of `new RegExp` (the pattern walk beyond the
+/// `parser->size` compile meter). Calibrated raw-exact for short patterns.
+pub const REGEXP_CTOR_PER_SOURCE_BYTE: u64 = 16;
+/// The native residual of `RegExp.prototype.exec` (`fx_RegExp_prototype_exec`)
+/// BEYOND the match meter the matcher carries, the result-array `fxNewSlot`s,
+/// and the result-string chunk allocations. Covers the host frame, the
+/// `lastIndex` get, and `fxToString(argument)`. Calibrated raw-exact.
+pub const REGEXP_EXEC_FRAME_METERING: u64 = 114696;
+/// The on-match residual of `exec` beyond the frame and the explicit
+/// per-capture slot/chunk allocations (the `fxCacheUTF8ToUnicodeOffset`
+/// remaps + `fxCacheArray`). Calibrated.
+pub const REGEXP_EXEC_MATCH_METERING: u64 = 560;
+/// The per-extra-capture residual of `exec` on a match. Calibrated.
+pub const REGEXP_EXEC_PER_CAPTURE: u64 = 32;
+/// The native residual of `RegExp.prototype.test` beyond the `exec` cost it
+/// drives (the `test` host frame + the `mxGetID(_exec)` + `mxRunCount(1)`
+/// re-entrant call framing). Calibrated raw-exact.
+pub const REGEXP_TEST_FRAME_METERING: u64 = 147456;
+/// The extra residual of a `g`/`y` (stateful) `exec`/`test`: the
+/// `fxCacheUnicodeToUTF8Offset` (read `lastIndex`) + `fxCacheUTF8ToUnicode
+/// Offset` (write it back) remap framing. Charged on the advancing path.
+pub const REGEXP_STATEFUL_METERING: u64 = 81920;
+/// The residual of a RegExp per-flag / `source` accessor getter beyond the
+/// `GET_PROPERTY` dispatch (the getter's `mxMeterOne`, if any). Calibrated.
+pub const REGEXP_GETTER_METERING: u64 = 0;
 /// The non-slot residual of `fxPushPromiseFunctions` beyond the 13 explicit
 /// `fxNewSlot`s [`Interp::make_resolving_functions`] charges (the two
 /// `fxNewHostFunction`s — each instance + CALLBACK + HOME + LENGTH + NAME,
@@ -1502,6 +1534,33 @@ pub enum NativeMethod {
     /// `alloc_method` name/length machinery uses.
     PromiseResolveFunction,
     PromiseRejectFunction,
+    /// `RegExp.prototype.exec(string)` (`fx_RegExp_prototype_exec`): compile-
+    /// once, drive the matcher from `lastIndex` (for `g`/`y`), and build the
+    /// match-result array (`[whole, ...captures]` + `index`/`input`/`groups`),
+    /// updating `lastIndex`. Returns `null` on no match.
+    RegExpExec,
+    /// `RegExp.prototype.test(string)` (`fx_RegExp_prototype_test`): the same
+    /// match drive as `exec`, returning a boolean and updating `lastIndex`.
+    RegExpTest,
+    /// `RegExp.prototype.toString()` (`fx_RegExp_prototype_toString`): the
+    /// `/source/flags` literal string, read through the `source`/`flags`
+    /// getters.
+    RegExpToString,
+    /// `String.prototype.match(regexp)` (`fx_String_prototype_match`): coerce
+    /// the receiver to string, the argument to a RegExp, and dispatch to the
+    /// matcher — the non-global path returns `exec`'s result; the global path
+    /// collects every whole match.
+    StringMatch,
+    /// `String.prototype.search(regexp)` (`fx_String_prototype_search`): the
+    /// index of the first match, or `-1`.
+    StringSearch,
+    /// `String.prototype.replace(pattern, replacement)`
+    /// (`fx_String_prototype_replace`): string-or-RegExp pattern with a
+    /// string replacement carrying the `$`-substitution grammar.
+    StringReplace,
+    /// `String.prototype.split(separator[, limit])`
+    /// (`fx_String_prototype_split`): split on a string-or-RegExp separator.
+    StringSplit,
 }
 
 impl Default for FuncInfo {
@@ -1653,6 +1712,54 @@ struct PromiseData {
     settled_guard: bool,
 }
 
+/// Per-instance RegExp state (XS's `XS_REGEXP_KIND` internal slot plus the
+/// key slot holding the source string). `program` is the compiled pattern
+/// (child 8's `endor-regexp`): its `code[0]` is the flags word, `code[1]`
+/// the capture count (including the whole match at index 0), and it carries
+/// the compile meter. `source` is the pattern source string (the `.source`
+/// getter's value, minus the empty-pattern `(?:)` substitution which the
+/// getter applies). `flags` is the canonical flag string (`d`-order:
+/// `dgimsuvy`) the constructor resolved.
+#[derive(Clone, Debug)]
+struct RegExpData {
+    program: endor_regexp::Program,
+    source: String,
+    flags: String,
+    /// The `lastIndex` internal store (XS's own writable `lastIndex` data
+    /// property). Backed here in the side table rather than as a heap
+    /// property so `exec`/`test` can advance it internally even when the
+    /// program never names `lastIndex`; a `re.lastIndex` get/set is
+    /// special-cased in `GET_PROPERTY`/`SET_PROPERTY` to read/write this
+    /// field (with `ToLength` clamping on set, as `exec` applies).
+    last_index: f64,
+}
+
+/// The program-local symbol ids of the RegExp accessor getters, resolved at
+/// [`Interp::link_intrinsics`]. Each is `None` when the program never names
+/// that getter.
+#[derive(Copy, Clone, Debug, Default)]
+struct RegExpGetterIds {
+    source: Option<u16>,
+    flags: Option<u16>,
+    global: Option<u16>,
+    ignore_case: Option<u16>,
+    multiline: Option<u16>,
+    dot_all: Option<u16>,
+    sticky: Option<u16>,
+    unicode: Option<u16>,
+    has_indices: Option<u16>,
+    unicode_sets: Option<u16>,
+}
+
+/// The program-local symbol ids of the exec-result array's named slots
+/// (`index`/`input`/`groups`), resolved at [`Interp::link_intrinsics`].
+#[derive(Copy, Clone, Debug, Default)]
+struct RegExpResultIds {
+    index: Option<u16>,
+    input: Option<u16>,
+    groups: Option<u16>,
+}
+
 /// A promise's settlement status (XS's `mxPendingStatus`/`mxFulfilledStatus`/
 /// `mxRejectedStatus`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1780,6 +1887,12 @@ pub enum Native {
     /// table; the resolve/reject functions it hands the executor are host
     /// functions recorded in [`Interp::promise_functions`].
     Promise,
+    /// `RegExp` — the regular-expression constructor (`xsRegExp.c`
+    /// `fx_RegExp`). Its per-instance compiled program + source/flags live in
+    /// the [`Interp::regexps`] side table; `lastIndex` is an ordinary own
+    /// integer property. The matcher itself is the `endor-regexp` crate
+    /// (child 8).
+    RegExp,
 }
 
 impl Native {
@@ -1810,6 +1923,7 @@ impl Native {
             Native::TypedArray(i) => TYPED_ARRAY_TYPES[i as usize].name,
             Native::DataView => "DataView",
             Native::Promise => "Promise",
+            Native::RegExp => "RegExp",
         }
     }
 
@@ -1847,6 +1961,7 @@ impl Native {
         }
         v.push(("DataView", Native::DataView));
         v.push(("Promise", Native::Promise));
+        v.push(("RegExp", Native::RegExp));
         v
     }
 }
@@ -2255,6 +2370,29 @@ pub struct Interp {
     /// Read by the thenable-adoption path (a later increment).
     #[allow(dead_code)]
     then_id: Option<u16>,
+    /// Per-instance RegExp state (XS's `XS_REGEXP_KIND` internal slot): the
+    /// compiled program plus the source/flags strings. Keyed by the RegExp
+    /// instance's slot, like [`Self::promises`]. `lastIndex` is an ordinary
+    /// own integer property of the instance, not stored here. See
+    /// [`RegExpData`].
+    regexps: std::collections::HashMap<crate::value::SlotIndex, RegExpData>,
+    /// The realm's `%RegExp.prototype%` (a boot object), so a `new RegExp`
+    /// instance (and a `/.../` literal) chains to it and `exec`/`test`/the
+    /// accessor getters resolve.
+    regexp_proto: crate::value::SlotIndex,
+    /// The program-local symbol id of `lastIndex` (XS's `mxID(_lastIndex)`),
+    /// resolved at [`Self::link_intrinsics`], so `re.lastIndex` reads/writes
+    /// the instance's own last-index property. `None` when unreferenced.
+    last_index_id: Option<u16>,
+    /// The program-local symbol ids of the RegExp accessor getters
+    /// (`source`/`flags`/`global`/`ignoreCase`/`multiline`/`dotAll`/`sticky`/
+    /// `unicode`/`hasIndices`/`unicodeSets`), so a `re.source` &co. get routes
+    /// to the accessor in `GET_PROPERTY`. `None` when unreferenced.
+    regexp_getter_ids: RegExpGetterIds,
+    /// The program-local symbol ids of the exec-result array's named slots
+    /// (`index`/`input`/`groups`), set on the match array by `exec`. `None`
+    /// when unreferenced.
+    regexp_result_ids: RegExpResultIds,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -2418,6 +2556,11 @@ impl Interp {
             promise_functions: std::collections::HashMap::new(),
             promise_jobs: std::collections::VecDeque::new(),
             then_id: None,
+            regexps: std::collections::HashMap::new(),
+            regexp_proto: crate::value::SlotIndex::NULL,
+            last_index_id: None,
+            regexp_getter_ids: RegExpGetterIds::default(),
+            regexp_result_ids: RegExpResultIds::default(),
             jumps: Vec::new(),
         };
         interp.create_intrinsics();
@@ -2529,6 +2672,13 @@ impl Interp {
                 // below. The per-instance settlement state lives in the
                 // `promises` side table.
                 Native::Promise => self.slots.alloc(Slot::instance(object_proto)),
+                // `%RegExp.prototype%`: a plain boot object chaining to
+                // %Object.prototype%, carrying `exec`/`test`/`toString` (bound
+                // below) and the `source`/`flags`/per-flag accessor getters
+                // (special-cased by id in `GET_PROPERTY`). The per-instance
+                // compiled program lives in the `regexps` side table;
+                // `lastIndex` is an ordinary own property of the instance.
+                Native::RegExp => self.slots.alloc(Slot::instance(object_proto)),
             };
             self.ctor_prototype.insert(f, proto);
         }
@@ -2782,6 +2932,23 @@ impl Interp {
                 self.proto_methods.push((promise_ctor, name, mf));
             }
         }
+        // `%RegExp.prototype%`: `exec`/`test`/`toString`, bound at link time
+        // only when the program references the name. The per-instance compiled
+        // program lives in the `regexps` side table; the `source`/`flags`/
+        // per-flag accessor getters are special-cased by id in `GET_PROPERTY`.
+        self.regexp_proto = self
+            .intrinsics
+            .get("RegExp")
+            .and_then(|&c| self.ctor_prototype.get(&c).copied())
+            .unwrap_or(crate::value::SlotIndex::NULL);
+        for (name, m) in [
+            ("exec", NativeMethod::RegExpExec),
+            ("test", NativeMethod::RegExpTest),
+            ("toString", NativeMethod::RegExpToString),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((self.regexp_proto, name, mf));
+        }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
         // carries toString/valueOf/hasOwnProperty/isPrototypeOf; each Error
@@ -3016,6 +3183,13 @@ impl Interp {
             ("trim", StringTrim),
             ("trimStart", StringTrimStart),
             ("trimEnd", StringTrimEnd),
+            // The RegExp-consuming String methods (`xsString.c`
+            // `fx_String_prototype_match`/`search`/`replace`/`split`), driving
+            // child 8's matcher over a string-or-RegExp argument.
+            ("match", StringMatch),
+            ("search", StringSearch),
+            ("replace", StringReplace),
+            ("split", StringSplit),
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((p, name, mf));
@@ -3179,6 +3353,24 @@ impl Interp {
         self.byte_offset_id = id_of("byteOffset");
         self.buffer_id = id_of("buffer");
         self.then_id = id_of("then");
+        self.last_index_id = id_of("lastIndex");
+        self.regexp_getter_ids = RegExpGetterIds {
+            source: id_of("source"),
+            flags: id_of("flags"),
+            global: id_of("global"),
+            ignore_case: id_of("ignoreCase"),
+            multiline: id_of("multiline"),
+            dot_all: id_of("dotAll"),
+            sticky: id_of("sticky"),
+            unicode: id_of("unicode"),
+            has_indices: id_of("hasIndices"),
+            unicode_sets: id_of("unicodeSets"),
+        };
+        self.regexp_result_ids = RegExpResultIds {
+            index: id_of("index"),
+            input: id_of("input"),
+            groups: id_of("groups"),
+        };
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -3463,6 +3655,16 @@ impl Interp {
                     // Promise]` — the completion the oracle reports for a bare
                     // promise.
                     "[object Promise]".to_string()
+                } else if let Some(d) = self.regexps.get(&r) {
+                    // A RegExp stringifies through `RegExp.prototype.toString`
+                    // as the `/source/flags` literal (the empty pattern renders
+                    // its `(?:)` source).
+                    let (source, _alloc) = self.regexp_source_bytes(r);
+                    format!(
+                        "/{}/{}",
+                        String::from_utf8_lossy(&source),
+                        d.flags
+                    )
                 } else if let Some(info) = self.error_data.get(&r) {
                     match &info.message {
                         Some(m) if !m.is_empty() => format!("{}: {}", info.name, m),
@@ -4041,6 +4243,15 @@ impl Interp {
                             // `arr.length = N`: the exotic-array length accessor
                             // setter (`fxArrayLengthSetter` → `fxArraySetLength`).
                             self.array_set_length(inst, value);
+                        } else if self.regexps.contains_key(&inst) && Some(id) == self.last_index_id
+                        {
+                            // `re.lastIndex = N`: the `lastIndex` own data
+                            // property, backed by the side table. Coerced with
+                            // `ToLength`-ish integer semantics (the covered
+                            // grammar assigns a non-negative integer).
+                            let n = to_number(&value);
+                            let clamped = if n.is_nan() || n < 0.0 { 0.0 } else { n.floor() };
+                            self.regexps.get_mut(&inst).unwrap().last_index = clamped;
                         } else {
                             self.instance_put(inst, id, value);
                         }
@@ -4129,6 +4340,38 @@ impl Interp {
                             } else if Some(id) == self.buffer_id {
                                 self.meter.tick_raw(TYPED_ARRAY_LENGTH_GET_METERING);
                                 Slot::of(Kind::Reference, Payload::Reference(dv.buffer))
+                            } else {
+                                self.instance_get(inst, id)
+                            }
+                        }
+                        Payload::Reference(inst) if self.regexps.contains_key(&inst) => {
+                            // The RegExp accessor getters (`fx_RegExp_prototype_
+                            // get_*`) and the `lastIndex` own data property.
+                            // `source`/`flags` return strings (a fresh chunk);
+                            // the per-flag getters read `code[0]` and return a
+                            // boolean; `lastIndex` reads the side-table store.
+                            // Any other name (`exec`/`test`/`toString`/
+                            // `constructor`) resolves up the prototype chain.
+                            let g = self.regexp_getter_ids;
+                            if Some(id) == self.last_index_id {
+                                let li = self.regexps[&inst].last_index;
+                                if li == (li as i32) as f64 {
+                                    Slot::integer(li as i32)
+                                } else {
+                                    Slot::number(li)
+                                }
+                            } else if Some(id) == g.source {
+                                self.meter.tick_raw(REGEXP_GETTER_METERING);
+                                let (bytes, _alloc) = self.regexp_source_bytes(inst);
+                                self.new_string_metered(&bytes)
+                            } else if Some(id) == g.flags {
+                                self.meter.tick_raw(REGEXP_GETTER_METERING);
+                                let flags = self.regexps[&inst].flags.clone();
+                                self.new_string_metered(flags.as_bytes())
+                            } else if let Some(bit) = regexp_flag_bit_for(g, id) {
+                                self.meter.tick_raw(REGEXP_GETTER_METERING);
+                                let f = self.regexps[&inst].program.flags();
+                                Slot::boolean(f & bit != 0)
                             } else {
                                 self.instance_get(inst, id)
                             }
@@ -4640,6 +4883,22 @@ impl Interp {
                 }
                 XS_CODE_UNDEFINED => {
                     self.push(Slot::undefined());
+                    pc += size as usize;
+                }
+                // `regexp` (XS_CODE_REGEXP, xsRun.c:2786): push the `RegExp`
+                // constructor (`mxRegExpConstructor`). A `/.../` literal
+                // compiles to `regexp; new; string <pattern>; string <flags>;
+                // run 2` — i.e. `new RegExp(pattern, flags)` — so this handler
+                // just materializes the constructor reference for the `new`
+                // machinery. Pure dispatch, no allocation, no meter (like
+                // `global`).
+                XS_CODE_REGEXP => {
+                    let ctor = self
+                        .intrinsics
+                        .get("RegExp")
+                        .copied()
+                        .unwrap_or(crate::value::SlotIndex::NULL);
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(ctor)));
                     pc += size as usize;
                 }
                 // `string` (XS_CODE_STRING_1/2/4, xsRun.c:3044): a string
@@ -6180,6 +6439,40 @@ impl Interp {
                 }
                 Slot::of(Kind::Reference, Payload::Reference(promise))
             }
+            // `new RegExp(pattern, flags)` and the bare-call `RegExp(...)`
+            // (`fx_RegExp` + `fxInitializeRegExp`): coerce the pattern and
+            // flags to strings, compile the pattern with child 8's matcher,
+            // and build the instance (compiled program + source/flags in the
+            // `regexps` side table, `lastIndex` = 0). A `/.../ ` literal reaches
+            // here as `new RegExp(<pattern>, <flags>)`. A RegExp-valued pattern
+            // (the copy-constructor / `.source`+`.flags` read path) and a
+            // syntax-error or not-yet-ported pattern feature self-name an
+            // honest skip rather than mis-metering the throw.
+            Native::RegExp => {
+                let pattern_arg = arg(0);
+                let flags_arg = arg(1);
+                // A RegExp-valued pattern reads its `source`/`flags` back
+                // through getters (`fx_RegExp`'s `patternIsRegExp` branch) —
+                // a later increment.
+                if let Payload::Reference(r) = pattern_arg.value {
+                    if self.regexps.contains_key(&r) {
+                        return Err(Halt::Unsupported("RegExp:regexp-pattern-arg"));
+                    }
+                }
+                let pattern = if pattern_arg.kind == Kind::Undefined {
+                    String::new()
+                } else {
+                    let bytes = self.to_string_bytes_metered(pattern_arg);
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
+                let flags = if flags_arg.kind == Kind::Undefined {
+                    String::new()
+                } else {
+                    let bytes = self.to_string_bytes_metered(flags_arg);
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
+                self.build_regexp(pattern, flags)?
+            }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -6281,6 +6574,326 @@ impl Interp {
         let derived = self.new_promise_instance();
         let (resolve, reject) = self.make_resolving_functions(derived);
         (derived, resolve, reject)
+    }
+
+    /// The canonical flag string for a compiled flags word (`code[0]`), in
+    /// the fixed `d g i m s u v y` order XS's `fx_RegExp_prototype_get_flags`
+    /// emits (each bit read from `code[0]`).
+    fn regexp_flag_string(flags: u32) -> String {
+        use endor_regexp::{
+            XS_REGEXP_D, XS_REGEXP_G, XS_REGEXP_I, XS_REGEXP_M, XS_REGEXP_S, XS_REGEXP_U,
+            XS_REGEXP_V, XS_REGEXP_Y,
+        };
+        let mut s = String::new();
+        if flags & XS_REGEXP_D != 0 { s.push('d'); }
+        if flags & XS_REGEXP_G != 0 { s.push('g'); }
+        if flags & XS_REGEXP_I != 0 { s.push('i'); }
+        if flags & XS_REGEXP_M != 0 { s.push('m'); }
+        if flags & XS_REGEXP_S != 0 { s.push('s'); }
+        if flags & XS_REGEXP_U != 0 { s.push('u'); }
+        if flags & XS_REGEXP_V != 0 { s.push('v'); }
+        if flags & XS_REGEXP_Y != 0 { s.push('y'); }
+        s
+    }
+
+    /// Build a RegExp instance from a coerced pattern + flags string
+    /// (`fx_RegExp` → `fxNewRegExpInstance` + `fxInitializeRegExp`): compile
+    /// the pattern with child 8's matcher, chain the instance to
+    /// `%RegExp.prototype%`, and record its program/source/flags +
+    /// `lastIndex` = 0 in the `regexps` side table. A syntax error or a
+    /// not-yet-ported pattern feature self-names an honest skip (XS throws a
+    /// catchable `SyntaxError`; endor does not model native-error throws with
+    /// metering this stage, consistent with the other constructors' abort
+    /// handling).
+    fn build_regexp(&mut self, pattern: String, flags: String) -> Result<Slot, Halt> {
+        let program = match endor_regexp::compile(&pattern, &flags) {
+            Ok(p) => p,
+            Err(endor_regexp::CompileError::Syntax(_)) => {
+                return Err(Halt::Unsupported("RegExp:syntax-error-throw"))
+            }
+            Err(endor_regexp::CompileError::Unsupported(name)) => {
+                return Err(Halt::Unsupported(name))
+            }
+        };
+        // `fxNewRegExpInstance`: four `fxNewSlot`s — the instance, the
+        // `XS_REGEXP_KIND` internal slot, the source-key slot, and the
+        // `lastIndex` integer property.
+        for _ in 0..4 {
+            self.meter.tick_slot_alloc();
+        }
+        // `fxCompileRegExp`'s parse meter (`XS_PARSE_REGEXP_METERING` per
+        // byte), carried by the program.
+        self.meter.tick_raw(program.compile_meter_raw);
+        // The `fx_RegExp` host frame + `fxGetPrototypeFromConstructor` + the
+        // `mxRunCount(2)` `fxInitializeRegExp` call framing, plus the
+        // per-source-byte residual (the pattern walk in `fxInitializeRegExp`/
+        // `fxCompileRegExp` beyond the `parser->size` compile meter).
+        self.meter.tick_raw(REGEXP_CTOR_FRAME_METERING);
+        self.meter
+            .tick_raw(REGEXP_CTOR_PER_SOURCE_BYTE * pattern.len() as u64);
+        let canonical_flags = Self::regexp_flag_string(program.flags());
+        let proto = self.regexp_proto;
+        let inst = self.slots.alloc(Slot::instance(proto));
+        self.regexps.insert(
+            inst,
+            RegExpData {
+                program,
+                source: pattern,
+                flags: canonical_flags,
+                last_index: 0.0,
+            },
+        );
+        Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
+    }
+
+    /// Drive the matcher for `exec`/`test` (`fxMatchRegExp` from the resolved
+    /// `lastIndex`): returns `(matched, captures, match_start, match_end)` in
+    /// **code-unit** offsets (== byte offsets for the covered non-`u`,
+    /// ASCII-subject subset), charging the match meter and updating
+    /// `lastIndex`. A non-ASCII subject under a `g`/`y` flag (where the
+    /// code-unit↔byte `lastIndex` remap matters) self-names an honest skip.
+    fn regexp_match_drive(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        subject: &[u8],
+    ) -> Result<(bool, Vec<(i32, i32)>), Halt> {
+        let (flags_word, global, sticky, last_index) = {
+            let d = &self.regexps[&inst];
+            let f = d.program.flags();
+            (
+                f,
+                f & endor_regexp::XS_REGEXP_G != 0,
+                f & endor_regexp::XS_REGEXP_Y != 0,
+                d.last_index,
+            )
+        };
+        let _ = flags_word;
+        let advance = global || sticky;
+        // The code-unit↔byte `lastIndex` remap (`fxCacheUnicodeToUTF8Offset`)
+        // is identity only for an ASCII subject; a multi-byte subject under a
+        // stateful flag self-names.
+        if advance && !subject.is_ascii() {
+            return Err(Halt::Unsupported("RegExp:non-ascii-stateful-lastIndex"));
+        }
+        let start = if advance { last_index } else { 0.0 };
+        let stop = subject.len() as f64;
+        if advance && start > stop {
+            // `lastIndex` past the end: no match, reset to 0.
+            self.regexps.get_mut(&inst).unwrap().last_index = 0.0;
+            let captures = vec![(-1, -1); self.regexps[&inst].program.capture_count];
+            return Ok((false, captures));
+        }
+        if advance {
+            // `fxCacheUnicodeToUTF8Offset` (read `lastIndex` → byte offset) +
+            // `fxCacheUTF8ToUnicodeOffset` (write the match end back) framing.
+            self.meter.tick_raw(REGEXP_STATEFUL_METERING);
+        }
+        let start_i = start as i32;
+        let outcome = {
+            let program = &self.regexps[&inst].program;
+            endor_regexp::match_regexp(program, subject, start_i)
+        };
+        self.meter.tick_raw(outcome.match_meter_raw);
+        if !outcome.matched {
+            if advance {
+                self.regexps.get_mut(&inst).unwrap().last_index = 0.0;
+            }
+            return Ok((false, outcome.captures));
+        }
+        if advance {
+            // Advance `lastIndex` to the whole-match end (code units == bytes
+            // for ASCII).
+            let end = outcome.captures[0].1 as f64;
+            self.regexps.get_mut(&inst).unwrap().last_index = end;
+        }
+        Ok((true, outcome.captures))
+    }
+
+    /// `RegExp.prototype.exec(string)` (`fx_RegExp_prototype_exec`): the match
+    /// drive plus the result-array construction (`[whole, ...captures]` with
+    /// the `index`/`input`/`groups` own properties), or `null` on no match.
+    fn regexp_exec(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        arg0: Slot,
+    ) -> Result<Slot, Halt> {
+        self.meter.tick_raw(REGEXP_EXEC_FRAME_METERING);
+        let subject_slot = self.to_string_slot_metered(arg0);
+        let subject = match subject_slot.value {
+            Payload::String(off) => self.str_content(off).to_vec(),
+            _ => Vec::new(),
+        };
+        let named = self.regexps[&inst].program.name_count > 0;
+        if named {
+            // Named-group result shaping (`groups` object) is a later
+            // increment — self-name rather than emit a wrong `groups`.
+            return Err(Halt::Unsupported("RegExp.exec:named-groups"));
+        }
+        let (matched, captures) = self.regexp_match_drive(inst, &subject)?;
+        if !matched {
+            return Ok(Slot::null());
+        }
+        // On a match XS charges a per-match residual plus a small per-extra-
+        // capture residual (the `fxCacheUTF8ToUnicodeOffset` remaps and
+        // `fxCacheArray`), beyond the explicit per-capture slot/chunk allocs.
+        let capture_count = captures.len() as u64;
+        self.meter.tick_raw(
+            REGEXP_EXEC_MATCH_METERING
+                + REGEXP_EXEC_PER_CAPTURE * capture_count.saturating_sub(1),
+        );
+        let match_start = captures[0].0;
+        // The result array: one element per capture (whole match at 0).
+        let result = self.new_array_unmetered();
+        let mut items: Vec<(u32, Slot)> = Vec::with_capacity(captures.len());
+        for (i, &(from, to)) in captures.iter().enumerate() {
+            // `resultItem = fxNewSlot` per capture.
+            self.meter.tick_slot_alloc();
+            let slot = if from >= 0 {
+                let piece = &subject[from as usize..to as usize];
+                self.new_string_metered(piece)
+            } else {
+                Slot::undefined()
+            };
+            items.push((i as u32, slot));
+        }
+        {
+            let a = self.arrays.get_mut(&result).unwrap();
+            for (i, s) in items {
+                a.items.insert(i, s);
+            }
+            a.length = captures.len() as u32;
+        }
+        // The three named own properties `index`/`input`/`groups`, each a
+        // `fxNewSlot` on the result array.
+        self.meter.tick_slot_alloc(); // index
+        if let Some(id) = self.regexp_result_ids.index {
+            self.instance_put_raw(result, id, Slot::integer(match_start));
+        }
+        self.meter.tick_slot_alloc(); // input
+        if let Some(id) = self.regexp_result_ids.input {
+            // XS aliases `input` to the argument string (no copy), so reuse the
+            // coerced subject slot rather than allocating a fresh chunk.
+            self.instance_put_raw(result, id, subject_slot);
+        }
+        self.meter.tick_slot_alloc(); // groups
+        if let Some(id) = self.regexp_result_ids.groups {
+            self.instance_put_raw(result, id, Slot::undefined());
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(result)))
+    }
+
+    /// `RegExp.prototype.test(string)` (`fx_RegExp_prototype_test` →
+    /// `fxExecuteRegExp`): XS's `test` invokes `this.exec(string)` in full
+    /// (building the result array) and maps the result to a boolean, so the
+    /// metering is `exec`'s entire cost plus `test`'s own frame and the
+    /// `mxGetID(_exec)` + `mxRunCount(1)` re-entrant call framing. endor
+    /// mirrors that: run the exec machinery, discard the array, return the
+    /// boolean.
+    fn regexp_test(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        arg0: Slot,
+    ) -> Result<Slot, Halt> {
+        self.meter.tick_raw(REGEXP_TEST_FRAME_METERING);
+        let result = self.regexp_exec(inst, arg0)?;
+        Ok(Slot::boolean(result.kind != Kind::Null))
+    }
+
+    /// `RegExp.prototype.toString()` (`fx_RegExp_prototype_toString`): the
+    /// `/source/flags` literal, built from the (escaped) source and the flag
+    /// string.
+    fn regexp_to_string(&mut self, inst: crate::value::SlotIndex) -> Result<Slot, Halt> {
+        let (source_bytes, _escaped) = self.regexp_source_bytes(inst);
+        let flags = self.regexps[&inst].flags.clone();
+        let mut out = Vec::with_capacity(source_bytes.len() + flags.len() + 2);
+        out.push(b'/');
+        out.extend_from_slice(&source_bytes);
+        out.push(b'/');
+        out.extend_from_slice(flags.as_bytes());
+        Ok(self.new_string_metered(&out))
+    }
+
+    /// The `.source` getter's bytes (`fx_RegExp_prototype_get_source`): the
+    /// empty pattern renders as `(?:)`; otherwise `/`, newlines, and LS/PS are
+    /// backslash-escaped. Returns `(bytes, allocated)` where `allocated` is
+    /// true when XS builds a fresh escaped chunk (an unescaped source is
+    /// returned as the interned key string, no allocation).
+    fn regexp_source_bytes(&self, inst: crate::value::SlotIndex) -> (Vec<u8>, bool) {
+        let src = self.regexps[&inst].source.as_bytes();
+        if src.is_empty() {
+            return (b"(?:)".to_vec(), false);
+        }
+        // Does any character need escaping?
+        let mut needs = false;
+        let mut prev = 0u8;
+        let mut i = 0;
+        while i < src.len() {
+            let c = src[i];
+            if (c == b'/' && prev != b'\\') || c == 10 || c == 13 {
+                needs = true;
+            } else if c == 0xE2
+                && i + 2 < src.len()
+                && src[i + 1] == 0x80
+                && (src[i + 2] == 0xA8 || src[i + 2] == 0xA9)
+            {
+                needs = true;
+            }
+            prev = c;
+            i += 1;
+        }
+        if !needs {
+            return (src.to_vec(), false);
+        }
+        let mut out = Vec::with_capacity(src.len() + 4);
+        prev = 0;
+        i = 0;
+        while i < src.len() {
+            let c = src[i];
+            if c == b'/' && prev != b'\\' {
+                out.push(b'\\');
+                out.push(b'/');
+            } else if c == 10 {
+                out.push(b'\\');
+                out.push(b'n');
+            } else if c == 13 {
+                out.push(b'\\');
+                out.push(b'r');
+            } else if c == 0xE2
+                && i + 2 < src.len()
+                && src[i + 1] == 0x80
+                && src[i + 2] == 0xA8
+            {
+                out.extend_from_slice(b"\\u2028");
+                i += 2;
+            } else if c == 0xE2
+                && i + 2 < src.len()
+                && src[i + 1] == 0x80
+                && src[i + 2] == 0xA9
+            {
+                out.extend_from_slice(b"\\u2029");
+                i += 2;
+            } else {
+                out.push(c);
+            }
+            prev = c;
+            i += 1;
+        }
+        (out, true)
+    }
+
+    /// Insert an own data property onto a freshly-built boot instance (the
+    /// exec result array's `index`/`input`/`groups`) as a single linked
+    /// `fxNewSlot`, without the property-table-growth cost `instance_put`
+    /// charges (the slot alloc is metered by the caller, mirroring XS's
+    /// `resultItem = resultItem->next = fxNewSlot`).
+    fn instance_put_raw(&mut self, inst: crate::value::SlotIndex, id: u16, value: Slot) {
+        let head = self.slots.get(inst).next;
+        let mut prop = value;
+        prop.id = id;
+        prop.flag = 0;
+        prop.next = head;
+        let idx = self.slots.alloc(prop);
+        self.slots.get_mut(inst).next = idx;
     }
 
     /// `Promise.prototype.then(onFulfilled, onRejected)`
@@ -8875,6 +9488,44 @@ impl Interp {
             // (`call_promise_function`) and never reach here.
             NativeMethod::PromiseResolveFunction | NativeMethod::PromiseRejectFunction => {
                 return Err(Halt::Unsupported("promise:resolving-fn-unexpected"))
+            }
+            // `RegExp.prototype.exec`/`test`/`toString` — the JavaScript RegExp
+            // surface over child 8's matcher.
+            NativeMethod::RegExpExec => {
+                let inst = match this.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("RegExp.exec:non-regexp-this")),
+                };
+                self.regexp_exec(inst, arg0)?
+            }
+            NativeMethod::RegExpTest => {
+                let inst = match this.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("RegExp.test:non-regexp-this")),
+                };
+                self.regexp_test(inst, arg0)?
+            }
+            NativeMethod::RegExpToString => {
+                let inst = match this.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("RegExp.toString:non-regexp-this")),
+                };
+                self.regexp_to_string(inst)?
+            }
+            // `String.prototype.{match,search,replace,split}` over the matcher
+            // — a later increment; self-name so the runner records an honest
+            // skip rather than a wrong value.
+            NativeMethod::StringMatch => {
+                return Err(Halt::Unsupported("String.prototype.match"))
+            }
+            NativeMethod::StringSearch => {
+                return Err(Halt::Unsupported("String.prototype.search"))
+            }
+            NativeMethod::StringReplace => {
+                return Err(Halt::Unsupported("String.prototype.replace"))
+            }
+            NativeMethod::StringSplit => {
+                return Err(Halt::Unsupported("String.prototype.split"))
             }
         };
         self.stack.truncate(base);
@@ -12330,6 +12981,32 @@ impl Interp {
     /// fresh chunk (`fxNumberToString` → `tick_chunk_new(len+1)`); a string
     /// is identity and a boolean/null/undefined is an interned string, both
     /// allocation-free.
+    /// Coerce a value to a **String slot** (`fxToString`), metering exactly
+    /// the allocation `fxToString` performs. A string is identity (no chunk);
+    /// a number/bigint renders into a fresh chunk; a boolean/null/undefined is
+    /// an interned string. Used where the coerced string itself is retained
+    /// (e.g. `exec`'s `input`, which XS aliases to the argument string rather
+    /// than copying).
+    fn to_string_slot_metered(&mut self, s: Slot) -> Slot {
+        if s.kind == Kind::String {
+            return s;
+        }
+        let bytes = self.to_string_bytes_metered(s);
+        // `to_string_bytes_metered` already charged the render chunk; re-alloc
+        // the interned slot without double-charging the chunk (a number's
+        // chunk was metered; the boolean/null/undefined interned strings carry
+        // no chunk). Mirror `new_string_metered`'s chunk for the number case is
+        // already paid, so store the bytes without re-metering.
+        if bytes.is_empty() {
+            let off = self.chunks.alloc(b"\x00");
+            return Slot::of(Kind::String, Payload::String(off));
+        }
+        let mut buf = bytes;
+        buf.push(0);
+        let off = self.chunks.alloc(&buf);
+        Slot::of(Kind::String, Payload::String(off))
+    }
+
     fn to_string_bytes_metered(&mut self, s: Slot) -> Vec<u8> {
         match s.value {
             Payload::String(off) => self.str_content(off).to_vec(),
@@ -12651,6 +13328,37 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::TypedArray(_) => "native-call:TypedArray",
         Native::DataView => "native-call:DataView",
         Native::Promise => "native-call:Promise",
+        Native::RegExp => "native-call:RegExp",
+    }
+}
+
+/// Map a property id to the `XS_REGEXP_*` bit its boolean per-flag getter
+/// reads (`fx_RegExp_prototype_get_{global,ignoreCase,…}`), or `None` when
+/// the id is not one of the per-flag getters.
+fn regexp_flag_bit_for(g: RegExpGetterIds, id: u16) -> Option<u32> {
+    use endor_regexp::{
+        XS_REGEXP_D, XS_REGEXP_G, XS_REGEXP_I, XS_REGEXP_M, XS_REGEXP_S, XS_REGEXP_U, XS_REGEXP_V,
+        XS_REGEXP_Y,
+    };
+    let some = Some(id);
+    if some == g.global {
+        Some(XS_REGEXP_G)
+    } else if some == g.ignore_case {
+        Some(XS_REGEXP_I)
+    } else if some == g.multiline {
+        Some(XS_REGEXP_M)
+    } else if some == g.dot_all {
+        Some(XS_REGEXP_S)
+    } else if some == g.sticky {
+        Some(XS_REGEXP_Y)
+    } else if some == g.unicode {
+        Some(XS_REGEXP_U)
+    } else if some == g.has_indices {
+        Some(XS_REGEXP_D)
+    } else if some == g.unicode_sets {
+        Some(XS_REGEXP_V)
+    } else {
+        None
     }
 }
 

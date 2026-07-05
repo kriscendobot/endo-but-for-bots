@@ -10,6 +10,13 @@ publish.workspace = true
 name = "endor_vm"
 path = "src/lib.rs"
 
+[dependencies]
+# The engine-internal XSRE matcher (child 8). endor-vm links it as the
+# JavaScript `RegExp` surface (child 9): construction compiles a pattern
+# with `compile`, and `exec`/`test`/the String regex methods drive
+# `match_regexp`. Both halves are `#![forbid(unsafe_code)]`.
+endor-regexp = { path = "../endor-regexp" }
+
 [features]
 # Off by default. The determinism firewall (design
 # `designs/xs2rust-endor-meter-opcode-cost-instrumentation.md` § firewall):

@@ -47,6 +47,9 @@ dependencies = [
 [[package]]
 name = "endor-vm"
 version = "0.0.1"
+dependencies = [
+ "endor-regexp",
+]
 
 [[package]]
 name = "find-msvc-tools"
