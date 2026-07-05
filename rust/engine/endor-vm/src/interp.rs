@@ -700,9 +700,56 @@ pub const JSON_STRINGIFY_SETUP_METERING: u64 = 82432;
 /// The extra residual a `JSON.stringify` of a **produced** top-level primitive
 /// accrues over the setup (the `fxStringifyJSONName` + value-append path):
 /// a fixed `16384` (`1 << 14`), independent of the primitive's spelling (the
-/// result chunk is metered separately). Structured (object/array) values carry
-/// per-node allocation costs not modeled this stage — they self-name.
+/// result chunk is metered separately). This is also the recursive
+/// `fxStringifyJSONProperty` leaf cost — a primitive property/element serializes
+/// for exactly one built-in step.
 pub const JSON_STRINGIFY_SCALAR_METERING: u64 = 1 << 14;
+
+// Structured `JSON.stringify` (object/array) per-node metering, decomposed
+// against the pin `48ee02d8cfe0` `xsJSON.c` `fxStringifyJSONProperty` and its
+// callees, and reconciled bit-exact against the oracle (README § the JSON
+// stage). Every value walked recurses through `fxStringifyJSONProperty`; the
+// costs below are the run-only 16.16 units that call charges, exclusive of the
+// result chunk (which the caller meters once via `new_string_metered`) and of
+// the setup holder ([`JSON_STRINGIFY_SETUP_METERING`]). Each constant is a whole
+// number of `mxMeterOne` (`1<<14`) steps plus the exact `fxNewSlot`/`fxNewChunk`
+// allocations the C path makes, not a fitted total.
+//
+/// A top-level reference pays no residual over the recursive child cost beyond
+/// the setup: the wrapper's holder fetch and the enter costs fully account for
+/// it. Measured against the pin — the enter constants below are anchored at the
+/// value the top-level node actually charges, so no top-only term is added.
+pub const JSON_STRINGIFY_TOP_REFERENCE_METERING: u64 = 0;
+/// Entering an **array** node (`fxIsArray` true): `fxStringifyJSONChars("[")`,
+/// `mxGetID(_length)`, `fxToInteger`, the empty/`]` close — `11` built-in steps
+/// (`180224`), value-independent, paid by every array however deep.
+pub const JSON_STRINGIFY_ARRAY_ENTER_METERING: u64 = 11 << 14;
+/// A **non-empty** array's one-time `level`/indent setup over the enter cost:
+/// one built-in step (`16384`).
+pub const JSON_STRINGIFY_ARRAY_NONEMPTY_METERING: u64 = 1 << 14;
+/// Each array element's per-iteration body (`mxPushReference`, `mxGetIndex`,
+/// `mxPushInteger`, the recursive dispatch frame): `5` built-in steps
+/// (`81920`), exclusive of the recursive child cost added on top.
+pub const JSON_STRINGIFY_ARRAY_ELEMENT_METERING: u64 = 5 << 14;
+/// Entering an **object** node: `fxStringifyJSONChars("{")`, `at =
+/// fxNewInstance` (one `fxNewSlot`, `+256`), the `mxBehaviorOwnKeys` base walk,
+/// the empty/`}` close — `8` built-in steps plus the instance slot
+/// (`131072 + 256 = 131328`).
+pub const JSON_STRINGIFY_OBJECT_ENTER_METERING: u64 = (8 << 14) + 256;
+/// Each own enumerable key contributes one `XS_AT_KIND` slot to the keys list
+/// `mxBehaviorOwnKeys` builds (`fxNewSlot`, `+256`), charged per own key whether
+/// or not it survives the `getOwnProperty`/`DONT_ENUM` filter.
+pub const JSON_STRINGIFY_OBJECT_KEY_SLOT_METERING: u64 = 256;
+/// A **non-empty** object's one-time `level`/indent + `mxPushUndefined`/
+/// `mxPushReference` setup over the enter cost — `65528`. (Not a clean step
+/// multiple: the `mxBehaviorGetOwnProperty` probe of the reference's first
+/// internal slot shaves 8 raw units off the fourth step; measured against the
+/// pin.)
+pub const JSON_STRINGIFY_OBJECT_NONEMPTY_METERING: u64 = (4 << 14) - 8;
+/// Each surviving object key's per-iteration body (`getOwnProperty`, `mxGetAll`,
+/// `fxStringifyJSONName`, the recursive dispatch frame): `4` built-in steps
+/// (`65536`), exclusive of the key chunk and the recursive child cost.
+pub const JSON_STRINGIFY_OBJECT_KEY_BODY_METERING: u64 = 4 << 14;
 
 /// The raw 16.16 native-host-frame cost of a `String.prototype` method call,
 /// beyond the modeled `mxMeterSome` steps and the result chunk. Like the
@@ -8479,21 +8526,29 @@ impl Interp {
                 {
                     return Err(Halt::Unsupported("JSON.stringify:replacer-or-space"));
                 }
-                // A structured (object/array) value carries per-node allocation
-                // costs (the keys instance, per-key strings, the recursive
-                // property frames) not yet modeled to a clean constant — it
-                // self-names an honest skip rather than a computron divergence.
-                // A top-level primitive is bit-exact.
+                // A callable top-level value serializes to nothing but still
+                // runs the reference branch's `toJSON` probe, a corner endor
+                // does not meter — self-name it rather than risk a divergence.
                 if arg0.kind == Kind::Reference {
-                    return Err(Halt::Unsupported("JSON.stringify:structured-metering"));
+                    if let Payload::Reference(r) = arg0.value {
+                        if self.functions.contains_key(&r) {
+                            return Err(Halt::Unsupported("JSON.stringify:callable-top"));
+                        }
+                    }
                 }
                 self.meter.tick_raw(JSON_STRINGIFY_SETUP_METERING);
                 let mut visited: Vec<crate::value::SlotIndex> = Vec::new();
-                match self.json_serialize(arg0, &mut visited)? {
-                    Some(bytes) => {
-                        self.meter.tick_raw(JSON_STRINGIFY_SCALAR_METERING);
-                        Ok(self.new_string_metered(&bytes))
-                    }
+                // `cost` accumulates the recursive `fxStringifyJSONProperty` node
+                // metering (exclusive of the result chunk); a top-level
+                // reference pays [`JSON_STRINGIFY_TOP_REFERENCE_METERING`] once.
+                let mut cost: u64 = 0;
+                let out = self.json_serialize(arg0, &mut visited, &mut cost)?;
+                if arg0.kind == Kind::Reference && out.is_some() {
+                    cost += JSON_STRINGIFY_TOP_REFERENCE_METERING;
+                }
+                self.meter.tick_raw(cost);
+                match out {
+                    Some(bytes) => Ok(self.new_string_metered(&bytes)),
                     // A value that serializes to nothing (undefined / symbol)
                     // yields `undefined`, with no chunk (setup metered only).
                     None => Ok(Slot::undefined()),
@@ -8516,31 +8571,45 @@ impl Interp {
         &mut self,
         value: Slot,
         visited: &mut Vec<crate::value::SlotIndex>,
+        cost: &mut u64,
     ) -> Result<Option<Vec<u8>>, Halt> {
         match value.kind {
-            Kind::Null => Ok(Some(b"null".to_vec())),
+            Kind::Null => {
+                *cost += JSON_STRINGIFY_SCALAR_METERING;
+                Ok(Some(b"null".to_vec()))
+            }
             Kind::Undefined => Ok(None),
-            Kind::Boolean => Ok(Some(
-                if matches!(value.value, Payload::Boolean(true)) {
-                    b"true".to_vec()
-                } else {
-                    b"false".to_vec()
-                },
-            )),
+            Kind::Boolean => {
+                *cost += JSON_STRINGIFY_SCALAR_METERING;
+                Ok(Some(
+                    if matches!(value.value, Payload::Boolean(true)) {
+                        b"true".to_vec()
+                    } else {
+                        b"false".to_vec()
+                    },
+                ))
+            }
             Kind::Integer => match value.value {
-                Payload::Integer(i) => Ok(Some(i.to_string().into_bytes())),
+                Payload::Integer(i) => {
+                    *cost += JSON_STRINGIFY_SCALAR_METERING;
+                    Ok(Some(i.to_string().into_bytes()))
+                }
                 _ => Ok(None),
             },
             Kind::Number => match value.value {
-                Payload::Number(n) => Ok(Some(if n.is_finite() {
-                    number_to_ecma_string(n).into_bytes()
-                } else {
-                    b"null".to_vec()
-                })),
+                Payload::Number(n) => {
+                    *cost += JSON_STRINGIFY_SCALAR_METERING;
+                    Ok(Some(if n.is_finite() {
+                        number_to_ecma_string(n).into_bytes()
+                    } else {
+                        b"null".to_vec()
+                    }))
+                }
                 _ => Ok(None),
             },
             Kind::String => match value.value {
                 Payload::String(off) => {
+                    *cost += JSON_STRINGIFY_SCALAR_METERING;
                     let content = self.str_content(off).to_vec();
                     Ok(Some(json_escape_string(&content)))
                 }
@@ -8551,9 +8620,12 @@ impl Interp {
                     Payload::Reference(r) => r,
                     _ => return Ok(None),
                 };
-                // A callable value serializes to nothing.
+                // A callable value serializes to nothing (`{}` / `null`), but XS
+                // still runs the reference branch's `mxGetID(_toJSON)` probe,
+                // whose cost endor does not model here — self-name the corner
+                // rather than risk a computron divergence.
                 if self.functions.contains_key(&inst) {
-                    return Ok(None);
+                    return Err(Halt::Unsupported("JSON.stringify:callable-value"));
                 }
                 // A boxed wrapper (Number/String/Boolean object) unwraps to its
                 // primitive in XS — not modeled here; self-name.
@@ -8572,19 +8644,28 @@ impl Interp {
                 }
                 visited.push(inst);
                 let out = if let Some(a) = self.arrays.get(&inst).cloned() {
+                    // `fxIsArray` branch: enter cost, then one iteration body per
+                    // index (paid for holes too — they serialize as `null`), plus
+                    // the recursive child cost each element adds through `cost`.
+                    *cost += JSON_STRINGIFY_ARRAY_ENTER_METERING;
+                    if a.length > 0 {
+                        *cost += JSON_STRINGIFY_ARRAY_NONEMPTY_METERING;
+                    }
                     let mut buf = vec![b'['];
                     for i in 0..a.length {
                         if i > 0 {
                             buf.push(b',');
                         }
+                        *cost += JSON_STRINGIFY_ARRAY_ELEMENT_METERING;
                         let elem = a
                             .items
                             .get(&i)
                             .map(|s| Slot::of(s.kind, s.value))
                             .unwrap_or_else(Slot::undefined);
-                        // A hole / undefined / callable element serializes as
-                        // `null` in array context.
-                        match self.json_serialize(elem, visited)? {
+                        // A hole / undefined element serializes as `null` in
+                        // array context (a callable element self-names inside
+                        // `json_serialize`).
+                        match self.json_serialize(elem, visited, cost)? {
                             Some(b) => buf.extend_from_slice(&b),
                             None => buf.extend_from_slice(b"null"),
                         }
@@ -8596,11 +8677,24 @@ impl Interp {
                     // properties in insertion order, skipping values that
                     // serialize to nothing.
                     let keys = self.object_own_string_keys(inst);
+                    // Enter cost, one `XS_AT_KIND` keys-list slot per own key, and
+                    // the non-empty setup when the keys list is non-empty.
+                    *cost += JSON_STRINGIFY_OBJECT_ENTER_METERING;
+                    *cost += keys.len() as u64 * JSON_STRINGIFY_OBJECT_KEY_SLOT_METERING;
+                    if !keys.is_empty() {
+                        *cost += JSON_STRINGIFY_OBJECT_NONEMPTY_METERING;
+                    }
                     let mut buf = vec![b'{'];
                     let mut first = true;
                     for (id, key) in keys {
+                        // Each enumerable own key runs the loop body
+                        // (`getOwnProperty`/`getAll`/`fxPushKeyString`) whether or
+                        // not its value emits; the key-string chunk is
+                        // `fxNewChunk(len+1)` rounded to 8-byte alignment.
+                        *cost += JSON_STRINGIFY_OBJECT_KEY_BODY_METERING
+                            + (((key.len() as u64 + 1) + 7) & !7);
                         let v = self.instance_get(inst, id);
-                        if let Some(vb) = self.json_serialize(v, visited)? {
+                        if let Some(vb) = self.json_serialize(v, visited, cost)? {
                             if !first {
                                 buf.push(b',');
                             }
