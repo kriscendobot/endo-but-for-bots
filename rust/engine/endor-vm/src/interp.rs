@@ -963,6 +963,11 @@ pub const PROMISE_THEN_METERING: u64 = 278536;
 /// explicitly in [`Interp::promise_then`]. Measured zero. Calibrated against
 /// the pin.
 pub const PROMISE_REACTION_METERING: u64 = 0;
+/// The native residual of `Promise.prototype.catch` (`fx_Promise_prototype_
+/// catch`) BEYOND the `then` it delegates to: the frame, `mxGetID(_then)`, and
+/// the `mxRunCount(2)` re-dispatch into `then`. Calibrated raw-exact against
+/// the pin (`147456` = 2.25 `XS_CODE_METERING`).
+pub const PROMISE_CATCH_FRAME_METERING: u64 = 147456;
 /// The residual of queuing one promise job (`fxQueueJob`): the job instance +
 /// the `count + 4` captured argument slots. Charged when a settled promise's
 /// reaction is queued (at `.then` on a settled promise, or at settle time for
@@ -6260,6 +6265,18 @@ impl Interp {
     fn promise_then(&mut self, promise: crate::value::SlotIndex, base: usize) -> Result<Slot, Halt> {
         let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
         let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+        self.promise_then_with(promise, arg0, arg1)
+    }
+
+    /// The core of `.then` (`fxPromiseThen`), given the raw handler slots. A
+    /// handler is "present" iff it is a reference (XS's `mxIsReference` gate).
+    /// Shared by `.then` and `.catch` (which passes `(undefined, onRejected)`).
+    fn promise_then_with(
+        &mut self,
+        promise: crate::value::SlotIndex,
+        arg0: Slot,
+        arg1: Slot,
+    ) -> Result<Slot, Halt> {
         let on_fulfilled = if arg0.kind == Kind::Reference {
             arg0
         } else {
@@ -8798,8 +8815,19 @@ impl Interp {
                 self.settle_promise(derived, arg0, true, 1)?;
                 Slot::of(Kind::Reference, Payload::Reference(derived))
             }
-            NativeMethod::PromiseCatch
-            | NativeMethod::PromiseFinally
+            // `Promise.prototype.catch(onRejected)`: `this.then(undefined,
+            // onRejected)`. XS routes through the actual `then` method (a
+            // `mxGetID(_then)` + `mxRunCount(2)`), so it carries a small frame
+            // over the `then` cost.
+            NativeMethod::PromiseCatch => {
+                let promise = match this.value {
+                    Payload::Reference(r) if self.promises.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("catch:non-promise-this")),
+                };
+                self.meter.tick_raw(PROMISE_CATCH_FRAME_METERING);
+                self.promise_then_with(promise, Slot::undefined(), arg0)?
+            }
+            NativeMethod::PromiseFinally
             | NativeMethod::PromiseAll
             | NativeMethod::PromiseRace
             | NativeMethod::PromiseAllSettled
