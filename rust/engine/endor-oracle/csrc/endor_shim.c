@@ -122,6 +122,24 @@ int endor_oracle_run(const char *source, txU4 sourceLen, EndorOracleResult *out)
 			the->meterIndex = 0;
 			fxRunScript(the, script, mxRealmGlobal(realm), C_NULL,
 				mxRealmClosures(realm)->value.reference, C_NULL, module);
+			/* Pump-loop latch: drain the promise job queue with metering
+			 * still accumulating, modeling the host-driven microtask drain
+			 * the endor embedding performs after a crank (design § promises,
+			 * the pump-loop latch). fxRunScript queues promise jobs — setting
+			 * the->promiseJobs via the xsnap-platform fxQueuePromiseJobs —
+			 * but does not run them; the metered computron count must include
+			 * the reactions, since a crank's cost (message delivery plus its
+			 * microtask drain) is the consensus-relevant unit. We drain via
+			 * fxRunPromiseJobs (not fxRunLoop) so no timer jobs run and no
+			 * exit-time unhandled-rejection check aborts a completed run. The
+			 * queue-neutral fxRunPromiseJobs leaves the script's completion
+			 * value at the stack top, captured below. A program that queues
+			 * no jobs leaves the->promiseJobs clear, so this is a no-op and
+			 * the non-promise corpora measure identically. */
+			while (the->promiseJobs) {
+				the->promiseJobs = 0;
+				fxRunPromiseJobs(the);
+			}
 			out->computrons = the->meterIndex >> 16;
 			out->meter_raw = (txU4)the->meterIndex;
 
