@@ -385,8 +385,45 @@ key, a computed read / `in` of a boot default-key name the program never
 referenced (the incomplete `%Object.prototype%` member set), a
 `defineProperty` with a partial or accessor descriptor / a redefine of an
 existing key / a non-object descriptor / a non-boolean attribute / an
-enumerable **novel** key `Object.keys` cannot render to a string. The stage-3
-built-ins reach
+enumerable **novel** key `Object.keys` cannot render to a string.
+
+The stage-3b **promises** child (7/9) lands `Promise`, the promise **job
+queue**, and the **pump-loop latch** — the host-driven microtask drain the
+endor embedding performs after a crank. `xsPromise.c` calls `mxMeter` exactly
+once in the whole file (the unhandled-rejection list walk), so promise metering
+is almost entirely allocation-driven: the `fxNewSlot` clusters of
+`fxNewPromiseInstance` (6 slots), `fxPushPromiseFunctions` (13 — the two
+resolve/reject host functions + their shared home object),
+`fxNewPromiseCapability` (a derived promise + resolving pair + 8),
+`fxPromiseThen`'s reaction (6, +1 THENS-link when the promise is still pending),
+and `fxQueueJob` (6 per queued job), each over the calibrated native frame of
+its entry point and the reaction/executor bodies the re-entrant dispatch meters
+(interp.rs § Promise metering). Landed bit-exact (result AND computron) against
+the pin: `new Promise(executor)` (the executor invoked synchronously, its
+resolve/reject settling the instance under a shared `[[AlreadyResolved]]`
+guard), `Promise.resolve`/`Promise.reject`, `then`/`catch` (reaction
+registration returning a derived promise), and the whole microtask machinery —
+resolution chains, already-settled promises, pass-through (a handler-less
+`then()`), and rejection routing — with the reactions **run at the drain**. The
+drain is the crux of the consensus-relevant scheduling: `fxRunScript` queues
+promise jobs but does not run them, so BOTH sides pump the queue after the
+script settles — the oracle shim gained a post-`fxRunScript` `fxRunPromiseJobs`
+loop (metering still accumulating) and `endor-vm::run` drains its own job queue
+the same way, so the metered computrons include the whole crank (message
+delivery plus its microtask drain), the unit an xsnap/Agoric crank meters. The
+curated `stage3b-promises.js` corpus and the `gen_stage3b_promise_program`
+fulfilled-chain fuzz arm agree bit-exactly, and `built-ins/Promise` dual-run
+grows to `total=474 covered=7 divergent=0` (from ~0 before this child — the
+constructor bound as a value but no machinery). The honest **named skips** are:
+**thenable adoption** (`resolve` with a reference / `Promise.resolve(object)` /
+a reaction returning a promise), a reaction **handler that throws** (the thrown
+value's capture out of the re-entrant frame is a later increment), `.finally`,
+the `all`/`race`/`allSettled`/`any` **combinators**, a non-user-function
+executor, and — stage 4's charter — **async functions / await** (the
+`structural:async-or-can-block` skip dominating the section); each self-names
+`Halt::Unsupported` rather than answer a wrong value or a computron divergence.
+
+The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
 table, so a `Boolean`/`Object`/… reference relinks to endor's intrinsic
