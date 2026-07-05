@@ -13,6 +13,7 @@ so it builds in-repo from the first commit (resolved question 9).
 | `endor-oracle` | audited FFI (the one exception) | Compiles JS to XS bytecode and runs it on C-XS, returning `(bytecode, result, run-only computrons)`. Dev/CI only; never linked into a shipped engine. |
 | `endor-262` | `#![forbid(unsafe_code)]` | Dual-run harness: runs the same bytecode on `endor-vm` and the oracle, recording four-valued + computron agreement. |
 | `endor-fuzz` | `#![forbid(unsafe_code)]` | cargo-fuzz targets 1 (differential source) and 2 (bytecode decoder), authored so the logic is a plain testable lib. |
+| `endor-regexp` | `#![forbid(unsafe_code)]` | Engine-internal port of the XS RegExp engine (`xsre.c`): the pattern compiler (parse → measure → code) and the backtracking match VM, metering-exact against the pin. No JavaScript surface (child 9 integrates). |
 
 ## Building the oracle: the `c/moddable` pin
 
@@ -443,3 +444,67 @@ not include the built-ins (`eval`/`String`/`Array`/`typeof`/real `Error`
 objects) the bulk of `language/` needs, so most tests are honestly skipped
 today, the covered count growing as later stages land the built-ins. See
 the design's § test262 conformance (requirement 6).
+
+## The XSRE RegExp engine port (stage-3b, `endor-regexp`)
+
+`endor-regexp` is the engine-internal transliteration of the pin's RegExp
+engine (`xsre.c`, the design's resolved question 6). It has **no
+JavaScript surface** — child 9 integrates the `RegExp` builtin; this crate
+is the matcher itself, so it can be pinned to C-XS in isolation.
+
+Two halves, both `#![forbid(unsafe_code)]`:
+
+- **`compile`** ports `fxCompileRegExp`: a recursive-descent parse into a
+  term tree, a `measure` pass assigning each term its **byte** offset in
+  the code array (kept in bytes exactly as C-XS keeps them, so the compile
+  meter and the emitted graph match the pin), and a `code` pass emitting
+  the integer step stream.
+- **`match_regexp`** ports `fxMatchRegExp`: the backtracking VM over that
+  step stream. C-XS threads its backtrack states as a linked list through
+  the machine stack or `c_malloc`; the safe port keeps them in a
+  `Vec<State>` and records an assertion's saved point as a length marker
+  (so `fxPopStates` becomes a `truncate`) — behaviorally identical, no
+  `unsafe`.
+
+**Metering hooks carried through** (so child 9 can calibrate end to end):
+`Program::compile_meter_raw` is the regexp-compile component
+(`size × XS_PARSE_REGEXP_METERING`), and `MatchOutcome::match_meter_raw`
+is `steps × XS_REGEXP_METERING` — the matcher's per-step cost.
+
+**Parity is pinned against C-XS** through the oracle shim's new
+`endor_oracle::regexp` entry point (which calls `fxCompileRegExp` +
+`fxMatchRegExp` directly and returns captures + per-phase meter). The
+`tests/parity.rs` suite is **bit-exact on the matched answer, every
+capture's byte offsets, and the per-step match meter**: `total=275
+checked=275 skipped=0 divergent=0`, covering character classes,
+greedy/lazy quantifiers, groups/backreferences, anchors, alternation,
+lookahead + lookbehind, and pathological backtracking. The **match** meter
+is the consensus-relevant number and is pinned exactly; the *compile*
+meter is deliberately not asserted against the shim, because C's compile
+number folds in `fxNewChunk`'s `XS_CHUNK_ALLOCATION_METERING` over the code
+and data buffers — a GC-allocator artifact the `Vec`-backed port
+structurally does not incur (the design already excludes
+parse/allocation metering from the parity number).
+
+The **fuzz arm** (`endor_fuzz::regexp`, cargo-fuzz target
+`differential_regexp`) is a structure-aware generator over the supported
+grammar whose 3000-seed sweep pins the same three quantities bit-exact,
+**zero divergence**. It already earned its keep: it caught a missing
+backreference-number range check (`fxCaptureReferenceMeasure` rejects
+`\11` when there are fewer than 11 groups; XS reads the whole decimal
+greedily and errors, it does not fall back to `\1`), now ported. Both the
+suite and the sweep bound catastrophic inputs deliberately — the oracle
+shim leaves the C matcher's meter interval unset, so a nested unbounded
+empty star (`(a*)*b`) backtracks unbounded on the **pin too**; that is a
+both-engines pathology, not a port divergence, so such inputs are excluded
+from the corpus and the generator never applies an unbounded quantifier to
+a group.
+
+**Honest, named skips (the stage bar).** This increment ports the core
+grammar over the non-`i`/`u`/`v` subset. Every deferred surface compiles
+to a **named** `CompileError::Unsupported`, never a wrong meter or a wrong
+value: the `i` flag (case folding), the `u`/`v` flags (CESU-8 surrogate
+walk, unicode property escapes, V-mode string sets), `\p{}`/`\P{}`, named
+captures (`(?<name>)` / `\k<name>`), inline modifiers (`(?flags:)`), and
+astral (`> 0xFFFF`) code points. The crate is `#![forbid(unsafe_code)]`
+and Miri-clean (`cargo +nightly miri test -p endor-regexp --lib`).
