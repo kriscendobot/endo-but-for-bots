@@ -705,6 +705,60 @@ pub fn gen_json_parse_program(data: &[u8]) -> String {
     format!("JSON.parse({})", lit)
 }
 
+/// Structure-aware generator for the **stage-3b promises** surface: a
+/// fulfilled resolution chain over `Promise`, its `resolve` static, and
+/// `then`/`catch`, driven to the pump-loop drain — bit-exact (result AND
+/// computron) against the pin. A source promise (`Promise.resolve(n)`, a
+/// `new Promise` whose executor synchronously resolves, or a never-settling
+/// pending promise) is followed by a bounded chain of reactions; each handler
+/// is either an assignment to the observed variable `x`, an integer return
+/// (chaining a primitive to the next reaction), or absent (a pass-through
+/// `then()`/`catch()`). The completion observes `x`.
+///
+/// The generator stays inside the **fulfilled-chain** regime on purpose: a
+/// handler never throws and never returns a reference (both are honest named
+/// skips — a throwing/reference-returning handler), and no rejection is
+/// emitted, so the `fxAddUnhandledRejection` metered list walk (the one
+/// `mxMeter` site in `xsPromise.c`, whose per-entry cost grows with the
+/// unhandled-list length) never fires more than the single-entry case the
+/// constants absorb. Rejection routing (`then(undefined, h)` / `catch`) is
+/// covered bit-exact by the curated corpus, which bounds it to a single
+/// rejection. Rides the full symbol-linking differential check.
+pub fn gen_stage3b_promise_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    let val = (b.next() % 20) as i32; // the resolution value
+    // The source promise — always fulfilled or pending (never rejected).
+    let source = match b.choice(4) {
+        0 => format!("Promise.resolve({})", val),
+        1 => format!("new Promise(function(res){{res({})}})", val),
+        2 => format!("new Promise(function(resolve,reject){{resolve({})}})", val),
+        // A never-settling pending promise: its reactions register but never
+        // fire, so the completion stays at the initial `x`.
+        _ => "new Promise(function(){})".to_string(),
+    };
+    // A bounded chain of reactions. `then(h)` and `then()` (pass-through) keep
+    // the promise fulfilled; `catch(h)` on a fulfilled promise passes through
+    // (its handler never runs), a valid covered shape.
+    let steps = (b.next() % 4) as usize; // 0..=3 chained reactions
+    let mut chain = String::new();
+    for _ in 0..steps {
+        let step = match b.choice(4) {
+            // Assignment handler: returns undefined → resolves the derived with
+            // undefined (a covered pass-through of `undefined` downstream).
+            0 => "then(function(v){x=v})".to_string(),
+            // Integer-returning handler: chains a fresh primitive downstream.
+            1 => format!("then(function(v){{x=v;return {}}})", (b.next() % 20) as i32),
+            // Pass-through `then()` — no handler, the value flows through.
+            2 => "then()".to_string(),
+            // `catch(h)` on a fulfilled promise: the handler never runs.
+            _ => "catch(function(e){x=e})".to_string(),
+        };
+        chain.push('.');
+        chain.push_str(&step);
+    }
+    format!("var x=0; {}{}; x", source, chain)
+}
+
 /// Structure-aware generator for **array spread** (`[...arr]`) — which
 /// desugars to the for-of iterator loop appending each element. Emits a single
 /// spread of a dense literal, optionally with leading/trailing plain elements,
@@ -1891,6 +1945,46 @@ mod tests {
         assert!(checked > 0);
         assert!(distinct.len() > 40, "json-parse sweep too uniform: {} distinct", distinct.len());
         assert!(prim && array && object, "shapes reached: prim={} array={} object={}", prim, array, object);
+    }
+
+    #[test]
+    fn generated_stage3b_promise_programs_agree_bit_exact() {
+        // The stage-3b promises surface — a fulfilled resolution chain over
+        // Promise/`resolve`/`then`/`catch` driven to the pump-loop drain — is
+        // bit-exact (result AND computron), INCLUDING the reactions run at the
+        // drain. Sweep a spread of seeds, reaching the resolve-static,
+        // executor-resolve, and pending sources and chains of length 0..3.
+        let mut checked = 0;
+        let (mut resolved, mut executor, mut pending, mut chained) = (false, false, false, false);
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(24 + (seed % 40)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(11))
+                        .wrapping_add((seed as u8).wrapping_mul(7)),
+                );
+            }
+            let prog = gen_stage3b_promise_program(&buf);
+            distinct.insert(prog.clone());
+            resolved |= prog.contains("Promise.resolve");
+            executor |= prog.contains("function(res)") || prog.contains("function(resolve,reject)");
+            pending |= prog.contains("function(){}");
+            chained |= prog.contains(").then") || prog.contains(").catch");
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3b promises differential divergence on {:?}: {:?}", prog, d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 40, "promise sweep too uniform: {} distinct", distinct.len());
+        assert!(
+            resolved && executor && pending && chained,
+            "shapes reached: resolved={} executor={} pending={} chained={}",
+            resolved, executor, pending, chained
+        );
     }
 
     #[test]
