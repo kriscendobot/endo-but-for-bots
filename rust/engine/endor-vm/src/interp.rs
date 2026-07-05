@@ -216,6 +216,22 @@ pub const GOPD_PRESENT_RESIDUAL_METERING: u64 = 99608;
 /// `Object.getOwnPropertyDescriptor(o, k)` native-body residual for an absent
 /// key: the lookup returns `undefined`, no descriptor is built.
 pub const GOPD_ABSENT_RESIDUAL_METERING: u64 = 65560;
+/// `Object.defineProperty(o, k, descriptor)` native-body residual for defining
+/// a **new** own data property from the canonical four-field data descriptor
+/// (`{value, writable, enumerable, configurable}`, no `get`/`set`): the whole
+/// `fxDescriptorToSlot` field read (six `mxHasID`/four `mxGetID` over the
+/// descriptor's own program-symbol keys, the three `fxToBoolean` coercions)
+/// plus `fxOrdinaryDefineOwnProperty` creating the property slot — folded into
+/// one measured raw constant, beyond the call-dispatch opcodes the interpreter
+/// loop already meters. Calibrated against the pin via the isolated raw-gap. A
+/// novel key's intern slot is metered separately by [`Interp::intern_key`].
+pub const DEFINE_PROPERTY_NEW_RESIDUAL_METERING: u64 = 622024;
+/// XS property flag bits (`xsCommon.h`): a data property's attribute byte.
+pub const XS_DONT_DELETE_FLAG: u8 = 2; // configurable: false
+pub const XS_DONT_ENUM_FLAG: u8 = 4; // enumerable: false
+pub const XS_DONT_SET_FLAG: u8 = 8; // writable: false
+pub const XS_GETTER_FLAG: u8 = 32;
+pub const XS_SETTER_FLAG: u8 = 64;
 /// The fixed re-dispatch overhead `Function.prototype.call` accrues beyond
 /// the visible `.call` opcodes and the callee body (measured as `2<<16`),
 /// plus one built-in step ([`CALL_TRAMPOLINE_PER_ARG`]) per forwarded
@@ -908,6 +924,17 @@ pub enum NativeMethod {
     /// descriptor object (`{value, writable, enumerable, configurable}`) for
     /// `o`'s own property `k`, or `undefined` when absent.
     ObjectGetOwnPropertyDescriptor,
+    /// `Object.defineProperty(o, k, descriptor)` — define a **new** own data
+    /// property on an ordinary object from a full four-field data descriptor
+    /// (`{value, writable, enumerable, configurable}`), storing the
+    /// `writable`/`enumerable`/`configurable` booleans as XS's property flag
+    /// byte (`XS_DONT_SET_FLAG`/`XS_DONT_ENUM_FLAG`/`XS_DONT_DELETE_FLAG`) so
+    /// the attributes ripple through `Object.keys` (the enumerable filter) and
+    /// `getOwnPropertyDescriptor` (the flag → descriptor readback). Returns
+    /// the object. The verifyProperty machinery. A partial/accessor
+    /// descriptor, a redefine of an existing key, or an exotic receiver
+    /// self-names.
+    ObjectDefineProperty,
     FunctionToString,
     /// `Function.prototype.call` — a re-entrant trampoline: invoke the
     /// receiver function with the first argument as `this` and the rest as
@@ -2392,6 +2419,9 @@ impl Interp {
             let gopd = self.alloc_method(NativeMethod::ObjectGetOwnPropertyDescriptor);
             self.proto_methods
                 .push((object_ctor, "getOwnPropertyDescriptor", gopd));
+            let defprop = self.alloc_method(NativeMethod::ObjectDefineProperty);
+            self.proto_methods
+                .push((object_ctor, "defineProperty", defprop));
         }
         let fp_tostring = self.alloc_method(NativeMethod::FunctionToString);
         self.proto_methods.push((func_proto, "toString", fp_tostring));
@@ -6392,14 +6422,21 @@ impl Interp {
                 match self.find_property(inst, id) {
                     Some(p) => {
                         let prop = *self.slots.get(p);
-                        // An accessor / non-enumerable / internal-flagged own
-                        // property needs the accessor-descriptor shape or the
-                        // exact non-standard attributes — honest skip.
-                        if prop.flag != 0 {
+                        // An accessor own property needs the accessor-descriptor
+                        // shape (`{get, set, enumerable, configurable}`), which
+                        // is not modeled — honest skip. A data property carries
+                        // only the `writable`/`enumerable`/`configurable` flag
+                        // bits, rendered below; a literal's property is flag 0
+                        // (all true), an `Object.defineProperty`-defined one may
+                        // clear any of them.
+                        if prop.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
                             return Err(Halt::Unsupported(
-                                "getOwnPropertyDescriptor:non-data-property",
+                                "getOwnPropertyDescriptor:accessor-property",
                             ));
                         }
+                        let writable = prop.flag & XS_DONT_SET_FLAG == 0;
+                        let enumerable = prop.flag & XS_DONT_ENUM_FLAG == 0;
+                        let configurable = prop.flag & XS_DONT_DELETE_FLAG == 0;
                         // The whole `fxFromPropertyDescriptor` build, folded
                         // into one measured residual; the descriptor object is
                         // constructed with its per-allocation metering
@@ -6410,9 +6447,13 @@ impl Interp {
                         // Insert value → writable → enumerable → configurable;
                         // the chain (prepended) then reverses to XS's key order.
                         self.define_descriptor_field(desc, "value", value);
-                        self.define_descriptor_field(desc, "writable", Slot::boolean(true));
-                        self.define_descriptor_field(desc, "enumerable", Slot::boolean(true));
-                        self.define_descriptor_field(desc, "configurable", Slot::boolean(true));
+                        self.define_descriptor_field(desc, "writable", Slot::boolean(writable));
+                        self.define_descriptor_field(desc, "enumerable", Slot::boolean(enumerable));
+                        self.define_descriptor_field(
+                            desc,
+                            "configurable",
+                            Slot::boolean(configurable),
+                        );
                         Slot::of(Kind::Reference, Payload::Reference(desc))
                     }
                     None => {
@@ -6420,6 +6461,117 @@ impl Interp {
                         Slot::undefined()
                     }
                 }
+            }
+            // `Object.defineProperty(o, k, descriptor)`: define a **new** own
+            // data property on an ordinary object from a full four-field data
+            // descriptor. Covers the verifyProperty shape — `{value, writable,
+            // enumerable, configurable}` all present, no `get`/`set` — storing
+            // the booleans as the property's XS flag byte so the attributes
+            // ripple through `keys`/`getOwnPropertyDescriptor`. A redefine of an
+            // existing key, a partial or accessor descriptor, an index/exotic
+            // key, or an exotic receiver self-names.
+            NativeMethod::ObjectDefineProperty => {
+                let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                let arg2 = self.stack.get(base + 6).copied().unwrap_or_else(Slot::undefined);
+                let inst = match arg0.value {
+                    Payload::Reference(o) => o,
+                    _ => return Err(Halt::Unsupported("defineProperty:non-object")),
+                };
+                if self.arrays.contains_key(&inst)
+                    || self.collections.contains_key(&inst)
+                    || self.typed_arrays.contains_key(&inst)
+                    || self.array_buffers.contains_key(&inst)
+                    || self.data_views.contains_key(&inst)
+                    || self.wrapper_data.contains_key(&inst)
+                    || self.error_data.contains_key(&inst)
+                {
+                    return Err(Halt::Unsupported("defineProperty:exotic-object"));
+                }
+                let descref = match arg2.value {
+                    Payload::Reference(d) => d,
+                    _ => return Err(Halt::Unsupported("defineProperty:non-object-descriptor")),
+                };
+                let key = match arg1.value {
+                    Payload::String(off) if arg1.kind == Kind::String => {
+                        String::from_utf8_lossy(self.str_content(off)).into_owned()
+                    }
+                    _ => return Err(Halt::Unsupported("defineProperty:non-string-key")),
+                };
+                if string_to_index(&key).is_some() {
+                    return Err(Halt::Unsupported("defineProperty:index-key"));
+                }
+                // A boot default-key name the program never symbol-referenced
+                // can't be rendered/keyed soundly (see the intern-table gate).
+                if !self.symbol_ids.contains_key(&key) && self.default_keys.contains(key.as_str()) {
+                    return Err(Halt::Unsupported("defineProperty:ambiguous-default-key"));
+                }
+                // Read the descriptor's four data fields (their keys are the
+                // descriptor literal's program symbols). Any get/set present,
+                // or any of the four absent, is outside the covered shape.
+                let field = |slf: &Self, name: &str| -> Option<Slot> {
+                    slf.symbol_ids
+                        .get(name)
+                        .and_then(|&fid| slf.find_property(descref, fid))
+                        .map(|p| {
+                            let s = slf.slots.get(p);
+                            Slot::of(s.kind, s.value)
+                        })
+                };
+                if field(self, "get").is_some() || field(self, "set").is_some() {
+                    return Err(Halt::Unsupported("defineProperty:accessor-descriptor"));
+                }
+                let (value, writable, enumerable, configurable) = match (
+                    field(self, "value"),
+                    field(self, "writable"),
+                    field(self, "enumerable"),
+                    field(self, "configurable"),
+                ) {
+                    (Some(v), Some(w), Some(e), Some(c)) => (v, w, e, c),
+                    _ => return Err(Halt::Unsupported("defineProperty:partial-descriptor")),
+                };
+                // The three attribute flags coerce the field values to boolean
+                // (XS's `fxToBoolean`); a non-boolean attribute is outside the
+                // covered shape (its coercion metering is unmodeled here).
+                let as_bool = |s: Slot| -> Option<bool> {
+                    match s.kind {
+                        Kind::Boolean => Some(matches!(s.value, Payload::Boolean(true))),
+                        _ => None,
+                    }
+                };
+                let (w, e, c) = match (as_bool(writable), as_bool(enumerable), as_bool(configurable))
+                {
+                    (Some(w), Some(e), Some(c)) => (w, e, c),
+                    _ => return Err(Halt::Unsupported("defineProperty:non-boolean-attribute")),
+                };
+                let id = self.intern_key(&key);
+                // Only a genuinely-new own property is covered; a redefine runs
+                // the configurable-compatibility checks (different metering).
+                if self.find_property(inst, id).is_some() {
+                    return Err(Halt::Unsupported("defineProperty:redefine"));
+                }
+                let mut flag = 0u8;
+                if !w {
+                    flag |= XS_DONT_SET_FLAG;
+                }
+                if !e {
+                    flag |= XS_DONT_ENUM_FLAG;
+                }
+                if !c {
+                    flag |= XS_DONT_DELETE_FLAG;
+                }
+                // The whole `fxDescriptorToSlot` field read +
+                // `fxOrdinaryDefineOwnProperty` create, folded into one measured
+                // residual (the property slot built with per-allocation metering
+                // suppressed); a novel key's intern slot is metered above.
+                self.meter.tick_raw(DEFINE_PROPERTY_NEW_RESIDUAL_METERING);
+                let mut prop = value;
+                prop.id = id;
+                prop.flag = flag;
+                let head = self.slots.get(inst).next;
+                prop.next = head;
+                let idx = self.slots.alloc(prop);
+                self.slots.get_mut(inst).next = idx;
+                arg0
             }
             // `Array.prototype.push(...items)` — dense fast path only.
             NativeMethod::ArrayPush => {
@@ -10329,17 +10481,26 @@ impl Interp {
         let mut cur = self.slots.get(inst).next;
         while !cur.is_null() {
             let s = self.slots.get(cur);
-            if s.flag != 0 {
+            // An accessor own property is outside the covered shape — its
+            // enumerability is knowable but its presence signals a model
+            // (getter/setter) endor does not carry, so honest-skip.
+            if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
                 return None;
             }
-            // Every own key of a covered object literal is a program symbol;
-            // an id outside the program-symbol range (a runtime-interned novel
-            // key or an internal id) can't be rendered to its name here.
-            let name_idx = (s.id as usize).checked_sub(1)?;
-            if name_idx >= self.symbol_names.len() {
-                return None;
+            // A non-enumerable data property (an `Object.defineProperty` with
+            // `enumerable:false`) is present but excluded from the key set;
+            // an enumerable one — flag 0 or carrying only `writable`/
+            // `configurable`-false bits — is included in creation order.
+            if s.flag & XS_DONT_ENUM_FLAG == 0 {
+                // Every enumerable key of a covered object is a program symbol;
+                // an id outside the program-symbol range (a runtime-interned
+                // novel key or an internal id) can't be rendered to its name.
+                let name_idx = (s.id as usize).checked_sub(1)?;
+                if name_idx >= self.symbol_names.len() {
+                    return None;
+                }
+                ids.push(s.id);
             }
-            ids.push(s.id);
             cur = s.next;
         }
         // The own-property chain is newest-first (`instance_put` prepends);

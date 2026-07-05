@@ -88,3 +88,25 @@ var o={a:1}; "missing" in o;
 var o={a:1,b:2}; ("a" in o) && !("c" in o);
 // A novel key `in` composes with hasOwnProperty over the same absent name.
 var o={a:1}; ("zzz" in o)===false && o.hasOwnProperty("zzz")===false;
+// --- Object.defineProperty: define a new own data property (verifyProperty) ---
+// A full four-field data descriptor, all-true attributes: reads back the value.
+var o={}; Object.defineProperty(o,"x",{value:5,writable:true,enumerable:true,configurable:true}); o.x;
+var o={a:1}; Object.defineProperty(o,"b",{value:2,writable:true,enumerable:true,configurable:true}); o.b;
+// A string value.
+var o={}; Object.defineProperty(o,"s",{value:"hi",writable:true,enumerable:true,configurable:true}); o.s;
+// enumerable:false — defined, readable, but excluded from Object.keys.
+var o={a:1}; Object.defineProperty(o,"h",{value:9,writable:true,enumerable:false,configurable:true}); o.h;
+var o={a:1}; Object.defineProperty(o,"h",{value:9,writable:true,enumerable:false,configurable:true}); Object.keys(o).length;
+var o={}; Object.defineProperty(o,"h",{value:9,writable:true,enumerable:false,configurable:true}); Object.keys(o).length;
+// enumerable:true — included in Object.keys, in creation order after literals.
+var o={a:1}; Object.defineProperty(o,"e",{value:9,writable:true,enumerable:true,configurable:true}); o.e; Object.keys(o).length;
+var o={a:1,b:2}; Object.defineProperty(o,"c",{value:9,writable:true,enumerable:true,configurable:true}); o.c; var k=Object.keys(o); k.length;
+// The defined attributes read back through getOwnPropertyDescriptor.
+var o={}; Object.defineProperty(o,"x",{value:7,writable:false,enumerable:true,configurable:true}); var d=Object.getOwnPropertyDescriptor(o,"x"); d.writable;
+var o={}; Object.defineProperty(o,"x",{value:7,writable:true,enumerable:false,configurable:true}); var d=Object.getOwnPropertyDescriptor(o,"x"); d.enumerable;
+var o={}; Object.defineProperty(o,"x",{value:7,writable:true,enumerable:true,configurable:false}); var d=Object.getOwnPropertyDescriptor(o,"x"); d.configurable;
+var o={}; Object.defineProperty(o,"x",{value:7,writable:true,enumerable:true,configurable:true}); var d=Object.getOwnPropertyDescriptor(o,"x"); d.value;
+// defineProperty returns the object.
+var o={}; (Object.defineProperty(o,"x",{value:1,writable:true,enumerable:true,configurable:true})===o);
+// The verifyProperty shape: define then check the descriptor attributes agree.
+var o={}; Object.defineProperty(o,"p",{value:42,writable:false,enumerable:false,configurable:true}); var d=Object.getOwnPropertyDescriptor(o,"p"); d.value===42 && d.writable===false && d.enumerable===false && d.configurable===true;

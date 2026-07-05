@@ -1143,7 +1143,19 @@ pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
     // this novel pool to stay on the covered path.
     const NOVEL: &[&str] = &["zzz", "missing", "qux", "wibble", "novelkey"];
     let novel_key = NOVEL[(b.next() as usize) % NOVEL.len()];
-    match b.choice(10) {
+    // Fresh keys for `Object.defineProperty` — disjoint from `PRESENT` (so a
+    // define is always a NEW property, never a self-naming redefine) and read
+    // back statically (so each is a program symbol `Object.keys` can render).
+    const DEFKEY: &[&str] = &["dp", "dr", "ds", "dt"];
+    let def_key = DEFKEY[(b.next() as usize) % DEFKEY.len()];
+    let def_w = b.next() & 1 == 0;
+    let def_e = b.next() & 1 == 0;
+    let def_c = b.next() & 1 == 0;
+    let def_desc = format!(
+        "{{value:7,writable:{},enumerable:{},configurable:{}}}",
+        def_w, def_e, def_c
+    );
+    match b.choice(12) {
         // hasOwnProperty over a present key.
         0 => match present_key {
             Some(k) => format!("var o={}; o.hasOwnProperty(\"{}\")", obj, k),
@@ -1202,7 +1214,26 @@ pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
         },
         // `key in o` for a genuinely-novel key ⇒ sound `false` — the walk
         // exhausts the chain and interns one key slot.
-        _ => format!("var o={}; \"{}\" in o", obj, novel_key),
+        7 => format!("var o={}; \"{}\" in o", obj, novel_key),
+        // `Object.defineProperty` a new data property, then read the value
+        // back (the key is a program symbol via the static read).
+        10 => format!(
+            "var o={}; Object.defineProperty(o,\"{}\",{}); o.{}",
+            obj, def_key, def_desc, def_key
+        ),
+        // `Object.defineProperty` then read one attribute back through
+        // `getOwnPropertyDescriptor` (the flag → descriptor readback).
+        _ => {
+            let attr = match b.choice(3) {
+                0 => "writable",
+                1 => "enumerable",
+                _ => "configurable",
+            };
+            format!(
+                "var o={}; Object.defineProperty(o,\"{}\",{}); var d=Object.getOwnPropertyDescriptor(o,\"{}\"); d.{}",
+                obj, def_key, def_desc, def_key, attr
+            )
+        }
     }
 }
 
@@ -1941,6 +1972,7 @@ mod tests {
         let mut saw_gopd = false;
         let mut saw_absent = false;
         let mut saw_computed = false;
+        let mut saw_defprop = false;
         let mut saw_in = false;
         let mut distinct = std::collections::BTreeSet::new();
         for seed in 0u32..1200 {
@@ -1960,6 +1992,7 @@ mod tests {
             saw_gopd |= prog.contains("Object.getOwnPropertyDescriptor(");
             saw_absent |= prog.contains("zzz") || prog.contains("missing");
             saw_computed |= prog.contains("var k=");
+            saw_defprop |= prog.contains("Object.defineProperty(");
             saw_in |= prog.contains(" in o");
             match differential_check_with_symbols(&prog) {
                 Ok(()) => checked += 1,
@@ -1980,6 +2013,7 @@ mod tests {
         assert!(saw_gopd, "getOwnPropertyDescriptor arm never generated");
         assert!(saw_absent, "absent-key arm never generated");
         assert!(saw_computed, "computed member-access arm never generated");
+        assert!(saw_defprop, "defineProperty arm never generated");
         assert!(saw_in, "`in` operator arm never generated");
     }
 
