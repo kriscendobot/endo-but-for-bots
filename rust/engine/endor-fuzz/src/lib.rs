@@ -592,6 +592,65 @@ pub fn gen_stage3_text_math_program(data: &[u8]) -> String {
     }
 }
 
+/// Structure-aware generator for the **stage-3b json-metering** surface:
+/// `JSON.stringify` over a structured (object/array) value built recursively
+/// from primitives, objects, and arrays — every emitted program bit-exact
+/// (serialized value AND computron) against the pin. Draws only the raw-clean
+/// subset: numeric/boolean/null/ASCII-string leaves, string keys, and bounded
+/// depth/breadth, avoiding the self-named corners (callable values,
+/// `toJSON`/wrapper objects, a replacer/space argument). Depth and breadth are
+/// kept small on purpose: a *large* nested object literal accrues a
+/// sub-computron raw drift in endor's object-literal *construction* metering
+/// (visible on the bare `var v = {…}` literal, independent of JSON) that can
+/// tip a computron boundary — a pre-existing object-literal issue outside the
+/// JSON surface. The bound keeps this arm a clean differential test of the JSON
+/// *stringify* metering itself. Rides [`differential_check_with_symbols`] (the
+/// `JSON` namespace relinks by name).
+pub fn gen_json_structured_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    fn mk_key(b: &mut Bytes) -> String {
+        let n = 1 + (b.next() % 4) as usize; // 1..=4 characters, non-empty key
+        (0..n).map(|_| ALPHA[(b.next() as usize) % ALPHA.len()] as char).collect()
+    }
+    fn mk_leaf(b: &mut Bytes) -> String {
+        match b.choice(5) {
+            0 => ((b.next() % 40) as i32 - 20).to_string(),
+            1 => "true".to_string(),
+            2 => "false".to_string(),
+            3 => "null".to_string(),
+            _ => {
+                let n = (b.next() % 4) as usize;
+                let s: String =
+                    (0..n).map(|_| ALPHA[(b.next() as usize) % ALPHA.len()] as char).collect();
+                format!("\"{}\"", s)
+            }
+        }
+    }
+    // A value at the given remaining depth: a leaf at depth 0, else a leaf,
+    // object, or array (bounded breadth).
+    fn mk_value(b: &mut Bytes, depth: u8) -> String {
+        if depth == 0 || b.next() % 3 == 0 {
+            return mk_leaf(b);
+        }
+        if b.next() % 2 == 0 {
+            let n = (b.next() % 3) as usize; // 0..=2 keys (small literal)
+            let mut parts = Vec::new();
+            for i in 0..n {
+                // Distinct keys per object so the small literal stays
+                // construction-exact (a duplicate key is valid but needless).
+                parts.push(format!("{}{}:{}", mk_key(b), i, mk_value(b, depth - 1)));
+            }
+            format!("{{{}}}", parts.join(","))
+        } else {
+            let n = (b.next() % 3) as usize; // 0..=2 elements (small literal)
+            let parts: Vec<String> = (0..n).map(|_| mk_value(b, depth - 1)).collect();
+            format!("[{}]", parts.join(","))
+        }
+    }
+    format!("JSON.stringify({})", mk_value(&mut b, 2))
+}
+
 /// Structure-aware generator for **array spread** (`[...arr]`) — which
 /// desugars to the for-of iterator loop appending each element. Emits a single
 /// spread of a dense literal, optionally with leading/trailing plain elements,
@@ -1706,6 +1765,44 @@ mod tests {
         assert!(checked > 0);
         assert!(distinct.len() > 40, "text-math-json sweep too uniform: {} distinct", distinct.len());
         assert!(math && string && number && json, "families reached: math={} string={} number={} json={}", math, string, number, json);
+    }
+
+    #[test]
+    fn generated_stage3b_json_structured_programs_agree_bit_exact() {
+        // The stage-3b json-metering surface — structured JSON.stringify over
+        // objects and arrays built recursively from primitives — is bit-exact
+        // (serialized value AND computron). Sweep a spread of seeds over the
+        // recursive generator and assert zero divergence, reaching both the
+        // object and array node shapes and depth beyond a single level.
+        let mut checked = 0;
+        let (mut object, mut array, mut nested) = (false, false, false);
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..800 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(24 + (seed % 40)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(11))
+                        .wrapping_add((seed as u8).wrapping_mul(7)),
+                );
+            }
+            let prog = gen_json_structured_program(&buf);
+            distinct.insert(prog.clone());
+            object |= prog.contains('{');
+            array |= prog.contains('[');
+            nested |= prog.contains("{{")
+                || prog.contains("[[")
+                || prog.contains("[{")
+                || prog.contains("{") && prog.contains("[");
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3b json-metering differential divergence on {:?}: {:?}", prog, d),
+            }
+        }
+        assert!(checked > 0);
+        assert!(distinct.len() > 40, "json-structured sweep too uniform: {} distinct", distinct.len());
+        assert!(object && array && nested, "shapes reached: object={} array={} nested={}", object, array, nested);
     }
 
     #[test]

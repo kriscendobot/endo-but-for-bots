@@ -323,6 +323,17 @@ pub fn stage3_json_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-json.js"))
 }
 
+/// The stage-3b (json-metering) curated corpus: structured `JSON.stringify`
+/// over object and array values — the recursive `fxStringifyJSONProperty`
+/// per-node metering (the keys-list instance and its per-key AT slots, the
+/// per-iteration bodies, each key's `fxPushKeyString` chunk, and the final
+/// result `fxNewChunk`), bit-exact (result AND computron) against the oracle at
+/// the pin `48ee02d8cfe0`. Every constant decomposes to whole `mxMeterOne`
+/// steps plus the exact allocations, so the computrons track the node walk.
+pub fn stage3b_json_metering_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3b-json-metering.js"))
+}
+
 /// The stage-3 child-5 (collections) curated corpus: Map/Set/WeakMap/WeakSet
 /// construction, `set`/`add`/`get`/`has`/`delete`/`size`, growth across the
 /// hash-table rehash boundaries, SameValueZero key equality, and reference
@@ -958,6 +969,35 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3 json bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage3b_json_metering_corpus_is_bit_exact_against_oracle() {
+        // The stage-3b json-metering acceptance bar: structured JSON.stringify
+        // over objects and arrays (flat, nested, holes/undefined, string
+        // escapes) agrees with C-XS on BOTH the serialized value AND the
+        // computron count — the recursive per-node metering reproduces the
+        // pin's `fxStringifyJSONProperty` allocation walk exactly.
+        let programs = stage3b_json_metering_corpus();
+        assert!(!programs.is_empty(), "stage-3b json-metering corpus must be non-empty");
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-3b json-metering bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
