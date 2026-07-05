@@ -1143,7 +1143,7 @@ pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
     // this novel pool to stay on the covered path.
     const NOVEL: &[&str] = &["zzz", "missing", "qux", "wibble", "novelkey"];
     let novel_key = NOVEL[(b.next() as usize) % NOVEL.len()];
-    match b.choice(8) {
+    match b.choice(10) {
         // hasOwnProperty over a present key.
         0 => match present_key {
             Some(k) => format!("var o={}; o.hasOwnProperty(\"{}\")", obj, k),
@@ -1194,7 +1194,15 @@ pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
         },
         // Computed string member read of a genuinely-novel key: interns one
         // key slot and reads bit-exact `undefined` (absent-own, no inherited).
-        _ => format!("var o={}; var k=\"{}\"; typeof o[k]", obj, novel_key),
+        8 => format!("var o={}; var k=\"{}\"; typeof o[k]", obj, novel_key),
+        // `key in o` for a present key ⇒ `true` (an own-hit chain walk).
+        9 => match present_key {
+            Some(k) => format!("var o={}; \"{}\" in o", obj, k),
+            None => format!("var o={}; \"{}\" in o", obj, novel_key),
+        },
+        // `key in o` for a genuinely-novel key ⇒ sound `false` — the walk
+        // exhausts the chain and interns one key slot.
+        _ => format!("var o={}; \"{}\" in o", obj, novel_key),
     }
 }
 
@@ -1933,6 +1941,7 @@ mod tests {
         let mut saw_gopd = false;
         let mut saw_absent = false;
         let mut saw_computed = false;
+        let mut saw_in = false;
         let mut distinct = std::collections::BTreeSet::new();
         for seed in 0u32..1200 {
             let data = seed.to_le_bytes();
@@ -1951,6 +1960,7 @@ mod tests {
             saw_gopd |= prog.contains("Object.getOwnPropertyDescriptor(");
             saw_absent |= prog.contains("zzz") || prog.contains("missing");
             saw_computed |= prog.contains("var k=");
+            saw_in |= prog.contains(" in o");
             match differential_check_with_symbols(&prog) {
                 Ok(()) => checked += 1,
                 Err(d) => panic!(
@@ -1970,6 +1980,7 @@ mod tests {
         assert!(saw_gopd, "getOwnPropertyDescriptor arm never generated");
         assert!(saw_absent, "absent-key arm never generated");
         assert!(saw_computed, "computed member-access arm never generated");
+        assert!(saw_in, "`in` operator arm never generated");
     }
 
     #[test]

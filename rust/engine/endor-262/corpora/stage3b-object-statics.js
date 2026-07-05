@@ -76,3 +76,15 @@ var o={a:1}; var j="zzz"; var m="yyy"; typeof o[j]; typeof o[m];
 var o={p:7}; var k="p"; o[k]===o.p;
 // A computed novel key composes with hasOwnProperty over the same name.
 var o={a:1}; var k="zzz"; o[k]===undefined && o.hasOwnProperty(k)===false;
+// --- the `in` operator over the intern table (sound false-answers) ---
+// A present own key is `true` (the existing own-hit case).
+var o={a:1}; "a" in o;
+var o={foo:10,bar:20}; "bar" in o;
+// A genuinely-novel key is a sound `false` — it can be no inherited built-in
+// (absent from XS's boot key table), so `in` walks to null and interns one
+// key slot.
+var o={a:1}; "zzz" in o;
+var o={a:1}; "missing" in o;
+var o={a:1,b:2}; ("a" in o) && !("c" in o);
+// A novel key `in` composes with hasOwnProperty over the same absent name.
+var o={a:1}; ("zzz" in o)===false && o.hasOwnProperty("zzz")===false;

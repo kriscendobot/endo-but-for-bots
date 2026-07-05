@@ -4584,18 +4584,22 @@ impl Interp {
                     pc += size as usize;
                 }
 
-                // `in` (`XS_CODE_IN`, xsRun.c → fxRunIn → fxHasAt): does the
-                // right operand (object) have a property named by the left
-                // (key). Stack: [.., left (key), right (object)]. endor answers
-                // only the case it can decide soundly: the key resolves to a
-                // program symbol whose property is an **own** property of the
-                // object ⇒ `true` (metered one built-in step, `fxHasAt`). A
-                // key that is *not* an own property cannot be answered `false`
-                // safely — endor's per-program symbol table cannot tell a
-                // genuinely-absent key from an unreferenced inherited built-in
-                // (`'toString' in {}` is `true` in XS), so it self-names rather
-                // than risk a wrong `false`. A non-object right operand throws
-                // in XS ("in: not an object") — self-name there too.
+                // `in` (`XS_CODE_IN`, xsRun.c → fxRunIn → fxHasAt = fxAt +
+                // fxHasAll): does the right operand (object) have a property
+                // named by the left (key). Stack: [.., left (key), right
+                // (object)]. The key is resolved through the global intern
+                // table exactly as `fxAt` does, then answered by a full
+                // prototype-chain walk (`fxHasAll`). A program symbol present
+                // own-or-inherited ⇒ `true`. When endor's (possibly
+                // incomplete) chain does not hold the name, `false` is sound
+                // only if the name can be no inherited built-in: a boot
+                // default-key name the program never referenced could be an
+                // unlinked inherited method (`'toString' in {}` is `true` in
+                // XS), so it self-names rather than risk a wrong `false`; a
+                // genuinely-novel name (absent from the boot key table) is
+                // absent everywhere, so `in` is soundly `false`, `fxAt`
+                // interning one key slot. An index-valued key, a non-string
+                // key, or a non-object right operand stays out of grammar.
                 XS_CODE_IN => {
                     let obj = self.pop();
                     let key = self.pop();
@@ -4603,21 +4607,35 @@ impl Interp {
                         Payload::Reference(r) => r,
                         _ => return Halt::Unsupported(op.name()),
                     };
-                    let id = match key.value {
-                        Payload::String(off) => {
-                            let s = String::from_utf8_lossy(self.str_content(off)).into_owned();
-                            self.symbol_ids.get(&s).copied()
+                    let s = match key.value {
+                        Payload::String(off) if key.kind == Kind::String => {
+                            String::from_utf8_lossy(self.str_content(off)).into_owned()
                         }
-                        _ => None,
+                        _ => return Halt::Unsupported(op.name()),
                     };
-                    match id.and_then(|i| self.find_property(objref, i)) {
-                        Some(_) => {
-                            self.meter.tick_raw(IN_METERING);
-                            self.push(Slot::boolean(true));
-                            pc += size as usize;
-                        }
-                        None => return Halt::Unsupported(op.name()),
+                    // An index-valued key routes through the exotic index
+                    // [[HasProperty]], not modeled here — self-name.
+                    if string_to_index(&s).is_some() {
+                        return Halt::Unsupported(op.name());
                     }
+                    // A boot default-key name the program never referenced as a
+                    // symbol could be an inherited built-in endor never linked
+                    // (`'toString' in {}` is `true` in XS) — do not risk a wrong
+                    // `false`; self-name before interning.
+                    if !self.symbol_ids.contains_key(&s) && self.default_keys.contains(s.as_str()) {
+                        return Halt::Unsupported(op.name());
+                    }
+                    // Resolve the key through the intern table exactly as
+                    // `fxAt` does (a novel name meters one `fxNewSlot`; a known
+                    // one none), then answer with the metered chain walk: XS
+                    // meters one `XS_CODE_METERING` per prototype level the
+                    // `fxOrdinaryHasProperty` recursion descends.
+                    let id = self.intern_key(&s);
+                    let (present, recursions) = self.instance_has(objref, id);
+                    self.meter.tick_raw(IN_METERING);
+                    self.meter.tick_code_n(recursions);
+                    self.push(Slot::boolean(present));
+                    pc += size as usize;
                 }
 
                 // ---- stack ------------------------------------------
@@ -10451,6 +10469,32 @@ impl Interp {
             cur = self.instance_prototype(cur);
         }
         Slot::undefined()
+    }
+
+    /// Does `inst` have property `id` as an own-or-inherited property (XS's
+    /// `mxBehaviorHasProperty` chain walk, the `fxHasAll` half of `fxHasAt`)?
+    /// Returns `(present, recursions)` where `recursions` is the number of
+    /// prototype levels descended past the receiver — exactly the count of
+    /// recursive `fxOrdinaryHasProperty` calls XS makes, each of which meters
+    /// one `XS_CODE_METERING`: `0` when found own, `k` when found on the
+    /// k-th prototype, and the full chain length minus one on a total miss.
+    /// The prototype objects carry data only for names the program references,
+    /// so a `false` here is only *sound* for a name that cannot be an unlinked
+    /// inherited built-in — the caller (`XS_CODE_IN`) gates on `default_keys`.
+    fn instance_has(&self, inst: crate::value::SlotIndex, id: u16) -> (bool, u64) {
+        let mut cur = inst;
+        let mut recursions = 0u64;
+        loop {
+            if self.find_property(cur, id).is_some() {
+                return (true, recursions);
+            }
+            let proto = self.instance_prototype(cur);
+            if proto.is_null() {
+                return (false, recursions);
+            }
+            cur = proto;
+            recursions += 1;
+        }
     }
 
     /// Read a `*_LOCAL_*` opcode's 1-based scope-index operand: a `u8` for
