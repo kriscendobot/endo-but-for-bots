@@ -57,3 +57,22 @@ var o={a:1}; var d=Object.getOwnPropertyDescriptor(o,"zzz"); d===undefined;
 var o={a:"hello"}; var d=Object.getOwnPropertyDescriptor(o,"a"); d.value;
 // The verifyProperty shape: hasOwnProperty + descriptor attributes agree.
 var o={k:42}; var d=Object.getOwnPropertyDescriptor(o,"k"); o.hasOwnProperty("k") && d.enumerable && d.configurable && d.writable;
+// --- computed string member access o[k] via the interning AT opcode ---
+// A computed key that names a present program symbol reads the own value; the
+// key resolves through the intern table without allocating (a program symbol).
+var o={a:1}; var k="a"; o[k];
+var o={foo:10,bar:20}; var k="bar"; o[k];
+var o={a:1,b:2,c:3}; var k="c"; o[k];
+// A genuinely-novel computed key misses the table, interns exactly one key
+// slot, and reads undefined (the absent-own, no-inherited case).
+var o={a:1}; var k="zzz"; o[k];
+var o={a:1}; var k="zzz"; typeof o[k];
+var o={a:1}; var k="missing"; o[k]===undefined;
+// The intern table is persistent: a repeated novel computed key allocates no
+// second slot, and two distinct novel keys each intern their own.
+var o={a:1}; var k="zzz"; o[k]; o[k];
+var o={a:1}; var j="zzz"; var m="yyy"; typeof o[j]; typeof o[m];
+// The computed key and a static access agree on a present property.
+var o={p:7}; var k="p"; o[k]===o.p;
+// A computed novel key composes with hasOwnProperty over the same name.
+var o={a:1}; var k="zzz"; o[k]===undefined && o.hasOwnProperty(k)===false;

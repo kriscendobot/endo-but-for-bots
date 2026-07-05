@@ -3429,7 +3429,7 @@ impl Interp {
                         Some(k) => k,
                         None => return Halt::Unsupported(op.name()),
                     };
-                    let at = match self.to_at_key(key) {
+                    let at = match self.resolve_at_key(key) {
                         Some(at) => at,
                         None => return Halt::Unsupported(op.name()),
                     };
@@ -9966,13 +9966,22 @@ impl Interp {
         id
     }
 
-    /// Convert a stack value into an `XS_AT_KIND` computed key (XS's
-    /// `XS_CODE_AT_ALL`): an integer/number that is a valid array index
-    /// becomes an index key (`id == XS_NO_ID`); a symbol or a program-known
-    /// string name becomes a named key. Returns `None` for a key endor does
-    /// not yet model (a non-index string absent from the symbol table, an
-    /// object needing `ToPrimitive`), so the caller self-names an honest skip.
-    fn to_at_key(&self, key: Slot) -> Option<Slot> {
+    /// Resolve a computed key at an `AT`/`AT_2` opcode, **interning** a
+    /// genuinely-novel string name through the global intern table (XS's
+    /// `fxNewNameX`/`fxNewName` in the `XS_CODE_AT_ALL` string branch). This
+    /// never returns `None` for a string key: a
+    /// non-index name that misses the symbol table is interned (metering one
+    /// `fxNewSlot` key slot for a novel name, none for a boot default or a
+    /// prior key — exactly [`Self::intern_key`]), so `o[k]` for any string `k`
+    /// resolves to a named key rather than self-naming. A string that parses
+    /// as an array index routes to the index item and, matching XS's
+    /// `if (flag) the->meterIndex += 2 * XS_CODE_METERING`, meters two extra
+    /// code units. Integer/number index keys and the negative/non-index
+    /// numeric-name cases (which XS reaches through the same `mxToString` +
+    /// `fxNewName` path) are handled identically. A symbol value key stays out
+    /// of the covered grammar (`None`), as does a reference needing
+    /// `ToPrimitive`.
+    fn resolve_at_key(&mut self, key: Slot) -> Option<Slot> {
         match key.kind {
             Kind::Integer => {
                 let i = match key.value {
@@ -9982,12 +9991,11 @@ impl Interp {
                 if i >= 0 {
                     Some(Slot::of(Kind::At, Payload::At(crate::value::XS_NO_ID, i as u32)))
                 } else {
-                    // A negative integer is not an array index; it names a
-                    // string property key ("-1"). Resolve it as a name id.
+                    // A negative integer names a string key ("-1"): XS's
+                    // `mxToString` + `fxNewName` interns it (no index branch).
                     let name = number_to_ecma_string(i as f64);
-                    self.symbol_ids
-                        .get(&name)
-                        .map(|&id| Slot::of(Kind::At, Payload::At(id, 0)))
+                    let id = self.intern_key(&name);
+                    Some(Slot::of(Kind::At, Payload::At(id, 0)))
                 }
             }
             Kind::Number => {
@@ -9995,37 +10003,44 @@ impl Interp {
                     Payload::Number(n) => n,
                     _ => return None,
                 };
-                // A non-negative integral number within the index range is an
-                // index key; anything else names a string key.
                 if n >= 0.0 && n.fract() == 0.0 && n < 4294967295.0 {
                     Some(Slot::of(Kind::At, Payload::At(crate::value::XS_NO_ID, n as u32)))
                 } else {
                     let name = number_to_ecma_string(n);
-                    self.symbol_ids
-                        .get(&name)
-                        .map(|&id| Slot::of(Kind::At, Payload::At(id, 0)))
+                    let id = self.intern_key(&name);
+                    Some(Slot::of(Kind::At, Payload::At(id, 0)))
                 }
             }
-            Kind::Symbol => {
-                // A symbol key: XS uses the symbol's own id. endor models the
-                // symbol keys the program names via the symbol table; a bare
-                // Symbol value key is out of the covered grammar.
-                None
-            }
+            Kind::Symbol => None,
             Kind::String => {
-                // A string key names a property; resolve it to the program's
-                // symbol id (an index-valued string routes to the array item).
                 let content = match key.value {
                     Payload::String(off) => self.str_content(off).to_vec(),
                     _ => return None,
                 };
-                let s = String::from_utf8_lossy(&content);
+                let s = String::from_utf8_lossy(&content).into_owned();
                 if let Some(idx) = string_to_index(&s) {
+                    // An index-valued string routes to the item; XS meters the
+                    // `fxStringToIndex` success two extra code units.
+                    self.meter.tick_code_n(2);
                     Some(Slot::of(Kind::At, Payload::At(crate::value::XS_NO_ID, idx)))
+                } else if !self.symbol_ids.contains_key(&s) && self.default_keys.contains(s.as_str())
+                {
+                    // A boot default-key name that the *program* never named as
+                    // a symbol (so `link_intrinsics` never linked its inherited
+                    // method under a known id): endor cannot tell an absent-own
+                    // read of such a name from an inherited built-in it has not
+                    // modeled, so a computed read would risk a wrong `undefined`
+                    // (e.g. `o["hasOwnProperty"]` — inherited in XS, unlinked
+                    // here). Self-name rather than answer unsoundly. A name the
+                    // program *does* reference statically is a program symbol
+                    // (in `symbol_ids`) and resolves exactly as its `o.name`
+                    // static access already does; a genuinely-novel name
+                    // (absent from `default_keys`) can be no built-in property,
+                    // so its miss is a sound `undefined` — interned below.
+                    None
                 } else {
-                    self.symbol_ids
-                        .get(s.as_ref())
-                        .map(|&id| Slot::of(Kind::At, Payload::At(id, 0)))
+                    let id = self.intern_key(&s);
+                    Some(Slot::of(Kind::At, Payload::At(id, 0)))
                 }
             }
             _ => None,

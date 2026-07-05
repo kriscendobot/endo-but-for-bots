@@ -1135,7 +1135,15 @@ pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
         .get((b.next() as usize).wrapping_rem(keys.len().max(1)))
         .copied();
     let absent_key = ABSENT[(b.next() as usize) % ABSENT.len()];
-    match b.choice(6) {
+    // Genuinely-novel names (absent from XS's boot key table AND the literal)
+    // — a computed read/`hasOwnProperty` of one is bit-exact `undefined`/false,
+    // interning exactly one key slot. A boot default key (`toString`, …) read
+    // by a *computed* key self-names (endor cannot tell an unlinked inherited
+    // built-in from an absent own), so the computed-access arms draw only from
+    // this novel pool to stay on the covered path.
+    const NOVEL: &[&str] = &["zzz", "missing", "qux", "wibble", "novelkey"];
+    let novel_key = NOVEL[(b.next() as usize) % NOVEL.len()];
+    match b.choice(8) {
         // hasOwnProperty over a present key.
         0 => match present_key {
             Some(k) => format!("var o={}; o.hasOwnProperty(\"{}\")", obj, k),
@@ -1173,10 +1181,20 @@ pub fn gen_stage3b_object_statics_program(data: &[u8]) -> String {
             ),
         },
         // getOwnPropertyDescriptor of an absent key: undefined.
-        _ => format!(
+        5 => format!(
             "var o={}; typeof Object.getOwnPropertyDescriptor(o,\"{}\")",
             obj, absent_key
         ),
+        // Computed string member read `o[k]` of a present key via the
+        // interning AT opcode: reads the own value (a program symbol, no
+        // slot allocated).
+        6 => match present_key {
+            Some(k) => format!("var o={}; var k=\"{}\"; o[k]", obj, k),
+            None => format!("var o={}; var k=\"{}\"; typeof o[k]", obj, novel_key),
+        },
+        // Computed string member read of a genuinely-novel key: interns one
+        // key slot and reads bit-exact `undefined` (absent-own, no inherited).
+        _ => format!("var o={}; var k=\"{}\"; typeof o[k]", obj, novel_key),
     }
 }
 
@@ -1914,6 +1932,7 @@ mod tests {
         let mut saw_keys = false;
         let mut saw_gopd = false;
         let mut saw_absent = false;
+        let mut saw_computed = false;
         let mut distinct = std::collections::BTreeSet::new();
         for seed in 0u32..1200 {
             let data = seed.to_le_bytes();
@@ -1931,6 +1950,7 @@ mod tests {
             saw_keys |= prog.contains("Object.keys(");
             saw_gopd |= prog.contains("Object.getOwnPropertyDescriptor(");
             saw_absent |= prog.contains("zzz") || prog.contains("missing");
+            saw_computed |= prog.contains("var k=");
             match differential_check_with_symbols(&prog) {
                 Ok(()) => checked += 1,
                 Err(d) => panic!(
@@ -1949,6 +1969,7 @@ mod tests {
         assert!(saw_keys, "Object.keys arm never generated");
         assert!(saw_gopd, "getOwnPropertyDescriptor arm never generated");
         assert!(saw_absent, "absent-key arm never generated");
+        assert!(saw_computed, "computed member-access arm never generated");
     }
 
     #[test]
