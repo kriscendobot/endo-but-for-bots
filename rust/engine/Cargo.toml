@@ -11,6 +11,7 @@ members = [
     "endor-oracle",
     "endor-262",
     "endor-fuzz",
+    "endor-regexp",
 ]
 
 [workspace.package]

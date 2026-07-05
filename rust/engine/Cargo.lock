@@ -25,6 +25,7 @@ name = "endor-fuzz"
 version = "0.0.1"
 dependencies = [
  "endor-oracle",
+ "endor-regexp",
  "endor-vm",
 ]
 
@@ -34,6 +35,13 @@ version = "0.0.1"
 dependencies = [
  "cc",
  "endor-vm",
+]
+
+[[package]]
+name = "endor-regexp"
+version = "0.0.1"
+dependencies = [
+ "endor-oracle",
 ]
 
 [[package]]
