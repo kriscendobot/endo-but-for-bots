@@ -142,9 +142,7 @@ The deferred paths are honest **named skips**, never faked: `indexOf`/
 a multi-character partial-then-full match over-counts), `Number.prototype.
 toString` at a non-decimal radix, non-ASCII case/trim and astral offset math, a
 String method result consumed *directly* (without an intervening variable) as a
-receiver/argument (an extra temporary-lifetime residual), and — the largest
-remaining work — **`JSON.parse`** (the tokenizer + per-node allocation
-metering, still an honest named skip).
+receiver/argument (an extra temporary-lifetime residual).
 
 The stage-3b **json-metering** child closes **structured `JSON.stringify`**
 (object/array values): the recursive `fxStringifyJSONProperty` per-node metering
@@ -161,10 +159,29 @@ leaf; the wobble the child-4 measurements saw is entirely the final result
 A **callable value** (function) — whose reference branch runs an unmodeled
 `mxGetID(_toJSON)` probe — and the `toJSON`/wrapper/replacer/space corners remain
 honest named skips (`JSON.stringify:callable-value`, …), never a wrong value or a
-divergence. This lifts `built-ins/JSON` to `total=138 covered=4 divergent=0`
-(most stringify files also round-trip through the still-skipped `JSON.parse`),
-and the curated `stage3b-json-metering.js` corpus + the
-`gen_json_structured_program` differential fuzz arm both agree bit-exactly.
+divergence.
+
+The same child implements **`JSON.parse`** (`fx_JSON_parse` — the tokenizer,
+recursive value construction, and per-node allocation metering), bit-exact
+(result AND computron). The parse path calls **no** `mxMeter` (like `xsMapSet`),
+so every unit is the native-frame residual `49152` (over the call trampoline the
+interpreter already meters) plus the exact allocations: a produced string's
+tokenizer chunk (`fxNewChunk(size+1)`); an array's `fxNewArrayInstance` two
+slots + one linked `fxNewSlot` (`33024` fixed body) per element + the one-time
+`fxCacheArray` item chunk (`length * sizeof(txSlot)` = `length*32` + header); an
+object's `fxNewObjectInstance` slot + per member a `65792` body + the key-name
+intern (a novel name one `fxNewSlot`) + the key-string chunk + the recursive
+value. Numbers classify exactly as XS (`INTEGER` iff integral, in `txInteger`
+range, and non-zero). Honest named skips: a reviver argument
+(`JSON.parse:reviver`), a non-string argument needing coercion
+(`JSON.parse:non-string`), a surrogate/astral `\u` escape (`JSON.parse:astral`),
+malformed input whose `SyntaxError` partial metering is unmodeled
+(`JSON.parse:syntax`), and re-serializing a parsed object's runtime-interned key
+(`JSON.stringify:interned-key`, child-5's interned-key rendering gap). Together
+this lifts `built-ins/JSON` to `total=138 covered=15 divergent=0` (from 2 before
+this child), and the curated `stage3b-json-metering.js` corpus + the
+`gen_json_structured_program` and `gen_json_parse_program` differential fuzz arms
+all agree bit-exactly.
 
 One neighbouring **pre-existing** observation the parse child (or an object-
 literal child) should note: a *large/deep* nested **object literal**
