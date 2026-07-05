@@ -884,6 +884,69 @@ pub const BIGINT_ARITH_FRAME_METERING: u64 = 1 << 14;
 /// [`Interp::make_bigint`]). Measured `1 << 14` raw-exact against the pin.
 pub const BIGINT_NEG_FRAME_METERING: u64 = 1 << 14;
 
+// ---- Promise metering (xsPromise.c; the pump-loop latch) -------------
+//
+// xsPromise.c calls `mxMeter` exactly once in the whole file (the
+// unhandled-rejection list walk), so — like xsMapSet.c and the JSON parse
+// path — promise metering is almost entirely allocation-driven: the
+// `fxNewSlot`/`fxNewInstance`/`fxNewChunk`/`fxNewHostFunction` clusters plus
+// the native host frames of each entry point, over the `RUN` dispatch the
+// interpreter already meters and the re-entrant reaction/executor bodies the
+// nested dispatch meters. Each constant below is the native residual of one
+// entry point BEYOND the explicit allocation ticks its handler charges,
+// calibrated raw-exact against the pin `48ee02d8cfe0`.
+
+/// The native residual of `new Promise(executor)` (`fx_Promise`) BEYOND the
+/// `RUN` dispatch, the explicit six `fxNewPromiseInstance` `fxNewSlot`s, the
+/// [`PROMISE_FUNCTIONS_METERING`] resolving-pair cluster, and the executor
+/// body the re-entrant `run_callback` meters. Covers the native host frame,
+/// `fxGetPrototypeFromConstructor`, and the `mxRunCount(2)` executor-call
+/// framing. Calibrated raw-exact against the pin (`new Promise(function(r){})`
+/// = 6 instance slots + 13 resolving-pair slots + this frame + the empty
+/// executor body = 32 computrons).
+pub const PROMISE_CTOR_FRAME_METERING: u64 = 261888;
+/// The non-slot residual of `fxPushPromiseFunctions` beyond the 13 explicit
+/// `fxNewSlot`s [`Interp::make_resolving_functions`] charges (the two
+/// `fxNewHostFunction`s — each instance + CALLBACK + HOME + LENGTH + NAME,
+/// the empty name interned so no chunk — plus the shared home object's
+/// instance + boolean guard slot + promise-reference slot). Measured zero:
+/// the pair allocates no chunk and `xsPromise.c`/`fxNewHostFunction` call no
+/// `mxMeter` here. Calibrated raw-exact against the pin.
+pub const PROMISE_FUNCTIONS_METERING: u64 = 0;
+/// The native residual of `Promise.resolve(v)` (`fx_Promise_resolve` →
+/// `fx_Promise_resolveAux`) BEYOND the capability's promise instance +
+/// resolving pair and the `mxRunCount(1)` resolve call. Calibrated raw-exact
+/// against the pin.
+pub const PROMISE_RESOLVE_STATIC_METERING: u64 = 0;
+/// The native residual of `Promise.reject(reason)` (`fx_Promise_reject`).
+/// Calibrated raw-exact against the pin.
+pub const PROMISE_REJECT_STATIC_METERING: u64 = 0;
+/// The native frame residual of a **resolve** function call
+/// (`fxResolvePromise`) BEYOND the `RUN` dispatch, when it settles a promise
+/// with a primitive value and no thenable/reactions (the path allocates
+/// nothing). Calibrated raw-exact against the pin.
+pub const PROMISE_RESOLVE_FN_METERING: u64 = 32488;
+/// The native frame residual of a **reject** function call
+/// (`fxRejectPromise`). `fxRejectPromise` is a shorter body than
+/// `fxResolvePromise` (no `mxTry`/thenable probe) yet meters a little more of
+/// its own frame. Calibrated raw-exact against the pin.
+pub const PROMISE_REJECT_FN_METERING: u64 = 32488;
+/// The native residual of the `[[AlreadyResolved]]`-guarded early return of a
+/// resolve/reject function (XS returns right after the boolean check).
+/// Measured zero against the pin (a second `resolve`/`reject` adds nothing).
+pub const PROMISE_SETTLE_GUARDED_METERING: u64 = 0;
+/// The native residual of `Promise.prototype.then` (`fx_Promise_prototype_
+/// then` → `fxPromiseThen`) BEYOND the capability's derived promise +
+/// resolving pair and the reaction-instance `fxNewSlot`s. Calibrated
+/// raw-exact against the pin.
+pub const PROMISE_THEN_METERING: u64 = 0;
+/// The per-reaction residual of one queued promise job's execution
+/// (`fxQueueJob` capture + `fxRunPromiseJobs`'s `mxRunCount` +
+/// `fxOnResolvedPromise`/`fxOnRejectedPromise` trampoline) BEYOND the
+/// reaction body the nested dispatch meters and the derived promise's settle.
+/// Calibrated raw-exact against the pin.
+pub const PROMISE_JOB_METERING: u64 = 0;
+
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
 /// program's code buffer (set by the following `code` opcode) and the
@@ -1361,6 +1424,42 @@ pub enum NativeMethod {
     /// (`fx_DataView_prototype_set`): coerce and write an element of the type
     /// indexed by the payload. One `mxMeterOne` per write.
     DataViewSet(u8),
+    /// `Promise.prototype.then(onFulfilled, onRejected)`
+    /// (`fx_Promise_prototype_then`): register the reaction pair on the
+    /// receiver promise and return a fresh derived promise the reaction's
+    /// outcome settles. Re-entrant when the promise is already settled (it
+    /// queues a job, run at the pump-loop drain).
+    PromiseThen,
+    /// `Promise.prototype.catch(onRejected)` (`fx_Promise_prototype_catch`):
+    /// `then(undefined, onRejected)`.
+    PromiseCatch,
+    /// `Promise.prototype.finally(onFinally)`
+    /// (`fx_Promise_prototype_finally`): a `then` whose handlers run
+    /// `onFinally` and pass the settlement through — a later increment
+    /// (self-names until then).
+    PromiseFinally,
+    /// `Promise.resolve(value)` (`fx_Promise_resolve`): a promise resolved
+    /// with `value` (returned as-is when already a native promise).
+    PromiseResolveStatic,
+    /// `Promise.reject(reason)` (`fx_Promise_reject`): a promise rejected
+    /// with `reason`.
+    PromiseRejectStatic,
+    /// `Promise.all(iterable)` (`fx_Promise_all`): a later increment.
+    PromiseAll,
+    /// `Promise.race(iterable)` (`fx_Promise_race`): a later increment.
+    PromiseRace,
+    /// `Promise.allSettled(iterable)` (`fx_Promise_allSettled`): a later
+    /// increment.
+    PromiseAllSettled,
+    /// `Promise.any(iterable)` (`fx_Promise_any`): a later increment.
+    PromiseAny,
+    /// A promise's resolve/reject function (XS's `fxResolvePromise`/
+    /// `fxRejectPromise` host functions handed to the executor). Recognized
+    /// in the `RUN` dispatch by a `promise_functions` side-table lookup, not
+    /// bound as a prototype method; this variant is the marker the
+    /// `alloc_method` name/length machinery uses.
+    PromiseResolveFunction,
+    PromiseRejectFunction,
 }
 
 impl Default for FuncInfo {
@@ -1493,6 +1592,74 @@ struct DataViewData {
     size: u32,
 }
 
+/// A promise instance's settlement state (XS's `XS_PROMISE_KIND` STATUS
+/// slot + RESULT slot + THENS list, `xsPromise.c` `fxNewPromiseInstance`).
+/// Kept in the [`Interp::promises`] side table, keyed by the promise
+/// instance's slot. `state` is the fulfilled/rejected/pending status;
+/// `result` is the fulfillment value or rejection reason once settled;
+/// `reactions` are the `.then` reactions registered while still pending
+/// (drained into the job queue at settlement); `settled_guard` is the
+/// shared `[[AlreadyResolved]]` boolean the promise's resolve/reject
+/// functions consult (XS's boolean slot in the `fxPushPromiseFunctions`
+/// home object — one flag shared by the pair, tripped by whichever fires
+/// first).
+#[derive(Clone, Debug)]
+struct PromiseData {
+    state: PromiseState,
+    result: Slot,
+    reactions: Vec<PromiseReaction>,
+    settled_guard: bool,
+}
+
+/// A promise's settlement status (XS's `mxPendingStatus`/`mxFulfilledStatus`/
+/// `mxRejectedStatus`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+/// A registered `.then` reaction on a still-pending promise (XS's THENS
+/// reaction instance, `fxPromiseThen`): the user handlers (`undefined` when
+/// absent) and the derived promise's capability functions the handler's
+/// outcome resolves/rejects.
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)] // fields consumed by the `.then`/job-drain increment
+struct PromiseReaction {
+    on_fulfilled: Slot,
+    on_rejected: Slot,
+    resolve: Slot,
+    reject: Slot,
+}
+
+/// A resolve/reject function's bound data (XS's `fxPushPromiseFunctions`
+/// home object): which promise it settles and whether it resolves or
+/// rejects. Kept in the [`Interp::promise_functions`] side table, keyed by
+/// the host-function instance's slot; the `[[AlreadyResolved]]` guard lives
+/// on the target [`PromiseData::settled_guard`] (shared by the pair).
+#[derive(Copy, Clone, Debug)]
+struct PromiseFnData {
+    promise: crate::value::SlotIndex,
+    reject: bool,
+}
+
+/// A queued microtask (XS's promise job, `fxQueueJob` onto `mxPendingJobs`).
+/// A reaction job runs `on_fulfilled`/`on_rejected` against `value` and
+/// settles the derived promise via the captured capability, exactly as
+/// `fxOnResolvedPromise`/`fxOnRejectedPromise` do. FIFO-ordered in
+/// [`Interp::promise_jobs`]; drained by [`Interp::run_promise_jobs`] after
+/// the script settles (the pump-loop latch).
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)] // fields consumed by the `.then`/job-drain increment
+struct PromiseJob {
+    reaction: PromiseReaction,
+    /// The settled value/reason to feed the reaction.
+    value: Slot,
+    /// `true` if the source promise rejected (run `on_rejected`).
+    rejected: bool,
+}
+
 /// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
 /// keys, 2 = entries) `iterable` is the array and `index` the cursor. For a
 /// **for-in enumerator** (`kind` = 3) `enum_keys` is the pre-collected list of
@@ -1566,6 +1733,11 @@ pub enum Native {
     /// `fx_DataView`). Its per-instance view state lives in the
     /// [`Interp::data_views`] side table.
     DataView,
+    /// `Promise` — the promise constructor (`xsPromise.c` `fx_Promise`). Its
+    /// per-instance settlement state lives in the [`Interp::promises`] side
+    /// table; the resolve/reject functions it hands the executor are host
+    /// functions recorded in [`Interp::promise_functions`].
+    Promise,
 }
 
 impl Native {
@@ -1595,6 +1767,7 @@ impl Native {
             Native::ArrayBuffer => "ArrayBuffer",
             Native::TypedArray(i) => TYPED_ARRAY_TYPES[i as usize].name,
             Native::DataView => "DataView",
+            Native::Promise => "Promise",
         }
     }
 
@@ -1631,6 +1804,7 @@ impl Native {
             v.push((t.name, Native::TypedArray(i as u8)));
         }
         v.push(("DataView", Native::DataView));
+        v.push(("Promise", Native::Promise));
         v
     }
 }
@@ -2007,6 +2181,30 @@ pub struct Interp {
     /// under the ids the program reads them by.
     value_id: Option<u16>,
     done_id: Option<u16>,
+    /// Per-instance promise settlement state (XS's `XS_PROMISE_KIND` STATUS/
+    /// RESULT/THENS internal slots). Keyed by the promise instance's slot,
+    /// like [`Self::collections`]. See [`PromiseData`].
+    promises: std::collections::HashMap<crate::value::SlotIndex, PromiseData>,
+    /// The realm's `%Promise.prototype%` (a boot object), so a `new Promise`
+    /// instance chains to it and `then`/`catch`/`finally` resolve.
+    promise_proto: crate::value::SlotIndex,
+    /// A resolve/reject host function's bound data (XS's
+    /// `fxPushPromiseFunctions` home object). Keyed by the function
+    /// instance's slot; consulted in the `RUN` dispatch when a program calls
+    /// a resolve/reject function it was handed. See [`PromiseFnData`].
+    promise_functions: std::collections::HashMap<crate::value::SlotIndex, PromiseFnData>,
+    /// The pending promise-job queue (XS's `mxPendingJobs` list): the
+    /// microtasks queued by settling a promise with registered reactions,
+    /// drained FIFO by [`Self::run_promise_jobs`] after the script settles —
+    /// the host-driven pump-loop drain the endor embedding performs (design
+    /// § promises, the pump-loop latch).
+    promise_jobs: std::collections::VecDeque<PromiseJob>,
+    /// The program-local symbol id of `then` (XS's `mxID(_then)`), resolved
+    /// at [`Self::link_intrinsics`], so thenable adoption can probe an
+    /// argument's `.then`. `None` when the program never references `then`.
+    /// Read by the thenable-adoption path (a later increment).
+    #[allow(dead_code)]
+    then_id: Option<u16>,
     /// The jump-buffer chain (XS's `the->firstJump`), innermost last.
     /// `CATCH` pushes a [`CatchJump`]; `UNCATCH` pops it; `THROW`/`RETHROW`
     /// unwind to the top entry, restoring the value stack, scope, and call
@@ -2164,6 +2362,11 @@ impl Interp {
             iterators: std::collections::HashMap::new(),
             value_id: None,
             done_id: None,
+            promises: std::collections::HashMap::new(),
+            promise_proto: crate::value::SlotIndex::NULL,
+            promise_functions: std::collections::HashMap::new(),
+            promise_jobs: std::collections::VecDeque::new(),
+            then_id: None,
             jumps: Vec::new(),
         };
         interp.create_intrinsics();
@@ -2253,6 +2456,11 @@ impl Interp {
                 // special-cased by id). The per-instance view state lives in
                 // the `data_views` side table.
                 Native::DataView => self.slots.alloc(Slot::instance(object_proto)),
+                // `%Promise.prototype%`: a plain boot object chaining to
+                // %Object.prototype%, carrying `then`/`catch`/`finally` bound
+                // below. The per-instance settlement state lives in the
+                // `promises` side table.
+                Native::Promise => self.slots.alloc(Slot::instance(object_proto)),
             };
             self.ctor_prototype.insert(f, proto);
         }
@@ -2472,6 +2680,39 @@ impl Interp {
             let setter = self.alloc_method(NativeMethod::DataViewSet(kind));
             self.proto_methods.push((self.dataview_proto, gname, getter));
             self.proto_methods.push((self.dataview_proto, sname, setter));
+        }
+        // `%Promise.prototype%`: `then`/`catch`/`finally`, bound at link time
+        // only when the program references the name. The per-instance
+        // settlement state lives in the `promises` side table; the statics
+        // (`resolve`/`reject`/`all`/`race`/…) bind on the `Promise`
+        // constructor instance below.
+        self.promise_proto = self
+            .intrinsics
+            .get("Promise")
+            .and_then(|&c| self.ctor_prototype.get(&c).copied())
+            .unwrap_or(crate::value::SlotIndex::NULL);
+        for (name, m) in [
+            ("then", NativeMethod::PromiseThen),
+            ("catch", NativeMethod::PromiseCatch),
+            ("finally", NativeMethod::PromiseFinally),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((self.promise_proto, name, mf));
+        }
+        // `Promise.*` statics — own methods of the `Promise` constructor
+        // instance (not the prototype).
+        if let Some(&promise_ctor) = self.intrinsics.get("Promise") {
+            for (name, m) in [
+                ("resolve", NativeMethod::PromiseResolveStatic),
+                ("reject", NativeMethod::PromiseRejectStatic),
+                ("all", NativeMethod::PromiseAll),
+                ("race", NativeMethod::PromiseRace),
+                ("allSettled", NativeMethod::PromiseAllSettled),
+                ("any", NativeMethod::PromiseAny),
+            ] {
+                let mf = self.alloc_method(m);
+                self.proto_methods.push((promise_ctor, name, mf));
+            }
         }
         // Native prototype methods (bound to their prototype at link time,
         // only when the program references the method name). %Object.prototype%
@@ -2869,6 +3110,7 @@ impl Interp {
         self.byte_length_id = id_of("byteLength");
         self.byte_offset_id = id_of("byteOffset");
         self.buffer_id = id_of("buffer");
+        self.then_id = id_of("then");
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
             // Record the program-local id for every name, so a native
@@ -3147,6 +3389,12 @@ impl Interp {
                         CollKind::WeakMap => "[object WeakMap]".to_string(),
                         CollKind::WeakSet => "[object WeakSet]".to_string(),
                     }
+                } else if self.promises.contains_key(&r) {
+                    // A promise stringifies through `Object.prototype.toString`
+                    // under its `Symbol.toStringTag` ("Promise"): `[object
+                    // Promise]` — the completion the oracle reports for a bare
+                    // promise.
+                    "[object Promise]".to_string()
                 } else if let Some(info) = self.error_data.get(&r) {
                     match &info.message {
                         Some(m) if !m.is_empty() => format!("{}: {}", info.name, m),
@@ -3187,6 +3435,20 @@ impl Interp {
     /// Run a program bytecode buffer to completion.
     pub fn run(&mut self, code: &[u8]) -> RunOutcome {
         let mut halt = self.dispatch(code);
+        // Pump-loop latch: after the script settles, drain the promise job
+        // queue with metering still accumulating — the host-driven microtask
+        // drain the endor embedding performs after a crank (design § promises).
+        // This mirrors the oracle shim's post-`fxRunScript` `fxRunPromiseJobs`
+        // loop, so the metered computrons include the reactions. The script's
+        // completion value (`self.result`) was fixed at `END` and is not
+        // changed by the drain (reactions mutate closure state, not the
+        // top-level result). A job that reaches an un-modeled path turns the
+        // whole run into an honest `Halt::Unsupported`.
+        if halt == Halt::Return {
+            if let Err(h) = self.run_promise_jobs(code) {
+                halt = h;
+            }
+        }
         // A program that completes with a Symbol *value* is coerced to a
         // string by the harness (`String(result)`), which throws — so the
         // oracle reports the run as an abort, not a completion. Mirror that:
@@ -4039,9 +4301,33 @@ impl Interp {
                             None
                         }
                     });
-                    if let Some((native, base)) = callee {
+                    // A promise resolve/reject function (XS's `fxResolvePromise`/
+                    // `fxRejectPromise`, handed to an executor / capability):
+                    // recognized by its `promise_functions` entry. Checked
+                    // before the generic `method` branch — the function carries
+                    // a `PromiseResolveFunction`/`RejectFunction` method marker
+                    // for `typeof`/render, but it settles here, not in
+                    // `call_native_method`.
+                    let promise_fn = func_ref.and_then(|(f, base)| {
+                        if self.promise_functions.contains_key(&f) {
+                            Some((f, base))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((f, base)) = promise_fn {
+                        match self.call_promise_function(f, base, argc) {
+                            Ok(()) => {
+                                if self.check_meter() == MeterCheck::Abort {
+                                    return Halt::MeterAbort;
+                                }
+                                pc = ret_pc;
+                            }
+                            Err(h) => return h,
+                        }
+                    } else if let Some((native, base)) = callee {
                         // A native (intrinsic) constructor callee.
-                        match self.call_native(native, base, argc, has_target) {
+                        match self.call_native(native, base, argc, has_target, code) {
                             Ok(()) => {
                                 // Return into the JS caller: `END_ALL` checks.
                                 if self.check_meter() == MeterCheck::Abort {
@@ -5315,7 +5601,12 @@ impl Interp {
         base: usize,
         argc: usize,
         has_target: bool,
+        code: &[u8],
     ) -> Result<(), Halt> {
+        // `code` is threaded through for a native constructor that re-enters
+        // user code (the `Promise` executor via `run_callback`); the
+        // value-producing natives ignore it.
+        let _ = code;
         // Argument i is at `base + 4 + i` (arg0 is the deepest); missing
         // arguments read `undefined`.
         let arg = |i: usize| -> Slot {
@@ -5777,6 +6068,46 @@ impl Interp {
                 self.data_views.insert(inst, DataViewData { buffer: buf, offset, size });
                 Slot::of(Kind::Reference, Payload::Reference(inst))
             }
+            // `new Promise(executor)` (`fx_Promise`): a fresh pending promise
+            // whose resolve/reject functions are handed to the executor, which
+            // runs synchronously inside the construct (`mxRunCount(2)`). The
+            // promise instance is `fxNewPromiseInstance` (six `fxNewSlot`s), the
+            // resolving pair is `fxPushPromiseFunctions`
+            // ([`PROMISE_FUNCTIONS_METERING`]), and the native frame residual is
+            // [`PROMISE_CTOR_FRAME_METERING`]; the executor body is metered by
+            // the re-entrant `run_callback`. A non-user-function executor, and a
+            // non-`new` `Promise(...)` call (a TypeError in XS), self-name.
+            Native::Promise if has_target => {
+                let executor = arg(0);
+                let ef = match executor.value {
+                    Payload::Reference(ef)
+                        if self
+                            .functions
+                            .get(&ef)
+                            .map_or(false, |fi| fi.native.is_none() && fi.method.is_none())
+                            && !self.bound_functions.contains_key(&ef) =>
+                    {
+                        ef
+                    }
+                    _ => return Err(Halt::Unsupported("promise:non-user-executor")),
+                };
+                let _ = ef;
+                self.meter.tick_raw(PROMISE_CTOR_FRAME_METERING);
+                let promise = self.new_promise_instance();
+                let (resolve, reject) = self.make_resolving_functions(promise);
+                // Invoke `executor(resolve, reject)` with `this = undefined`,
+                // re-entrant. A throw rejects the promise via `fxRejectException`
+                // — its thrown-value capture + metering is a later increment, so
+                // an executor throw self-names rather than mis-settle.
+                match self.run_callback(code, executor, Slot::undefined(), &[resolve, reject]) {
+                    Ok(_) => {}
+                    Err(Halt::Throw(_)) => {
+                        return Err(Halt::Unsupported("promise:executor-throw"))
+                    }
+                    Err(h) => return Err(h),
+                }
+                Slot::of(Kind::Reference, Payload::Reference(promise))
+            }
             // The remaining fundamentals constructors' call/coerce/construct
             // behaviors land incrementally; until then they self-name so the
             // differential runner records an honest skip.
@@ -5787,6 +6118,192 @@ impl Interp {
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// Allocate a fresh **pending** promise instance (XS's
+    /// `fxNewPromiseInstance`): a heap instance chaining to
+    /// `%Promise.prototype%`, its [`PromiseData`] in the `promises` side table,
+    /// and the six `fxNewSlot`s XS charges (promise, STATUS, THENS, the
+    /// THENS-holder instance, RESULT, ENVIRONMENT). The native frame residual
+    /// is charged by the caller.
+    fn new_promise_instance(&mut self) -> crate::value::SlotIndex {
+        for _ in 0..6 {
+            self.meter.tick_slot_alloc();
+        }
+        let proto = self.promise_proto;
+        let inst = self.slots.alloc(Slot::instance(proto));
+        self.promises.insert(
+            inst,
+            PromiseData {
+                state: PromiseState::Pending,
+                result: Slot::undefined(),
+                reactions: Vec::new(),
+                settled_guard: false,
+            },
+        );
+        inst
+    }
+
+    /// Build the resolve/reject function pair that settles `promise` (XS's
+    /// `fxPushPromiseFunctions`): two host functions recorded in
+    /// `promise_functions`, sharing the promise's `[[AlreadyResolved]]` guard
+    /// ([`PromiseData::settled_guard`]). Metered as
+    /// [`PROMISE_FUNCTIONS_METERING`]. Returns `(resolve, reject)` reference
+    /// slots.
+    fn make_resolving_functions(&mut self, promise: crate::value::SlotIndex) -> (Slot, Slot) {
+        // XS's `fxPushPromiseFunctions` allocates 13 `fxNewSlot`s: each of the
+        // two `fxNewHostFunction`s is instance + CALLBACK + HOME + LENGTH +
+        // NAME (5 slots, an empty interned name → no chunk), and the shared
+        // home object is `fxNewInstance` + a boolean guard slot + a
+        // promise-reference slot (3). endor's model materializes only the two
+        // function instances, but meters XS's full slot count.
+        for _ in 0..13 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(PROMISE_FUNCTIONS_METERING);
+        let fp = self.function_proto;
+        let resolve = self.slots.alloc(Slot::instance(fp));
+        self.functions.insert(
+            resolve,
+            FuncInfo {
+                method: Some(NativeMethod::PromiseResolveFunction),
+                ..FuncInfo::default()
+            },
+        );
+        self.promise_functions
+            .insert(resolve, PromiseFnData { promise, reject: false });
+        let reject = self.slots.alloc(Slot::instance(fp));
+        self.functions.insert(
+            reject,
+            FuncInfo {
+                method: Some(NativeMethod::PromiseRejectFunction),
+                ..FuncInfo::default()
+            },
+        );
+        self.promise_functions
+            .insert(reject, PromiseFnData { promise, reject: true });
+        (
+            Slot::of(Kind::Reference, Payload::Reference(resolve)),
+            Slot::of(Kind::Reference, Payload::Reference(reject)),
+        )
+    }
+
+    /// A promise resolve/reject function call (XS's `fxResolvePromise`/
+    /// `fxRejectPromise`, dispatched from the `RUN` handler by a
+    /// `promise_functions` lookup). Settles the bound promise with argument 0
+    /// (or `undefined`), returning `undefined`. The value stack holds the call
+    /// frame `[THIS, FUNCTION, RESULT, FRAME, arg0?]` from `base`.
+    fn call_promise_function(
+        &mut self,
+        f: crate::value::SlotIndex,
+        base: usize,
+        argc: usize,
+    ) -> Result<(), Halt> {
+        let data = self.promise_functions[&f];
+        let value = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        self.settle_promise(data.promise, value, data.reject, argc)?;
+        self.stack.truncate(base);
+        self.push(Slot::undefined());
+        Ok(())
+    }
+
+    /// Settle `promise` (XS's `fxResolvePromise`/`fxRejectPromise` core): trip
+    /// the shared `[[AlreadyResolved]]` guard (a second settle is a metered
+    /// no-op), record the state/result, and queue a job per reaction that was
+    /// registered while pending. A **resolve with a reference value** probes
+    /// `.then` for adoption — the thenable-adoption path (and resolving a
+    /// promise with itself, a TypeError) is a later increment, so it
+    /// self-names rather than mis-settle. Rejection accepts any value.
+    fn settle_promise(
+        &mut self,
+        promise: crate::value::SlotIndex,
+        value: Slot,
+        reject: bool,
+        _argc: usize,
+    ) -> Result<(), Halt> {
+        match self.promises.get(&promise) {
+            Some(pd) => {
+                if pd.settled_guard {
+                    // The `[[AlreadyResolved]]` short-circuit: XS returns right
+                    // after the boolean check, before any state change or
+                    // allocation — a near-zero native residual.
+                    self.meter.tick_raw(PROMISE_SETTLE_GUARDED_METERING);
+                    return Ok(());
+                }
+            }
+            None => return Err(Halt::Unsupported("promise:settle-non-promise")),
+        }
+        // Resolving with an object/function requires the `.then` probe
+        // (thenable adoption) — deferred; only a primitive resolve value and
+        // any rejection reason settle synchronously here.
+        if !reject && value.kind == Kind::Reference {
+            return Err(Halt::Unsupported("promise:resolve-thenable"));
+        }
+        let state = if reject {
+            PromiseState::Rejected
+        } else {
+            PromiseState::Fulfilled
+        };
+        let reactions = {
+            let pd = self.promises.get_mut(&promise).unwrap();
+            pd.settled_guard = true;
+            pd.state = state;
+            pd.result = value;
+            std::mem::take(&mut pd.reactions)
+        };
+        // Queue one job per registered reaction (XS's `fxQueueJob` per THEN),
+        // preserving registration (FIFO) order.
+        for reaction in reactions {
+            self.promise_jobs.push_back(PromiseJob {
+                reaction,
+                value,
+                rejected: reject,
+            });
+        }
+        // The native frame residual of the resolve/reject function body over
+        // its `RUN` dispatch (the settle path allocates nothing when there are
+        // no reactions and no thenable). `fxRejectPromise` charges slightly
+        // more than `fxResolvePromise`.
+        self.meter.tick_raw(if reject {
+            PROMISE_REJECT_FN_METERING
+        } else {
+            PROMISE_RESOLVE_FN_METERING
+        });
+        Ok(())
+    }
+
+    /// Whether any promise jobs are pending (the pump-loop latch query — XS's
+    /// `the->promiseJobs` flag / `mxPendingJobs` non-empty). The host drains
+    /// with [`Self::run_promise_jobs`] after each turn. The design's daemon
+    /// pump loop queries this per-machine (replacing xsnap's global latch); the
+    /// in-process `run` drains internally, so it is exposed for the embedding.
+    #[inline]
+    #[allow(dead_code)]
+    fn has_pending_jobs(&self) -> bool {
+        !self.promise_jobs.is_empty()
+    }
+
+    /// Drain the promise job queue (XS's `fxRunPromiseJobs`, the host-driven
+    /// microtask drain the endor embedding runs after a crank — the pump-loop
+    /// latch). Each job runs its reaction handler against the settled value and
+    /// settles the derived promise, which may queue further jobs; the drain
+    /// continues until the queue empties. Metering accumulates through the
+    /// reactions, matching the oracle shim's post-`fxRunScript` drain.
+    fn run_promise_jobs(&mut self, code: &[u8]) -> Result<(), Halt> {
+        while let Some(job) = self.promise_jobs.pop_front() {
+            self.run_promise_job(code, job)?;
+        }
+        Ok(())
+    }
+
+    /// Run one queued promise job (XS's `fxOnResolvedPromise`/
+    /// `fxOnRejectedPromise` trampoline). Reactions are registered by
+    /// `.then`; the job-execution increment lands with it, so until then a
+    /// queued job self-names rather than mis-run. (No job is queued before
+    /// `.then` exists, so this is unreachable in the construct-only slice.)
+    fn run_promise_job(&mut self, code: &[u8], job: PromiseJob) -> Result<(), Halt> {
+        let _ = (code, job);
+        Err(Halt::Unsupported("promise:job-drain"))
     }
 
     /// Build a fresh Error instance of type `name` from a native Error
@@ -8054,6 +8571,28 @@ impl Interp {
                 self.data_view_write(dv.buffer, abs, kind, value, little)?;
                 self.meter.tick_raw(DATA_VIEW_SET_METERING);
                 Slot::undefined()
+            }
+            // The `Promise.prototype` methods and statics that re-enter user
+            // code / build derived promises are handled outside this
+            // value-returning match (`.then` and the statics thread `code`);
+            // this arm is reached only for the not-yet-modeled ones, an honest
+            // named skip. `.then`/`resolve`/`reject` are intercepted before the
+            // generic method dispatch (see `call_native_method_reentrant`).
+            NativeMethod::PromiseThen
+            | NativeMethod::PromiseCatch
+            | NativeMethod::PromiseFinally
+            | NativeMethod::PromiseResolveStatic
+            | NativeMethod::PromiseRejectStatic
+            | NativeMethod::PromiseAll
+            | NativeMethod::PromiseRace
+            | NativeMethod::PromiseAllSettled
+            | NativeMethod::PromiseAny => {
+                return Err(Halt::Unsupported(promise_method_unsupported_name(m)))
+            }
+            // The resolve/reject functions settle in the `RUN` dispatch
+            // (`call_promise_function`) and never reach here.
+            NativeMethod::PromiseResolveFunction | NativeMethod::PromiseRejectFunction => {
+                return Err(Halt::Unsupported("promise:resolving-fn-unexpected"))
             }
         };
         self.stack.truncate(base);
@@ -11829,6 +12368,24 @@ fn native_unsupported_name(native: Native) -> &'static str {
         Native::ArrayBuffer => "native-call:ArrayBuffer",
         Native::TypedArray(_) => "native-call:TypedArray",
         Native::DataView => "native-call:DataView",
+        Native::Promise => "native-call:Promise",
+    }
+}
+
+/// The self-naming skip label for a `Promise` method endor does not yet
+/// model (an honest `Halt::Unsupported`, never a wrong value).
+fn promise_method_unsupported_name(m: NativeMethod) -> &'static str {
+    match m {
+        NativeMethod::PromiseThen => "Promise.prototype.then",
+        NativeMethod::PromiseCatch => "Promise.prototype.catch",
+        NativeMethod::PromiseFinally => "Promise.prototype.finally",
+        NativeMethod::PromiseResolveStatic => "Promise.resolve",
+        NativeMethod::PromiseRejectStatic => "Promise.reject",
+        NativeMethod::PromiseAll => "Promise.all",
+        NativeMethod::PromiseRace => "Promise.race",
+        NativeMethod::PromiseAllSettled => "Promise.allSettled",
+        NativeMethod::PromiseAny => "Promise.any",
+        _ => "Promise.method",
     }
 }
 
