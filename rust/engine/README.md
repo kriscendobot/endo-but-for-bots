@@ -711,6 +711,60 @@ async `import()`/`importHook` loader, and `import.meta`. GC roots were not touch
 (no run-loop/allocation-pressure wiring in this child), so the GC-roots ledger
 note carries forward untouched.
 
+The stage-4b **compartment** child (3/5) grows the stage-1 `Compartment.evaluate`
+seam into the full **native `Compartment`** the SES suites probe
+(`endor_vm::compartment`, `xsModule.c`'s compartment half): **per-compartment
+globals** over the machine's shared `Rc` intrinsics with **endowments** copied
+onto the new global at construction; a **`globalThis`** whose identity is the
+compartment's own — distinct per compartment (nested compartments included),
+stable for one compartment — read via `Compartment::global_this`; **nested
+compartments** (`Compartment::new_compartment`) minting a child over the **same**
+machine intrinsics with fresh globals and a fresh globalThis identity (a
+Compartment created inside a compartment chains correctly); and **module-map
+integration** — a compartment owns a `module::ModuleGraph` (the `new
+Compartment({ modules, resolveHook, importHook })` surface), and a **static**
+`import { x } from 'm'` resolves through **this** compartment's map
+(`Compartment::import_static`), so two compartments with different maps for the
+same specifier import different modules. The per-compartment evaluator
+(`evaluate_with_symbols`) relinks a program's intrinsic references to the shared
+intrinsics by the C-XS symbol atom (exactly as `run_program_with_symbols` does for
+the top-level realm) and seeds this compartment's own globals, so two compartments
+over one machine diverge exactly and only in their own globals.
+
+**Compartment differential (the acceptance evidence).** `built-ins/Compartment`
+does not exist upstream, so the corpus is the evidence: `stage4-compartment.js`
+(29 programs) is compiled once on the oracle and its exact bytecode evaluated in
+**two** compartments over **one** machine's shared intrinsics
+(`endor_262::compartment_dual_run`), asserting **RESULT agreement** (both
+compartments == the oracle's completion value, over one `Rc::ptr_eq` intrinsics
+graph — evaluate faithfulness, shared-intrinsics identity, cross-compartment
+values) **plus computron agreement** (the same bytecode with no globals seeded
+reproduces the oracle's run-only count). A **global-separation** differential
+seeds the same global id with a different value in each of two compartments and
+confirms each renders its **own** binding — matching the oracle's `String()` of
+that value while diverging between the compartments. Locked as two `cargo test`
+bars (`stage4_compartment_corpus_agrees_across_two_compartments`,
+`compartments_isolate_their_own_globals_against_a_seeded_value`) alongside **12
+endor-side unit tests** (`endor_vm::compartment::tests` — isolation, shared
+intrinsics, distinct/stable globalThis, nested chaining, endowments, constructor
+resolve/import-hook shape, static-import module-map resolution, module-map
+isolation, cross-compartment live indirect binding, dynamic-import named skip).
+**Named skips** (self-naming, never a wrong value): dynamic
+`compartment.import()` (`compartment:dynamic-import`), the async host loader the
+static half does not build. **Scope fold (recorded honestly):** endor models
+`Compartment` **host-side** (a Rust realm API matching XS's C-level compartment
+machinery), **not** as a guest-callable `Compartment` intrinsic — a guest
+`new Compartment().evaluate('…')` would need the interpreter to expose a native
+constructor whose `evaluate` re-enters the compiler, a re-entrant compile seam
+that needs the oracle at run time (which `endor-vm` deliberately does not link,
+`#![forbid(unsafe_code)]`), so a program that references the `Compartment`
+intrinsic itself is a named skip (`compartment:intrinsic-surface`), exactly as
+the module goal is a named skip on the oracle seam. `lockdown`/`harden` (freezing
+the shared intrinsics) lands in the next child. GC roots were not touched (no
+run-loop/allocation-pressure wiring in this child), so the GC-roots ledger note
+carries forward untouched. The compartment evaluator's global-seeding path is
+**Miri-clean** (`endor_vm::compartment::tests` under Miri, single-threaded).
+
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
