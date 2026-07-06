@@ -15190,6 +15190,52 @@ mod tests {
         assert_eq!(rec.opcode_count(Opcode::XS_CODE_BRANCH_1), 2);
         assert_eq!(rec.opcode_count(Opcode::XS_CODE_END), 1);
     }
+
+    #[test]
+    fn utf16_code_units_round_trip_through_the_encoding() {
+        // The UTF-16BE encode/decode pair is exact for every code unit,
+        // including lone surrogates and astral pairs — the storage form is a
+        // sequence of 16-bit code units, so nothing is normalized away.
+        for units in [
+            vec![],
+            vec![0x0000u16],                         // U+0000 (no NUL-terminator hazard)
+            "hello".encode_utf16().collect(),        // ASCII
+            "héllo — Ω".encode_utf16().collect(),    // BMP non-ASCII
+            "𝒜𝒷".encode_utf16().collect(),           // astral (surrogate pairs)
+            vec![0xD834, 0x0041, 0xDD1E],            // a LONE high surrogate mid-string
+        ] {
+            let bytes = units_to_be16(&units);
+            assert_eq!(bytes.len(), units.len() * 2, "2 bytes per code unit");
+            assert_eq!(be16_to_units(&bytes), units, "BE decode is the inverse");
+        }
+        // `str_to_be16(&str)` agrees with encoding the str's code units.
+        for s in ["", "a", "𝒜b", "Ω"] {
+            let u: Vec<u16> = s.encode_utf16().collect();
+            assert_eq!(str_to_be16(s), units_to_be16(&u));
+        }
+    }
+
+    #[test]
+    fn string_atom_round_trips_through_chunk_storage() {
+        // A string value stored in the chunk arena (a "string atom") must read
+        // back bit-identically under the UTF-16BE encoding — the snapshot /
+        // atom round-trip the representation change must preserve. Exercises
+        // BMP, astral, and a lone surrogate, plus the O(1) `length`/`str_len`.
+        let mut interp = Interp::new();
+        for units in [
+            "café".encode_utf16().collect::<Vec<u16>>(),
+            "𝒜z".encode_utf16().collect::<Vec<u16>>(),
+            vec![0x0041u16, 0xD800, 0x0042], // 'A', lone high surrogate, 'B'
+        ] {
+            let slot = interp.new_string_units(&units);
+            let off = match slot.value {
+                Payload::String(o) => o,
+                _ => panic!("new_string_units must yield a String slot"),
+            };
+            assert_eq!(interp.str_units(off), units, "stored units read back exactly");
+            assert_eq!(interp.str_len(off), units.len(), "length is the code-unit count");
+        }
+    }
 }
 
 // ---- BigInt limb arithmetic (xsBigInt.c: txU4 little-endian digits) ----
