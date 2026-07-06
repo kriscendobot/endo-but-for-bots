@@ -17274,6 +17274,30 @@ mod tests {
         assert_eq!(out.result, "0", "pre-drain x");
     }
 
+    /// The stage-4b async-function suspend/resume + result-promise settle path
+    /// is Miri-clean: `var x=0; async function f(){ x = await 7; } f(); x` drives
+    /// `new_async_instance` (the result-promise + resolving-pair allocation and
+    /// the `async_instances` HashMap insert), `START_ASYNC`'s frame clone,
+    /// `AWAIT`'s snapshot into the side table (`stack.split_off`), the
+    /// `await_schedule` general path (`new_promise_capability` + the
+    /// `AsyncAwait` native reaction registered via `promise_then_native`), and
+    /// the drain resume (`run_promise_job` → `step_async` reinstalling the frame
+    /// and settling the result promise). Asserts the completion (the pre-drain
+    /// `x` = 0) — under Miri this exercises the new async side-table and
+    /// reaction allocation paths for UB (the crate is `#![forbid(unsafe_code)]`,
+    /// so this is a defensive backstop). Bytecode + symbols captured from the
+    /// pin `48ee02d8cfe0`.
+    #[test]
+    fn async_await_suspend_resume_is_miri_clean() {
+        const BYTECODE: &[u8] = &[0x0b,0x00,0x9e,0x02,0x86,0x01,0x00,0x8e,0xe6,0x01,0x92,0x86,0x02,0x00,0xe0,0xe6,0x02,0x92,0x4b,0x4d,0x01,0x00,0x07,0x01,0x00,0x2e,0x12,0x0b,0x00,0xc1,0x4d,0x02,0x00,0x72,0x07,0x0a,0x25,0x02,0xbb,0x44,0xbf,0x02,0x00,0x92,0x44,0x58,0x92,0x42,0xe0,0x89,0x03,0x00,0x72,0x04,0xbf,0x01,0x00,0x92,0x4d,0x02,0x00,0x72,0x00,0xbf,0x02,0x00,0x92,0xe0,0x4d,0x01,0x00,0x66,0x01,0x00,0x28,0xab,0x00,0xbb,0x4d,0x02,0x00,0x67,0x02,0x00,0xbb,0xa9];
+        const SYMBOLS: &[u8] = &[0x04,0x00,0x66,0x00,0x78,0x00,0x63,0x61,0x6c,0x6c,0x65,0x72,0x00];
+        let out = crate::run_program_with_symbols(BYTECODE, SYMBOLS);
+        assert!(out.completed, "async program should complete: {:?}", out.halt);
+        // The completion is the pre-drain `x` (the resume runs at the drain,
+        // after the script returns); the awaited 7 settles into `x` at the drain.
+        assert_eq!(out.result, "0", "pre-drain x");
+    }
+
     #[test]
     fn utf16_code_units_round_trip_through_the_encoding() {
         // The UTF-16BE encode/decode pair is exact for every code unit,
