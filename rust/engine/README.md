@@ -597,25 +597,65 @@ generator throw-into-suspended skips), `resolve(promise-itself)`
 (`promise:resolve-self`, a catchable TypeError), and **adopting a native
 promise** (`promise:adopt-native-thenable`, whose `.then` is
 `%Promise.prototype%.then` — it needs the resolving functions registered as
-**native** reaction handlers). The **reported scope fold**, carried forward to a
-follow-up child (each already a named skip, never a wrong value or a
-divergence): **`Promise.prototype.finally`** and the **`all`/`race`/
-`allSettled`/`any` combinators** (both blocked on the same infrastructure — a
-reaction handler that is a **native** function, which the current drain's
-`run_callback` only-user-function trampoline cannot invoke; `finally`'s
-`finallyAux` and the combinators' `fxCombinePromisesCallback` are both native
-reaction handlers), and the whole **async-function surface** —
-`XS_CODE_ASYNC_FUNCTION`/`await`, `XS_CODE_ASYNC_GENERATOR_FUNCTION`/
-`for-await-of`, and the async-iterator protocol (the designated scope fold). The
-keystone was the gating deliverable ("resolve it first"); it unblocks the folded
-surfaces, which now share one clear prerequisite (native reaction handlers). The
-full implementation map for the folded async-function surface — the
-`ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT`/`BRANCH_STATUS` opcode handlers, the
-`fxStepAsync` → `step_async` model, the 5-slot native-reaction path that also
-unblocks `finally` + the combinators, and the bars to add — is written up for the
-next dedicated invocation in [`ASYNC-AWAIT-HANDOFF.md`](ASYNC-AWAIT-HANDOFF.md).
-The keystone alone consumed a full handler invocation, so the async-function
-surface is sized as its own follow-up child rather than co-fitting here.
+**native** reaction handlers). The keystone was the gating deliverable
+("resolve it first"); it unblocks the folded surfaces, which share one clear
+prerequisite — native reaction handlers — now built (see the stage-4b child).
+
+The stage-4b **async-function surface** child (2/5) lands the folded
+`XS_CODE_ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT` opcode surface over the keystone,
+bit-exact (result AND computron) against the pin, executing directly from
+[`ASYNC-AWAIT-HANDOFF.md`](ASYNC-AWAIT-HANDOFF.md). An async function is a
+`new_async_function` re-chaining `[[Prototype]]` to a new `%AsyncFunction.
+prototype%` intrinsic (no own `.prototype`; the calibrated
+`ASYNC_FUNCTION_DEFINE_DELTA` backs out the constructor-prototype allocation).
+`START_ASYNC` clones the frame like `new_generator_instance`, builds the result
+promise via `new_promise_instance` + `make_resolving_functions`, runs
+`step_async` synchronously to the first `await` or completion, and returns the
+result promise (mirroring `START_GENERATOR`'s boundary split). `AWAIT` is a
+YIELD-shaped suspend reading a new `async_run_stack`, returning `Halt::Await`
+(per-suspend metering reuses `GENERATOR_YIELD_METERING` — the identical C code);
+`BRANCH_STATUS` now honors a threaded `resume_status` (fulfilled → branch by
+offset leaving the resolved value on the stack; rejected → `THROW_STATUS` unwind
+to the innermost handler), with the generator path unchanged (it only ever
+resumes `NoStatus`). The shared prerequisite — the **5-slot native-reaction
+path** (`PromiseReaction.kind = AsyncAwait(inst)`, `promise_then_native` a
+null-capability `fxPromiseThen`, dispatched at the drain in `run_promise_job` to
+`step_async` rather than a user handler) — is built here; `await_schedule`'s
+native-promise **fast path** (identity check + reaction, `ASYNC_AWAIT_FASTPATH_
+CREDIT`) and **general path** (`new_promise_capability` + the reaction + calling
+the fresh resolve, `ASYNC_AWAIT_GENERAL_METERING`) both land bit-exact. Metering
+is frozen as calibrated `ASYNC_INSTANCE_METERING` (the `fxNewAsyncInstance`
+cluster + completion-settle framing), the define delta, and the two await-branch
+constants. `language/statements/async-function` dual-run grows to **`total=60
+covered=6 divergent=0`** (54 named skips) and `language/expressions/await` to
+**`total=21 covered=6 divergent=0`** (15 named skips) — both from `covered=0`
+(every test was a `structural:async-or-can-block` skip); `built-ins/AsyncFunction`
+is **`total=16 covered=1 divergent=0`**, and `built-ins/Promise` holds at
+**`total=474 covered=9 divergent=0`** (finally + combinators still skipped). The
+curated `stage4-async-await.js` corpus (14 programs — plain awaits, the
+native-promise fast path, nested async, multi-await chains, await-in-loop, async
+arrows, thenable await, rejection paths) is locked as the cargo bar
+`stage4_async_await_corpus_is_bit_exact_against_oracle`, and the suspend/resume +
+result-promise-settle path is exercised Miri-clean
+(`async_await_suspend_resume_is_miri_clean`). GC-roots: the `async_instances`
+side table (its `frame: Option<SavedFrame>` and the result-promise/resolving-
+function slots) and the `async_run_stack` join the root set, on the same
+deterministic trigger points as the generator table; the `AsyncAwait(inst)`
+reaction edge roots the suspended instance while its awaited promise is pending.
+The honest **named skip** carried per the handoff: **`await` inside a live
+`try`** (`await:await-in-try` — the jump-chain snapshot/rebase, the same
+increment generators defer for `yield-in-try`). The **reported scope fold**,
+carried forward to a follow-up child (each already a named skip, never a wrong
+value or a divergence): **`Promise.prototype.finally`** and the **`all`/`race`/
+`allSettled`/`any` combinators** — both now rest on the landed 5-slot
+native-reaction path, but each is its own surface (`finally`'s `finallyAux`
+chains a `Promise.resolve(...).then(finallyReturn/finallyThrow)` native-reaction
+family; the combinators need the iterator protocol + a shared-count native
+reaction), so they are sized as their own child rather than half-fit here — and
+**async generators / `for-await-of`** (`XS_CODE_ASYNC_GENERATOR_FUNCTION`, the
+async-iterator protocol; the designated scope fold). The keystone + this surface
+consumed their handler invocations; `finally` + the combinators are the next
+child on this now-unblocked substrate.
 
 The stage-4 **module machinery** child (5/8) lands the **static half** of
 `xsModule.c` as `endor_vm::module` — module records, a module map with a static

@@ -1,15 +1,28 @@
 # Async/await implementation handoff (stage-4 child 4/8, PR #600)
 
-Status: the **keystone** (promise native-handler double-settle calibration,
-thenable adoption, long `then`-chains, `Promise.resolve(nativePromise)` identity)
-landed bit-exact at HEAD `49e27a89b` — see README § the stage-4 async/await child.
-The **async-function surface** (`XS_CODE_ASYNC_FUNCTION`/`await`,
-`XS_CODE_ASYNC_GENERATOR_FUNCTION`/`for-await-of`) remains the honest **scope
-fold**: the async opcodes fall through to the interpreter's default arm
-(`Halt::Unsupported(op.name())`, interp.rs ~L6423), so async programs self-name as
-named skips (`async_function` / `start_async` / `await`), never a wrong value or a
-divergence. This note is the full implementation map so the next dedicated
-invocation executes directly instead of re-deriving it from the C source.
+Status: **LANDED** (stage-4b child 2/5). The **keystone** (promise native-handler
+double-settle calibration, thenable adoption, long `then`-chains,
+`Promise.resolve(nativePromise)` identity) landed bit-exact at `49e27a89b`, and
+the **async-function surface** (`XS_CODE_ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT` +
+`BRANCH_STATUS`, `step_async`, `await_schedule`, and the 5-slot native-reaction
+path) landed bit-exact against the pin per the map below — see README § the
+stage-4b async-function surface child. Dual-run: `language/statements/async-
+function total=60 covered=6 divergent=0`, `language/expressions/await total=21
+covered=6 divergent=0`, `built-ins/AsyncFunction total=16 covered=1 divergent=0`,
+`built-ins/Promise total=474 covered=9 divergent=0`. Corpus bar
+`stage4_async_await_corpus_is_bit_exact_against_oracle` (14 programs); Miri
+`async_await_suspend_resume_is_miri_clean`.
+
+**Still folded** (each an honest named skip, never a wrong value): `await` inside
+a live `try` (`await:await-in-try`); async generators
+(`XS_CODE_ASYNC_GENERATOR_FUNCTION`) / `for-await-of`; and — riding on the
+now-landed 5-slot native-reaction path but each its own surface —
+`Promise.prototype.finally` (`finallyAux` chains a
+`Promise.resolve(...).then(finallyReturn/finallyThrow)` native-reaction family)
+and the `all`/`race`/`allSettled`/`any` combinators (iterator protocol + a
+shared-count `fxCombinePromisesCallback` native reaction). These are the next
+child on this substrate. The implementation map below is retained as the C-XS
+reference for that follow-up.
 
 **Sizing lesson (why this is a separate invocation).** Child 4 as specified is
 two full deliverables — the keystone AND the async-function surface. The keystone
