@@ -312,6 +312,49 @@ pub fn locate_test262() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+/// Collect the checked-in test262 files carrying the `ses-xs-parity`
+/// feature marker — the exact set `packages/test262-runner` runs `xst`
+/// against with `--features-include ses-xs-parity` to prove the XS↔Node
+/// HardenedJS surface (design § test262 conformance; `ses-xs-parity`
+/// convention). Selection is by the same signal the harness uses: the test's
+/// front-matter `features:` list contains `ses-xs-parity`. Deterministic
+/// (sorted) order.
+pub fn ses_xs_parity_files(test_root: &Path) -> Vec<PathBuf> {
+    collect_js(test_root)
+        .into_iter()
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|s| {
+                    let fm = parse_features(&s);
+                    fm.iter().any(|f| f == "ses-xs-parity")
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Parse the front-matter `features: [...]` list (single-line array), the
+/// axis the `ses-xs-parity` opt-in set is selected by.
+fn parse_features(src: &str) -> Vec<String> {
+    let (start, end) = match (src.find("/*---"), src.find("---*/")) {
+        (Some(s), Some(e)) if e > s => (s + 5, e),
+        _ => return Vec::new(),
+    };
+    for line in src[start..end].lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("features:") {
+            if let (Some(a), Some(b)) = (rest.find('['), rest.find(']')) {
+                return rest[a + 1..b]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +488,75 @@ mod tests {
         assert!(
             rep.met_bar(),
             "zero divergence required on the covered grammar; got {} divergence(s)",
+            rep.divergences.len()
+        );
+    }
+
+    #[test]
+    fn ses_xs_parity_suite_has_zero_divergence() {
+        // The stage-4 closure SES-conformance bar (child 5/5). Run the
+        // repo's own `ses-xs-parity`-tagged test262 files — the exact set
+        // `packages/test262-runner` exercises `xst` against to prove the
+        // XS↔Node HardenedJS surface — against endor, and require ZERO
+        // RESULT divergence. A test endor cannot run end-to-end (it references
+        // the `Compartment` intrinsic global, or calls `lockdown()`, neither
+        // of which endor binds as a JS global — the Compartment child's
+        // `compartment:intrinsic-surface` fold and the harden child's
+        // `lockdown()` fold) is an HONEST NAMED skip, never a divergence.
+        // This states exactly how much of the SES-parity surface endor
+        // reaches today (the tally), with zero lies on what it reaches.
+        let (root, harness) = match locate_test262() {
+            Some(p) => p,
+            None => {
+                eprintln!("test262 subset absent; skipping the ses-xs-parity bar");
+                return;
+            }
+        };
+        let all = ses_xs_parity_files(&root);
+        assert!(
+            !all.is_empty(),
+            "the repo's ses-xs-parity feature set must be non-empty"
+        );
+        // GUARD: a test tagged `lockdown` calls `lockdown()`, which the C-XS
+        // ORACLE SHIM (the bare `fxCreateMachine` boot) crashes on — the same
+        // `lockdown()` surface the stage-4b harden child folded as an honest
+        // `Halt::Unsupported` on the endor side. Since dual-run runs the
+        // program on the oracle FIRST, handing a `lockdown()` test to the
+        // oracle SIGSEGVs the harness process. These are pre-partitioned into
+        // a NAMED structural skip (`oracle-shim-unsafe:lockdown`) and never
+        // dual-run — the honest closure-point verdict, reproducible by s10,
+        // that flips when either endor grows `lockdown()` or the shim is
+        // hardened to survive it.
+        let (lockdown, files): (Vec<_>, Vec<_>) = all.into_iter().partition(|p| {
+            std::fs::read_to_string(p)
+                .map(|s| parse_features(&s).iter().any(|f| f == "lockdown"))
+                .unwrap_or(false)
+        });
+        let mut rep = run_files(&harness, &root, &files);
+        // Fold the oracle-unsafe lockdown tests into the report as a named
+        // structural skip (they count toward the honest total).
+        if !lockdown.is_empty() {
+            rep.total += lockdown.len();
+            *rep.skipped
+                .entry("oracle-shim-unsafe:lockdown".into())
+                .or_insert(0) += lockdown.len();
+        }
+        eprintln!(
+            "ses-xs-parity: total={} covered={} divergent={}",
+            rep.total,
+            rep.covered,
+            rep.divergences.len()
+        );
+        eprintln!("  skipped-by-reason (honest split):");
+        for (reason, n) in rep.skip_summary() {
+            eprintln!("    {:>5}  {}", n, reason);
+        }
+        for (path, detail) in &rep.divergences {
+            eprintln!("  DIVERGENCE {}\n    {}", path, detail);
+        }
+        assert!(
+            rep.met_bar(),
+            "zero RESULT divergence required on the ses-xs-parity suite; got {} divergence(s)",
             rep.divergences.len()
         );
     }

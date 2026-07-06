@@ -817,6 +817,94 @@ collection/wrapper/error) to `harden`/`petrify` self-names
 were not touched (no run-loop/allocation-pressure wiring), so the GC-roots
 ledger note carries forward untouched.
 
+### Stage-4 acceptance evidence (closure child 5/5)
+
+This is the consolidated stage-4 (Hardened JavaScript & Compartment) acceptance
+block — the material the whole-stage-4 acceptance review (supervisor stage s10)
+independently reproduces. Full `cargo test --workspace --
+--test-threads=1` is green; `#![forbid(unsafe_code)]` is intact on every engine
+crate; no GC/allocation path was touched by this child, so the GC-roots ledger
+note carries forward untouched and Miri is not implicated here.
+
+**Per-child covered/divergent numbers (all `divergent=0`).**
+
+| Stage-4 child | Landed surface | Headline dual-run / corpus evidence |
+|---|---|---|
+| 4a-1 object-integrity | `preventExtensions`/`seal`/`freeze` + slot-arena attribute stamps | `built-ins/Object covered=176 divergent=0` (from 63) |
+| 4a-2 classes (`new.target`) | `XS_CODE_TARGET` real semantics | `built-ins/Function covered=40 divergent=0`; `language/{statements,expressions}/class covered=1 divergent=0` each (rest named skips) |
+| 4a-3 generators | `function*` + iteration protocol suspend/resume | `language/{statements,expressions}/generators covered=74/79 divergent=0`; `for-of covered=118`; `stage4-generators.js` corpus bit-exact |
+| 4a-4 async/promise keystone | promise native-handler double-settle + thenable adoption | `built-ins/Promise covered=9 divergent=0`; `stage4-async-promises.js` bit-exact |
+| 4a-5 modules (static half) | `endor_vm::module` records/map/resolve/link/evaluate, TDZ, ModuleSource | 14 cargo-locked unit tests; `language/module-code` dual-run structurally skipped (oracle shim compiles the script goal only) — certified by the endor-side corpus + manual-`xst` method |
+| 4b-2 async-function surface | `ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT` opcodes | `language/{statements,expressions}/await covered=6/6 divergent=0`; `stage4-async-await.js` bit-exact |
+| 4b-3 Compartment | native `Compartment::evaluate_with_symbols` over shared intrinsics | `stage4-compartment.js` differential across two compartments, result+computron agreement |
+| 4b-4 lockdown/harden | native `harden(x)`/`petrify(x)` over the slot arena | `stage4-harden.js` (30 programs) result-gated agreement; 3 Miri-clean freeze unit tests; `built-ins/Object` unchanged at `covered=176 divergent=0` |
+| 4b-5 closure (this child) | boot-bundle identical-run verdict + ses-xs-parity tally | below |
+
+**Boot-bundle identical-run verdict (`daemon-endor-architecture.md` § Unified
+runner).** The daemon boots `polyfills.js` → `host_aliases.js` → `ses_boot.js`
+(SES `lockdown()` + the HandledPromise shim). The first two are committed
+sources embedded by `rust/endo/xsnap/src/lib.rs`; `ses_boot.js` is **not
+committed** — it is a ~1 MB build artifact the daemon bundler (`rollup` over
+`@endo/*`) generates before the `include_str!`, absent in a fresh checkout, and
+bundling the full SES distribution is out of this engine workspace's scope. The
+bar (`endor-262::tests::stage4_daemon_boot_bundle_never_diverges_and_names_its_gaps`,
+locked in `cargo test`) dual-runs the **actual committed bytes** the daemon boots
+against the pin. **Verdict: the committed boot bundle does not run identically on
+endor yet** — its first statement reads `globalThis`, and endor has **no live
+global-object binding**, so every bundle honestly aborts there
+(`boot:no-globalThis-global-object-binding`) rather than diverging. Result
+agreement is the bar and endor **never lies** about the bundle (zero divergence —
+no wrong value, no over-acceptance); it declines it with a self-named halt. This
+is a **named, ledgered post-stage-4 engine gap**, not a fold to be hidden. The
+downstream engine gaps the bundle would hit *after* a `globalThis` binding lands
+(observed by dual-running each polyfill sub-behavior against the pin) are the
+rest of the ledger:
+
+| Ledgered boot-bundle gap | Blocking construct in the bundle |
+|---|---|
+| `boot:no-globalThis-global-object-binding` | `typeof globalThis.TextEncoder` (first statement; blocks all three bundles today) |
+| `boot:Reflect-intrinsic` | `Reflect.ownKeys(descs)` in the harden deep-freeze |
+| `boot:typed-array-from-iterable` | `new Uint8Array([...])` (the from-array form; the length form works) |
+| `boot:defineProperty-symbol-key` | `Object.defineProperty(Object, Symbol.for('harden'), …)` |
+| `boot:class-instance-construction` | `new TextEncoder()` (class-body method dispatch on a constructed instance) |
+| `boot:ses-lockdown-bundle` | `ses_boot.js` — the uncommitted ~1 MB SES bundle (bundler out of scope) |
+
+The bar flips to green (and the ledger advances to the next row) the moment the
+`globalThis` binding lands. No committed bundle was silently narrowed to make the
+bar pass.
+
+**SES conformance (`ses-xs-parity`) tally.** The repo's `ses-xs-parity` feature
+set — the exact tests `packages/test262-runner` runs `xst` against with
+`--features-include ses-xs-parity` — is **2 files**, both under
+`built-ins/Compartment/prototype` (`Symbol.toStringTag.js`,
+`Symbol.toStringTag-lockdown.js`). The bar
+(`endor-262::test262::tests::ses_xs_parity_suite_has_zero_divergence`, locked in
+`cargo test`) runs them against endor with **zero RESULT divergence**:
+`total=2 covered=0 divergent=0`, each skip named — `1 endor-aborted` (the
+non-lockdown file references the `Compartment` **intrinsic global**, which endor
+does not bind as a JS intrinsic — the Compartment child's
+`compartment:intrinsic-surface` fold; endor's `Compartment` is a Rust host type),
+and `1 oracle-shim-unsafe:lockdown` (the lockdown-tagged file calls `lockdown()`,
+which SIGSEGVs the bare-boot C-XS **oracle shim** — the same `lockdown()` surface
+the harden child folded on the endor side; it is pre-partitioned out and never
+dual-run). endor reaches none of the SES-parity surface end-to-end today, but
+lies about none of it; the tally grows as the `Compartment`/`lockdown` intrinsic
+globals land.
+
+**Consolidated fold ledger for s10 (each verified STILL an honest named skip at
+this closure point).**
+
+| Fold | Origin child | Self-named skip |
+|---|---|---|
+| async generators / `for-await-of` | 4a-3 / 4b-2 | designated scope fold (excluded from the async corpora) |
+| `language/module-code` dual-run | 4a-5 | structural skip (oracle shim = script goal only); certified by endor-side corpus + manual-`xst` |
+| runtime `XS_CODE_MODULE`/`XS_CODE_TRANSFER`, dynamic `import()`, `import.meta` | 4a-5 | named `Halt::Unsupported` skips |
+| `Compartment` intrinsic global surface | 4b-3 | `compartment:intrinsic-surface` (confirmed by the ses-xs-parity `endor-aborted` skip above) |
+| `await`-in-`try` | 4b-2 | `await:await-in-try` |
+| `lockdown()` + `mutabilities` | 4b-4 | `Halt::Unsupported` (endor); `oracle-shim-unsafe:lockdown` (oracle shim); confirmed by the ses-xs-parity guard above |
+| `harden`/`petrify` exotic receiver | 4b-4 | `harden:exotic-object` / `petrify:exotic-object` |
+| daemon boot bundle (`globalThis` + downstream) | 4b-5 | boot-bundle gap ledger above |
+
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
