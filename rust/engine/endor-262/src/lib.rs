@@ -434,6 +434,19 @@ pub fn stage4_new_target_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage4-new-target.js"))
 }
 
+/// The stage-4 generators corpus (child 3/8): generator functions and the
+/// iteration protocol closure — `function*` declarations/expressions and
+/// object-literal `*m()` methods, the suspend/resume of the interpreter
+/// activation (`START_GENERATOR`/`YIELD`/the `BRANCH_STATUS` resume epilogue),
+/// `%GeneratorPrototype%.next(v)`/`return(v)` with sent values and completion
+/// results, and `for-of`/spread over a generator. Bit-exact (result AND
+/// computron) against the pin. `yield*` delegation, `throw`/`return` into a
+/// suspended body, a `yield` inside `try`, `new`-constructed generators, and
+/// async generators are honest named skips (excluded from this corpus).
+pub fn stage4_generators_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-generators.js"))
+}
+
 /// The stage-3b promises corpus (child 7/9): `Promise` construction + the
 /// executor, `resolve`/`reject` settling, the `Promise.resolve`/`reject`
 /// statics, `then`/`catch` reaction registration, and the microtask job queue
@@ -1325,6 +1338,47 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-4 new.target bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage4_generators_corpus_is_bit_exact_against_oracle() {
+        // The stage-4 generators acceptance bar (child 3/8): generator
+        // functions and the iteration protocol — `function*` decl/expr and
+        // object-literal `*m()`, the suspend/resume of the interpreter
+        // activation (`START_GENERATOR` snapshots the fresh frame and returns
+        // the instance; `YIELD` snapshots and unwinds to the `.next` driver via
+        // `Halt::Yield`; `.next(v)` reinstalls the frame and runs a nested
+        // dispatch through the `BRANCH_STATUS` resume epilogue to the next
+        // `yield` or `END`), the sent value, completion `{value, done}`, and
+        // `for-of`/spread over a generator — all agreeing with C-XS on BOTH the
+        // completion value AND the computron count. Metering is allocation-
+        // driven (calibrated frozen constants over the identical bytecode).
+        // `yield*` delegation, `throw`/`return` into a suspended body, `yield`
+        // inside `try`, `new`-constructed generators, and async generators are
+        // the reported scope fold — honest named skips excluded from the corpus.
+        let programs = stage4_generators_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4 generators corpus must be non-empty"
+        );
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-4 generators bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

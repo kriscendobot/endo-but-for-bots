@@ -150,6 +150,51 @@ pub const PROPERTY_CREATE_REMAINDER: u64 = 280;
 /// function's arity/body length moves its computrons the way C-XS's does.)
 pub const FUNCTION_DEFINE_METERING: u64 = 67816;
 
+// ---- generator metering (design § generators) ----------------------------
+// Generators call `mxMeter` nowhere in `xsGenerator.c`/the `YIELD`/
+// `START_GENERATOR` opcode bodies, so — like promises and collections —
+// generator metering is entirely allocation-driven: over the identical
+// bytecode both engines dispatch (per-opcode `CODE_METERING` matches by
+// construction), each constant below is the `fxNewSlot`/`fxNewChunk` cluster
+// of one generator operation, calibrated raw-exact against the pin's run-only
+// meter (accuracy-over-parity: a deterministic per-release cost, pinned to the
+// oracle for *result*-relevant allocation faithfulness).
+//
+// Calibrated below via the isolated per-operation raw gap; a placeholder `0`
+// until the empirical loop sets each. An un-calibrated path must self-name a
+// skip rather than complete with a wrong computron.
+/// `fxNewGeneratorFunctionInstance`'s extra allocation over a plain
+/// `function` define: the `fxNewObjectInstance` `.prototype` object chaining
+/// to `%GeneratorPrototype%` plus its `_prototype` property slot. Calibrated
+/// raw-exact via the isolated `function* g(){}` gap.
+pub const GENERATOR_FUNCTION_EXTRA_METERING: u64 = 24;
+/// `START_GENERATOR` → `fxNewGeneratorInstance`: the instance slot plus its
+/// two internal property slots (the `XS_STACK_KIND` saved-stack holder and the
+/// resume-state integer), plus XS's initial saved-activation `fxNewChunk`.
+/// Calibrated via the `g()`-minus-`g` gap.
+pub const GENERATOR_START_METERING: u64 = 1136;
+/// `YIELD`'s activation save (`fxNewChunk`/`fxRenewChunk` growing the
+/// instance's saved-stack chunk to hold the suspended frame). Calibrated on a
+/// top-of-body `yield`; XS's chunk scales with the exact suspended activation
+/// size, so a `yield` reached with extra live loop/scope temporaries carries a
+/// small sub-computron residual over this constant (the `while(true) yield`
+/// drift, ~408 raw/resume) — below the computron floor for typical programs, a
+/// documented approximation per the accuracy-over-parity doctrine (endor's own
+/// deterministic cost, not a back-fit).
+pub const GENERATOR_YIELD_METERING: u64 = 32616;
+/// `fxNewGeneratorResult`: the `{value, done}` result object a completion
+/// (`END`) or an already-completed `.next`/`.return` builds
+/// (`fxNewObjectInstance` + two property slots). A *yield*'s result object is
+/// built by the body's own `OBJECT`/`NEW_PROPERTY` bytecode (metered by those
+/// dispatched opcodes), so it does NOT carry this constant. Calibrated via the
+/// second-`next`-on-empty-body gap.
+pub const GENERATOR_RESULT_METERING: u64 = 66304;
+/// The per-resume residual of `fx_Generator_prototype_aux` + `fxRunID`
+/// re-entry over the `RUN` trampoline the interpreter already meters — exactly
+/// one dispatch (`1 << 16`) beyond the body opcodes both engines run.
+/// Calibrated identical for a suspended-start and a suspended-yield resume.
+pub const GENERATOR_RESUME_METERING: u64 = 65536;
+
 /// The raw 16.16 cost C-XS accrues in `function_environment`
 /// (`fxNewEnvironmentInstance`): the closure environment instance the
 /// function captures its defining scope through. Accrued once per
@@ -1223,6 +1268,11 @@ struct FuncInfo {
     /// definition metering, and read for free thereafter). `NULL` until the
     /// name is interned at definition.
     name_chunk: crate::value::ChunkOffset,
+    /// `true` for a generator function (`XS_CODE_GENERATOR_FUNCTION`): its
+    /// `.prototype` chains to `%GeneratorPrototype%` and its body leads with
+    /// `START_GENERATOR`. Recorded for clarity/diagnostics; the body opcode
+    /// drives the actual generator-object creation.
+    is_generator: bool,
 }
 
 /// The `Math` static functions endor models (`xsMath.c`). Each is a
@@ -1690,6 +1740,17 @@ pub enum NativeMethod {
     /// `onFinally` and pass the settlement through — a later increment
     /// (self-names until then).
     PromiseFinally,
+    /// `%GeneratorPrototype%.next(v)` (`fx_Generator_prototype_next`): resume
+    /// the suspended body with `v` as the yield expression's value, running
+    /// to the next `yield` or completion; returns `{value, done}`.
+    GeneratorNext,
+    /// `%GeneratorPrototype%.return(v)` (`fx_Generator_prototype_return`):
+    /// force completion with `v` (unwinding any `finally` is a named skip).
+    GeneratorReturn,
+    /// `%GeneratorPrototype%.throw(e)` (`fx_Generator_prototype_throw`):
+    /// resume by throwing `e` at the suspension point (a named skip until the
+    /// throw-into-suspended path is modeled).
+    GeneratorThrow,
     /// `Promise.resolve(value)` (`fx_Promise_resolve`): a promise resolved
     /// with `value` (returned as-is when already a native promise).
     PromiseResolveStatic,
@@ -1752,6 +1813,7 @@ impl Default for FuncInfo {
             name: String::new(),
             arity: 0,
             name_chunk: crate::value::ChunkOffset::NULL,
+            is_generator: false,
         }
     }
 }
@@ -2145,7 +2207,10 @@ impl Native {
 }
 
 /// Why a run stopped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is not derivable: `Halt::Yield` carries a `Slot`, whose `Number` arm
+// holds an `f64` (only `PartialEq`). `Halt` is compared with `==` (a
+// `PartialEq` use), never used as a hash key, so `PartialEq` alone suffices.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Halt {
     /// Reached RETURN/END: the completion value is in `result`.
     Return,
@@ -2167,6 +2232,13 @@ pub enum Halt {
     /// in the xsnap lineage. Carries the slot count over the limit for
     /// diagnostics.
     StackOverflow(usize),
+    /// A generator body reached `XS_CODE_YIELD` and suspended its
+    /// activation into the `generators` side table (design § generators).
+    /// Carries the yielded value; produced only inside a
+    /// [`Self::resume_generator`] nested dispatch and caught there (it is
+    /// never seen by the top-level `run`). This is endor's structural
+    /// analog of XS's `goto XS_CODE_END_ALL` out of `fxRunID` at a yield.
+    Yield(Slot),
 }
 
 /// The result of running one program's bytecode on endor-vm.
@@ -2531,6 +2603,20 @@ pub struct Interp {
     /// The realm's `%Promise.prototype%` (a boot object), so a `new Promise`
     /// instance chains to it and `then`/`catch`/`finally` resolve.
     promise_proto: crate::value::SlotIndex,
+    /// Per-instance generator state (design § generators): the suspended
+    /// activation and lifecycle state a generator's `next`/`return`/`throw`
+    /// resume. Keyed by the generator instance's slot index, modeled on
+    /// `promises`.
+    generators: std::collections::HashMap<crate::value::SlotIndex, GeneratorData>,
+    /// The realm's `%GeneratorPrototype%` (a boot object carrying
+    /// `next`/`return`/`throw`); a generator function's `.prototype` chains
+    /// to it, so a generator instance resolves those methods by the ordinary
+    /// prototype-chain walk.
+    generator_proto: crate::value::SlotIndex,
+    /// The stack of generators currently executing on a nested
+    /// [`Self::resume_generator`] dispatch (its top is the innermost). The
+    /// `YIELD` arm reads the top to snapshot the right instance.
+    gen_run_stack: Vec<GenRunFrame>,
     /// A resolve/reject host function's bound data (XS's
     /// `fxPushPromiseFunctions` home object). Keyed by the function
     /// instance's slot; consulted in the `RUN` dispatch when a program calls
@@ -2634,6 +2720,81 @@ struct CatchJump {
     flag: u8,
 }
 
+/// The lifecycle state of a generator instance (`xsGenerator.c`'s `state`
+/// slot, which holds a resume opcode: `XS_CODE_START_GENERATOR` before the
+/// first `next`, `XS_NO_CODE` while executing, `XS_CODE_END` when done).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GeneratorState {
+    /// Created by `START_GENERATOR`, not yet resumed (`.next` runs the body
+    /// from the start; the first `.next` argument is discarded per spec).
+    SuspendedStart,
+    /// Suspended at a `yield`; `.next(v)` resumes with `v` as the yield
+    /// expression's value.
+    SuspendedYield,
+    /// Currently running on a `resume_generator` nested dispatch (a
+    /// re-entrant `.next`/`for-of` while executing is a `TypeError` in XS).
+    Executing,
+    /// Fell off the end or `return`ed; every further `.next` yields
+    /// `{value: undefined, done: true}`.
+    Completed,
+}
+
+/// A generator's suspended interpreter activation — the endor analog of the
+/// slot region XS's `YIELD`/`START_GENERATOR` copy into the instance's
+/// `XS_STACK_KIND` chunk. It captures exactly the frame state
+/// [`Interp::resume_generator`] must reinstall to continue the body: the
+/// scope (`locals`/`id_map`), the call identity (`args`/`this_val`/
+/// `cur_func`/`cur_target`/`strict`/`result`), the generator's own value-stack
+/// temporaries (`stack_slice`, the slots above the frame base at the suspend
+/// point), and the resume cursor (`resume_pc`). A generator suspended inside a
+/// `try` (a live `CatchJump` above the frame base) is an honest named skip for
+/// now — `stack_slice` alone reproduces the un-nested case bit-exactly.
+struct SavedFrame {
+    locals: Vec<Slot>,
+    id_map: std::collections::HashMap<u16, usize>,
+    args: Vec<Slot>,
+    this_val: Slot,
+    cur_func: crate::value::SlotIndex,
+    cur_target: bool,
+    strict: bool,
+    result: Slot,
+    stack_slice: Vec<Slot>,
+    resume_pc: usize,
+}
+
+/// Which `%GeneratorPrototype%` entry drove a resume (XS's `txFlag status`
+/// argument to `fx_Generator_prototype_aux`): `next` (`XS_NO_STATUS`),
+/// `return` (`XS_RETURN_STATUS`), or `throw` (`XS_THROW_STATUS`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GenStatus {
+    Next,
+    Return,
+    Throw,
+}
+
+/// Per-instance generator state in the `generators` side table (modeled on
+/// `promises`): the lifecycle state and the suspended activation (`None`
+/// once completed).
+struct GeneratorData {
+    state: GeneratorState,
+    frame: Option<SavedFrame>,
+}
+
+/// The context of a generator currently executing on a nested
+/// [`Interp::resume_generator`] dispatch, so the `YIELD` arm knows which
+/// instance to snapshot into and where its value-stack region begins.
+/// A stack (not a scalar) because a generator body may drive another
+/// generator's `.next` before it yields.
+struct GenRunFrame {
+    gen: crate::value::SlotIndex,
+    /// `self.stack.len()` at the moment the generator frame was installed;
+    /// `self.stack[stack_base..]` is the generator's own temporaries.
+    stack_base: usize,
+    /// `self.jumps.len()` at install; a `YIELD` with `self.jumps.len() >
+    /// jumps_base` is suspended inside a `try` (the named skip above).
+    jumps_base: usize,
+}
+
 impl Default for Interp {
     fn default() -> Self {
         Interp::new()
@@ -2733,6 +2894,9 @@ impl Interp {
             done_id: None,
             promises: std::collections::HashMap::new(),
             promise_proto: crate::value::SlotIndex::NULL,
+            generators: std::collections::HashMap::new(),
+            generator_proto: crate::value::SlotIndex::NULL,
+            gen_run_stack: Vec::new(),
             promise_functions: std::collections::HashMap::new(),
             promise_jobs: std::collections::VecDeque::new(),
             then_id: None,
@@ -3096,6 +3260,24 @@ impl Interp {
         ] {
             let mf = self.alloc_method(m);
             self.proto_methods.push((self.promise_proto, name, mf));
+        }
+        // `%GeneratorPrototype%` (`xsGenerator.c`'s `fxBuildGenerator`): a boot
+        // object carrying `next`/`return`/`throw`. XS chains it to
+        // `%IteratorPrototype%`; endor has no separate `%IteratorPrototype%`
+        // (its array iterators chain straight to `%Object.prototype%`), so
+        // `%GeneratorPrototype%` does too — the covered surface (`.next`,
+        // `for-of`) reaches the same methods. A generator function's
+        // `.prototype` chains to this (see `new_generator_function`), so a
+        // generator instance resolves these by the ordinary chain walk.
+        let generator_proto = self.slots.alloc(Slot::instance(self.object_proto));
+        self.generator_proto = generator_proto;
+        for (name, m) in [
+            ("next", NativeMethod::GeneratorNext),
+            ("return", NativeMethod::GeneratorReturn),
+            ("throw", NativeMethod::GeneratorThrow),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((generator_proto, name, mf));
         }
         // `Promise.*` statics — own methods of the `Promise` constructor
         // instance (not the prototype).
@@ -4407,6 +4589,18 @@ impl Interp {
                             let it = self.make_collection_iterator(i, it_kind);
                             self.push(it);
                         }
+                        Payload::Reference(i) if self.generators.contains_key(&i) => {
+                            // `for (x of gen)` — `gen[Symbol.iterator]()` returns
+                            // the generator itself (%IteratorPrototype%'s
+                            // `[Symbol.iterator]` is identity); no new iterator is
+                            // built. The surrounding loop reads `.next` (→
+                            // `GeneratorNext` via the prototype chain) and drives
+                            // the {value,done} protocol. The `fxGetIterator`
+                            // get + identity-`Symbol.iterator` call dispatch is
+                            // metered as the array case.
+                            self.meter.tick_raw(FOR_OF_GET_ITERATOR_METERING);
+                            self.push(iterable);
+                        }
                         _ => return Halt::Unsupported(op.name()),
                     }
                     pc += size as usize;
@@ -4461,6 +4655,32 @@ impl Interp {
                         // built-in step plus the property-slot allocation.
                         self.instance_put(inst, id, value);
                         self.meter.tick_builtin();
+                        // An object-literal generator method (`{ *m(){} }`)
+                        // compiles the value as an ANONYMOUS `GENERATOR_FUNCTION`
+                        // renamed here by `fxRenameFunction` (`XS_METHOD` define
+                        // flag), charging two built-in steps — XS does this for a
+                        // generator method but not a plain `{ m(){} }` (which is
+                        // already bit-exact without it). Name it and charge the
+                        // rename so the method's `.name`/computrons match.
+                        if let Payload::Reference(f) = value.value {
+                            let needs_rename = self
+                                .functions
+                                .get(&f)
+                                .map(|fi| fi.is_generator && fi.name.is_empty())
+                                .unwrap_or(false);
+                            if needs_rename {
+                                self.meter.tick_builtin_some(2);
+                                let fname = (id as usize)
+                                    .checked_sub(1)
+                                    .and_then(|i| self.symbol_names.get(i).cloned())
+                                    .unwrap_or_default();
+                                let name_chunk = self.alloc_str_text(fname.as_bytes());
+                                if let Some(fi) = self.functions.get_mut(&f) {
+                                    fi.name = fname;
+                                    fi.name_chunk = name_chunk;
+                                }
+                            }
+                        }
                     }
                     pc += 5;
                 }
@@ -4728,6 +4948,20 @@ impl Interp {
                 XS_CODE_CONSTRUCTOR_FUNCTION | XS_CODE_FUNCTION => {
                     let name = id!(1);
                     let f = self.new_function(name);
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
+                    pc += ilen;
+                }
+                // `generator` (`XS_CODE_GENERATOR_FUNCTION` →
+                // `fxNewGeneratorFunctionInstance`): like `function`, but the
+                // instance's `.prototype` object chains to `%GeneratorPrototype%`
+                // (so a generator instance resolves `next`/`return`/`throw`) and
+                // the body's leading `START_GENERATOR` produces a generator
+                // object rather than running. The body range/closures are filled
+                // by the following `code`/`function_environment`, exactly as a
+                // plain function.
+                XS_CODE_GENERATOR_FUNCTION => {
+                    let name = id!(1);
+                    let f = self.new_generator_function(name);
                     self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
                     pc += ilen;
                 }
@@ -5710,6 +5944,44 @@ impl Interp {
                     }
                     pc = branch_target(pc, size, off);
                 }
+                // `branch_status` (`XS_CODE_BRANCH_STATUS_*`, xsRun.c:1577): the
+                // generator/async resume epilogue, right after `YIELD`/`AWAIT`.
+                // XS branches on `the->status` (the resume mode): `next`
+                // (`XS_NO_STATUS`) takes `index + offset` (branch past the
+                // return/throw handling and continue the body); `return` takes
+                // `index` (fall into the `SET_RESULT; END` return handling);
+                // `throw` sets the exception and jumps. endor's
+                // [`Self::resume_generator`] admits ONLY a `next` resume
+                // (`return`/`throw` into a suspended body are named skips there),
+                // so the status reaching here is always `NO_STATUS` → always
+                // branch by `offset`. No allocation; XS meters it as one
+                // dispatch, which endor mirrors (`tick_code` at the loop top).
+                XS_CODE_BRANCH_STATUS_1 => {
+                    let off = s1!(1);
+                    if off < 0 && self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                    pc = branch_target(pc, size, off);
+                }
+                XS_CODE_BRANCH_STATUS_2 => {
+                    let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                    if off < 0 && self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                    pc = branch_target(pc, size, off);
+                }
+                XS_CODE_BRANCH_STATUS_4 => {
+                    let off = i32::from_le_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                    ]);
+                    if off < 0 && self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                    pc = branch_target(pc, size, off);
+                }
                 // mxBranchElse: the fall-through (cond true) takes INDEX
                 // with no check; only the branch-taken (cond false) path
                 // is an `mxBranch`, so it checks when its offset < 0.
@@ -5905,6 +6177,87 @@ impl Interp {
                     return Halt::Return;
                 }
 
+                // ---- generators -------------------------------------
+                // `start_generator` (`XS_CODE_START_GENERATOR`, xsRun.c:1172):
+                // the leading opcode of a generator body. Rather than running,
+                // it creates the generator instance, snapshots the fresh
+                // activation into the `generators` side table (resume cursor =
+                // just past this opcode), and returns the instance to `g()`'s
+                // caller — exactly as `END` returns a completion value. The body
+                // proper runs on the first `.next` (`resume_generator`).
+                XS_CODE_START_GENERATOR => {
+                    // A generator built with `new` is a `TypeError` in XS
+                    // (`mxFrameHasTarget`); self-name rather than mis-handle.
+                    if self.cur_target {
+                        return Halt::Unsupported("generator:new-target");
+                    }
+                    let resume_pc = pc + size as usize;
+                    let proto = self
+                        .prototype_of(self.cur_func)
+                        .unwrap_or(self.generator_proto);
+                    let gen = self.new_generator_instance(proto, resume_pc);
+                    let gen_slot = Slot::of(Kind::Reference, Payload::Reference(gen));
+                    // Return the generator to the caller, mirroring `END`'s
+                    // boundary/non-boundary split (no construct-return: guarded).
+                    if self.call_stack.len() == return_depth {
+                        if return_depth != 0 {
+                            let _ = self.leave_call();
+                            self.push(gen_slot);
+                        }
+                        return Halt::Return;
+                    }
+                    let resume = self.leave_call();
+                    self.push(gen_slot);
+                    pc = resume;
+                    if self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                }
+                // `yield` (`XS_CODE_YIELD`, xsRun.c:1213): suspend the running
+                // generator. Snapshot its activation (scope + own stack
+                // temporaries + resume cursor) back into the `generators` table
+                // and unwind to the `resume_generator` driver via
+                // [`Halt::Yield`], carrying the yielded value (the `.next`
+                // result). Only reachable inside a generator resume; `AWAIT` /
+                // `YIELD_STAR` share this label in XS but stay honest skips
+                // (async is child 4; delegation is below the fold).
+                XS_CODE_YIELD => {
+                    let (gen, stack_base, jumps_base) = match self.gen_run_stack.last() {
+                        Some(g) => (g.gen, g.stack_base, g.jumps_base),
+                        None => return Halt::Unsupported("yield:no-generator"),
+                    };
+                    // A `yield` inside a live `try` needs the jump chain
+                    // snapshotted and rebased — an honest named skip for now.
+                    if self.jumps.len() > jumps_base {
+                        return Halt::Unsupported("generator:yield-in-try");
+                    }
+                    let resume_pc = pc + size as usize;
+                    let yielded = self.pop();
+                    let stack_slice = self.stack.split_off(stack_base);
+                    // XS's `YIELD` copies the activation into the instance's
+                    // `XS_STACK_KIND` chunk (`fxNewChunk`/`fxRenewChunk`) — a
+                    // calibrated raw residual over the same bytecode both
+                    // engines dispatch.
+                    self.meter.tick_raw(GENERATOR_YIELD_METERING);
+                    let frame = SavedFrame {
+                        locals: std::mem::take(&mut self.locals),
+                        id_map: std::mem::take(&mut self.id_map),
+                        args: std::mem::take(&mut self.args),
+                        this_val: self.this_val,
+                        cur_func: self.cur_func,
+                        cur_target: self.cur_target,
+                        strict: self.strict,
+                        result: self.result,
+                        stack_slice,
+                        resume_pc,
+                    };
+                    if let Some(g) = self.generators.get_mut(&gen) {
+                        g.state = GeneratorState::SuspendedYield;
+                        g.frame = Some(frame);
+                    }
+                    return Halt::Yield(yielded);
+                }
+
                 // ---- exceptions: the jump-buffer chain --------------
                 // `catch L` (`XS_CODE_CATCH_*`, xsRun.c:1365): establish a
                 // handler. Push a jump recording the resume target
@@ -6058,6 +6411,73 @@ impl Interp {
         let proto = self.slots.alloc(Slot::instance(self.object_proto));
         self.ctor_prototype.insert(f, proto);
         f
+    }
+
+    /// Define a generator function (`XS_CODE_GENERATOR_FUNCTION` →
+    /// `fxNewGeneratorFunctionInstance`). Like [`Self::new_function`] but the
+    /// function's `.prototype` object chains to `%GeneratorPrototype%` (so a
+    /// generator instance resolves `next`/`return`/`throw`) rather than to
+    /// `%Object.prototype%`. XS builds this prototype as an explicit
+    /// `fxNewObjectInstance` + a `_prototype` property slot on top of the base
+    /// function instance; that extra allocation cluster over the plain
+    /// `function` define is the calibrated [`GENERATOR_FUNCTION_EXTRA_METERING`].
+    fn new_generator_function(&mut self, name: u16) -> crate::value::SlotIndex {
+        let f = self.new_function(name);
+        // Re-chain the default `.prototype` object to `%GeneratorPrototype%`
+        // and account XS's extra generator-prototype allocation.
+        self.meter.tick_raw(GENERATOR_FUNCTION_EXTRA_METERING);
+        if let Some(&proto) = self.ctor_prototype.get(&f) {
+            if let Payload::Reference(_) | Payload::None = self.slots.get(proto).value {
+                let s = self.slots.get_mut(proto);
+                s.value = Payload::Reference(self.generator_proto);
+            }
+        }
+        // Mark the function as a generator so a bare call is understood (the
+        // body's `START_GENERATOR` is what actually produces the instance).
+        if let Some(info) = self.functions.get_mut(&f) {
+            info.is_generator = true;
+        }
+        f
+    }
+
+    /// Allocate a generator instance (`fxNewGeneratorInstance`) chained to
+    /// `proto` (the generator function's `.prototype`) and record its
+    /// suspended-start activation snapshot in the `generators` side table.
+    /// XS allocates the instance slot plus two internal property slots (the
+    /// `XS_STACK_KIND` saved-stack holder and the resume-state integer); that
+    /// three-`fxNewSlot` cluster is the calibrated
+    /// [`GENERATOR_START_METERING`].
+    fn new_generator_instance(
+        &mut self,
+        proto: crate::value::SlotIndex,
+        resume_pc: usize,
+    ) -> crate::value::SlotIndex {
+        self.meter.tick_raw(GENERATOR_START_METERING);
+        let inst = self.slots.alloc(Slot::instance(proto));
+        // Snapshot the current (freshly-entered) frame. At `START_GENERATOR`
+        // the value stack holds nothing above the frame base (`begin` set up
+        // `locals`, not temporaries), so `stack_slice` is empty; on the first
+        // `.next` the body runs from `resume_pc`.
+        let frame = SavedFrame {
+            locals: self.locals.clone(),
+            id_map: self.id_map.clone(),
+            args: self.args.clone(),
+            this_val: self.this_val,
+            cur_func: self.cur_func,
+            cur_target: self.cur_target,
+            strict: self.strict,
+            result: self.result,
+            stack_slice: Vec::new(),
+            resume_pc,
+        };
+        self.generators.insert(
+            inst,
+            GeneratorData {
+                state: GeneratorState::SuspendedStart,
+                frame: Some(frame),
+            },
+        );
+        inst
     }
 
     /// Allocate a closure environment instance (`fxNewEnvironmentInstance`,
@@ -6233,6 +6653,185 @@ impl Interp {
         match self.dispatch_at(code, body_start, return_depth) {
             Halt::Return => Ok(self.pop()),
             other => Err(other),
+        }
+    }
+
+    /// Build a generator `{value, done}` result object (`fxNewGeneratorResult`):
+    /// a fresh `%Object.prototype%`-chained object with `value`/`done` own data
+    /// properties, metering the calibrated [`GENERATOR_RESULT_METERING`]. The
+    /// property ids are the program-local `value`/`done` symbols (resolved in
+    /// `link_intrinsics`); a program that never names them still runs (the
+    /// object is unread), so a `None` id just omits that property.
+    fn new_generator_result(&mut self, value: Slot, done: bool) -> Slot {
+        self.meter.tick_raw(GENERATOR_RESULT_METERING);
+        let result = self.slots.alloc(Slot::instance(self.object_proto));
+        if let Some(vid) = self.value_id {
+            self.set_own_unmetered(result, vid, value);
+        }
+        if let Some(did) = self.done_id {
+            self.set_own_unmetered(result, did, Slot::boolean(done));
+        }
+        Slot::of(Kind::Reference, Payload::Reference(result))
+    }
+
+    /// The `{value, done}` a `next`/`return`/`throw` on an already-completed
+    /// generator produces (`fx_Generator_prototype_aux`, the `state == END`
+    /// branch): `next` → `{undefined, true}`; `return(v)` → `{v, true}`;
+    /// `throw(e)` re-throws `e` (the native-`TypeError`/rethrow path endor does
+    /// not model yet — an honest named skip).
+    fn generator_done_result(&mut self, status: GenStatus, sent: Slot) -> Result<Slot, Halt> {
+        match status {
+            GenStatus::Next => Ok(self.new_generator_result(Slot::undefined(), true)),
+            GenStatus::Return => Ok(self.new_generator_result(sent, true)),
+            GenStatus::Throw => Err(Halt::Unsupported("generator:throw-on-completed")),
+        }
+    }
+
+    /// Drive a generator's `.next(v)` / `.return(v)` / `.throw(e)`
+    /// (`fx_Generator_prototype_aux` + `fxRunID`): reinstall the suspended
+    /// activation, run a nested [`Self::dispatch_at`] to the next `yield` or
+    /// completion, and return the `{value, done}` result. The driver's
+    /// activation is suspended onto `call_stack` (exactly as [`Self::enter_call`]
+    /// does) so the generator's `END`/`leave_call` restores it; a `yield`
+    /// unwinds here via [`Halt::Yield`] with the driver still suspended, which
+    /// this restores. `.return`/`.throw` into a live suspended body (finally
+    /// unwinding / throw-into-suspended) are honest named skips.
+    fn resume_generator(
+        &mut self,
+        code: &[u8],
+        gen: crate::value::SlotIndex,
+        sent: Slot,
+        status: GenStatus,
+    ) -> Result<Slot, Halt> {
+        let state = self
+            .generators
+            .get(&gen)
+            .map(|g| g.state)
+            .ok_or(Halt::Unsupported("generator:not-a-generator"))?;
+        match state {
+            GeneratorState::Executing => {
+                // Re-entrant resume of a running generator: `TypeError`
+                // ("generator is running") in XS — a named skip for now.
+                return Err(Halt::Unsupported("generator:already-running"));
+            }
+            GeneratorState::Completed => return self.generator_done_result(status, sent),
+            GeneratorState::SuspendedStart => {
+                // `return`/`throw` before the first `next`: XS marks the
+                // generator done without running the body.
+                if status != GenStatus::Next {
+                    if let Some(g) = self.generators.get_mut(&gen) {
+                        g.state = GeneratorState::Completed;
+                        g.frame = None;
+                    }
+                    return self.generator_done_result(status, sent);
+                }
+            }
+            GeneratorState::SuspendedYield => {}
+        }
+        // `return`/`throw` into a live suspended body needs finally-unwinding /
+        // throw-into-suspended (the catch/finally jump chain) — below the fold.
+        if status == GenStatus::Return {
+            return Err(Halt::Unsupported("generator:return-into-suspended"));
+        }
+        if status == GenStatus::Throw {
+            return Err(Halt::Unsupported("generator:throw-into-suspended"));
+        }
+        let was_start = state == GeneratorState::SuspendedStart;
+        let saved = self
+            .generators
+            .get_mut(&gen)
+            .and_then(|g| g.frame.take())
+            .ok_or(Halt::Unsupported("generator:no-frame"))?;
+        // The per-resume native-frame residual (`fx_Generator_prototype_aux` +
+        // `fxRunID` re-entry) over the `RUN` trampoline already metered.
+        self.meter.tick_raw(GENERATOR_RESUME_METERING);
+        // Suspend the driver activation onto `call_stack` (mirroring
+        // `enter_call`), then install the generator frame.
+        let driver_footprint = FRAME_OVERHEAD_SLOTS + self.args.len() + self.locals.len();
+        self.frame_slots += driver_footprint;
+        self.call_stack.push(CallerState {
+            locals: std::mem::take(&mut self.locals),
+            id_map: std::mem::take(&mut self.id_map),
+            result: self.result,
+            strict: self.strict,
+            args: std::mem::take(&mut self.args),
+            this_val: self.this_val,
+            cur_func: self.cur_func,
+            cur_target: self.cur_target,
+            ret_pc: 0,
+        });
+        let stack_base = self.stack.len();
+        let jumps_base = self.jumps.len();
+        self.locals = saved.locals;
+        self.id_map = saved.id_map;
+        self.args = saved.args;
+        self.this_val = saved.this_val;
+        self.cur_func = saved.cur_func;
+        self.cur_target = saved.cur_target;
+        self.strict = saved.strict;
+        self.result = saved.result;
+        self.stack.extend(saved.stack_slice);
+        // On a yield-resume the sent value becomes the yield expression's value
+        // (XS overwrites the saved yield slot with `the->scratch`); the first
+        // `next`'s argument is discarded per spec.
+        if !was_start {
+            self.push(sent);
+        }
+        if let Some(g) = self.generators.get_mut(&gen) {
+            g.state = GeneratorState::Executing;
+        }
+        let return_depth = self.call_stack.len();
+        self.gen_run_stack.push(GenRunFrame {
+            gen,
+            stack_base,
+            jumps_base,
+        });
+        let outcome = self.dispatch_at(code, saved.resume_pc, return_depth);
+        self.gen_run_stack.pop();
+        match outcome {
+            Halt::Yield(v) => {
+                // The `YIELD` arm snapshotted the generator and truncated the
+                // stack to `stack_base`; the driver is still suspended — restore
+                // it (its own `leave_call`). `v` is the `{value, done: false}`
+                // object the generator body **built by bytecode** (`OBJECT` +
+                // `NEW_PROPERTY`×2 before `YIELD`), so it is the `.next` result
+                // as-is — NOT re-wrapped (its allocation is already metered by
+                // those opcodes both engines dispatch).
+                let _ = self.leave_call();
+                self.stack.truncate(stack_base);
+                self.jumps.truncate(jumps_base);
+                Ok(v)
+            }
+            Halt::Return => {
+                // The generator's `END` boundary branch already ran
+                // `leave_call` (driver restored) and pushed the completion.
+                let ret = self.pop();
+                self.stack.truncate(stack_base);
+                self.jumps.truncate(jumps_base);
+                if let Some(g) = self.generators.get_mut(&gen) {
+                    g.state = GeneratorState::Completed;
+                    g.frame = None;
+                }
+                Ok(self.new_generator_result(ret, true))
+            }
+            other => {
+                // A throw / meter-abort / overflow escaped the body. Restore the
+                // driver best-effort, mark the generator done, propagate.
+                while self.call_stack.len() >= return_depth {
+                    let _ = self.leave_call();
+                }
+                if self.stack.len() > stack_base {
+                    self.stack.truncate(stack_base);
+                }
+                if self.jumps.len() > jumps_base {
+                    self.jumps.truncate(jumps_base);
+                }
+                if let Some(g) = self.generators.get_mut(&gen) {
+                    g.state = GeneratorState::Completed;
+                    g.frame = None;
+                }
+                Err(other)
+            }
         }
     }
 
@@ -10449,6 +11048,30 @@ impl Interp {
                     _ => return Err(Halt::Unsupported("then:non-promise-this")),
                 };
                 self.promise_then(promise, base)?
+            }
+            // `%GeneratorPrototype%.next/return/throw` (`fx_Generator_prototype_
+            // aux`): resume the suspended body and return `{value, done}`. A
+            // non-generator receiver is a `TypeError` in XS — an honest skip.
+            NativeMethod::GeneratorNext => {
+                let gen = match this.value {
+                    Payload::Reference(r) if self.generators.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("generator:next-non-generator")),
+                };
+                self.resume_generator(code, gen, arg0, GenStatus::Next)?
+            }
+            NativeMethod::GeneratorReturn => {
+                let gen = match this.value {
+                    Payload::Reference(r) if self.generators.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("generator:return-non-generator")),
+                };
+                self.resume_generator(code, gen, arg0, GenStatus::Return)?
+            }
+            NativeMethod::GeneratorThrow => {
+                let gen = match this.value {
+                    Payload::Reference(r) if self.generators.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("generator:throw-non-generator")),
+                };
+                self.resume_generator(code, gen, arg0, GenStatus::Throw)?
             }
             // `Promise.resolve(v)` (`fx_Promise_resolve`): a native promise
             // whose constructor is `Promise` is returned as-is; otherwise a
@@ -15370,6 +15993,10 @@ mod tests {
                 | Halt::Unsupported(_)
                 | Halt::StackOverflow(_) => {}
                 Halt::Decode(_) => unreachable!("handled above"),
+                // `Yield` is produced only inside a `resume_generator` nested
+                // dispatch and consumed there; it never escapes to a top-level
+                // `run` outcome.
+                Halt::Yield(_) => unreachable!("yield escaped a generator resume"),
             }
         }
     }
