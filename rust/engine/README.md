@@ -471,6 +471,60 @@ allocation metering against the pin — each a divergence surface that does not 
 the one-invocation budget alongside a *green* result, so it is carried forward as
 the next class child's scope.
 
+The stage-4 **generators** child (3/8) lands **generator functions and the
+iteration-protocol closure** (the pin's `xsGenerator.c` sync half), bit-exact
+(result AND computron) against the pin. The **suspend/resume of the interpreter
+activation** is heap state in a new `generators` side table (modeled on
+`promises`): a `GeneratorData` holds the lifecycle state (suspended-start /
+suspended-yield / executing / completed) and a `SavedFrame` — the scope
+(`locals`/`id_map`), the call identity (`args`/`this_val`/`cur_func`/`cur_target`/
+`strict`/`result`), the generator's own value-stack temporaries, and the resume
+cursor. The representation is deliberately the one async/await (child 4) resumes
+on. `XS_CODE_GENERATOR_FUNCTION` defines a generator function whose `.prototype`
+chains to a new `%GeneratorPrototype%` (`next`/`return`/`throw`), so an instance
+resolves the methods by the ordinary prototype-chain walk; `XS_CODE_START_GENERATOR`
+creates the instance, snapshots the fresh activation, and returns it (the body
+runs on the first `.next`); `XS_CODE_YIELD` snapshots the activation and unwinds
+to the `.next` driver via a new `Halt::Yield` (the `{value, done}` object is the
+one the body **built by bytecode** — `OBJECT`/`NEW_PROPERTY` — returned as-is);
+`XS_CODE_BRANCH_STATUS_{1,2,4}` is the yield-resume epilogue (a `next` resume
+always branches past the return/throw handling). `%GeneratorPrototype%.next(v)`/
+`return(v)` run through `resume_generator`, which suspends the driver's own
+activation onto `call_stack` (exactly as `enter_call` does), reinstalls the
+generator frame, runs a nested `dispatch_at` to the next `yield` or `END`, and
+restores the driver — so the sent value, completion `{value, done}`, and
+`for-of`/spread over a generator all land bit-exact. Metering is allocation-driven
+(`xsGenerator.c` calls no `mxMeter`): calibrated frozen constants over the
+identical bytecode both engines dispatch —
+`GENERATOR_FUNCTION_EXTRA_METERING` (24, the extra `.prototype` cluster),
+`GENERATOR_START_METERING` (1136, `fxNewGeneratorInstance`'s slots),
+`GENERATOR_YIELD_METERING` (32616, the saved-stack `fxNewChunk`; a `yield` reached
+with extra live loop temporaries carries a small sub-computron residual over this,
+a documented approximation), `GENERATOR_RESULT_METERING` (66304, a completion
+`fxNewGeneratorResult` — a *yield*'s result object is metered by its own bytecode,
+so it carries none), and `GENERATOR_RESUME_METERING` (65536, exactly one dispatch
+of `fxRunID` re-entry). An object-literal `*m()` method compiles anonymous and is
+named by `fxRenameFunction`'s two steps at `NEW_PROPERTY`. The dual-run sections
+agree with **zero divergence**, every skip named:
+`language/statements/generators total=252 covered=74 divergent=0`,
+`language/expressions/generators total=268 covered=79 divergent=0`,
+`built-ins/GeneratorPrototype total=57 covered=8 divergent=0`,
+`built-ins/GeneratorFunction total=20 covered=0 divergent=0` (its tests drive the
+`GeneratorFunction` constructor as a value, an honest skip), and
+`language/statements/for-of` grows to **`covered=118`** (from 92) with `for (x of
+gen)` now driven, still `divergent=0`. The curated `stage4-generators.js` corpus
+is locked as `stage4_generators_corpus_is_bit_exact_against_oracle`, and the
+suspend/resume + allocation paths are exercised Miri-clean
+(`generator_suspend_resume_is_miri_clean`). The headline **scope fold** —
+carried forward as honest named skips (`Halt::Unsupported`, never a wrong value or
+a silent divergence): **`yield*` delegation** (`YIELD_STAR`), **`.throw(e)` and
+`.return(v)` into a *suspended* body** (throw-into-suspended and `finally`
+unwinding through the catch/finally jump chain — `generator:throw-into-suspended`/
+`generator:return-into-suspended`), a **`yield` inside a live `try`**
+(`generator:yield-in-try` — the jump-chain snapshot/rebase), a **`new`-constructed
+generator** (`generator:new-target`), and **async generators / `await`** (child 4,
+which resumes on this same `SavedFrame` machinery).
+
 The stage-3b **promises** child (7/9) lands `Promise`, the promise **job
 queue**, and the **pump-loop latch** — the host-driven microtask drain the
 endor embedding performs after a crank. `xsPromise.c` calls `mxMeter` exactly
