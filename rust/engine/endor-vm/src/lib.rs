@@ -31,7 +31,9 @@ pub mod opcode;
 pub mod symbols;
 pub mod value;
 
-pub use compartment::{Compartment, Intrinsics, Machine};
+pub use compartment::{
+    Compartment, CompartmentId, CompartmentOptions, CompartmentSkip, Intrinsics, Machine,
+};
 pub use gc::{GcStats, Heap};
 pub use interp::{Halt, Interp, Native, RunOutcome, PROGRAM_INVOCATION_COMPUTRONS};
 pub use meter::{Meter, MeterCheck};
