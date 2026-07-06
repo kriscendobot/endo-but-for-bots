@@ -92,6 +92,27 @@ int endor_oracle_run(const char *source, txU4 sourceLen, EndorOracleResult *out)
 			txSlot *realm;
 			txSlot *result;
 
+			/* Install the Hardened-JavaScript globals the embedder (xst.c /
+			 * xstFuzz.c) installs, but the bare fxCreateMachine boot does not:
+			 * harden/lockdown/petrify/mutabilities. Without this an `harden(x)`
+			 * program is an undefined-reference throw. Mirrors xst.c's
+			 * fxNextHostFunctionProperty install on the realm global; the ids
+			 * intern to the same atoms the program's references use. This is the
+			 * minimal audited extension of the oracle FFI seam the stage-4b
+			 * lockdown/harden child needs to differential-run against the pin. */
+			{
+				txSlot *global = mxGlobal.value.reference;
+				txSlot *slot = fxLastProperty(the, global);
+				slot = fxNextHostFunctionProperty(the, slot, fx_harden, 1,
+					fxID(the, "harden"), XS_DONT_ENUM_FLAG);
+				slot = fxNextHostFunctionProperty(the, slot, fx_lockdown, 0,
+					fxID(the, "lockdown"), XS_DONT_ENUM_FLAG);
+				slot = fxNextHostFunctionProperty(the, slot, fx_petrify, 1,
+					fxID(the, "petrify"), XS_DONT_ENUM_FLAG);
+				slot = fxNextHostFunctionProperty(the, slot, fx_mutabilities, 1,
+					fxID(the, "mutabilities"), XS_DONT_ENUM_FLAG);
+			}
+
 			stream.buffer = (txString)source;
 			stream.offset = 0;
 			stream.size = (txSize)sourceLen;

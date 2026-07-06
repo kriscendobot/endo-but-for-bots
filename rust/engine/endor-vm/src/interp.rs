@@ -394,6 +394,37 @@ pub const XS_SETTER_FLAG: u8 = 64;
 /// spends on `XS_METHOD_FLAG`/`XS_GETTER_FLAG` — the two are never the same
 /// slot, so the overlap is harmless. Only the extensibility bit is modeled.
 pub const XS_DONT_PATCH_FLAG: u8 = 16;
+/// XS instance-slot flag bit (`xsAll.h` `XS_DONT_MARSHALL_FLAG = 64`): the
+/// marker `harden`/`lockdown` stamp on a *hardened* (transitively frozen)
+/// instance's own `XS_INSTANCE_KIND` slot. `fx_hardenQueue` skips an instance
+/// already carrying it (the visited set), and `fx_harden` short-circuits a
+/// re-`harden` of an already-hardened object. It lives on the *instance* flag
+/// byte, disjoint from the property flag byte's `XS_SETTER_FLAG` (also `64`) —
+/// the two never name the same slot (the instance's head slot is never a
+/// property), so the overlap is harmless, exactly as `XS_DONT_PATCH_FLAG`'s is.
+pub const XS_DONT_MARSHALL_FLAG: u8 = 64;
+/// `harden`/`petrify` per-hardened-object base: `fx_hardenFreezeAndTraverse`
+/// builds the two `fxNewInstance` ownKeys holders (the freeze pass and the
+/// traverse pass) over the `mxBehaviorPreventExtensions` frame. Modeled as two
+/// `INTEGRITY_APPLY_KEYS_BASE`-shaped holders. `xsLockdown.c` calls no
+/// `mxMeter`, so harden's whole cost is these allocation constants; the count
+/// is deterministic per release (the bar) — computron parity against the pin is
+/// structurally unavailable over a transitive walk into endor's sparse
+/// intrinsics, so the corpus is result-gated.
+pub const HARDEN_OBJECT_BASE_METERING: u64 = 2 * 65792;
+/// `harden`/`petrify` per-own-key cost: the two `mxBehaviorOwnKeys` at-slots
+/// (`fxNewSlot`, `1<<8` each — freeze pass + traverse pass) plus the
+/// `mxBehaviorDefineOwnProperty` re-stamp (no allocation). Petrify's single
+/// pass uses [`PETRIFY_PER_KEY_METERING`].
+pub const HARDEN_PER_KEY_METERING: u64 = 2 * 256;
+/// `harden` per newly-queued instance: the `fx_hardenQueue` worklist
+/// `fxNewSlot` (`1<<8`).
+pub const HARDEN_QUEUE_ITEM_METERING: u64 = 256;
+/// `petrify` single-object base: one `fxNewInstance` ownKeys holder (petrify
+/// walks the keys once, no transitive traverse pass).
+pub const PETRIFY_OBJECT_BASE_METERING: u64 = 65792;
+/// `petrify` per-own-key cost: one `mxBehaviorOwnKeys` at-slot.
+pub const PETRIFY_PER_KEY_METERING: u64 = 256;
 /// The fixed re-dispatch overhead `Function.prototype.call` accrues beyond
 /// the visible `.call` opcodes and the callee body (measured as `2<<16`),
 /// plus one built-in step ([`CALL_TRAMPOLINE_PER_ARG`]) per forwarded
@@ -1740,6 +1771,26 @@ pub enum NativeMethod {
     /// `fxToNumber` then the `fpclassify` test. No chunk.
     GlobalIsNaN,
     GlobalIsFinite,
+    /// The global `harden(x)` (`fx_harden`, `xsLockdown.c`): the transitive
+    /// freeze worklist over the slot arena — prevent extensions and stamp
+    /// every own data property non-writable/non-configurable (accessors
+    /// non-configurable), then queue the prototype and every reference-valued
+    /// property, marking each reached instance `XS_DONT_MARSHALL_FLAG`. Returns
+    /// `x`. `xsLockdown.c` calls no `mxMeter`, so the cost is allocation-driven
+    /// (the worklist `fxNewSlot`s + the two `fxNewInstance` ownKeys holders per
+    /// object). Endor's intrinsics are modeled sparsely, so the transitive
+    /// object count diverges from the pin — the freeze *result* is faithful,
+    /// the computron count over an intrinsic-spilling walk is not (a structural
+    /// divergence, the same sparse-intrinsics fact the module/compartment
+    /// children record). Result-gated corpus.
+    GlobalHarden,
+    /// The global `petrify(x)` (`fx_petrify`, `xsLockdown.c`): a *single*-object
+    /// freeze (non-transitive) — prevent extensions, stamp every own property
+    /// non-writable/non-configurable, and additionally stamp the internal data
+    /// slots (ArrayBuffer/Date/Map/Set/WeakMap/WeakSet) `XS_DONT_SET_FLAG`.
+    /// Returns `x`. Allocation-driven metering (the one `fxNewInstance` ownKeys
+    /// holder + its at-slots).
+    GlobalPetrify,
     /// `JSON.stringify(value)` (`fx_JSON_stringify`): serialize `value` over
     /// XS's traversal order. The stringifier's working buffer is C-malloc'd
     /// (unmetered); only the final `fxNewChunk(offset)` meters. The
@@ -3720,6 +3771,26 @@ impl Interp {
         self.create_string_proto();
         self.create_number_globals();
         self.create_json();
+        self.create_hardened_globals();
+    }
+
+    /// Bind the Hardened-JavaScript global functions (`xsLockdown.c`) the
+    /// embedder installs — `harden`/`petrify` — as native function instances in
+    /// `intrinsics`, so [`Self::link_intrinsics`] binds them into the global
+    /// object under the program-local id the C-XS compiler assigned each name
+    /// (`typeof harden === "function"`). `lockdown` (transitively freezing the
+    /// shared intrinsics, taming Date/Math, the idempotence throw) and
+    /// `mutabilities` (the `fxVerify*` mutable-residue report) are the reported
+    /// scope fold of this child — a program that references either self-names an
+    /// honest `Halt::Unsupported` rather than a wrong value (see their dispatch).
+    fn create_hardened_globals(&mut self) {
+        for (name, m) in [
+            ("harden", NativeMethod::GlobalHarden),
+            ("petrify", NativeMethod::GlobalPetrify),
+        ] {
+            let mf = self.alloc_method(m);
+            self.intrinsics.insert(name, mf);
+        }
     }
 
     /// Build the `JSON` namespace object (XS's `mxJSONObject`, `xsJSON.c`): a
@@ -10516,6 +10587,11 @@ impl Interp {
                 };
                 Slot::boolean(r)
             }
+            // The global `harden(x)` (`fx_harden`, `xsLockdown.c`): the
+            // transitive freeze worklist. Returns `x`.
+            NativeMethod::GlobalHarden => self.do_harden(arg0)?,
+            // The global `petrify(x)` (`fx_petrify`): the single-object freeze.
+            NativeMethod::GlobalPetrify => self.do_petrify(arg0)?,
             // `Array.prototype.push(...items)` — dense fast path only.
             NativeMethod::ArrayPush => {
                 let inst = match self.dense_array_this(this) {
@@ -15115,6 +15191,142 @@ impl Interp {
         self.slots.get(inst).flag & XS_DONT_PATCH_FLAG == 0
     }
 
+    /// The global `harden(x)` (`fx_harden` + `fx_hardenFreezeAndTraverse` +
+    /// `fx_hardenQueue`, `xsLockdown.c`): the transitive freeze worklist over
+    /// the slot arena. Prevent extensions and stamp every own data property
+    /// non-writable/non-configurable (accessors non-configurable) on each
+    /// reached instance, then queue its prototype and every reference-valued
+    /// own property, marking each reached instance `XS_DONT_MARSHALL_FLAG` so
+    /// the graph is walked once. Returns `x` (the argument). A non-reference
+    /// argument, an already-hardened object, and `harden()` with no argument
+    /// pass through per XS. `xsLockdown.c` calls no `mxMeter`, so the cost is
+    /// the allocation constants; computron parity over a transitive walk into
+    /// endor's sparse intrinsics is structurally unavailable, so the corpus is
+    /// result-gated (the freeze *result* is faithful).
+    fn do_harden(&mut self, arg0: Slot) -> Result<Slot, Halt> {
+        if arg0.kind != Kind::Reference {
+            return Ok(arg0);
+        }
+        let inst = match arg0.value {
+            Payload::Reference(i) => i,
+            _ => return Ok(arg0),
+        };
+        // Already hardened: XS short-circuits (`slot->flag & flag`).
+        if self.slots.get(inst).flag & XS_DONT_MARSHALL_FLAG != 0 {
+            return Ok(arg0);
+        }
+        let mut list: Vec<crate::value::SlotIndex> = Vec::new();
+        self.harden_enqueue(inst, &mut list);
+        let mut i = 0;
+        while i < list.len() {
+            self.harden_freeze_and_traverse(list[i], &mut list)?;
+            i += 1;
+        }
+        Ok(arg0)
+    }
+
+    /// `fx_hardenQueue`: mark `inst` hardened (`XS_DONT_MARSHALL_FLAG`, the
+    /// visited set) and push it onto the worklist, skipping an already-marked
+    /// instance. XS marks the instance during processing and checks the mark at
+    /// enqueue; marking at enqueue is behaviorally identical (the mark is only a
+    /// visited set — the freeze still happens in `harden_freeze_and_traverse`)
+    /// and makes the Vec-backed walk terminate without duplicate entries.
+    fn harden_enqueue(&mut self, inst: crate::value::SlotIndex, list: &mut Vec<crate::value::SlotIndex>) {
+        if inst.is_null() {
+            return;
+        }
+        if self.slots.get(inst).flag & XS_DONT_MARSHALL_FLAG != 0 {
+            return;
+        }
+        self.slots.get_mut(inst).flag |= XS_DONT_MARSHALL_FLAG;
+        self.meter.tick_raw(HARDEN_QUEUE_ITEM_METERING);
+        list.push(inst);
+    }
+
+    /// `fx_hardenFreezeAndTraverse`: freeze one instance and queue its
+    /// referents. Prevent extensions; stamp every own property `DONT_DELETE`
+    /// (and, for a data property, `DONT_SET`); then queue the prototype and
+    /// every reference-valued own property.
+    fn harden_freeze_and_traverse(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        list: &mut Vec<crate::value::SlotIndex>,
+    ) -> Result<(), Halt> {
+        // XS's `mxBehaviorPreventExtensions` fails only for an exotic instance
+        // that refuses it (throwing "extensible object"). Endor models the
+        // integrity flags on ordinary instances; an exotic instance in the
+        // hardened graph self-names rather than mis-freeze.
+        if !self.is_ordinary_object(inst) {
+            return Err(Halt::Unsupported("harden:exotic-object"));
+        }
+        self.meter.tick_raw(HARDEN_OBJECT_BASE_METERING);
+        self.slots.get_mut(inst).flag |= XS_DONT_PATCH_FLAG;
+        let slots = self.own_property_slots(inst);
+        for &p in &slots {
+            self.meter.tick_raw(HARDEN_PER_KEY_METERING);
+            let s = self.slots.get_mut(p);
+            s.flag |= XS_DONT_DELETE_FLAG;
+            if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) == 0 {
+                s.flag |= XS_DONT_SET_FLAG;
+            }
+        }
+        // Traverse: queue the prototype and every reference-valued own property
+        // (a data property holding a reference, or — deferred — an accessor's
+        // getter/setter). The instance is already marked (enqueue), so a cycle
+        // back to it is skipped.
+        let proto = self.instance_prototype(inst);
+        self.harden_enqueue(proto, list);
+        for &p in &slots {
+            let s = *self.slots.get(p);
+            if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                // An accessor own property: XS queues its getter/setter function
+                // instances. Endor keeps intrinsic accessors outside the slot
+                // graph, so their transitive freeze is a documented gap — the
+                // property itself is stamped non-configurable above (the
+                // observable), the getter/setter functions are not walked.
+                continue;
+            }
+            if s.kind == Kind::Reference {
+                if let Payload::Reference(r) = s.value {
+                    self.harden_enqueue(r, list);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The global `petrify(x)` (`fx_petrify`, `xsLockdown.c`): a *single*-object
+    /// freeze (non-transitive, no prototype walk). Prevent extensions and stamp
+    /// every own property non-writable/non-configurable. XS additionally stamps
+    /// the internal data slots (ArrayBuffer/Date/Map/Set/WeakMap/WeakSet)
+    /// `DONT_SET`; endor models those as exotic instances (not ordinary
+    /// property slots), so a petrify of such a receiver self-names rather than
+    /// half-stamp. Returns `x`.
+    fn do_petrify(&mut self, arg0: Slot) -> Result<Slot, Halt> {
+        if arg0.kind != Kind::Reference {
+            return Ok(arg0);
+        }
+        let inst = match arg0.value {
+            Payload::Reference(i) => i,
+            _ => return Ok(arg0),
+        };
+        if !self.is_ordinary_object(inst) {
+            return Err(Halt::Unsupported("petrify:exotic-object"));
+        }
+        self.meter.tick_raw(PETRIFY_OBJECT_BASE_METERING);
+        self.slots.get_mut(inst).flag |= XS_DONT_PATCH_FLAG;
+        let slots = self.own_property_slots(inst);
+        for &p in &slots {
+            self.meter.tick_raw(PETRIFY_PER_KEY_METERING);
+            let s = self.slots.get_mut(p);
+            s.flag |= XS_DONT_DELETE_FLAG;
+            if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) == 0 {
+                s.flag |= XS_DONT_SET_FLAG;
+            }
+        }
+        Ok(arg0)
+    }
+
     /// Add one field of a synthesized property descriptor object (an own
     /// enumerable data property `name = value`) **without** metering — its
     /// allocation cost is folded into the descriptor build's single measured
@@ -17099,6 +17311,94 @@ mod tests {
         assert!(out.completed);
         assert_eq!(out.result, "Error: boom");
         assert_eq!(out.computrons, 13, "bit-exact computrons vs C-XS");
+    }
+
+    /// Build a small ordinary-object graph `{a:1, b:{c:2}}` in a fresh arena
+    /// and return `(interp, outer, inner, id_a, id_b, id_c)`.
+    fn build_harden_graph() -> (
+        Interp,
+        crate::value::SlotIndex,
+        crate::value::SlotIndex,
+        u16,
+        u16,
+        u16,
+    ) {
+        let mut interp = Interp::new();
+        let proto = interp.object_proto;
+        let inner = interp.slots.alloc(Slot::instance(proto));
+        let id_c = interp.intern_key("c");
+        interp.instance_put(inner, id_c, Slot::number(2.0));
+        let outer = interp.slots.alloc(Slot::instance(proto));
+        let id_a = interp.intern_key("a");
+        interp.instance_put(outer, id_a, Slot::number(1.0));
+        let id_b = interp.intern_key("b");
+        interp.instance_put(outer, id_b, Slot::of(Kind::Reference, Payload::Reference(inner)));
+        (interp, outer, inner, id_a, id_b, id_c)
+    }
+
+    #[test]
+    fn harden_freezes_target_transitively_and_returns_it() {
+        // `harden({a:1, b:{c:2}})`: the target and every instance reachable from
+        // it are prevented-extensions + every own data property stamped
+        // non-writable/non-configurable, and each reached instance marked
+        // `XS_DONT_MARSHALL_FLAG` (the visited set). harden returns its argument.
+        let (mut interp, outer, inner, id_a, _id_b, id_c) = build_harden_graph();
+        let arg = Slot::of(Kind::Reference, Payload::Reference(outer));
+        let r = interp.do_harden(arg).expect("harden ok");
+        assert!(matches!(r.value, Payload::Reference(x) if x == outer));
+        // The target: non-extensible + hardened-marked.
+        let of = interp.slots.get(outer).flag;
+        assert!(of & XS_DONT_PATCH_FLAG != 0, "target non-extensible");
+        assert!(of & XS_DONT_MARSHALL_FLAG != 0, "target hardened-marked");
+        // Its own data property `a`: non-writable + non-configurable.
+        let pa = interp.find_property(outer, id_a).expect("a present");
+        let paf = interp.slots.get(pa).flag;
+        assert!(paf & XS_DONT_SET_FLAG != 0 && paf & XS_DONT_DELETE_FLAG != 0);
+        // Transitive: the nested object `{c:2}` is frozen too.
+        let inf = interp.slots.get(inner).flag;
+        assert!(inf & XS_DONT_PATCH_FLAG != 0, "nested non-extensible");
+        assert!(inf & XS_DONT_MARSHALL_FLAG != 0, "nested hardened-marked");
+        let pc = interp.find_property(inner, id_c).expect("c present");
+        assert!(interp.slots.get(pc).flag & XS_DONT_SET_FLAG != 0);
+        // Idempotent: a second harden is a no-op (still frozen, no panic).
+        let r2 = interp.do_harden(arg).expect("re-harden ok");
+        assert!(matches!(r2.value, Payload::Reference(x) if x == outer));
+        // A non-reference argument passes through unchanged.
+        let prim = interp.do_harden(Slot::number(3.0)).expect("harden prim ok");
+        assert_eq!(prim.kind, Kind::Number);
+    }
+
+    #[test]
+    fn petrify_freezes_single_object_not_transitively() {
+        // `petrify({a:1, b:{c:2}})`: the target is frozen (non-extensible + own
+        // properties non-writable/non-configurable), but — unlike harden — the
+        // nested object it references is left untouched (petrify is
+        // non-transitive and does not mark `XS_DONT_MARSHALL_FLAG`).
+        let (mut interp, outer, inner, id_a, _id_b, _id_c) = build_harden_graph();
+        let arg = Slot::of(Kind::Reference, Payload::Reference(outer));
+        let r = interp.do_petrify(arg).expect("petrify ok");
+        assert!(matches!(r.value, Payload::Reference(x) if x == outer));
+        let of = interp.slots.get(outer).flag;
+        assert!(of & XS_DONT_PATCH_FLAG != 0, "target non-extensible");
+        assert!(of & XS_DONT_MARSHALL_FLAG == 0, "petrify leaves DONT_MARSHALL clear");
+        let pa = interp.find_property(outer, id_a).expect("a present");
+        assert!(interp.slots.get(pa).flag & XS_DONT_SET_FLAG != 0);
+        // The nested object is NOT frozen (non-transitive).
+        assert!(
+            interp.slots.get(inner).flag & XS_DONT_PATCH_FLAG == 0,
+            "nested stays extensible under petrify"
+        );
+    }
+
+    #[test]
+    fn harden_transitive_freeze_is_miri_clean() {
+        // Exercise the harden worklist (the Vec-backed graph walk, the slot-flag
+        // mutation, and the allocation-metering ticks) over a small object graph
+        // so Miri validates the touched allocation path is UB-free. `harden`
+        // adds no `unsafe`; this pins the walk under `cargo +nightly miri test`.
+        let (mut interp, outer, _inner, _id_a, _id_b, _id_c) = build_harden_graph();
+        let arg = Slot::of(Kind::Reference, Payload::Reference(outer));
+        let _ = interp.do_harden(arg).expect("harden ok");
     }
 
     #[test]

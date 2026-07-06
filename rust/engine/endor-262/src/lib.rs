@@ -424,6 +424,22 @@ pub fn stage4_object_integrity_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage4-object-integrity.js"))
 }
 
+/// The stage-4b lockdown/harden corpus (child 4/5): the Hardened-JavaScript
+/// `harden(x)`/`petrify(x)` globals ported from `xsLockdown.c` — the transitive
+/// freeze worklist (`harden`) and the single-object freeze (`petrify`). Asserted
+/// RESULT-exact against the pin (the oracle shim installs the harden/lockdown/
+/// petrify/mutabilities globals xst.c/xstFuzz.c install). `xsLockdown.c` calls
+/// no `mxMeter`, so the metering is allocation-driven; computron parity over a
+/// transitive harden is structurally unavailable because endor models
+/// intrinsics sparsely (the freeze *result* is faithful, the transitive object
+/// count is not). `lockdown()` (freezing the shared intrinsics + Date/Math
+/// taming + the idempotence throw) and `mutabilities` (the mutable-residue
+/// report) are the reported scope fold — a program referencing either
+/// self-names an honest `Halt::Unsupported`, excluded from this corpus.
+pub fn stage4_harden_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-harden.js"))
+}
+
 /// The stage-4 `new.target` corpus (child 2/8, the landed slice): the
 /// `XS_CODE_TARGET` opcode with real semantics — the target constructor inside
 /// a construct frame, `undefined` inside a plain call, across the factory-guard
@@ -1418,6 +1434,51 @@ mod tests {
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
+    }
+
+    #[test]
+    fn stage4_harden_corpus_agrees_on_results_against_oracle() {
+        // The stage-4b lockdown/harden acceptance bar (child 4/5): the
+        // Hardened-JavaScript `harden(x)`/`petrify(x)` globals from
+        // `xsLockdown.c`. `harden` is the transitive freeze worklist (prevent
+        // extensions + stamp every own data property non-writable/
+        // non-configurable, then queue the prototype and every reference-valued
+        // property, marking each reached instance `XS_DONT_MARSHALL_FLAG`);
+        // `petrify` is the single-object freeze. Asserted RESULT-exact against
+        // the pin: every program completes on BOTH engines to the same value
+        // (freeze semantics — a sloppy write to a frozen property is a no-op, a
+        // hardened object is `Object.isFrozen`, harden is transitive/idempotent
+        // and returns its argument, a non-reference passes through, petrify is
+        // non-transitive). Computron parity is NOT asserted: `xsLockdown.c`
+        // calls no `mxMeter`, so harden's cost is allocation-driven, and a
+        // transitive walk spills into endor's sparsely-modeled intrinsics, whose
+        // object count diverges from the pin's full intrinsic graph — the same
+        // structural sparse-intrinsics fact the module/compartment children
+        // record. `lockdown()`/`mutabilities` are the reported scope fold
+        // (honest `Halt::Unsupported`), excluded from this corpus.
+        let programs = stage4_harden_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4b harden corpus must be non-empty"
+        );
+        let mut checked = 0usize;
+        for src in &programs {
+            let run = dual_run(src).expect("oracle machine must start");
+            assert!(
+                matches!(run.agreement, Agreement::BothComplete),
+                "harden program must complete on both engines: {:?}\n  agreement={:?} endor_halt={:?}",
+                src,
+                run.agreement,
+                run.endor_halt,
+            );
+            assert!(
+                run.result_agrees,
+                "harden program result divergence: {:?}\n  oracle={:?} endor={:?}",
+                src, run.oracle_result, run.endor_result,
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, programs.len());
     }
 
     #[test]
