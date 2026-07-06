@@ -15236,6 +15236,158 @@ mod tests {
             assert_eq!(interp.str_len(off), units.len(), "length is the code-unit count");
         }
     }
+
+    // Helper: the chunk offset of a String slot (panics otherwise).
+    fn str_off(slot: &Slot) -> crate::value::ChunkOffset {
+        match slot.value {
+            Payload::String(o) => o,
+            _ => panic!("expected a String slot"),
+        }
+    }
+
+    #[test]
+    fn utf16_index_heavy_direct_access_is_o1_and_correct_across_a_supplementary_char() {
+        // A tight index over a long string with supplementary-plane content
+        // embedded: the O(1) direct code-unit index (`str_units`/`str_len`, the
+        // substrate `str[i]`/`charCodeAt(i)` read) must be correct at EVERY
+        // position — including the lead/trail surrogate units of a pair and the
+        // first unit just past a supplementary char. No cursor, no side table:
+        // `length` is half the byte payload and index `i` is unit `i`, so the
+        // stored form is the only source of truth.
+        let mut interp = Interp::new();
+        // 100×'a', 𝒜 (a surrogate pair), 100×'b', 𝒷 (a second pair), 'c'.
+        let mut units: Vec<u16> = Vec::new();
+        units.extend(std::iter::repeat(b'a' as u16).take(100));
+        units.extend("𝒜".encode_utf16());
+        units.extend(std::iter::repeat(b'b' as u16).take(100));
+        units.extend("𝒷".encode_utf16());
+        units.push(b'c' as u16);
+        let off = str_off(&interp.new_string_units(&units));
+
+        // O(1) length is the code-unit count (205: 100 + 2 + 100 + 2 + 1).
+        assert_eq!(interp.str_len(off), 205);
+        assert_eq!(interp.str_len(off), units.len());
+
+        // Every index reads the exact stored code unit — the direct-index
+        // property at every position, no boundary walk.
+        let stored = interp.str_units(off);
+        for i in 0..units.len() {
+            assert_eq!(stored[i], units[i], "unit at index {i} reads back directly");
+        }
+
+        // The surrogate boundary: charCodeAt returns the individual units, and
+        // codePointAt at the lead returns the full code point while at the
+        // trail it returns the bare trail unit. `str_units[i]` IS charCodeAt(i);
+        // codePointAt is the standard recombination over the same units.
+        let cp_lead = units[100]; // the 𝒜 lead surrogate
+        let cp_trail = units[101]; // the 𝒜 trail surrogate
+        assert!((0xD800..=0xDBFF).contains(&cp_lead), "index 100 is a lead surrogate");
+        assert!((0xDC00..=0xDFFF).contains(&cp_trail), "index 101 is a trail surrogate");
+        assert_eq!(stored[100], cp_lead, "charCodeAt(100) == the lead unit");
+        assert_eq!(stored[101], cp_trail, "charCodeAt(101) == the trail unit");
+        // The unit just past the supplementary char is 'b' (index 102), read
+        // with no offset drift from the two-unit pair before it.
+        assert_eq!(stored[102], b'b' as u16, "the unit just past 𝒜 is 'b'");
+        // codePointAt(100) recombines the pair to U+1D49C.
+        let combined =
+            0x10000 + (((cp_lead as u32 - 0xD800) << 10) | (cp_trail as u32 - 0xDC00));
+        assert_eq!(combined, 0x1D49C, "codePointAt at the lead is the astral code point");
+    }
+
+    #[test]
+    fn utf16_slice_may_split_a_surrogate_pair_into_a_valid_lone_surrogate_string() {
+        // Code-unit slicing (`slice`/`substring`/`substr`) operates over the
+        // stored units and may split a pair — a lone surrogate is a valid JS
+        // string (WTF-16), never normalized to U+FFFD in storage. `str[1..2]`
+        // of "a𝒜b" is the lone lead; `str[2..3]` the lone trail.
+        let mut interp = Interp::new();
+        let units: Vec<u16> = "a𝒜b".encode_utf16().collect();
+        assert_eq!(units.len(), 4, "'a' + 2-unit pair + 'b'");
+
+        let lead = str_off(&interp.new_string_units(&units[1..2]));
+        assert_eq!(interp.str_units(lead), vec![units[1]], "a split lead surrogate survives");
+        assert_eq!(interp.str_len(lead), 1);
+
+        let trail = str_off(&interp.new_string_units(&units[2..3]));
+        assert_eq!(interp.str_units(trail), vec![units[2]], "a split trail surrogate survives");
+        assert_eq!(interp.str_len(trail), 1);
+
+        let whole = str_off(&interp.new_string_units(&units[1..3]));
+        assert_eq!(interp.str_units(whole), units[1..3].to_vec(), "the whole pair slices intact");
+    }
+
+    #[test]
+    fn utf16_lone_surrogate_round_trips_through_storage_comparison_and_concat() {
+        let mut interp = Interp::new();
+
+        // Storage: a lone surrogate is stored verbatim as its 2-byte BE unit —
+        // no NUL hazard, no normalization. str_content is exactly the payload.
+        let lone = vec![b'A' as u16, 0xD800, b'B' as u16];
+        let off = str_off(&interp.new_string_units(&lone));
+        assert_eq!(interp.str_units(off), lone, "the lone surrogate reads back unchanged");
+        assert_eq!(interp.str_content(off), &[0x00, 0x41, 0xD8, 0x00, 0x00, 0x42]);
+
+        // Comparison: byte-lexicographic order over the UTF-16BE payload is the
+        // code-unit (ECMAScript relational) order — even for lone surrogates,
+        // which sort between the BMP below and above them by their bare unit.
+        let d800 = str_off(&interp.new_string_units(&[0xD800]));
+        let d801 = str_off(&interp.new_string_units(&[0xD801]));
+        let bmp_e000 = str_off(&interp.new_string_units(&[0xE000]));
+        let bmp_007a = str_off(&interp.new_string_units(&[0x007A]));
+        assert!(interp.str_content(d800) < interp.str_content(d801), "0xD800 < 0xD801");
+        assert!(interp.str_content(d801) < interp.str_content(bmp_e000), "0xD801 < 0xE000");
+        assert!(interp.str_content(bmp_007a) < interp.str_content(d800), "'z' (0x7A) < 0xD800");
+
+        // Concat: joining two lone surrogates that form a pair reunites them
+        // into a supplementary code point in the middle (WTF-16 concat); joining
+        // two lone highs stays two lone highs. Drive the real `concat_add`.
+        let high = interp.new_string_units(&[0xD800]);
+        let low = interp.new_string_units(&[0xDC00]);
+        interp.concat_add(high, low);
+        let joined = interp.pop();
+        assert_eq!(
+            interp.str_units(str_off(&joined)),
+            vec![0xD800u16, 0xDC00],
+            "a lead+trail concat yields the intact pair for U+10000"
+        );
+
+        let high1 = interp.new_string_units(&[0xD800]);
+        let high2 = interp.new_string_units(&[0xD801]);
+        interp.concat_add(high1, high2);
+        let both = interp.pop();
+        assert_eq!(
+            interp.str_units(str_off(&both)),
+            vec![0xD800u16, 0xD801],
+            "two lone highs stay two lone highs — no spurious merge"
+        );
+    }
+
+    #[test]
+    fn utf16_string_atom_snapshot_round_trips_supplementary_and_lone_surrogate() {
+        // The snapshot/atom round-trip: a stored string's chunk payload
+        // (`str_content`, the exact bytes a snapshot serializes) reconstructs
+        // bit-identically into a fresh machine via the UTF-16BE decode — a
+        // supplementary-plane atom AND a lone-surrogate atom survive with no
+        // normalization or corruption.
+        let mut src = Interp::new();
+        for units in [
+            "café".encode_utf16().collect::<Vec<u16>>(),
+            "𝒜𝒷 astral".encode_utf16().collect::<Vec<u16>>(),
+            vec![b'A' as u16, 0xD800, b'B' as u16, 0xDFFF], // lone high + lone trail
+        ] {
+            let off = str_off(&src.new_string_units(&units));
+            // "Serialize": the raw stored payload is the snapshot atom.
+            let payload = src.str_content(off).to_vec();
+            assert_eq!(payload.len(), units.len() * 2, "2 bytes per code unit");
+            // "Deserialize" into a fresh machine's arena.
+            let mut dst = Interp::new();
+            let dst_off = dst.chunks.alloc(&payload);
+            assert_eq!(dst.str_units(dst_off), units, "atom decodes back to the same units");
+            assert_eq!(dst.str_len(dst_off), units.len(), "O(1) length survives the round-trip");
+            // And the bytes themselves are identical (bit-exact snapshot).
+            assert_eq!(dst.str_content(dst_off), payload.as_slice());
+        }
+    }
 }
 
 // ---- BigInt limb arithmetic (xsBigInt.c: txU4 little-endian digits) ----
