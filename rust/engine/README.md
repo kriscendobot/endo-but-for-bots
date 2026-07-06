@@ -617,6 +617,60 @@ next dedicated invocation in [`ASYNC-AWAIT-HANDOFF.md`](ASYNC-AWAIT-HANDOFF.md).
 The keystone alone consumed a full handler invocation, so the async-function
 surface is sized as its own follow-up child rather than co-fitting here.
 
+The stage-4 **module machinery** child (5/8) lands the **static half** of
+`xsModule.c` as `endor_vm::module` — module records, a module map with a static
+host resolve hook (specifier → module, no filesystem), module environments with
+**live indirect bindings**, **module namespace exotic objects**, **cyclic
+instantiate/evaluate ordering**, **TDZ on un-evaluated bindings**, and
+**`ModuleSource`** (the compile-only, bindings-reflection Compartment shape). The
+linkage is the ECMAScript CyclicModuleRecord algorithm XS's
+`fxLinkModules`/`fxExecuteModules` realize: `ResolveExport`/`GetExportedNames`
+resolve local, indirect (`export {x} from 'm'`), and star (`export *`) exports —
+excluding ambiguous star names and `default` from star — and `Link`/`Evaluate`
+walk the graph with the SCC `dfs_index`/`dfs_ancestor_index` bookkeeping so a
+dependency's body runs before its dependents and each body runs **exactly once**.
+An `import {x}`/`export {x} from 'm'` name resolves to the **same binding cell**
+as `m`'s local `x`, so a write in `m` is observed live through every importer and
+re-exporter; a binding cell is created **uninitialized (TDZ)** at link and reading
+it before the owner's body initializes it — the observable hazard in a cyclic
+graph, where the first-executed module reads a peer's not-yet-initialized live
+binding — is a `ReferenceError`. The namespace exotic object mirrors
+`fxModuleOwnKeys`: own **string** keys are the resolvable export names **sorted by
+code unit** (XS's `c_strcmp`), then the single symbol key `@@toStringTag` →
+`"Module"`; `[[Set]]` always fails and the object is non-extensible.
+
+**Path achieved (recorded honestly).** The acceptance-focus's *preferred* path — a
+`language/module-code/` **dual-run** — is **not** achievable across the current
+audited oracle seam: the `endor-oracle` shim compiles the **script goal only**
+(`fxParseScript(..., mxProgramFlag | mxEvalFlag)`); it does not drive the module
+goal / loader, so a top-level `import`/`export` is a script-goal syntax error and
+the `test262-language` runner already names every `module`-flagged test a
+`structural:module` skip. Extending the shim to drive `fxParseModule` +
+`fxLinkModules` + a resolve hook across the FFI is a larger, separately-audited
+seam this static child deliberately does not open; the **differential gap is
+self-named** here rather than papered over. The path this child therefore takes —
+the one the job's acceptance focus prescribes as the alternative — is the
+**endor-side unit corpus**: module semantics are certified by **14
+namespace/linkage/ordering/TDZ unit tests** locked into `cargo test`
+(`endor_vm::module::tests`), each a spec-faithful assertion (sorted keys, no-set,
+`@@toStringTag`, live indirect binding, star merge + ambiguity, cyclic TDZ vs.
+well-ordered live reads, diamond-evaluates-once, `ModuleSource` reflection). The
+**manual-xst method** for spot-checking module *results* against the pin
+(the differential the seam cannot automate): build `xst` from the pin
+(`c/moddable/xs/makefiles/lin/xst.mk`) and run a `.mjs` module directly
+(`xst path/to/module.mjs`), comparing the completion/namespace against the
+endor-side model — module bytecode is not fed to `endor-vm` because the oracle
+does not emit it. **Named skips** (wired at the interpreter's opcode dispatch,
+self-naming rather than falling to the generic op-name): dynamic `import()`
+(`module:dynamic-import`) and `import.meta` (`module:import-meta`), both needing
+the asynchronous host loader this static half does not build. **Scope fold**
+(carried forward, each a named skip — never a wrong value): feeding real module
+bytecode to `endor-vm` (blocked on the module-goal oracle seam above, so the
+`XS_CODE_MODULE`/`XS_CODE_TRANSFER` runtime opcodes stay unimplemented), the
+async `import()`/`importHook` loader, and `import.meta`. GC roots were not touched
+(no run-loop/allocation-pressure wiring in this child), so the GC-roots ledger
+note carries forward untouched.
+
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name

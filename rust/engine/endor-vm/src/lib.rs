@@ -26,6 +26,7 @@ pub mod default_keys;
 pub mod gc;
 pub mod interp;
 pub mod meter;
+pub mod module;
 pub mod opcode;
 pub mod symbols;
 pub mod value;
@@ -34,6 +35,10 @@ pub use compartment::{Compartment, Intrinsics, Machine};
 pub use gc::{GcStats, Heap};
 pub use interp::{Halt, Interp, Native, RunOutcome, PROGRAM_INVOCATION_COMPUTRONS};
 pub use meter::{Meter, MeterCheck};
+pub use module::{
+    BodyOp, ExportEntry, ImportEntry, ImportName, ModuleError, ModuleGraph, ModuleId,
+    ModuleRecord, ModuleSource, ModuleValue, Namespace,
+};
 pub use opcode::{instruction_len, Opcode};
 pub use symbols::parse_symbols;
 pub use value::{ChunkArena, ChunkOffset, Kind, Payload, Slot, SlotArena, SlotIndex};

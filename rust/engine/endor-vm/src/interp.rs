@@ -6419,6 +6419,24 @@ impl Interp {
                     pc += size as usize;
                 }
 
+                // Dynamic `import()` and `import.meta` (xsModule.c's
+                // `fxRunImport` / `mxModuleInternal` meta): these need the
+                // asynchronous host loader (`importHook`/`resolveHook`) and
+                // per-module `meta` object the stage-4 static half (child
+                // 5/8) deliberately does not build — the module machinery
+                // that lands is `ModuleSource`, namespaces, and cyclic
+                // static linkage (`endor_vm::module`). Rather than let them
+                // fall to the generic op-name skip, they self-name so the
+                // differential harness reports the exact unimplemented
+                // surface (design § accuracy over parity: an honest named
+                // skip, never a wrong value).
+                XS_CODE_IMPORT => {
+                    return Halt::Unsupported("module:dynamic-import");
+                }
+                XS_CODE_IMPORT_META => {
+                    return Halt::Unsupported("module:import-meta");
+                }
+
                 other => {
                     return Halt::Unsupported(other.name());
                 }
