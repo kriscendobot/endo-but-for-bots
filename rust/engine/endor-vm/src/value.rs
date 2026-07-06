@@ -57,8 +57,9 @@ pub enum Kind {
     Boolean = 2,
     Integer = 3,
     Number = 4,
-    /// String data living in the chunk arena (CESU-8, resolved
-    /// question 4). Payload holds a `ChunkOffset`.
+    /// String data living in the chunk arena (UTF-16 big-endian code units,
+    /// revised 2026-07-06 from CESU-8 — resolved question 4). Payload holds a
+    /// `ChunkOffset`.
     String = 5,
     /// An object instance living in the slot arena (XS's
     /// `XS_INSTANCE_KIND`). The instance's own slot is the head of its
@@ -407,8 +408,8 @@ impl SlotArena {
 /// bookkeeping.
 const CHUNK_HEADER: usize = 4;
 
-/// The chunk arena: variable-size data (strings in CESU-8, and later
-/// ArrayBuffers, BigInt digits, bytecode). Each block carries a length
+/// The chunk arena: variable-size data (strings as UTF-16 big-endian code
+/// units, ArrayBuffers, BigInt digits, bytecode). Each block carries a length
 /// header so [`ChunkArena::compact`] can slide-compact during GC,
 /// rewriting `ChunkOffset`s exactly where XS rewrites chunk pointers.
 #[derive(Default)]
@@ -422,8 +423,10 @@ impl ChunkArena {
     }
 
     /// Append bytes behind a length header, returning the offset of the
-    /// payload (not the header). Strings are stored in CESU-8 exactly as
-    /// XS holds them (resolved question 4).
+    /// payload (not the header). Strings are stored as UTF-16 big-endian code
+    /// units (revised 2026-07-06 from CESU-8; resolved question 4), so a byte-
+    /// lexicographic compare of two string payloads equals their code-unit
+    /// (ECMAScript string) ordering.
     pub fn alloc(&mut self, data: &[u8]) -> ChunkOffset {
         let header = self.bytes.len();
         self.bytes

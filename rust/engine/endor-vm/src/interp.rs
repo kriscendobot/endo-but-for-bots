@@ -1906,7 +1906,7 @@ struct IterState {
     result: crate::value::SlotIndex,
     done: bool,
     enum_keys: Vec<(u16, u32)>,
-    /// For a string iterator (`kind == 4`): the CESU-8 bytes being iterated,
+    /// For a string iterator (`kind == 4`): the UTF-16BE bytes being iterated,
     /// with `index` a BYTE offset into them (an array/enumerator leaves this
     /// empty and drives `index`/`enum_keys` instead).
     str_bytes: Vec<u8>,
@@ -2170,7 +2170,7 @@ pub struct Interp {
     meter_host: Option<Box<dyn FnMut(u64) -> bool>>,
     /// The machine slot heap (design § Value and heap model).
     pub slots: SlotArena,
-    /// The machine chunk heap (CESU-8 strings and later data).
+    /// The machine chunk heap (UTF-16BE strings and later data).
     pub chunks: ChunkArena,
     /// The interned `typeof` result strings (XS's `mxUndefinedString`
     /// &co.), allocated once at construction so `typeof` is dispatch-only.
@@ -2558,15 +2558,17 @@ impl Interp {
         // chunk arena *before* any run so `typeof` costs only its dispatch,
         // exactly as C-XS (no per-use allocation for an interned string).
         let mut chunks = ChunkArena::new();
+        // Interned `typeof` result strings, stored in the UTF-16BE form all
+        // string values use (`str_to_be16`).
         let static_str = StaticStrings {
-            undefined: chunks.alloc(b"undefined"),
-            object: chunks.alloc(b"object"),
-            boolean: chunks.alloc(b"boolean"),
-            number: chunks.alloc(b"number"),
-            string: chunks.alloc(b"string"),
-            function: chunks.alloc(b"function"),
-            symbol: chunks.alloc(b"symbol"),
-            bigint: chunks.alloc(b"bigint"),
+            undefined: chunks.alloc(&str_to_be16("undefined")),
+            object: chunks.alloc(&str_to_be16("object")),
+            boolean: chunks.alloc(&str_to_be16("boolean")),
+            number: chunks.alloc(&str_to_be16("number")),
+            string: chunks.alloc(&str_to_be16("string")),
+            function: chunks.alloc(&str_to_be16("function")),
+            symbol: chunks.alloc(&str_to_be16("symbol")),
+            bigint: chunks.alloc(&str_to_be16("bigint")),
         };
         let mut interp = Interp {
             stack: Vec::with_capacity(64),
@@ -3139,7 +3141,7 @@ impl Interp {
             "toStringTag",
             "unscopables",
         ] {
-            let desc = self.chunks.alloc(format!("Symbol.{}", name).as_bytes());
+            let desc = self.alloc_str_text(format!("Symbol.{}", name).as_bytes());
             let d = self
                 .slots
                 .alloc(Slot::of(Kind::String, Payload::String(desc)));
@@ -3496,7 +3498,7 @@ impl Interp {
         let data = std::mem::take(&mut self.proto_data);
         for (proto, pname, value) in &data {
             if let Some(&pid) = self.symbol_ids.get(*pname) {
-                let off = self.chunks.alloc(value.as_bytes());
+                let off = self.alloc_str_text(value.as_bytes());
                 self.set_own_unmetered(*proto, pid, Slot::of(Kind::String, Payload::String(off)));
             }
         }
@@ -3675,24 +3677,57 @@ impl Interp {
     /// the whole payload for an interned string stored without one): XS's
     /// `mxStringLength`/`c_strlen` view of a string value.
     #[inline]
+    /// The raw stored payload of a string value: its **UTF-16 big-endian**
+    /// code-unit bytes (2 bytes per code unit, revised 2026-07-06 from the
+    /// CESU-8 build — design § Value and heap model). There is no NUL
+    /// terminator (a UTF-16 code unit U+0000 is `00 00`, so a byte scan
+    /// cannot mark the end); the length comes from the chunk header. Big-
+    /// endian is chosen so byte-lexicographic order over this slice equals
+    /// UTF-16 code-unit order, which is exactly the ECMAScript string
+    /// ordering — the relational/equality opcodes therefore compare these
+    /// bytes directly with no decode.
     fn str_content(&self, off: crate::value::ChunkOffset) -> &[u8] {
-        let p = self.chunks.payload(off);
-        let end = p.iter().position(|&b| b == 0).unwrap_or(p.len());
-        &p[..end]
+        self.chunks.payload(off)
+    }
+
+    /// The string value's code units (`str_content` decoded from UTF-16BE).
+    fn str_units(&self, off: crate::value::ChunkOffset) -> Vec<u16> {
+        be16_to_units(self.str_content(off))
+    }
+
+    /// The string value's code-unit length (`length`, O(1) — half the stored
+    /// byte payload, no decode walk).
+    #[inline]
+    fn str_len(&self, off: crate::value::ChunkOffset) -> usize {
+        self.chunks.len_of(off) / 2
+    }
+
+    /// The string value rendered to a Rust `String` (`String::from_utf16_lossy`
+    /// over the code units), for the display/debug boundary and text-semantic
+    /// built-ins. Lone surrogates render as U+FFFD, matching the oracle shim's
+    /// lossy decode at the same boundary.
+    fn str_text(&self, off: crate::value::ChunkOffset) -> String {
+        String::from_utf16_lossy(&self.str_units(off))
+    }
+
+    /// Allocate a String value's chunk from **UTF-8 text** bytes, encoding them
+    /// to the stored UTF-16BE form. Unmetered — callers that meter the
+    /// allocation do so separately (at code-unit granularity). For text that is
+    /// pure ASCII (rendered numbers, names, typeof atoms) the code-unit count
+    /// equals the input byte count.
+    fn alloc_str_text(&mut self, text: &[u8]) -> crate::value::ChunkOffset {
+        let units: Vec<u16> = String::from_utf8_lossy(text).encode_utf16().collect();
+        self.chunks.alloc(&units_to_be16(&units))
     }
 
     /// Render a completion/thrown value the way the oracle shim does:
-    /// `fxToString` then the raw CESU-8 bytes up to the NUL through
-    /// `from_utf8_lossy` (`endor-oracle` `cstr_field`). Because both
-    /// engines run the same CESU-8 bytes through `from_utf8_lossy`, a
-    /// string value renders byte-identically to the oracle even for astral
-    /// code points (CESU-8 surrogate pairs both decode lossily the same
-    /// way). Non-string kinds defer to [`slot_to_ecma_string`].
+    /// `fxToString` then a lossy decode of the string's code units
+    /// (`String::from_utf16_lossy`), the display/debug boundary the design's
+    /// § Value and heap model routes through UTF-16. Non-string kinds defer to
+    /// [`slot_to_ecma_string`].
     fn render(&self, s: &Slot) -> String {
         match s.value {
-            Payload::String(off) => {
-                String::from_utf8_lossy(self.str_content(off)).into_owned()
-            }
+            Payload::String(off) => self.str_text(off),
             // A BigInt completion renders as its decimal magnitude (XS's
             // `String(aBigInt)`), no `n` suffix.
             Payload::BigInt(off) => {
@@ -3778,7 +3813,7 @@ impl Interp {
         let mut out = b"Symbol(".to_vec();
         if let Payload::Reference(d) = sym.value {
             if let Payload::String(off) = self.slots.get(d).value {
-                out.extend_from_slice(self.str_content(off));
+                out.extend_from_slice(self.str_text(off).as_bytes());
             }
         }
         out.push(b')');
@@ -4986,11 +5021,13 @@ impl Interp {
                 }
                 // `string` (XS_CODE_STRING_1/2/4, xsRun.c:3044): a string
                 // literal. The operand is a length-prefixed run of inline
-                // CESU-8 bytes (including the compiler's trailing NUL);
-                // `fxNewChunk(len)` copies them into a fresh chunk (metered
-                // per adjusted byte, `tick_chunk_new`), and a String slot
-                // referencing the chunk is pushed. `len` is the byte count
-                // from the length prefix, exactly XS's `index`.
+                // CESU-8 bytes (including the compiler's trailing NUL). Endor
+                // decodes that CESU-8 into UTF-16 code units (the stored form,
+                // design § Value and heap model) and copies them into a fresh
+                // chunk as UTF-16BE. The allocation is metered by code-unit
+                // length (`n_units + 1`, the O(n) string-op weight re-based to
+                // code units — for ASCII this equals the old CESU-8 byte count
+                // including the NUL, so ASCII literals meter identically).
                 XS_CODE_STRING_1 | XS_CODE_STRING_2 | XS_CODE_STRING_4 => {
                     let (n, data) = match op {
                         XS_CODE_STRING_1 => (code[pc + 1] as usize, pc + 2),
@@ -5007,8 +5044,9 @@ impl Interp {
                             pc + 5,
                         ),
                     };
-                    self.meter.tick_chunk_new(n as u64);
-                    let off = self.chunks.alloc(&code[data..data + n]);
+                    let units = cesu8_to_units(&code[data..data + n]);
+                    self.meter.tick_chunk_new((units.len() + 1) as u64);
+                    let off = self.chunks.alloc(&units_to_be16(&units));
                     self.push(Slot::of(Kind::String, Payload::String(off)));
                     pc += ilen;
                 }
@@ -5418,7 +5456,7 @@ impl Interp {
                     };
                     let s = match key.value {
                         Payload::String(off) if key.kind == Kind::String => {
-                            String::from_utf8_lossy(self.str_content(off)).into_owned()
+                            self.str_text(off)
                         }
                         _ => return Halt::Unsupported(op.name()),
                     };
@@ -5842,7 +5880,7 @@ impl Interp {
         // `name` string chunk at `fxNewFunctionName` (folded into the measured
         // [`FUNCTION_DEFINE_METERING`] cluster), so a later `f.name` read is a
         // free own-property read — endor mirrors that by pre-interning here.
-        let name_chunk = self.chunks.alloc(fname.as_bytes());
+        let name_chunk = self.alloc_str_text(fname.as_bytes());
         self.functions.insert(
             f,
             FuncInfo {
@@ -6096,7 +6134,7 @@ impl Interp {
                     }
                     Kind::String if argc >= 1 => match a.value {
                         Payload::String(off) => {
-                            let bytes = self.str_content(off).to_vec();
+                            let bytes = self.str_text(off).into_bytes();
                             // `fx_Number` folds the ToNumber result to integer
                             // kind (`fx_Math_toInteger`) in the non-target case.
                             math_to_integer(string_to_number(&bytes, true))
@@ -6130,7 +6168,7 @@ impl Interp {
                         // throws — that path stays in [`Self::run`].)
                         Kind::Symbol => {
                             let bytes = self.symbol_descriptive_bytes(a);
-                            let off = self.chunks.alloc(&bytes);
+                            let off = self.alloc_str_text(&bytes);
                             Slot::of(Kind::String, Payload::String(off))
                         }
                         Kind::Reference => {
@@ -6148,7 +6186,7 @@ impl Interp {
                         }
                         _ => {
                             let bytes = self.to_string_bytes_metered(a);
-                            let off = self.chunks.alloc(&bytes);
+                            let off = self.alloc_str_text(&bytes);
                             Slot::of(Kind::String, Payload::String(off))
                         }
                     }
@@ -6866,7 +6904,8 @@ impl Interp {
         self.meter.tick_raw(REGEXP_EXEC_FRAME_METERING);
         let subject_slot = self.to_string_slot_metered(arg0);
         let subject = match subject_slot.value {
-            Payload::String(off) => self.str_content(off).to_vec(),
+            // Transcode UTF-16 → UTF-8 for the matcher's byte-offset space.
+            Payload::String(off) => self.str_text(off).into_bytes(),
             _ => Vec::new(),
         };
         let named = self.regexps[&inst].program.name_count > 0;
@@ -7020,7 +7059,7 @@ impl Interp {
                 return Err(Halt::Unsupported("String.replace:function"));
             }
         }
-        let subject_bytes = match self.string_receiver_bytes(subject) {
+        let subject_bytes = match self.string_receiver_text(subject) {
             Some(c) => c,
             None => return Err(Halt::Unsupported("String.replace:non-string-receiver")),
         };
@@ -7085,9 +7124,7 @@ impl Interp {
         };
         // The final assembly `fxNewChunk(total + 1)`.
         self.meter.tick_chunk_new((assembled.len() + 1) as u64);
-        let mut buf = assembled;
-        buf.push(0);
-        let off = self.chunks.alloc(&buf);
+        let off = self.alloc_str_text(&assembled);
         Ok(Slot::of(Kind::String, Payload::String(off)))
     }
 
@@ -7157,7 +7194,7 @@ impl Interp {
         subject: Slot,
         limit_slot: Slot,
     ) -> Result<Slot, Halt> {
-        let subject_bytes = match self.string_receiver_bytes(subject) {
+        let subject_bytes = match self.string_receiver_text(subject) {
             Some(c) => c,
             None => return Err(Halt::Unsupported("String.split:non-string-receiver")),
         };
@@ -7284,7 +7321,7 @@ impl Interp {
             if let Some(a) = self.arrays.get(&r) {
                 if let Some(s) = a.items.get(&0) {
                     if let Payload::String(off) = s.value {
-                        return self.str_content(off).len();
+                        return self.str_len(off);
                     }
                 }
             }
@@ -7325,9 +7362,7 @@ impl Interp {
         out.extend_from_slice(flags.as_bytes());
         // The final chunk is the third concat, already metered; allocate it
         // without re-charging.
-        let mut buf = out;
-        buf.push(0);
-        let off = self.chunks.alloc(&buf);
+        let off = self.alloc_str_text(&out);
         Ok(Slot::of(Kind::String, Payload::String(off)))
     }
 
@@ -7713,7 +7748,7 @@ impl Interp {
         // measured construct constants).
         if let Some(text) = message {
             if let Some(&mid) = self.symbol_ids.get("message") {
-                let off = self.chunks.alloc(text.as_bytes());
+                let off = self.alloc_str_text(text.as_bytes());
                 self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
             }
         }
@@ -7776,7 +7811,7 @@ impl Interp {
         );
         if let Some(text) = message {
             if let Some(&mid) = self.symbol_ids.get("message") {
-                let off = self.chunks.alloc(text.as_bytes());
+                let off = self.alloc_str_text(text.as_bytes());
                 self.set_own_unmetered(inst, mid, Slot::of(Kind::String, Payload::String(off)));
             }
         }
@@ -7855,7 +7890,7 @@ impl Interp {
         };
         self.meter.tick_raw(BIND_CREATE_METERING + args_meter);
         let inst = self.slots.alloc(Slot::instance(self.function_proto));
-        let name_chunk = self.chunks.alloc(bound_name.as_bytes());
+        let name_chunk = self.alloc_str_text(bound_name.as_bytes());
         // Register in `functions` (native/method None) so `.length`/`.name`
         // read back the bound values through the ordinary GET_PROPERTY arm.
         self.functions.insert(
@@ -8167,7 +8202,7 @@ impl Interp {
             NativeMethod::ObjectToString => {
                 self.meter.tick_raw(METHOD_OBJECT_TOSTRING_METERING);
                 self.meter.tick_chunk_new(b"[object Object]".len() as u64);
-                let off = self.chunks.alloc(b"[object Object]");
+                let off = self.alloc_str_text(b"[object Object]");
                 Slot::of(Kind::String, Payload::String(off))
             }
             // `Function.prototype.toString`: XS renders any function as
@@ -8184,7 +8219,7 @@ impl Interp {
                 self.meter.tick_raw(METHOD_FUNCTION_TOSTRING_METERING);
                 let s = format!("function [\"{}\"] (){{[native code]}}", name);
                 self.meter.tick_chunk_new(s.len() as u64);
-                let off = self.chunks.alloc(s.as_bytes());
+                let off = self.alloc_str_text(s.as_bytes());
                 Slot::of(Kind::String, Payload::String(off))
             }
             // `Error.prototype.toString`: `name` / `name: message`.
@@ -8192,7 +8227,7 @@ impl Interp {
                 let s = self.render(&this);
                 self.meter.tick_raw(METHOD_ERROR_TOSTRING_METERING);
                 self.meter.tick_chunk_new(s.len() as u64);
-                let off = self.chunks.alloc(s.as_bytes());
+                let off = self.alloc_str_text(s.as_bytes());
                 Slot::of(Kind::String, Payload::String(off))
             }
             // `<wrapper>.toString`: stringify the wrapped primitive with the
@@ -8206,7 +8241,7 @@ impl Interp {
                 }
                 .unwrap_or(this);
                 let bytes = self.to_string_bytes_metered(prim);
-                let off = self.chunks.alloc(&bytes);
+                let off = self.alloc_str_text(&bytes);
                 Slot::of(Kind::String, Payload::String(off))
             }
             // `Function.prototype.bind(thisArg, ...boundArgs)`: create a bound
@@ -8221,7 +8256,7 @@ impl Interp {
                 }
                 let bytes = self.symbol_descriptive_bytes(this);
                 self.meter.tick_raw(SYMBOL_TO_STRING_METERING);
-                let off = self.chunks.alloc(&bytes);
+                let off = self.alloc_str_text(&bytes);
                 Slot::of(Kind::String, Payload::String(off))
             }
             // `Symbol.prototype.valueOf()`: the symbol primitive itself.
@@ -8290,7 +8325,7 @@ impl Interp {
                 // `false` because it is not an own property.
                 let (o, key) = match (this.value, arg0.value) {
                     (Payload::Reference(o), Payload::String(off)) => {
-                        (o, String::from_utf8_lossy(self.str_content(off)).into_owned())
+                        (o, self.str_text(off))
                     }
                     _ => return Err(Halt::Unsupported("hasOwnProperty:non-string-key")),
                 };
@@ -8358,9 +8393,7 @@ impl Interp {
                 data.length = n;
                 for (i, &id) in ids.iter().enumerate() {
                     let name = self.symbol_names[(id - 1) as usize].clone();
-                    let mut buf = name.into_bytes();
-                    buf.push(0);
-                    let off = self.chunks.alloc(&buf);
+                    let off = self.alloc_str_text(name.as_bytes());
                     data.items
                         .insert(i as u32, Slot::of(Kind::String, Payload::String(off)));
                 }
@@ -8389,7 +8422,7 @@ impl Interp {
                 }
                 let key = match arg1.value {
                     Payload::String(off) => {
-                        String::from_utf8_lossy(self.str_content(off)).into_owned()
+                        self.str_text(off)
                     }
                     _ => return Err(Halt::Unsupported("getOwnPropertyDescriptor:non-string-key")),
                 };
@@ -8471,7 +8504,7 @@ impl Interp {
                 };
                 let key = match arg1.value {
                     Payload::String(off) if arg1.kind == Kind::String => {
-                        String::from_utf8_lossy(self.str_content(off)).into_owned()
+                        self.str_text(off)
                     }
                     _ => return Err(Halt::Unsupported("defineProperty:non-string-key")),
                 };
@@ -9640,7 +9673,7 @@ impl Interp {
                     b",".to_vec()
                 } else if arg0.kind == Kind::String {
                     match arg0.value {
-                        Payload::String(off) => self.str_content(off).to_vec(),
+                        Payload::String(off) => self.str_text(off).into_bytes(),
                         _ => b",".to_vec(),
                     }
                 } else {
@@ -9674,7 +9707,7 @@ impl Interp {
                     }
                 }
                 self.meter.tick_chunk_new((out.len() + 1) as u64);
-                let off = self.chunks.alloc(&out);
+                let off = self.alloc_str_text(&out);
                 Slot::of(Kind::String, Payload::String(off))
             }
             // `Array.prototype.toString()` delegates to `this.join()` with the
@@ -9715,7 +9748,7 @@ impl Interp {
                     }
                 }
                 self.meter.tick_chunk_new((out.len() + 1) as u64);
-                let off = self.chunks.alloc(&out);
+                let off = self.alloc_str_text(&out);
                 Slot::of(Kind::String, Payload::String(off))
             }
             // Recognized-but-unimplemented Array methods and statics: honest
@@ -10054,7 +10087,7 @@ impl Interp {
             // non-RegExp argument (the `withoutRegexp` coerce path) and the
             // global `match` collection are honest named skips.
             NativeMethod::StringSearch => {
-                if self.string_receiver_bytes(this).is_none() {
+                if self.string_receiver_units(this).is_none() {
                     return Err(Halt::Unsupported("String.search:non-string-receiver"));
                 }
                 match arg0.value {
@@ -10065,7 +10098,7 @@ impl Interp {
                 }
             }
             NativeMethod::StringMatch => {
-                if self.string_receiver_bytes(this).is_none() {
+                if self.string_receiver_units(this).is_none() {
                     return Err(Halt::Unsupported("String.match:non-string-receiver"));
                 }
                 match arg0.value {
@@ -10079,7 +10112,7 @@ impl Interp {
             // literal string replacement). A string pattern, a global flag, a
             // function or `$`-bearing replacement self-name honest skips.
             NativeMethod::StringReplace => {
-                if self.string_receiver_bytes(this).is_none() {
+                if self.string_receiver_units(this).is_none() {
                     return Err(Halt::Unsupported("String.replace:non-string-receiver"));
                 }
                 let repl = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
@@ -10095,7 +10128,7 @@ impl Interp {
             // string (non-RegExp) separator self-names the `withoutRegexp`
             // path.
             NativeMethod::StringSplit => {
-                if self.string_receiver_bytes(this).is_none() {
+                if self.string_receiver_units(this).is_none() {
                     return Err(Halt::Unsupported("String.split:non-string-receiver"));
                 }
                 let limit = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
@@ -10525,7 +10558,7 @@ impl Interp {
                     // `fxNumberToString` step + result chunk.
                     self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
                     let bytes = self.to_string_bytes_metered(prim);
-                    let off = self.chunks.alloc(&bytes);
+                    let off = self.alloc_str_text(&bytes);
                     Slot::of(Kind::String, Payload::String(off))
                 } else {
                     return Err(Halt::Unsupported("Number.toString:non-decimal-radix"));
@@ -10536,7 +10569,7 @@ impl Interp {
             // the string-argument case exactly and self-names the rest.
             GlobalParseInt => {
                 let bytes = match arg0.map(|s| s.value) {
-                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    Some(Payload::String(off)) => self.str_text(off).into_bytes(),
                     None => return Ok(Slot::number(f64::NAN)),
                     _ => return Err(Halt::Unsupported("parseInt:non-string-argument")),
                 };
@@ -10556,7 +10589,7 @@ impl Interp {
             // whole = 0). String argument only.
             GlobalParseFloat => {
                 let bytes = match arg0.map(|s| s.value) {
-                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    Some(Payload::String(off)) => self.str_text(off).into_bytes(),
                     None => return Ok(Slot::number(f64::NAN)),
                     _ => return Err(Halt::Unsupported("parseFloat:non-string-argument")),
                 };
@@ -10573,7 +10606,7 @@ impl Interp {
                         Kind::Integer | Kind::Number => to_number(&s),
                         Kind::String => match s.value {
                             Payload::String(off) => {
-                                string_to_number(&self.str_content(off).to_vec(), true)
+                                string_to_number(&self.str_text(off).into_bytes(), true)
                             }
                             _ => f64::NAN,
                         },
@@ -10653,7 +10686,7 @@ impl Interp {
                     Slot { kind: Kind::String, value: Payload::String(o), .. } => o,
                     _ => return Err(Halt::Unsupported("JSON.parse:non-string")),
                 };
-                let input = self.str_content(off).to_vec();
+                let input = self.str_text(off).into_bytes();
                 self.meter.tick_raw(JSON_PARSE_SETUP_METERING);
                 let mut pos = 0usize;
                 let mut cost: u64 = 0;
@@ -10720,8 +10753,8 @@ impl Interp {
             Kind::String => match value.value {
                 Payload::String(off) => {
                     *cost += JSON_STRINGIFY_SCALAR_METERING;
-                    let content = self.str_content(off).to_vec();
-                    Ok(Some(json_escape_string(&content)))
+                    let units = self.str_units(off);
+                    Ok(Some(json_escape_string(&units)))
                 }
                 _ => Ok(None),
             },
@@ -10819,7 +10852,9 @@ impl Interp {
                                 buf.push(b',');
                             }
                             first = false;
-                            buf.extend_from_slice(&json_escape_string(key.as_bytes()));
+                            buf.extend_from_slice(&json_escape_string(
+                                &key.encode_utf16().collect::<Vec<u16>>(),
+                            ));
                             buf.push(b':');
                             buf.extend_from_slice(&vb);
                         }
@@ -10904,9 +10939,7 @@ impl Interp {
                 // The tokenizer's `s = fxNewChunk(the, size + 1)`: always a
                 // chunk, even for the empty string (unlike an interned literal).
                 *cost += (((bytes.len() as u64 + 1) + 7) & !7) + 16;
-                let mut buf = bytes;
-                buf.push(0);
-                let off = self.chunks.alloc(&buf);
+                let off = self.alloc_str_text(&bytes);
                 Ok(Slot::of(Kind::String, Payload::String(off)))
             }
             b't' => {
@@ -11186,44 +11219,65 @@ impl Interp {
         Ok(Slot::of(Kind::Reference, Payload::Reference(inst)))
     }
 
-    /// The CESU-8 content bytes of a string receiver (NUL-stripped), for a
-    /// primitive string or a boxed `String` wrapper. `None` for any other
-    /// receiver (an honest named skip — `String.prototype` methods on a
-    /// non-string `this` are not modeled this stage).
-    fn string_receiver_bytes(&self, this: Slot) -> Option<Vec<u8>> {
+    /// The UTF-16 code units of a string receiver, for a primitive string or a
+    /// boxed `String` wrapper. `None` for any other receiver (an honest named
+    /// skip — `String.prototype` methods on a non-string `this` are not modeled
+    /// this stage).
+    fn string_receiver_units(&self, this: Slot) -> Option<Vec<u16>> {
         match this.value {
-            Payload::String(off) => Some(self.str_content(off).to_vec()),
+            Payload::String(off) => Some(self.str_units(off)),
             Payload::Reference(r) => match self.wrapper_data.get(&r).map(|s| s.value) {
-                Some(Payload::String(off)) => Some(self.str_content(off).to_vec()),
+                Some(Payload::String(off)) => Some(self.str_units(off)),
                 _ => None,
             },
             _ => None,
         }
     }
 
-    /// Allocate a fresh String slot from CESU-8 `bytes`, metering the
-    /// `fxNewChunk(len + 1)` XS charges for the result string (payload + the
-    /// trailing NUL). An empty result reuses the interned empty string (no
+    /// The **UTF-8 text** bytes of a string receiver (lossy over lone
+    /// surrogates), for the regexp/matcher boundary — the `endor-regexp`
+    /// matcher works over UTF-8 bytes with byte offsets, so the subject is
+    /// transcoded UTF-16 → UTF-8 here (identity byte-for-byte on the ASCII
+    /// subject the covered regexp grammar reaches). `None` for a non-string
+    /// receiver.
+    fn string_receiver_text(&self, this: Slot) -> Option<Vec<u8>> {
+        self.string_receiver_units(this)
+            .map(|u| String::from_utf16_lossy(&u).into_bytes())
+    }
+
+    /// Allocate a fresh String slot from **UTF-8 text** `bytes`, decoding them
+    /// to UTF-16 code units and storing them as UTF-16BE. Metered by code-unit
+    /// length (`n_units + 1`, the re-based O(n) string-op weight; for ASCII
+    /// text this equals the old CESU-8 `len + 1`, so ASCII results meter
+    /// identically). An empty result reuses the interned empty string (no
     /// chunk), exactly as XS returns `mxEmptyString`.
     fn new_string_metered(&mut self, bytes: &[u8]) -> Slot {
-        if bytes.is_empty() {
-            // XS's `mxEmptyString` — an interned "", no fxNewChunk.
-            let off = self.chunks.alloc(b"\x00");
+        let units: Vec<u16> = String::from_utf8_lossy(bytes).encode_utf16().collect();
+        self.new_string_units(&units)
+    }
+
+    /// Allocate a fresh String slot from UTF-16 code `units` (the direct
+    /// storage form — used where the result is a code-unit slice of an existing
+    /// string, so lone surrogates survive without a lossy text round-trip).
+    /// Metered by code-unit length (`n_units + 1`); an empty result is the
+    /// interned empty string (no metered chunk).
+    fn new_string_units(&mut self, units: &[u16]) -> Slot {
+        if units.is_empty() {
+            // XS's `mxEmptyString` — an interned "", no metered fxNewChunk.
+            let off = self.chunks.alloc(&[]);
             return Slot::of(Kind::String, Payload::String(off));
         }
-        self.meter.tick_chunk_new((bytes.len() + 1) as u64);
-        let mut buf = bytes.to_vec();
-        buf.push(0);
-        let off = self.chunks.alloc(&buf);
+        self.meter.tick_chunk_new((units.len() + 1) as u64);
+        let off = self.chunks.alloc(&units_to_be16(units));
         Slot::of(Kind::String, Payload::String(off))
     }
 
     /// Dispatch a `String.prototype` method (`xsString.c`) over the primitive
-    /// receiver's CESU-8 bytes. BMP + CESU-8 surrogate content is handled by
-    /// the code-unit boundary walk ([`string_unit_starts`]); a position/search
-    /// argument that is not a number/string endor can coerce self-names an
-    /// honest skip. Meters exactly the pin's `mxMeterSome` + `fxNewChunk`,
-    /// plus the (zero) native frame.
+    /// receiver's UTF-16 code units (the stored form — indexing is direct, no
+    /// boundary walk). A position/search argument that is not a number/string
+    /// endor can coerce self-names an honest skip. Meters exactly the pin's
+    /// `mxMeterSome` + `fxNewChunk` (re-based to code-unit length), plus the
+    /// (zero) native frame.
     fn call_string(
         &mut self,
         m: NativeMethod,
@@ -11231,19 +11285,22 @@ impl Interp {
         base: usize,
         argc: usize,
     ) -> Result<Slot, Halt> {
-        let content = match self.string_receiver_bytes(this) {
+        let content = match self.string_receiver_units(this) {
             Some(c) => c,
             None => return Err(Halt::Unsupported("string-method:non-string-receiver")),
         };
-        let starts = string_unit_starts(&content);
-        let ulen = starts.len() as i64; // UTF-16 code-unit length
-        let byte_of = |unit: i64| -> usize {
+        let ulen = content.len() as i64; // UTF-16 code-unit length
+        // Clamp a (possibly negative / out-of-range) code-unit position to a
+        // valid slice index into `content` (units). Replaces the CESU-8
+        // byte-offset lookup — with UTF-16 storage the unit index *is* the
+        // slice index.
+        let clamp = |unit: i64| -> usize {
             if unit <= 0 {
                 0
             } else if unit >= ulen {
                 content.len()
             } else {
-                starts[unit as usize]
+                unit as usize
             }
         };
         let argn = |i: usize| -> Option<Slot> {
@@ -11281,8 +11338,7 @@ impl Interp {
                     _ => 0,
                 };
                 if pos < ulen {
-                    let cp = decode_code_point(&content, starts[pos as usize]);
-                    Slot::integer(cp as i32)
+                    Slot::integer(content[pos as usize] as i32)
                 } else {
                     Slot::number(f64::NAN)
                 }
@@ -11302,9 +11358,9 @@ impl Interp {
                     _ => 0,
                 };
                 if pos >= 0 && pos < ulen {
-                    let hi = decode_code_point(&content, starts[pos as usize]);
+                    let hi = content[pos as usize] as u32;
                     let cp = if (0xD800..=0xDBFF).contains(&hi) && pos + 1 < ulen {
-                        let lo = decode_code_point(&content, starts[(pos + 1) as usize]);
+                        let lo = content[(pos + 1) as usize] as u32;
                         if (0xDC00..=0xDFFF).contains(&lo) {
                             0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                         } else {
@@ -11329,11 +11385,9 @@ impl Interp {
                     _ => 0,
                 };
                 if pos < 0 || pos >= ulen {
-                    self.new_string_metered(b"")
+                    self.new_string_units(&[])
                 } else {
-                    let a = starts[pos as usize];
-                    let b = byte_of(pos + 1);
-                    self.new_string_metered(&content[a..b])
+                    self.new_string_units(&[content[pos as usize]])
                 }
             }
             // at(index): the one-unit string at `index` (negative from the
@@ -11354,9 +11408,7 @@ impl Interp {
                 if idx < 0 || idx >= ulen {
                     Slot::undefined()
                 } else {
-                    let a = starts[idx as usize];
-                    let b = byte_of(idx + 1);
-                    self.new_string_metered(&content[a..b])
+                    self.new_string_units(&[content[idx as usize]])
                 }
             }
             // slice([start[,end]]): the substring `[start,end)` with negative
@@ -11365,9 +11417,9 @@ impl Interp {
                 let start = arg_to_index(argn(0), 0, ulen, &to_num)?;
                 let end = arg_to_index(argn(1), ulen, ulen, &to_num)?;
                 if start < end {
-                    self.new_string_metered(&content[byte_of(start)..byte_of(end)])
+                    self.new_string_units(&content[clamp(start)..clamp(end)])
                 } else {
-                    self.new_string_metered(b"")
+                    self.new_string_units(&[])
                 }
             }
             // substring([start[,end]]): clamp both to `[0,len]`, swap if
@@ -11379,9 +11431,9 @@ impl Interp {
                     std::mem::swap(&mut start, &mut stop);
                 }
                 if start < stop {
-                    self.new_string_metered(&content[byte_of(start)..byte_of(stop)])
+                    self.new_string_units(&content[clamp(start)..clamp(stop)])
                 } else {
-                    self.new_string_metered(b"")
+                    self.new_string_units(&[])
                 }
             }
             // concat(...args): the receiver followed by each stringified
@@ -11392,13 +11444,13 @@ impl Interp {
                 for i in 0..argc {
                     let a = argn(i).unwrap();
                     match a.value {
-                        Payload::String(off) => out.extend_from_slice(self.str_content(off)),
+                        Payload::String(off) => out.extend_from_slice(&self.str_units(off)),
                         _ => return Err(Halt::Unsupported("concat:non-string-argument")),
                     }
                 }
                 self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
                 self.meter.tick_builtin_some(argc as u64);
-                self.new_string_metered(&out)
+                self.new_string_units(&out)
             }
             // repeat(count): the receiver repeated `count` times; a negative or
             // over-large count is a RangeError. mxMeterSome(count) + chunk.
@@ -11432,29 +11484,29 @@ impl Interp {
                 for _ in 0..count {
                     out.extend_from_slice(&content);
                 }
-                self.new_string_metered(&out)
+                self.new_string_units(&out)
             }
             // startsWith / endsWith: mxMeterSome(searchUnitLen), then a byte
             // compare (no per-byte meter). A regexp/non-string search arg
             // self-names.
             StringStartsWith | StringEndsWith => {
                 let sub = match argn(0).map(|s| s.value) {
-                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    Some(Payload::String(off)) => self.str_units(off),
                     _ => return Err(Halt::Unsupported("startsWith/endsWith:non-string-search")),
                 };
-                let sub_units = string_unit_starts(&sub).len() as u64;
+                let sub_units = sub.len() as u64;
                 let is_start = m == StringStartsWith;
-                // The position argument (unit), clamped to [0, ulen].
+                // The position argument (code unit), clamped to [0, ulen].
                 let pos = if is_start {
                     arg_to_position(argn(1), 0, ulen, &to_num)?
                 } else {
                     arg_to_position(argn(1), ulen, ulen, &to_num)?
                 };
-                let boff = byte_of(pos);
+                let at = clamp(pos);
                 let matches = if is_start {
-                    content.len() >= boff + sub.len() && content[boff..boff + sub.len()] == sub[..]
+                    content.len() >= at + sub.len() && content[at..at + sub.len()] == sub[..]
                 } else {
-                    boff >= sub.len() && content[boff - sub.len()..boff] == sub[..]
+                    at >= sub.len() && content[at - sub.len()..at] == sub[..]
                 };
                 self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
                 self.meter.tick_builtin_some(sub_units);
@@ -11467,12 +11519,12 @@ impl Interp {
             // unmetered.
             StringIncludes => {
                 let sub = match argn(0).map(|s| s.value) {
-                    Some(Payload::String(off)) => self.str_content(off).to_vec(),
+                    Some(Payload::String(off)) => self.str_units(off),
                     _ => return Err(Halt::Unsupported("includes:non-string-search")),
                 };
                 let from = arg_to_position(argn(1), 0, ulen, &to_num)?;
                 self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
-                let bfrom = byte_of(from).min(content.len());
+                let bfrom = clamp(from).min(content.len());
                 let hay = &content[bfrom..];
                 let found = sub.is_empty()
                     || (sub.len() <= hay.len() && hay.windows(sub.len()).any(|w| w == &sub[..]));
@@ -11491,27 +11543,30 @@ impl Interp {
             // over the code units + the result chunk. A non-ASCII code point
             // self-names (full Unicode case folding is not modeled).
             StringToLowerCase | StringToUpperCase => {
-                if content.iter().any(|&b| b >= 0x80) {
+                if content.iter().any(|&u| u >= 0x80) {
                     return Err(Halt::Unsupported("toCase:non-ascii"));
                 }
                 let up = m == StringToUpperCase;
-                let out: Vec<u8> = content
+                let out: Vec<u16> = content
                     .iter()
-                    .map(|&b| if up { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() })
+                    .map(|&u| {
+                        let b = u as u8;
+                        (if up { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() }) as u16
+                    })
                     .collect();
                 self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
                 self.meter.tick_builtin_some(ulen as u64);
-                self.new_string_metered(&out)
+                self.new_string_units(&out)
             }
             // trim / trimStart / trimEnd: strip ASCII whitespace. The pin
             // meters mxMeterSome(leading byte count) and/or mxMeterSome(kept
             // length), then allocates the result chunk. Non-ASCII content
             // self-names (its whitespace decode is not modeled).
             StringTrim | StringTrimStart | StringTrimEnd => {
-                if content.iter().any(|&b| b >= 0x80) {
+                if content.iter().any(|&u| u >= 0x80) {
                     return Err(Halt::Unsupported("trim:non-ascii"));
                 }
-                let is_ws = |b: u8| matches!(b, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20);
+                let is_ws = |u: u16| matches!(u, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20);
                 let trim_start = m != StringTrimEnd;
                 let trim_end = m != StringTrimStart;
                 self.meter.tick_raw(STRING_METERSOME_FRAME_METERING);
@@ -11529,7 +11584,7 @@ impl Interp {
                     }
                     self.meter.tick_builtin_some((hi - lo) as u64);
                 }
-                self.new_string_metered(&content[lo..hi])
+                self.new_string_units(&content[lo..hi])
             }
             _ => return Err(Halt::Unsupported("string-method:unmodeled")),
         };
@@ -11568,7 +11623,7 @@ impl Interp {
         Slot::of(Kind::Reference, Payload::Reference(iter))
     }
 
-    /// Build a String Iterator over the CESU-8 `bytes` (`fx_String_prototype_
+    /// Build a String Iterator over the UTF-16BE `bytes` (`fx_String_prototype_
     /// iterator` → `fxNewIteratorInstance`): allocate the iterator instance and
     /// its reused `{value, done}` result, recording a kind-4 [`IterState`] whose
     /// `index` is a BYTE offset into `bytes`. Meters the creation cluster
@@ -11753,7 +11808,7 @@ impl Interp {
     /// byte offset `index`, yield it as a fresh one-character string, and
     /// advance `index` past its bytes. BMP code points only (a single UTF-8
     /// sequence); an astral/surrogate sequence self-names an honest skip (its
-    /// CESU-8 surrogate-pair recombination is a later increment). Meters the
+    /// yielding astral code points by recombining surrogate pairs). Meters the
     /// per-`next()` base plus the yielded string's chunk allocation.
     fn string_iterator_next(&mut self, iter: crate::value::SlotIndex) -> Result<Slot, Halt> {
         let st = self.iterators[&iter].clone();
@@ -11763,36 +11818,34 @@ impl Interp {
         {
             (Slot::undefined(), true, st.index)
         } else {
+            // `index` is a BYTE offset into the UTF-16BE payload; each yielded
+            // code point consumes one code unit (2 bytes) or, for a valid
+            // surrogate pair, two (4 bytes) — `for...of` iterates by code point.
             let i = st.index as usize;
-            let b0 = st.str_bytes[i];
-            // UTF-8 sequence length from the lead byte.
-            let seq_len = if b0 < 0x80 {
-                1
-            } else if b0 >= 0xC0 && b0 < 0xE0 {
-                2
-            } else if b0 >= 0xE0 && b0 < 0xF0 {
-                3
-            } else {
-                // A 4-byte (astral) lead, or a CESU-8 surrogate half we do not
-                // recombine yet — self-name rather than mis-yield.
-                return Err(Halt::Unsupported("string-iterator:astral-or-surrogate"));
-            };
-            if i + seq_len > st.str_bytes.len() {
+            if i + 2 > st.str_bytes.len() {
                 return Err(Halt::Unsupported("string-iterator:truncated-sequence"));
             }
-            let seq = &st.str_bytes[i..i + seq_len];
-            // A 3-byte sequence encoding a surrogate (0xED 0xA0..0xBF ..) is a
-            // CESU-8 astral half; defer it honestly.
-            if seq_len == 3 && seq[0] == 0xED && seq[1] >= 0xA0 {
-                return Err(Halt::Unsupported("string-iterator:astral-or-surrogate"));
-            }
+            let hi = u16::from_be_bytes([st.str_bytes[i], st.str_bytes[i + 1]]);
+            let consumed = if (0xD800..=0xDBFF).contains(&hi) && i + 4 <= st.str_bytes.len() {
+                let lo = u16::from_be_bytes([st.str_bytes[i + 2], st.str_bytes[i + 3]]);
+                if (0xDC00..=0xDFFF).contains(&lo) {
+                    4 // a valid surrogate pair → one astral code point
+                } else {
+                    2 // a lone high surrogate → yielded as its own code unit
+                }
+            } else {
+                2
+            };
+            // The yielded string is exactly the consumed BE bytes (already the
+            // stored form). Metered by yielded code-unit length (`+1`), the
+            // re-based O(n) weight; ASCII yields meter identically to before.
             self.meter.tick_raw(STRING_ITERATOR_NEXT_METERING);
-            self.meter.tick_chunk_new((seq_len + 1) as u64);
-            let off = self.chunks.alloc(seq);
+            self.meter.tick_chunk_new((consumed / 2 + 1) as u64);
+            let off = self.chunks.alloc(&st.str_bytes[i..i + consumed]);
             (
                 Slot::of(Kind::String, Payload::String(off)),
                 false,
-                st.index + seq_len as u32,
+                st.index + consumed as u32,
             )
         };
         if let Some(s) = self.iterators.get_mut(&iter) {
@@ -11992,7 +12045,7 @@ impl Interp {
                         .unwrap_or_default()
                         .into_bytes()
                 };
-                let off = self.chunks.alloc(&bytes);
+                let off = self.alloc_str_text(&bytes);
                 (
                     Slot::of(Kind::String, Payload::String(off)),
                     false,
@@ -12044,7 +12097,7 @@ impl Interp {
     }
 
     /// Strict equality (`===`) with chunk-aware string comparison: two heap
-    /// strings are equal iff their CESU-8 content matches (the free
+    /// strings are equal iff their UTF-16BE content matches (the free
     /// [`strict_equals`] compares only primitive/reference kinds and treats
     /// two strings as unequal because it cannot see the chunk arena).
     fn strict_equal(&self, a: &Slot, b: &Slot) -> bool {
@@ -12730,7 +12783,7 @@ impl Interp {
             Kind::Symbol => None,
             Kind::String => {
                 let content = match key.value {
-                    Payload::String(off) => self.str_content(off).to_vec(),
+                    Payload::String(off) => self.str_text(off).into_bytes(),
                     _ => return None,
                 };
                 let s = String::from_utf8_lossy(&content).into_owned();
@@ -13132,8 +13185,8 @@ impl Interp {
     /// name resolves the inherited method up the `%String.prototype%` chain.
     fn string_property_get(&self, off: crate::value::ChunkOffset, id: u16) -> Slot {
         if Some(id) == self.length_id {
-            let units = string_unit_starts(self.str_content(off)).len();
-            return Slot::integer(units as i32);
+            // `length` is O(1) over UTF-16 storage: half the stored byte payload.
+            return Slot::integer(self.str_len(off) as i32);
         }
         if self.string_proto.is_null() {
             return Slot::undefined();
@@ -13142,16 +13195,14 @@ impl Interp {
     }
 
     /// Read a computed index of a primitive string (`str[i]`): the one-unit
-    /// string at UTF-16 index `index`, or `undefined` past the end. Allocates
-    /// the one-character result chunk (`fxStringGetProperty` → `fxNewChunk`),
-    /// metered via [`Interp::new_string_metered`].
+    /// string at UTF-16 code-unit index `index` (direct, O(1) — no boundary
+    /// walk), or `undefined` past the end. Allocates the one-unit result chunk
+    /// (`fxStringGetProperty` → `fxNewChunk`), metered via
+    /// [`Interp::new_string_units`].
     fn string_index_get(&mut self, off: crate::value::ChunkOffset, index: u32) -> Slot {
-        let content = self.str_content(off).to_vec();
-        let starts = string_unit_starts(&content);
-        if (index as usize) < starts.len() {
-            let a = starts[index as usize];
-            let b = starts.get(index as usize + 1).copied().unwrap_or(content.len());
-            self.new_string_metered(&content[a..b])
+        let units = self.str_units(off);
+        if let Some(&u) = units.get(index as usize) {
+            self.new_string_units(&[u])
         } else {
             Slot::undefined()
         }
@@ -13357,7 +13408,7 @@ impl Interp {
     }
 
     /// Relational comparison (`<`/`<=`/`>`/`>=`). Two strings compare
-    /// lexicographically by CESU-8 byte (== UTF-16 code-unit order, XS's
+    /// lexicographically by UTF-16BE byte (== code-unit order, XS's
     /// `c_strcmp`, and the ECMAScript abstract relational comparison on
     /// strings); two numerics compare as `f64` with NaN → false. A mixed
     /// string/numeric pair needs `ToNumber(string)` (or `ToPrimitive` of a
@@ -13543,15 +13594,16 @@ impl Interp {
     /// no allocation), and `fxConcatString` allocates the joined chunk
     /// `fxNewChunk(aSize + bSize + 1)`. The result is a new heap String.
     fn concat_add(&mut self, a: Slot, b: Slot) {
-        let sa = self.to_string_bytes_metered(a);
-        let sb = self.to_string_bytes_metered(b);
-        // fxConcatString: one fxNewChunk(aSize + bSize + 1).
-        self.meter.tick_chunk_new((sa.len() + sb.len() + 1) as u64);
-        let mut joined = Vec::with_capacity(sa.len() + sb.len() + 1);
-        joined.extend_from_slice(&sa);
-        joined.extend_from_slice(&sb);
-        joined.push(0); // C NUL terminator, as XS stores
-        let off = self.chunks.alloc(&joined);
+        let ua = self.to_string_units_metered(a);
+        let ub = self.to_string_units_metered(b);
+        // fxConcatString: one fxNewChunk over the joined code units. Metered by
+        // total code-unit length (`+1`, the re-based O(n) string weight; for
+        // ASCII operands this equals the old CESU-8 `aSize + bSize + 1`).
+        self.meter.tick_chunk_new((ua.len() + ub.len() + 1) as u64);
+        let mut joined = Vec::with_capacity(ua.len() + ub.len());
+        joined.extend_from_slice(&ua);
+        joined.extend_from_slice(&ub);
+        let off = self.chunks.alloc(&units_to_be16(&joined));
         self.push(Slot::of(Kind::String, Payload::String(off)));
     }
 
@@ -13570,25 +13622,33 @@ impl Interp {
         if s.kind == Kind::String {
             return s;
         }
-        let bytes = self.to_string_bytes_metered(s);
-        // `to_string_bytes_metered` already charged the render chunk; re-alloc
-        // the interned slot without double-charging the chunk (a number's
-        // chunk was metered; the boolean/null/undefined interned strings carry
-        // no chunk). Mirror `new_string_metered`'s chunk for the number case is
-        // already paid, so store the bytes without re-metering.
-        if bytes.is_empty() {
-            let off = self.chunks.alloc(b"\x00");
-            return Slot::of(Kind::String, Payload::String(off));
-        }
-        let mut buf = bytes;
-        buf.push(0);
-        let off = self.chunks.alloc(&buf);
+        let units = self.to_string_units_metered(s);
+        // `to_string_units_metered` already charged the render chunk; store the
+        // slot without double-charging (a number's chunk was metered; the
+        // boolean/null/undefined interned strings carry no chunk).
+        let off = self.chunks.alloc(&units_to_be16(&units));
         Slot::of(Kind::String, Payload::String(off))
+    }
+
+    /// `ToString` of a value to its UTF-16 code units, metering the render
+    /// allocation exactly where `to_string_bytes_metered` does. A string
+    /// returns its stored units verbatim (exact — lone surrogates survive); a
+    /// non-string renders to text (ASCII-shaped) and encodes to units. Used
+    /// where the coerced string is retained/joined at storage fidelity
+    /// (`concat`, `to_string_slot_metered`).
+    fn to_string_units_metered(&mut self, s: Slot) -> Vec<u16> {
+        if s.kind == Kind::String {
+            if let Payload::String(off) = s.value {
+                return self.str_units(off);
+            }
+        }
+        let bytes = self.to_string_bytes_metered(s);
+        String::from_utf8_lossy(&bytes).encode_utf16().collect()
     }
 
     fn to_string_bytes_metered(&mut self, s: Slot) -> Vec<u8> {
         match s.value {
-            Payload::String(off) => self.str_content(off).to_vec(),
+            Payload::String(off) => self.str_text(off).into_bytes(),
             Payload::Integer(i) => {
                 let r = i.to_string().into_bytes();
                 // `fxToString`/`fxNumberToString` on a number renders into a
@@ -14059,54 +14119,100 @@ fn to_boolean(s: &Slot) -> bool {
     }
 }
 
-// ToNumber (ECMAScript 7.1.4) for stage-1 value kinds.
-/// The byte offsets of each UTF-16 code unit in CESU-8 `content` — the
-/// non-continuation bytes (`(b & 0xC0) != 0x80`), exactly what
-/// `fxUnicodeLength` counts. For BMP each unit is a 1–3 byte UTF-8 sequence;
-/// a CESU-8 surrogate half also begins with a lead byte, so an astral pair
-/// yields two units, matching the UTF-16 code-unit semantics.
-fn string_unit_starts(content: &[u8]) -> Vec<usize> {
+/// Decode a string value's stored **UTF-16 big-endian** payload into its
+/// code units. A trailing odd byte (never produced by the store path) is
+/// ignored. This is the inverse of [`units_to_be16`].
+fn be16_to_units(content: &[u8]) -> Vec<u16> {
     content
-        .iter()
-        .enumerate()
-        .filter(|(_, &b)| (b & 0xC0) != 0x80)
-        .map(|(i, _)| i)
+        .chunks_exact(2)
+        .map(|p| u16::from_be_bytes([p[0], p[1]]))
         .collect()
 }
 
-/// Decode the Unicode scalar (or lone surrogate, for a CESU-8 surrogate half)
-/// of the UTF-8 sequence at byte offset `off` — `fxUTF8Decode` / the
-/// `charCodeAt` unit value.
-fn decode_code_point(content: &[u8], off: usize) -> u32 {
-    let b0 = content[off];
-    if b0 < 0x80 {
-        b0 as u32
-    } else if b0 < 0xE0 {
-        (((b0 & 0x1F) as u32) << 6) | (content[off + 1] & 0x3F) as u32
-    } else if b0 < 0xF0 {
-        (((b0 & 0x0F) as u32) << 12)
-            | (((content[off + 1] & 0x3F) as u32) << 6)
-            | (content[off + 2] & 0x3F) as u32
-    } else {
-        (((b0 & 0x07) as u32) << 18)
-            | (((content[off + 1] & 0x3F) as u32) << 12)
-            | (((content[off + 2] & 0x3F) as u32) << 6)
-            | (content[off + 3] & 0x3F) as u32
+/// Encode code `units` to the stored **UTF-16 big-endian** payload (2 bytes
+/// per unit). Big-endian so a byte-lexicographic compare of two payloads
+/// equals their code-unit ordering (the ECMAScript string relation).
+fn units_to_be16(units: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(units.len() * 2);
+    for &u in units {
+        out.extend_from_slice(&u.to_be_bytes());
     }
+    out
+}
+
+/// The stored UTF-16BE payload for a Rust `&str`, encoding it to code units
+/// (`str::encode_utf16`) then to big-endian bytes.
+fn str_to_be16(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 2);
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&u.to_be_bytes());
+    }
+    out
+}
+
+/// Decode the C-XS compiler's CESU-8 string-literal operand (as it sits in the
+/// bytecode, including its trailing NUL) into UTF-16 code units. CESU-8 encodes
+/// each UTF-16 code unit as its own 1–3 byte UTF-8-shaped sequence — a BMP
+/// scalar directly, a surrogate half (`0xED 0xA0..BF ..`) as one unit — so the
+/// decode is one unit per sequence, preserving lone surrogates. A stray 4-byte
+/// UTF-8 astral sequence (should not appear in CESU-8) is split into its
+/// surrogate pair. A trailing NUL and any malformed tail are dropped.
+fn cesu8_to_units(bytes: &[u8]) -> Vec<u16> {
+    let mut units = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        if b0 == 0 {
+            break; // the compiler's trailing NUL terminator
+        } else if b0 < 0x80 {
+            units.push(b0 as u16);
+            i += 1;
+        } else if b0 < 0xE0 {
+            if i + 1 >= bytes.len() {
+                break;
+            }
+            let cp = (((b0 & 0x1F) as u32) << 6) | (bytes[i + 1] & 0x3F) as u32;
+            units.push(cp as u16);
+            i += 2;
+        } else if b0 < 0xF0 {
+            if i + 2 >= bytes.len() {
+                break;
+            }
+            let cp = (((b0 & 0x0F) as u32) << 12)
+                | (((bytes[i + 1] & 0x3F) as u32) << 6)
+                | (bytes[i + 2] & 0x3F) as u32;
+            units.push(cp as u16); // BMP scalar or a lone surrogate half
+            i += 3;
+        } else {
+            if i + 3 >= bytes.len() {
+                break;
+            }
+            let cp = (((b0 & 0x07) as u32) << 18)
+                | (((bytes[i + 1] & 0x3F) as u32) << 12)
+                | (((bytes[i + 2] & 0x3F) as u32) << 6)
+                | (bytes[i + 3] & 0x3F) as u32;
+            // A genuine astral scalar → its surrogate pair (two code units).
+            let v = cp - 0x10000;
+            units.push((0xD800 + (v >> 10)) as u16);
+            units.push((0xDC00 + (v & 0x3FF)) as u16);
+            i += 4;
+        }
+    }
+    units
 }
 
 /// `fxStringifyJSONString` (`xsJSON.c`): the JSON-escaped, double-quoted form
-/// of a CESU-8 string. Control characters below 0x20 map to the short escapes
-/// (`\b\t\n\f\r`) or `\uXXXX`; `"` and `\` are backslash-escaped; a lone
-/// surrogate becomes `\uXXXX`; every other code point is copied verbatim (its
-/// raw UTF-8 bytes).
-fn json_escape_string(content: &[u8]) -> Vec<u8> {
+/// of a string, over its UTF-16 code `units`. Control characters below 0x20
+/// map to the short escapes (`\b\t\n\f\r`) or `\uXXXX`; `"` and `\` are
+/// backslash-escaped; any surrogate code unit becomes `\uXXXX` (matching the
+/// per-code-unit CESU-8 build — surrogate pairs are not recombined here);
+/// every other code unit is copied verbatim as its UTF-8 bytes. Output is a
+/// UTF-8 text buffer.
+fn json_escape_string(units: &[u16]) -> Vec<u8> {
     let mut out = vec![b'"'];
-    let starts = string_unit_starts(content);
-    for (k, &start) in starts.iter().enumerate() {
-        let end = starts.get(k + 1).copied().unwrap_or(content.len());
-        let cp = decode_code_point(content, start);
-        match cp {
+    let mut buf = [0u8; 4];
+    for &u in units {
+        match u {
             8 => out.extend_from_slice(b"\\b"),
             9 => out.extend_from_slice(b"\\t"),
             10 => out.extend_from_slice(b"\\n"),
@@ -14117,7 +14223,11 @@ fn json_escape_string(content: &[u8]) -> Vec<u8> {
             c if c < 0x20 || (0xD800..=0xDFFF).contains(&c) => {
                 out.extend_from_slice(format!("\\u{:04x}", c).as_bytes());
             }
-            _ => out.extend_from_slice(&content[start..end]),
+            c => {
+                // A BMP scalar (surrogates handled above): its UTF-8 bytes.
+                let ch = char::from_u32(c as u32).unwrap_or('\u{FFFD}');
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
         }
     }
     out.push(b'"');
