@@ -765,6 +765,58 @@ run-loop/allocation-pressure wiring in this child), so the GC-roots ledger note
 carries forward untouched. The compartment evaluator's global-seeding path is
 **Miri-clean** (`endor_vm::compartment::tests` under Miri, single-threaded).
 
+The stage-4b **lockdown/harden** child (4/5) lands the Hardened-JavaScript
+`harden(x)`/`petrify(x)` globals from `xsLockdown.c` onto endor's stage-4
+integrity machinery (child 1's `XS_DONT_PATCH_FLAG`/`XS_DONT_DELETE_FLAG`/
+`XS_DONT_SET_FLAG` slot-arena stamps). **`harden(x)`** (`fx_harden` +
+`fx_hardenFreezeAndTraverse` + `fx_hardenQueue`) is the transitive freeze
+worklist over the slot arena: each reached instance is prevent-extensions'd and
+every own data property stamped non-writable/non-configurable (accessors
+non-configurable), then its prototype and every reference-valued own property
+are queued, each reached instance marked `XS_DONT_MARSHALL_FLAG` (the visited
+set), so the object graph is walked once; it returns its argument, and a
+non-reference / already-hardened / no-arg call passes through per XS.
+**`petrify(x)`** (`fx_petrify`) is the single-object, non-transitive freeze (no
+prototype walk, `XS_DONT_MARSHALL_FLAG` left clear). The **oracle shim** is
+extended minimally to install the harden/lockdown/petrify/mutabilities globals
+`xst.c`/`xstFuzz.c` install (the bare `fxCreateMachine` boot does not, so an
+`harden(x)` program was an undefined-reference throw) — the audited FFI-seam
+extension the differential needs. Metering is **allocation-driven**
+(`xsLockdown.c` calls no `mxMeter`): `petrify` is computron-exact against the
+pin for even own-key counts (a sub-computron boundary wobble at odd counts);
+`harden`'s cost is deterministic per release, but **computron parity over a
+transitive harden is structurally unavailable** — endor models intrinsics
+sparsely (only program-referenced names), so harden's transitive object count
+diverges from the pin's full intrinsic graph (`harden({a:1})` freezes endor's
+sparse `%Object.prototype%`, not the pin's whole populated one), the same
+sparse-intrinsics fact the module/compartment children record. The
+**acceptance evidence** is therefore a **RESULT-gated** differential corpus:
+`stage4-harden.js` (30 programs) is locked as
+`stage4_harden_corpus_agrees_on_results_against_oracle`, each program
+completing on **both** engines to the **same value** — a sloppy write to a
+frozen property is a metered no-op, a hardened object is `Object.isFrozen`/
+`isSealed`/non-extensible, harden is transitive (a nested object reachable from
+the target is frozen, to arbitrary depth, a shared referent hardened once) and
+idempotent and returns its argument, a non-reference passes through, and
+`petrify` is non-transitive (the target's own reference property is frozen but
+its referent is not). Three `endor-vm` unit tests
+(`harden_freezes_target_transitively_and_returns_it`,
+`petrify_freezes_single_object_not_transitively`,
+`harden_transitive_freeze_is_miri_clean`) lock the freeze semantics and pin the
+worklist Miri-clean. Re-running `built-ins/Object` confirms the freeze
+machinery introduced **no regression**: `built-ins/Object total=3127
+covered=176 divergent=0 skipped=2951` (unchanged from child 1). **Scope fold
+(reported honestly, each an honest `Halt::Unsupported`, never a wrong value):**
+**`lockdown()`** — the full intrinsics whitelist/walk transitively freezing the
+shared intrinsics, the error/`Date.now`/`Math.random` compartment-safety
+taming, and the repeated-lockdown idempotence throw — and **`mutabilities`**
+(the `fxVerify*` mutable-residue report) are sized as a follow-up child on this
+now-landed harden substrate; an **exotic receiver** (array/typed-array/
+collection/wrapper/error) to `harden`/`petrify` self-names
+`harden:exotic-object`/`petrify:exotic-object` rather than mis-freeze. GC roots
+were not touched (no run-loop/allocation-pressure wiring), so the GC-roots
+ledger note carries forward untouched.
+
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
