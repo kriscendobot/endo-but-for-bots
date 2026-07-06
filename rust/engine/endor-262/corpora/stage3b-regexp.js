@@ -107,3 +107,13 @@ new RegExp("").source
 "a1b2".replace(/[0-9]/, "#")
 "x".replace(/(x)/, "y")
 "ab".replace(/(a)(b)/, "z")
+
+// --- String.prototype.split (Symbol.split → the sticky splitter) ----------
+"a,b,c".split(/,/)
+"abc".split(/,/)
+"a1b2c".split(/[0-9]/)
+"".split(/,/)
+"axbxc".split(/(x)/)
+"a,b".split(/,/, 5)
+"a,b,c".split(/,/).length
+"a1b2c".split(/([0-9])/)

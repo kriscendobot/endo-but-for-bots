@@ -961,6 +961,32 @@ pub const STRING_REPLACE_MATCH_METERING: u64 = 311272;
 /// i<c; i++)` capture-push loop (`mxGetIndex(i)` + `fxToString`) feeding the
 /// substitution, one per capture beyond the whole match. Calibrated raw-exact.
 pub const STRING_REPLACE_PER_CAPTURE: u64 = 49152;
+/// The native residual of `String.prototype.split` (`fx_String_prototype_
+/// split` → `fx_RegExp_prototype_split` via the `Symbol.split` protocol) BEYOND
+/// the `flags` cascade, the splitter construction, the per-step exec/`lastIndex`
+/// framing, and the explicit segment allocations: the String host frame + the
+/// `withRegexp` dispatch + the array setup. Calibrated raw-exact.
+pub const STRING_SPLIT_FRAME_METERING: u64 = 0;
+/// The residual of `split`'s species-constructor path: `mxGetID(_constructor)`
+/// + `fxToSpeciesConstructor` + `mxNew` + the `"y"` flag concat + the
+/// `mxRunCount(2)` splitter-construction framing (the construction's own slot/
+/// chunk/compile costs are charged explicitly by `build_split_splitter`).
+/// Calibrated raw-exact.
+pub const STRING_SPLIT_SPECIES_METERING: u64 = 672736;
+/// The per-loop-step residual of `split`: `mxSetID(_lastIndex)` (set the sticky
+/// scan position) + the sticky-`exec` dispatch framing, once per position
+/// walked. Calibrated raw-exact.
+pub const STRING_SPLIT_PER_STEP_METERING: u64 = 212984;
+/// The extra residual of a `split` step that matched: `mxGetID(_lastIndex)`
+/// (read the match end `e`) + the `fxIsSameValue(e, p)` check + the branch.
+/// Calibrated raw-exact.
+pub const STRING_SPLIT_MATCH_STEP_METERING: u64 = 163872;
+/// The per-capture-group residual of a `split` match: the `mxGetIndex(i)` read
+/// of each capture inserted between splits. Calibrated raw-exact.
+pub const STRING_SPLIT_PER_CAPTURE_METERING: u64 = 65568;
+/// The residual of the empty-subject `split` path (`size == 0`): the single
+/// `exec` framing + the null check, in place of the position loop. Calibrated.
+pub const STRING_SPLIT_EMPTY_METERING: u64 = 131064;
 /// The extra residual of a `g`/`y` (stateful) `exec`/`test`: the
 /// `fxCacheUnicodeToUTF8Offset` (read `lastIndex`) + `fxCacheUTF8ToUnicode
 /// Offset` (write it back) remap framing. Charged on the advancing path.
@@ -7027,6 +7053,181 @@ impl Interp {
         0
     }
 
+    /// Build the ephemeral **splitter** RegExp `split` constructs via the
+    /// species constructor (`new RegExp(this, flags + "y")`): the source is
+    /// `this`'s source, the flags are `this`'s flags with `y` (sticky) ensured.
+    /// Charges the same construction cost `build_regexp` does (slots + compile
+    /// meter + code/data chunks + ctor frame). Returns the splitter instance,
+    /// or a named skip if the (already-compiled) pattern somehow fails to
+    /// recompile.
+    fn build_split_splitter(&mut self, inst: crate::value::SlotIndex) -> Result<crate::value::SlotIndex, Halt> {
+        let (source, mut flags) = {
+            let d = &self.regexps[&inst];
+            (d.source.clone(), d.flags.clone())
+        };
+        if !flags.contains('y') {
+            flags.push('y');
+        }
+        let program = match endor_regexp::compile(&source, &flags) {
+            Ok(p) => p,
+            Err(endor_regexp::CompileError::Unsupported(name)) => return Err(Halt::Unsupported(name)),
+            Err(_) => return Err(Halt::Unsupported("String.split:splitter-recompile")),
+        };
+        for _ in 0..4 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(program.compile_meter_raw);
+        let code_bytes = program.compile_meter_raw / XS_PARSE_REGEXP_METERING;
+        self.meter.tick_chunk_new(code_bytes);
+        let data_bytes = (program.capture_count * 8
+            + program.name_count * 4
+            + program.assertion_count * 16
+            + program.quantifier_count * 12) as u64;
+        self.meter.tick_chunk_new(data_bytes);
+        self.meter.tick_raw(REGEXP_CTOR_FRAME_METERING);
+        let canonical = Self::regexp_flag_string(program.flags());
+        let proto = self.regexp_proto;
+        let sp = self.slots.alloc(Slot::instance(proto));
+        self.regexps.insert(
+            sp,
+            RegExpData { program, source, flags: canonical, last_index: 0.0 },
+        );
+        Ok(sp)
+    }
+
+    /// `String.prototype.split(regexp[, limit])` (`fx_String_prototype_split`
+    /// → `fx_RegExp_prototype_split` via the `Symbol.split` protocol): build a
+    /// sticky splitter (`new RegExp(this, flags+"y")`), then walk the subject,
+    /// sticky-`exec`-ing at each position, emitting the text between matches
+    /// (plus each capture group) as array elements. `inst` is the RegExp
+    /// argument, `subject` the receiver string, `limit` the split cap. A
+    /// non-RegExp separator (the `withoutRegexp` string-split path) self-names.
+    fn string_split(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        subject: Slot,
+        limit_slot: Slot,
+    ) -> Result<Slot, Halt> {
+        let subject_bytes = match self.string_receiver_bytes(subject) {
+            Some(c) => c,
+            None => return Err(Halt::Unsupported("String.split:non-string-receiver")),
+        };
+        // Non-ASCII would need the code-unit↔byte remap the sticky walk assumes
+        // away.
+        if !subject_bytes.is_ascii() {
+            return Err(Halt::Unsupported("String.split:non-ascii-subject"));
+        }
+        let limit: u64 = if limit_slot.kind == Kind::Undefined {
+            0xFFFF_FFFF
+        } else {
+            let n = to_number(&limit_slot);
+            if n.is_nan() || n < 0.0 { 0 } else { (n as u64) & 0xFFFF_FFFF }
+        };
+        self.meter.tick_raw(STRING_SPLIT_FRAME_METERING);
+        // `mxGetID(_flags)` in the worker (the eight-property cascade) + the
+        // species-constructor lookup/new framing.
+        self.meter.tick_raw(REGEXP_FLAGS_GETTER_METERING);
+        self.meter.tick_raw(STRING_SPLIT_SPECIES_METERING);
+        let splitter = self.build_split_splitter(inst)?;
+        // The result array + its `fxNewInstance`.
+        let array = self.new_array_unmetered();
+        let mut segments: Vec<Slot> = Vec::new();
+        let size = subject_bytes.len();
+        let mut push_segment = |this: &mut Self, from: usize, to: usize, segs: &mut Vec<Slot>| {
+            // `split_aux`: a `fxNewSlot` + the substring `fxNewChunk`.
+            this.meter.tick_slot_alloc();
+            let piece = &subject_bytes[from..to];
+            segs.push(this.new_string_metered(piece));
+        };
+        if limit == 0 {
+            return Ok(self.finish_split_array(array, segments));
+        }
+        if size == 0 {
+            // Empty subject: one exec; a match yields `[]`, a miss `[""]`.
+            self.meter.tick_raw(STRING_SPLIT_EMPTY_METERING);
+            self.regexps.get_mut(&splitter).unwrap().last_index = 0.0;
+            let (res, _start) = self.regexp_exec_inner(splitter, subject)?;
+            if res.kind == Kind::Null {
+                push_segment(self, 0, 0, &mut segments);
+            }
+            return Ok(self.finish_split_array(array, segments));
+        }
+        let mut p = 0usize;
+        let mut q = 0usize;
+        while q < size {
+            self.meter.tick_raw(STRING_SPLIT_PER_STEP_METERING);
+            self.regexps.get_mut(&splitter).unwrap().last_index = q as f64;
+            let (res, start) = self.regexp_exec_inner(splitter, subject)?;
+            if start.is_none() {
+                q += 1; // fxAdvanceStringIndex (ASCII → +1)
+            } else {
+                // An empty match (`a*`, `x?`, …) drives XS's
+                // `fxAdvanceStringIndex` empty-match corner, whose per-position
+                // metering this stage does not model — self-name rather than
+                // fit it (a non-empty-matching separator stays bit-exact).
+                if self.regexp_whole_match_len(res) == 0 {
+                    return Err(Halt::Unsupported("String.split:empty-match"));
+                }
+                // A matched step: `mxGetID(_lastIndex)` (read `e`) + the
+                // `fxIsSameValue(e, p)` check.
+                self.meter.tick_raw(STRING_SPLIT_MATCH_STEP_METERING);
+                let e = self.regexps[&splitter].last_index as usize;
+                if e == p {
+                    q += 1;
+                } else {
+                    push_segment(self, p, q, &mut segments);
+                    if segments.len() as u64 == limit {
+                        // The `goto bail` truncation boundary meters a hair
+                        // differently than the normal step completion; rather
+                        // than fit that corner, self-name it (the non-truncating
+                        // and no-limit paths stay bit-exact).
+                        return Err(Halt::Unsupported("String.split:limit-truncation"));
+                    }
+                    // The capture groups (result[1..]) inserted between splits.
+                    let cap_count = self.regexp_capture_count(res);
+                    for i in 1..cap_count {
+                        self.meter.tick_slot_alloc();
+                        self.meter.tick_raw(STRING_SPLIT_PER_CAPTURE_METERING);
+                        let cap = self.array_index_slot(res, i as u32);
+                        segments.push(cap);
+                        if segments.len() as u64 == limit {
+                            return Err(Halt::Unsupported("String.split:limit-truncation"));
+                        }
+                    }
+                    p = e;
+                    q = p;
+                }
+            }
+        }
+        push_segment(self, p, size, &mut segments);
+        Ok(self.finish_split_array(array, segments))
+    }
+
+    /// Read element `i` of an array instance (for `split`'s capture insertion),
+    /// or `undefined`.
+    fn array_index_slot(&self, arr: Slot, i: u32) -> Slot {
+        if let Payload::Reference(r) = arr.value {
+            if let Some(a) = self.arrays.get(&r) {
+                if let Some(s) = a.items.get(&i) {
+                    return *s;
+                }
+            }
+        }
+        Slot::undefined()
+    }
+
+    /// Populate a `split` result array from its ordered segment slots (each
+    /// already metered) and return it.
+    fn finish_split_array(&mut self, array: crate::value::SlotIndex, segments: Vec<Slot>) -> Slot {
+        let n = segments.len() as u32;
+        let a = self.arrays.get_mut(&array).unwrap();
+        for (i, s) in segments.into_iter().enumerate() {
+            a.items.insert(i as u32, s);
+        }
+        a.length = n;
+        Slot::of(Kind::Reference, Payload::Reference(array))
+    }
+
     /// The whole-match byte length from an `exec` result array (its element 0,
     /// the matched string).
     fn regexp_whole_match_len(&self, result: Slot) -> usize {
@@ -9821,10 +10022,21 @@ impl Interp {
                     _ => return Err(Halt::Unsupported("String.replace:non-regexp-pattern")),
                 }
             }
-            // `String.prototype.split` over the matcher — a later increment (the
-            // species-constructor + sticky-splitter machinery); self-name.
+            // `String.prototype.split(regexp[, limit])` over the matcher (via
+            // the `Symbol.split` protocol → the sticky-splitter worker). A
+            // string (non-RegExp) separator self-names the `withoutRegexp`
+            // path.
             NativeMethod::StringSplit => {
-                return Err(Halt::Unsupported("String.prototype.split"))
+                if self.string_receiver_bytes(this).is_none() {
+                    return Err(Halt::Unsupported("String.split:non-string-receiver"));
+                }
+                let limit = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                match arg0.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => {
+                        self.string_split(r, this, limit)?
+                    }
+                    _ => return Err(Halt::Unsupported("String.split:non-regexp-separator")),
+                }
             }
         };
         self.stack.truncate(base);
