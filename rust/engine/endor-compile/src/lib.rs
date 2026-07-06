@@ -15,15 +15,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ast;
 pub mod error;
 pub mod lexer;
 pub mod meter;
+pub mod parser;
 pub mod token;
+pub mod token_flags;
 pub mod unicode;
 
+pub use ast::{Item, Node};
 pub use error::{LexError, LexErrorKind};
 pub use lexer::{BigIntLiteral, Lexeme, Lexer};
 pub use meter::ParseMeter;
+pub use parser::{ParseError, ParseErrorKind, Parser};
 pub use token::Token;
 
 /// Scan `source` to completion, returning every [`Lexeme`] up to and

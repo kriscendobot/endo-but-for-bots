@@ -1,0 +1,1477 @@
+//! The parser — a transliteration of the expression grammar in
+//! `c/moddable/xs/sources/xsSyntaxical.c` at the oracle pin. It drives
+//! the [`Lexer`](crate::lexer::Lexer) pull-style and builds XS's exact
+//! AST ([`crate::ast`]) on a node stack, statement-for-statement with
+//! C-XS so the scoper and coder built on top (later stage-5 children)
+//! see the tree shapes the byte-identity bar depends on.
+//!
+//! Scope of this child (stage-5 child 2, expression grammar): the full
+//! operator precedence cascade (`fxCommaExpression` down to
+//! `fxLiteralExpression`), primary expressions, member / call / new /
+//! optional-chaining / tagged-template postfix chains, array and object
+//! **data** literals, template literals, `new.target` / `import.meta` /
+//! dynamic `import()`, and `yield` / `await` in expression position with
+//! XS's parser-state flags. Constructs whose bodies are statement or
+//! declaration grammar — arrow / function / generator / class
+//! expressions, object method / accessor shorthand, and the
+//! destructuring binding-conversion subsystem — are deferred to the
+//! statement-grammar child and reported as [`ParseErrorKind::Unsupported`]
+//! rather than mis-parsed (see the crate report).
+//!
+//! Errors are fail-fast, mirroring XS's `fxReportParserError`, which
+//! `longjmp`s out on the first error when a console is attached: the
+//! first [`ParseError`] short-circuits the parse. No byte sequence
+//! panics the parser (the fuzz target in a later child depends on this).
+
+use crate::ast::{flags, node_name, Item, Node, Value};
+use crate::error::LexError;
+use crate::lexer::{Lexeme, Lexer};
+use crate::meter::ParseMeter;
+use crate::token::Token;
+use crate::token_flags::has_flag;
+use crate::token_flags::{
+    ASSIGN_EXPRESSION, BEGIN_EXPRESSION, CALL_EXPRESSION, EQUAL_EXPRESSION, EXPONENTIATION_EXPRESSION,
+    IDENTIFIER_NAME, POSTFIX_EXPRESSION, PREFIX_EXPRESSION, RELATIONAL_EXPRESSION, SHIFT_EXPRESSION,
+    UNARY_EXPRESSION,
+};
+
+/// A parser error, classified and located as XS's `fxReportParserError`
+/// sites are. Carries the 1-based line and a message mirroring XS's
+/// wording where practical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseError {
+    /// Source line (`parser->states[0].line`).
+    pub line: u32,
+    /// The classified condition.
+    pub kind: ParseErrorKind,
+    /// Human-readable message, matching XS's wording where practical.
+    pub message: String,
+}
+
+/// The classified parse failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// A lexing error surfaced while pulling a token.
+    Lex(LexError),
+    /// A `SyntaxError` XS raises in the parser (an early error) — the
+    /// catch-all for the grammar's own `fxReportParserError` sites.
+    Syntax,
+    /// A construct valid in JS but not yet ported in this child (arrow /
+    /// function / class expressions, object methods/accessors,
+    /// destructuring). Deferred to the statement-grammar child; never
+    /// raised on input the folded features do not reach.
+    Unsupported,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "line {}: {}", self.line, self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl From<LexError> for ParseError {
+    fn from(e: LexError) -> ParseError {
+        ParseError { line: e.line, kind: ParseErrorKind::Lex(e.clone()), message: e.to_string() }
+    }
+}
+
+type PResult<T> = Result<T, ParseError>;
+
+/// The parser: the token window (`states[0]`/`states[1]`), the mode-flag
+/// word (`parser->flags`), and the node-build stack (`parser->root`).
+pub struct Parser {
+    lexer: Lexer,
+    /// `parser->states[0]` — the current token.
+    cur: Lexeme,
+    /// `parser->states[1]` — the one-token lookahead, present only after
+    /// an explicit `fxLookAheadOnce` (XS's `ahead` counter as an
+    /// `Option`).
+    ahead: Option<Lexeme>,
+    /// `parser->flags` (mode bits; see [`crate::ast::flags`]).
+    flags: u32,
+    /// The node-build stack (`parser->root`, top = last pushed).
+    stack: Vec<Item>,
+}
+
+impl Parser {
+    /// A parser over `source`. `strict` seeds `mxStrictFlag`; `module`
+    /// seeds the module context (`await` reserved at top level via the
+    /// async flag, as XS does for a module program).
+    pub fn new(source: &str, strict: bool, module: bool) -> PResult<Parser> {
+        let mut flags = 0u32;
+        if strict {
+            flags |= flags::STRICT;
+        }
+        if module {
+            flags |= flags::STRICT | flags::ASYNC;
+        }
+        let mut lexer = Lexer::new(source);
+        lexer.set_strict(flags & flags::STRICT != 0);
+        lexer.set_async(flags & flags::ASYNC != 0);
+        lexer.set_generator(flags & flags::GENERATOR != 0);
+        let cur = lexer.next()?;
+        Ok(Parser { lexer, cur, ahead: None, flags, stack: Vec::new() })
+    }
+
+    /// Parse a single expression (an `AssignmentExpression` — XS's
+    /// `fxAssignmentExpression`), the entry point the fixture tests use.
+    /// Returns the sole tree item; errors if input remains.
+    pub fn parse_assignment_expression(&mut self) -> PResult<Item> {
+        self.assignment_expression()?;
+        self.expect_eof()?;
+        Ok(self.pop())
+    }
+
+    /// Parse a full comma expression (`fxCommaExpression`) to end of
+    /// input.
+    pub fn parse_comma_expression(&mut self) -> PResult<Item> {
+        self.comma_expression()?;
+        self.expect_eof()?;
+        Ok(self.pop())
+    }
+
+    /// The parse meter (endor's own frozen cost table), for telemetry
+    /// after a parse.
+    pub fn meter(&self) -> &ParseMeter {
+        self.lexer.meter()
+    }
+
+    fn expect_eof(&mut self) -> PResult<()> {
+        if self.cur.token != Token::Eof {
+            return Err(self.error("missing eof"));
+        }
+        Ok(())
+    }
+
+    // --- errors ---
+
+    fn error(&self, message: &str) -> ParseError {
+        ParseError { line: self.cur.line, kind: ParseErrorKind::Syntax, message: message.to_string() }
+    }
+
+    fn unsupported(&self, what: &str) -> ParseError {
+        ParseError {
+            line: self.cur.line,
+            kind: ParseErrorKind::Unsupported,
+            message: format!("unsupported in stage-5 child 2: {} (deferred to statement-grammar child)", what),
+        }
+    }
+
+    // --- token window (fxGetNextToken / fxLookAheadOnce / fxMatchToken) ---
+
+    fn get_next_token(&mut self) -> PResult<()> {
+        if let Some(next) = self.ahead.take() {
+            self.cur = next;
+        } else {
+            self.sync_lexer_flags();
+            self.cur = self.lexer.next()?;
+        }
+        Ok(())
+    }
+
+    fn look_ahead_once(&mut self) -> PResult<()> {
+        if self.ahead.is_none() {
+            self.sync_lexer_flags();
+            self.ahead = Some(self.lexer.next()?);
+        }
+        Ok(())
+    }
+
+    /// The lexer classifies `await`/`yield` and strict reserved words
+    /// from its own flag copies; XS reads `parser->flags` directly, so
+    /// keep the two in sync before every scan.
+    fn sync_lexer_flags(&mut self) {
+        self.lexer.set_strict(self.flags & flags::STRICT != 0);
+        self.lexer.set_async(self.flags & flags::ASYNC != 0);
+        self.lexer.set_generator(self.flags & flags::GENERATOR != 0);
+    }
+
+    fn match_token(&mut self, expected: Token) -> PResult<()> {
+        if self.cur.token == expected {
+            if self.cur.escaped {
+                return Err(self.error("escaped keyword"));
+            }
+            self.get_next_token()
+        } else {
+            Err(self.error(&format!("missing {}", token_debug(expected))))
+        }
+    }
+
+    /// `fxIsKeyword` — is the current token an (unescaped) identifier
+    /// spelled `word`?
+    fn is_keyword(&self, word: &str) -> PResult<bool> {
+        if self.cur.token == Token::Identifier && self.cur.symbol.as_deref() == Some(word) {
+            if self.cur.escaped {
+                return Err(self.error("escaped keyword"));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    // --- node stack (fxPushNode / fxPopNode / fxPushNodeStruct / …) ---
+
+    fn push(&mut self, item: Item) {
+        self.stack.push(item);
+    }
+
+    fn pop(&mut self) -> Item {
+        self.stack.pop().expect("node stack underflow")
+    }
+
+    fn push_null(&mut self) {
+        self.stack.push(Item::Null);
+    }
+
+    fn push_symbol(&mut self, symbol: String) {
+        self.stack.push(Item::Symbol(symbol));
+    }
+
+    fn push_integer(&mut self, value: i32, line: u32) {
+        self.push(Item::Node(Box::new(Node { token: Token::Integer, line, flags: 0, children: Vec::new(), value: Value::Integer(value) })));
+    }
+
+    fn push_number(&mut self, value: f64, line: u32) {
+        self.push(Item::Node(Box::new(Node { token: Token::Number, line, flags: 0, children: Vec::new(), value: Value::Number(value) })));
+    }
+
+    fn push_string(&mut self, value: String, line: u32, escaped: bool) {
+        // `fxPushStringNode` sets `flags = states[0].escaped`
+        // (`mxStringEscapeFlag`, bit 0). Kept faithful; not surfaced in
+        // the dump.
+        self.push(Item::Node(Box::new(Node {
+            token: Token::String,
+            line,
+            flags: if escaped { 1 } else { 0 },
+            children: Vec::new(),
+            value: Value::Str(value),
+        })));
+    }
+
+    fn push_raw(&mut self, value: String, line: u32) {
+        self.push(Item::Node(Box::new(Node { token: Token::String, line, flags: 0, children: Vec::new(), value: Value::Str(value) })));
+    }
+
+    fn push_bigint(&mut self, value: crate::lexer::BigIntLiteral, line: u32) {
+        self.push(Item::Node(Box::new(Node { token: Token::Bigint, line, flags: 0, children: Vec::new(), value: Value::BigInt(value) })));
+    }
+
+    /// `fxPushNodeStruct` — pop `count` stack items and build a node of
+    /// `token`, its children in push order (`children[0]` = first
+    /// pushed). Inherits `mxStrictFlag | mxGeneratorFlag | mxAsyncFlag`
+    /// from `parser->flags`, as C-XS does.
+    fn push_node_struct(&mut self, count: usize, token: Token, line: u32) -> PResult<()> {
+        if count > self.stack.len() {
+            return Err(self.error(&format!("invalid {}", node_name(token))));
+        }
+        let start = self.stack.len() - count;
+        let children: Vec<Item> = self.stack.split_off(start);
+        let node = Node { token, line, flags: self.flags & flags::INHERITED, children, value: Value::None };
+        self.push(Item::Node(Box::new(node)));
+        Ok(())
+    }
+
+    /// `fxPushNodeList` — pop `count` stack items into a list, in source
+    /// order.
+    fn push_node_list(&mut self, count: usize) -> PResult<()> {
+        if count > self.stack.len() {
+            return Err(self.error("invalid list"));
+        }
+        let start = self.stack.len() - count;
+        let items: Vec<Item> = self.stack.split_off(start);
+        self.push(Item::List(items));
+        Ok(())
+    }
+
+    /// `fxSwapNodes` — swap the top two stack items.
+    fn swap_nodes(&mut self) {
+        let n = self.stack.len();
+        self.stack.swap(n - 1, n - 2);
+    }
+
+    /// Set flags on the top-of-stack node (`parser->root->flags |= …`).
+    fn set_top_flags(&mut self, add: u32) {
+        if let Some(Item::Node(node)) = self.stack.last_mut() {
+            node.flags |= add;
+        }
+    }
+
+    /// The symbol of the top-of-stack `Access` node (its `child[0]`), if
+    /// any.
+    fn top_access_symbol(&self) -> Option<String> {
+        if let Some(Item::Node(node)) = self.stack.last() {
+            if node.token == Token::Access {
+                if let Some(Item::Symbol(s)) = node.children.first() {
+                    return Some(s.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// The kind of the top-of-stack node, or `None` if it is not a node.
+    fn top_token(&self) -> Option<Token> {
+        match self.stack.last() {
+            Some(Item::Node(node)) => Some(node.token),
+            _ => None,
+        }
+    }
+
+    // --- fxCheckReference / fxCheckArrowFunction / fxCheckStrictSymbol ---
+
+    /// `fxCheckReference` — is the top-of-stack a valid assignment
+    /// target for `token`? Unwraps a single-item `Expressions` cover to
+    /// its reference, as XS does. Destructuring targets (Array/Object
+    /// converted to bindings) are deferred, so an assignment into one
+    /// reports [`ParseErrorKind::Unsupported`].
+    fn check_reference(&mut self, token: Token) -> PResult<bool> {
+        // Unwrap a parenthesized single reference: (x) = …
+        if self.top_token() == Some(Token::Expressions) {
+            self.unwrap_reference_cover();
+        }
+        let t = self.top_token();
+        match t {
+            Some(Token::Access) => {
+                if let Some(sym) = self.top_access_symbol() {
+                    self.check_strict_symbol(&sym)?;
+                }
+                Ok(true)
+            }
+            Some(Token::Member) | Some(Token::MemberAt) | Some(Token::PrivateMember) | Some(Token::Undefined) => Ok(true),
+            _ => {
+                if token == Token::Delete {
+                    return Ok(true);
+                }
+                if token == Token::Assign
+                    && matches!(t, Some(Token::Array) | Some(Token::Object))
+                {
+                    return Err(self.unsupported("destructuring assignment target"));
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Collapse `Expressions[ref]` (a single reference in parentheses)
+    /// down to the reference itself, iterating through nested covers, as
+    /// `fxCheckReference` does.
+    fn unwrap_reference_cover(&mut self) {
+        loop {
+            let single = match self.stack.last() {
+                Some(Item::Node(node)) if node.token == Token::Expressions => match node.children.first() {
+                    Some(Item::List(items)) if items.len() == 1 => Some(items[0].clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(item) = single else { return };
+            let inner_token = match &item {
+                Item::Node(n) => Some(n.token),
+                _ => None,
+            };
+            match inner_token {
+                Some(Token::Access) | Some(Token::Member) | Some(Token::MemberAt) | Some(Token::PrivateMember)
+                | Some(Token::Undefined) => {
+                    self.pop();
+                    self.push(item);
+                    return;
+                }
+                Some(Token::Expressions) => {
+                    self.pop();
+                    self.push(item);
+                    // loop again to unwrap the nested cover
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// `fxCheckArrowFunction` — none of the top `count` nodes may carry
+    /// `mxArrowFlag` (a bare arrow cannot be an operand). Arrows are
+    /// deferred here, so an arrow operand cannot arise; kept as a
+    /// faithful guard.
+    fn check_arrow_function(&mut self, count: usize) -> PResult<()> {
+        let n = self.stack.len();
+        for i in 0..count {
+            if let Some(Item::Node(node)) = self.stack.get(n - 1 - i) {
+                if node.flags & flags::ARROW != 0 {
+                    return Err(self.error("invalid arrow function"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `fxCheckStrictSymbol` — `arguments`/`eval`/`yield` are invalid
+    /// reference names in strict mode; `yield` also in a generator.
+    fn check_strict_symbol(&self, symbol: &str) -> PResult<()> {
+        if self.flags & flags::STRICT != 0 {
+            match symbol {
+                "arguments" => return Err(self.error("invalid arguments (strict mode)")),
+                "eval" => return Err(self.error("invalid eval (strict mode)")),
+                "yield" => return Err(self.error("invalid yield (strict mode)")),
+                _ => {}
+            }
+        } else if self.flags & flags::YIELD != 0 && symbol == "yield" {
+            return Err(self.error("invalid yield"));
+        }
+        Ok(())
+    }
+
+    // ================= expression cascade =================
+
+    /// `fxCommaExpression`.
+    fn comma_expression(&mut self) -> PResult<()> {
+        let mut count = 0usize;
+        let line = self.cur.line;
+        if has_flag(self.cur.token, BEGIN_EXPRESSION) {
+            self.assignment_expression()?;
+            count += 1;
+            while self.cur.token == Token::Comma {
+                self.get_next_token()?;
+                self.assignment_expression()?;
+                count += 1;
+            }
+        }
+        if count > 1 {
+            self.push_node_list(count)?;
+            self.push_node_struct(1, Token::Expressions, line)?;
+        } else if count == 0 {
+            self.push_null();
+            return Err(self.error("missing expression"));
+        }
+        Ok(())
+    }
+
+    /// `fxAssignmentExpression`.
+    fn assignment_expression(&mut self) -> PResult<()> {
+        if self.cur.token == Token::Yield {
+            return self.yield_expression();
+        }
+        self.conditional_expression()?;
+        while has_flag(self.cur.token, ASSIGN_EXPRESSION) {
+            let token = self.cur.token;
+            let line = self.cur.line;
+            if !self.check_reference(token)? {
+                return Err(self.error("no reference"));
+            }
+            self.get_next_token()?;
+            self.assignment_expression()?;
+            self.push_node_struct(2, token, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxConditionalExpression`.
+    fn conditional_expression(&mut self) -> PResult<()> {
+        self.coalesce_expression()?;
+        if self.cur.token == Token::QuestionMark {
+            let line = self.cur.line;
+            self.check_arrow_function(1)?;
+            self.get_next_token()?;
+            let saved = self.flags & flags::FOR;
+            self.flags &= !flags::FOR;
+            self.assignment_expression()?;
+            self.flags |= saved;
+            self.match_token(Token::Colon)?;
+            self.assignment_expression()?;
+            self.push_node_struct(3, Token::QuestionMark, line)?;
+        }
+        Ok(())
+    }
+
+    /// A left-associative binary ladder rung: parse `next`, then while
+    /// the current token has `class_flag`, consume it and another `next`
+    /// and fold a 2-child node of that token. Mirrors the shape shared by
+    /// `fxOrExpression` … `fxShiftExpression`.
+    fn binary_ladder(
+        &mut self,
+        class_flag: u32,
+        next: fn(&mut Self) -> PResult<()>,
+    ) -> PResult<()> {
+        next(self)?;
+        while has_flag(self.cur.token, class_flag) {
+            let token = self.cur.token;
+            let line = self.cur.line;
+            self.get_next_token()?;
+            next(self)?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, token, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxCoalesceExpression`.
+    fn coalesce_expression(&mut self) -> PResult<()> {
+        self.or_expression()?;
+        while self.cur.token == Token::Coalesce {
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.or_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::Coalesce, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxOrExpression`.
+    fn or_expression(&mut self) -> PResult<()> {
+        self.and_expression()?;
+        while self.cur.token == Token::Or {
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.and_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::Or, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxAndExpression`.
+    fn and_expression(&mut self) -> PResult<()> {
+        self.bit_or_expression()?;
+        while self.cur.token == Token::And {
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.bit_or_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::And, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxBitOrExpression`.
+    fn bit_or_expression(&mut self) -> PResult<()> {
+        self.bit_xor_expression()?;
+        while self.cur.token == Token::BitOr {
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.bit_xor_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::BitOr, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxBitXorExpression`.
+    fn bit_xor_expression(&mut self) -> PResult<()> {
+        self.bit_and_expression()?;
+        while self.cur.token == Token::BitXor {
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.bit_and_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::BitXor, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxBitAndExpression`.
+    fn bit_and_expression(&mut self) -> PResult<()> {
+        self.equal_expression()?;
+        while self.cur.token == Token::BitAnd {
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.equal_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::BitAnd, line)?;
+        }
+        Ok(())
+    }
+
+    /// `fxEqualExpression`.
+    fn equal_expression(&mut self) -> PResult<()> {
+        self.binary_ladder(EQUAL_EXPRESSION, Self::relational_expression)
+    }
+
+    /// `fxRelationalExpression` — including the `#private in obj` form
+    /// and the `for`-header `in`/`of` short-circuit.
+    fn relational_expression(&mut self) -> PResult<()> {
+        if self.cur.token == Token::PrivateIdentifier {
+            let line = self.cur.line;
+            let sym = self.cur.symbol.clone().unwrap_or_default();
+            self.push_symbol(sym);
+            self.get_next_token()?;
+            self.match_token(Token::In)?;
+            if self.flags & flags::FOR != 0 {
+                return Err(self.error("invalid in"));
+            }
+            self.shift_expression()?;
+            self.check_arrow_function(2)?;
+            self.push_node_struct(2, Token::PrivateIdentifier, line)?;
+        } else {
+            self.shift_expression()?;
+            if self.flags & flags::FOR != 0
+                && (self.cur.token == Token::In || self.is_keyword("of")?)
+            {
+                return Ok(());
+            }
+            while has_flag(self.cur.token, RELATIONAL_EXPRESSION) {
+                let token = self.cur.token;
+                let line = self.cur.line;
+                self.match_token(token)?;
+                self.shift_expression()?;
+                self.check_arrow_function(2)?;
+                self.push_node_struct(2, token, line)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `fxShiftExpression`.
+    fn shift_expression(&mut self) -> PResult<()> {
+        self.binary_ladder(SHIFT_EXPRESSION, Self::additive_expression)
+    }
+
+    /// `fxAdditiveExpression`.
+    fn additive_expression(&mut self) -> PResult<()> {
+        self.binary_ladder(
+            crate::token_flags::ADDITIVE_EXPRESSION,
+            Self::multiplicative_expression,
+        )
+    }
+
+    /// `fxMultiplicativeExpression`.
+    fn multiplicative_expression(&mut self) -> PResult<()> {
+        self.binary_ladder(
+            crate::token_flags::MULTIPLICATIVE_EXPRESSION,
+            Self::exponentiation_expression,
+        )
+    }
+
+    /// `fxExponentiationExpression` — right-associative, and a leading
+    /// unary operand cannot be an exponentiation base (`-x ** y` is an
+    /// early error handled by routing to `fxUnaryExpression`).
+    fn exponentiation_expression(&mut self) -> PResult<()> {
+        if has_flag(self.cur.token, UNARY_EXPRESSION) {
+            self.unary_expression()
+        } else {
+            self.prefix_expression()?;
+            if has_flag(self.cur.token, EXPONENTIATION_EXPRESSION) {
+                let token = self.cur.token;
+                let line = self.cur.line;
+                self.get_next_token()?;
+                self.exponentiation_expression()?;
+                self.check_arrow_function(2)?;
+                self.push_node_struct(2, token, line)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// `fxUnaryExpression` — `+ - ! ~ typeof void delete await`.
+    fn unary_expression(&mut self) -> PResult<()> {
+        if has_flag(self.cur.token, UNARY_EXPRESSION) {
+            let token = self.cur.token;
+            let line = self.cur.line;
+            self.match_token(token)?;
+            self.unary_expression()?;
+            self.check_arrow_function(1)?;
+            match token {
+                Token::Add => self.push_node_struct(1, Token::Plus, line)?,
+                Token::Subtract => self.push_node_struct(1, Token::Minus, line)?,
+                Token::Delete => {
+                    if !self.check_reference(token)? {
+                        return Err(self.error("no reference"));
+                    }
+                    self.push_node_struct(1, token, line)?;
+                }
+                Token::Await => {
+                    if self.flags & flags::GENERATOR != 0 && self.flags & flags::YIELD == 0 {
+                        return Err(self.error("invalid await"));
+                    }
+                    self.flags |= flags::AWAITING;
+                    self.push_node_struct(1, token, line)?;
+                }
+                _ => self.push_node_struct(1, token, line)?,
+            }
+            Ok(())
+        } else {
+            self.prefix_expression()
+        }
+    }
+
+    /// `fxPrefixExpression` — `++ --`.
+    fn prefix_expression(&mut self) -> PResult<()> {
+        if has_flag(self.cur.token, PREFIX_EXPRESSION) {
+            let token = self.cur.token;
+            let line = self.cur.line;
+            self.get_next_token()?;
+            self.prefix_expression()?;
+            self.check_arrow_function(1)?;
+            if !self.check_reference(token)? {
+                return Err(self.error("no reference"));
+            }
+            self.push_node_struct(1, token, line)?;
+            self.set_top_flags(flags::EXPRESSION_NO_VALUE);
+            Ok(())
+        } else {
+            self.postfix_expression()
+        }
+    }
+
+    /// `fxPostfixExpression` — `x++ x--` (no line terminator before).
+    fn postfix_expression(&mut self) -> PResult<()> {
+        self.call_expression()?;
+        if !self.cur.crlf && has_flag(self.cur.token, POSTFIX_EXPRESSION) {
+            let token = self.cur.token;
+            let line = self.cur.line;
+            self.check_arrow_function(1)?;
+            if !self.check_reference(token)? {
+                return Err(self.error("no reference"));
+            }
+            self.push_node_struct(1, token, line)?;
+            self.get_next_token()?;
+        }
+        Ok(())
+    }
+
+    /// `fxCallExpression` — the member / call / optional-chaining /
+    /// tagged-template postfix loop.
+    fn call_expression(&mut self) -> PResult<()> {
+        let chain_line = self.cur.line;
+        self.literal_expression(false)?;
+        if has_flag(self.cur.token, CALL_EXPRESSION) {
+            let mut chain_flag = false;
+            self.check_arrow_function(1)?;
+            loop {
+                let line = self.cur.line;
+                match self.cur.token {
+                    Token::Dot => {
+                        self.get_next_token()?;
+                        if self.cur.token == Token::Identifier {
+                            let sym = self.cur.symbol.clone().unwrap_or_default();
+                            self.push_symbol(sym);
+                            self.push_node_struct(2, Token::Member, line)?;
+                            self.get_next_token()?;
+                        } else if self.cur.token == Token::PrivateIdentifier {
+                            let sym = self.cur.symbol.clone().unwrap_or_default();
+                            self.push_symbol(sym);
+                            self.swap_nodes();
+                            self.push_node_struct(2, Token::PrivateMember, line)?;
+                            self.get_next_token()?;
+                        } else {
+                            return Err(self.error("missing property"));
+                        }
+                    }
+                    Token::LeftBracket => {
+                        self.get_next_token()?;
+                        self.comma_expression()?;
+                        self.push_node_struct(2, Token::MemberAt, line)?;
+                        self.match_token(Token::RightBracket)?;
+                    }
+                    Token::LeftParenthesis => {
+                        self.parameters()?;
+                        self.push_node_struct(2, Token::Call, line)?;
+                    }
+                    Token::Template => {
+                        if chain_flag {
+                            return Err(self.error("invalid template"));
+                        }
+                        let (s, r) = self.cur_template_strings();
+                        self.push_string(s, line, false);
+                        self.push_raw(r, line);
+                        self.push_node_struct(2, Token::TemplateMiddle, line)?;
+                        self.get_next_token()?;
+                        self.push_node_list(1)?;
+                        self.push_node_struct(2, Token::Template, line)?;
+                    }
+                    Token::TemplateHead => {
+                        if chain_flag {
+                            return Err(self.error("invalid template"));
+                        }
+                        self.template_expression()?;
+                        self.push_node_struct(2, Token::Template, line)?;
+                    }
+                    Token::Chain => {
+                        self.get_next_token()?;
+                        chain_flag = true;
+                        match self.cur.token {
+                            Token::Identifier => {
+                                self.push_node_struct(1, Token::Option, line)?;
+                                let sym = self.cur.symbol.clone().unwrap_or_default();
+                                self.push_symbol(sym);
+                                self.push_node_struct(2, Token::Member, line)?;
+                                self.get_next_token()?;
+                            }
+                            Token::PrivateIdentifier => {
+                                self.push_node_struct(1, Token::Option, line)?;
+                                let sym = self.cur.symbol.clone().unwrap_or_default();
+                                self.push_symbol(sym);
+                                self.swap_nodes();
+                                self.push_node_struct(2, Token::PrivateMember, line)?;
+                                self.get_next_token()?;
+                            }
+                            Token::LeftBracket => {
+                                self.push_node_struct(1, Token::Option, line)?;
+                                self.get_next_token()?;
+                                self.comma_expression()?;
+                                self.push_node_struct(2, Token::MemberAt, line)?;
+                                self.match_token(Token::RightBracket)?;
+                            }
+                            Token::LeftParenthesis => {
+                                self.push_node_struct(1, Token::Option, line)?;
+                                self.parameters()?;
+                                self.push_node_struct(2, Token::Call, line)?;
+                            }
+                            _ => return Err(self.error("invalid ?.")),
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            if chain_flag {
+                self.push_node_struct(1, Token::Chain, chain_line)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `fxLiteralExpression` — primary expressions. `no_call` is XS's
+    /// `flag` (set from `fxNewExpression`, suppressing `import(` as a
+    /// call).
+    fn literal_expression(&mut self, no_call: bool) -> PResult<()> {
+        let line = self.cur.line;
+        match self.cur.token {
+            Token::Null | Token::True | Token::False => {
+                let token = self.cur.token;
+                self.push_node_struct(0, token, line)?;
+                self.match_token(token)?;
+            }
+            Token::Import => self.import_literal(no_call, line)?,
+            Token::Super => self.super_literal(line)?,
+            Token::This => {
+                self.push_node_struct(0, Token::This, line)?;
+                self.set_top_flags(self.flags & flags::DERIVED);
+                self.match_token(Token::This)?;
+            }
+            Token::Integer => {
+                self.push_integer(self.cur.integer, line);
+                self.get_next_token()?;
+            }
+            Token::Number => {
+                self.push_number(self.cur.number, line);
+                self.get_next_token()?;
+            }
+            Token::Bigint => {
+                let b = self.cur.bigint.clone().expect("bigint lexeme carries a literal");
+                self.push_bigint(b, line);
+                self.get_next_token()?;
+            }
+            Token::Divide | Token::DivideAssign => {
+                let divide_assign = self.cur.token == Token::DivideAssign;
+                let rx = self.lexer.read_regexp(divide_assign)?;
+                self.cur = rx;
+                let modifier = self.cur.modifier.clone().unwrap_or_default();
+                let body = self.cur.string.clone().unwrap_or_default();
+                self.push_string(modifier, line, false);
+                self.push_string(body, line, false);
+                self.push_node_struct(2, Token::Regexp, line)?;
+                self.get_next_token()?;
+            }
+            Token::String => {
+                let s = self.cur.string.clone().unwrap_or_default();
+                let escaped = self.cur.escaped;
+                self.push_string(s, line, escaped);
+                self.get_next_token()?;
+            }
+            Token::Identifier => self.identifier_literal(line)?,
+            Token::Class => return Err(self.unsupported("class expression")),
+            Token::Function => return Err(self.unsupported("function expression")),
+            Token::New => self.new_expression()?,
+            Token::LeftBrace => {
+                let saved = self.flags & flags::FOR;
+                self.flags &= !flags::FOR;
+                self.object_expression()?;
+                self.flags |= saved;
+            }
+            Token::LeftBracket => {
+                let saved = self.flags & flags::FOR;
+                self.flags &= !flags::FOR;
+                self.array_expression()?;
+                self.flags |= saved;
+            }
+            Token::LeftParenthesis => self.group_expression(0)?,
+            Token::Template => {
+                self.push_null();
+                let (s, r) = self.cur_template_strings();
+                self.push_string(s, line, false);
+                self.push_raw(r, line);
+                self.push_node_struct(2, Token::TemplateMiddle, line)?;
+                self.get_next_token()?;
+                self.push_node_list(1)?;
+                self.push_node_struct(2, Token::Template, line)?;
+            }
+            Token::TemplateHead => {
+                self.push_null();
+                self.template_expression()?;
+                self.push_node_struct(2, Token::Template, line)?;
+            }
+            _ => {
+                self.push_node_struct(0, Token::Undefined, line)?;
+                return Err(self.error("missing expression"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The cooked / raw strings of the current `Template`/`TemplateHead`
+    /// lexeme.
+    fn cur_template_strings(&self) -> (String, String) {
+        (self.cur.string.clone().unwrap_or_default(), self.cur.raw.clone().unwrap_or_default())
+    }
+
+    /// `import` in expression position: dynamic `import(...)` or
+    /// `import.meta`.
+    fn import_literal(&mut self, no_call: bool, line: u32) -> PResult<()> {
+        self.match_token(Token::Import)?;
+        if !no_call && self.cur.token == Token::LeftParenthesis {
+            let saved = self.flags & flags::FOR;
+            self.get_next_token()?;
+            self.flags &= !flags::FOR;
+            self.assignment_expression()?;
+            if self.cur.token == Token::Comma {
+                self.get_next_token()?;
+                if has_flag(self.cur.token, BEGIN_EXPRESSION) {
+                    self.assignment_expression()?;
+                    if self.cur.token == Token::Comma {
+                        self.get_next_token()?;
+                    }
+                } else {
+                    self.push_null();
+                }
+            } else {
+                self.push_null();
+            }
+            self.flags |= saved;
+            self.match_token(Token::RightParenthesis)?;
+            self.push_node_struct(2, Token::ImportCall, line)?;
+        } else if self.cur.token == Token::Dot {
+            self.get_next_token()?;
+            if self.cur.token == Token::Identifier
+                && self.cur.symbol.as_deref() == Some("meta")
+                && !self.cur.escaped
+            {
+                self.get_next_token()?;
+                self.push_node_struct(0, Token::ImportMeta, line)?;
+            } else {
+                return Err(self.error("invalid import."));
+            }
+        } else {
+            return Err(self.error("invalid import"));
+        }
+        Ok(())
+    }
+
+    /// `super(...)` / `super.x` / `super[e]`.
+    fn super_literal(&mut self, line: u32) -> PResult<()> {
+        self.match_token(Token::Super)?;
+        if self.cur.token == Token::LeftParenthesis {
+            if self.flags & flags::DERIVED != 0 {
+                self.parameters()?;
+                self.push_node_struct(1, Token::Super, line)?;
+            } else {
+                self.push_node_struct(0, Token::Undefined, line)?;
+                return Err(self.error("invalid super"));
+            }
+        } else if self.cur.token == Token::Dot || self.cur.token == Token::LeftBracket {
+            if self.flags & flags::SUPER != 0 {
+                self.push_node_struct(0, Token::This, line)?;
+                self.set_top_flags(self.flags & (flags::DERIVED | flags::SUPER));
+            } else {
+                self.push_node_struct(0, Token::Undefined, line)?;
+                return Err(self.error("invalid super"));
+            }
+        } else {
+            return Err(self.error("invalid super"));
+        }
+        self.flags |= flags::SUPER;
+        Ok(())
+    }
+
+    /// An identifier in primary position: `x` → `Access`, or the async
+    /// arrow / `async function` covers (deferred).
+    fn identifier_literal(&mut self, line: u32) -> PResult<()> {
+        let escaped = self.cur.escaped;
+        let mut symbol = self.cur.symbol.clone().unwrap_or_default();
+        self.get_next_token()?;
+        if symbol == "async" && !escaped && !self.cur.crlf {
+            if self.cur.token == Token::Function {
+                return Err(self.unsupported("async function expression"));
+            }
+            if self.cur.token == Token::LeftParenthesis {
+                return Err(self.unsupported("async arrow / async(...) cover"));
+            }
+            if self.cur.token == Token::Identifier {
+                // async x => …  — an async arrow head.
+                return Err(self.unsupported("async arrow function"));
+            }
+        }
+        if symbol == "await" {
+            self.flags |= flags::AWAITING;
+        }
+        if !self.cur.crlf && self.cur.token == Token::Arrow {
+            return Err(self.unsupported("arrow function"));
+        }
+        if symbol == "arguments" {
+            self.flags |= flags::ARGUMENTS;
+        }
+        // Move the symbol onto the stack and wrap as Access.
+        let sym = std::mem::take(&mut symbol);
+        self.push_symbol(sym);
+        self.push_node_struct(1, Token::Access, line)?;
+        Ok(())
+    }
+
+    /// `fxArrayExpression` — array literal (elision, spread, elements).
+    fn array_expression(&mut self) -> PResult<()> {
+        let mut count = 0usize;
+        let mut elision = true;
+        let line = self.cur.line;
+        let mut spread_flag = false;
+        self.match_token(Token::LeftBracket)?;
+        while self.cur.token == Token::Comma
+            || self.cur.token == Token::Spread
+            || has_flag(self.cur.token, BEGIN_EXPRESSION)
+        {
+            let item_line = self.cur.line;
+            if self.cur.token == Token::Comma {
+                self.get_next_token()?;
+                if elision {
+                    self.push_node_struct(0, Token::Elision, item_line)?;
+                    count += 1;
+                } else {
+                    elision = true;
+                }
+            } else if self.cur.token == Token::Spread {
+                self.get_next_token()?;
+                if !elision {
+                    return Err(self.error("missing ,"));
+                }
+                self.assignment_expression()?;
+                self.push_node_struct(1, Token::Spread, item_line)?;
+                count += 1;
+                elision = false;
+                spread_flag = true;
+            } else {
+                if !elision {
+                    return Err(self.error("missing ,"));
+                }
+                self.assignment_expression()?;
+                count += 1;
+                elision = false;
+            }
+        }
+        self.match_token(Token::RightBracket)?;
+        self.push_node_list(count)?;
+        self.push_node_struct(1, Token::Array, line)?;
+        if count > 0 && elision {
+            self.set_top_flags(flags::ELISION);
+        }
+        if spread_flag {
+            self.set_top_flags(flags::SPREAD);
+        }
+        Ok(())
+    }
+
+    /// `fxObjectExpression` — object literal, **data** properties only
+    /// (`k: v`, shorthand `{k}`, cover default `{k = v}`, computed
+    /// `[e]: v`, string/number keys, `...spread`). Method / accessor /
+    /// generator shorthand is deferred (needs function bodies).
+    fn object_expression(&mut self) -> PResult<()> {
+        let mut count = 0usize;
+        let line = self.cur.line;
+        self.match_token(Token::LeftBrace)?;
+        loop {
+            let prop_line = self.cur.line;
+            let mut prop_flags = 0u32;
+            if self.cur.token == Token::RightBrace {
+                break;
+            }
+            if self.cur.token == Token::Spread {
+                self.get_next_token()?;
+                self.assignment_expression()?;
+                self.push_node_struct(1, Token::Spread, prop_line)?;
+            } else {
+                let (symbol, token0, token1, token2) = self.property_name()?;
+                if token1 == Token::PrivateProperty {
+                    return Err(self.error("invalid private property"));
+                } else if token2 == Token::Getter
+                    || token2 == Token::Setter
+                    || token2 == Token::Generator
+                    || token2 == Token::Function
+                    || self.cur.token == Token::LeftParenthesis
+                {
+                    return Err(self.unsupported("object method / accessor shorthand"));
+                } else if self.cur.token == Token::Colon {
+                    self.get_next_token()?;
+                    self.assignment_expression()?;
+                } else if token1 == Token::Property {
+                    prop_flags |= flags::SHORTHAND;
+                    let sym = symbol.clone().unwrap_or_default();
+                    self.push_symbol(sym);
+                    if self.cur.token == Token::Assign {
+                        self.push_node_struct(1, Token::Access, prop_line)?;
+                        self.get_next_token()?;
+                        self.assignment_expression()?;
+                        self.push_node_struct(2, Token::Binding, prop_line)?;
+                    } else if token0 == Token::Identifier {
+                        self.push_node_struct(1, Token::Access, prop_line)?;
+                    } else {
+                        self.push_node_struct(0, Token::Undefined, prop_line)?;
+                        return Err(self.error("invalid identifier"));
+                    }
+                } else {
+                    self.push_node_struct(0, Token::Undefined, prop_line)?;
+                    return Err(self.error("missing :"));
+                }
+                self.push_node_struct(2, token1, prop_line)?;
+                self.set_top_flags(prop_flags);
+            }
+            count += 1;
+            if self.cur.token == Token::RightBrace {
+                break;
+            }
+            self.match_token(Token::Comma)?;
+        }
+        self.match_token(Token::RightBrace)?;
+        self.push_node_list(count)?;
+        self.push_node_struct(1, Token::Object, line)?;
+        Ok(())
+    }
+
+    /// `fxPropertyName` — parse a property key, returning
+    /// `(symbol, token0, token1, token2)` and leaving the key on the
+    /// stack (a symbol for named/`Property`, an index node for
+    /// `PropertyAt`). The accessor/generator/async lookahead
+    /// (`token2`) is recognized so callers can reject the deferred
+    /// method forms precisely.
+    fn property_name(&mut self) -> PResult<(Option<String>, Token, Token, Token)> {
+        let mut symbol: Option<String> = None;
+        let mut token1 = Token::NoToken;
+        let mut token2 = Token::NoToken;
+        let line = self.cur.line;
+        self.look_ahead_once()?;
+        let token0 = self.cur.token;
+        if has_flag(token0, IDENTIFIER_NAME) {
+            symbol = self.cur.symbol.clone();
+            let ahead_token = self.ahead.as_ref().map(|s| s.token).unwrap_or(Token::NoToken);
+            let ahead_crlf = self.ahead.as_ref().map(|s| s.crlf).unwrap_or(false);
+            if ahead_token == Token::Colon {
+                self.push_symbol(symbol.clone().unwrap_or_default());
+                token1 = Token::Property;
+            } else if self.is_keyword("async")? && !ahead_crlf {
+                self.get_next_token()?;
+                if self.cur.token == Token::Multiply {
+                    token2 = Token::Generator;
+                    self.get_next_token()?;
+                } else {
+                    token2 = Token::Function;
+                }
+            } else if self.is_keyword("get")? {
+                token2 = Token::Getter;
+                self.get_next_token()?;
+            } else if self.is_keyword("set")? {
+                token2 = Token::Setter;
+                self.get_next_token()?;
+            } else {
+                self.push_symbol(symbol.clone().unwrap_or_default());
+                token1 = Token::Property;
+            }
+        } else if self.cur.token == Token::Multiply {
+            token2 = Token::Generator;
+            self.get_next_token()?;
+        } else if self.cur.token == Token::PrivateIdentifier {
+            symbol = self.cur.symbol.clone();
+            self.push_symbol(symbol.clone().unwrap_or_default());
+            token1 = Token::PrivateProperty;
+        } else if self.cur.token == Token::Integer {
+            self.push_property_index_integer(self.cur.integer, line);
+            token1 = Token::PropertyAt;
+        } else if self.cur.token == Token::Number {
+            self.push_property_index_number(self.cur.number, line);
+            token1 = Token::PropertyAt;
+        } else if self.cur.token == Token::String {
+            let s = self.cur.string.clone().unwrap_or_default();
+            self.push_symbol(s.clone());
+            symbol = Some(s);
+            token1 = Token::Property;
+        } else if self.cur.token == Token::LeftBracket {
+            self.get_next_token()?;
+            self.comma_expression()?;
+            if self.cur.token != Token::RightBracket {
+                return Err(self.error("missing ]"));
+            }
+            token1 = Token::PropertyAt;
+        } else {
+            self.push_null();
+            return Err(self.error("missing identifier"));
+        }
+
+        if token2 != Token::NoToken {
+            // A method / accessor / generator / async key follows the
+            // marker. These forms are deferred (they need a function
+            // body), and `object_expression` rejects them immediately
+            // after this returns, so the exact key parsing is elided —
+            // we do not consume further tokens here.
+            let _ = &mut token1;
+        } else {
+            // XS's `else fxGetNextToken(parser)` — consume the key token
+            // (or the computed-key `]`, or a literal key) so the caller
+            // sees the following `:` / `,` / `}` / `=` in `states[0]`.
+            self.get_next_token()?;
+        }
+        Ok((symbol, token0, token1, token2))
+    }
+
+    /// Push an integer property key as XS's `fxPushIndexNode` would: a
+    /// non-negative array index becomes an `Integer` (`PropertyAt`);
+    /// otherwise the caller falls back to a symbol. Integers are always
+    /// valid indices here.
+    fn push_property_index_integer(&mut self, value: i32, line: u32) {
+        self.push_integer(value, line);
+    }
+
+    /// Push a numeric property key. A number that is a canonical array
+    /// index becomes an `Integer`/`Number` index node.
+    fn push_property_index_number(&mut self, value: f64, line: u32) {
+        if value >= 0.0 && value == value.trunc() && value < 4_294_967_295.0 {
+            self.push_integer(value as i32, line);
+        } else {
+            self.push_number(value, line);
+        }
+    }
+
+    /// `fxTemplateExpression` — a template with substitutions
+    /// (`TemplateHead` … `${ expr }` … `TemplateTail`). Leaves a node
+    /// list of the items on the stack.
+    fn template_expression(&mut self) -> PResult<()> {
+        let mut count = 0usize;
+        let line = self.cur.line;
+        let (s, r) = self.cur_template_strings();
+        self.push_string(s, line, false);
+        self.push_raw(r, line);
+        self.push_node_struct(2, Token::TemplateMiddle, line)?;
+        count += 1;
+        loop {
+            self.get_next_token()?;
+            if self.cur.token != Token::RightBrace {
+                self.comma_expression()?;
+                count += 1;
+            }
+            if self.cur.token != Token::RightBrace {
+                return Err(self.error("missing }"));
+            }
+            // Continue the template string after the closing `}`.
+            let part = self.lexer.next_template_part()?;
+            self.cur = part;
+            let (s, r) = self.cur_template_strings();
+            self.push_string(s, line, false);
+            self.push_raw(r, line);
+            self.push_node_struct(2, Token::TemplateMiddle, line)?;
+            count += 1;
+            if self.cur.token == Token::TemplateTail {
+                self.get_next_token()?;
+                break;
+            }
+        }
+        self.push_node_list(count)?;
+        Ok(())
+    }
+
+    /// `fxYieldExpression`.
+    fn yield_expression(&mut self) -> PResult<()> {
+        let line = self.cur.line;
+        if self.flags & flags::YIELD == 0 {
+            return Err(self.error("invalid yield"));
+        }
+        self.flags |= flags::YIELDING;
+        self.match_token(Token::Yield)?;
+        if !self.cur.crlf && self.cur.token == Token::Multiply {
+            self.get_next_token()?;
+            self.assignment_expression()?;
+            self.push_node_struct(1, Token::Delegate, line)?;
+            return Ok(());
+        }
+        if !self.cur.crlf && has_flag(self.cur.token, BEGIN_EXPRESSION) {
+            self.assignment_expression()?;
+        } else {
+            self.push_node_struct(0, Token::Undefined, line)?;
+        }
+        self.push_node_struct(1, Token::Yield, line)?;
+        Ok(())
+    }
+
+    /// `fxParameters` — a parenthesized argument list (`( a, b, ...c )`),
+    /// yielding a `Params` node wrapping the argument list.
+    fn parameters(&mut self) -> PResult<()> {
+        let mut count = 0usize;
+        let line = self.cur.line;
+        let mut spread_flag = false;
+        self.match_token(Token::LeftParenthesis)?;
+        while self.cur.token == Token::Spread || has_flag(self.cur.token, BEGIN_EXPRESSION) {
+            let param_line = self.cur.line;
+            if self.cur.token == Token::Spread {
+                self.get_next_token()?;
+                self.assignment_expression()?;
+                self.push_node_struct(1, Token::Spread, param_line)?;
+                spread_flag = true;
+            } else {
+                self.assignment_expression()?;
+            }
+            count += 1;
+            if self.cur.token != Token::RightParenthesis {
+                self.match_token(Token::Comma)?;
+            }
+        }
+        self.match_token(Token::RightParenthesis)?;
+        self.push_node_list(count)?;
+        self.push_node_struct(1, Token::Params, line)?;
+        if spread_flag {
+            self.set_top_flags(flags::SPREAD);
+        }
+        Ok(())
+    }
+
+    /// `fxNewExpression` — `new X(...)`, member chains after `new`, and
+    /// `new.target`.
+    fn new_expression(&mut self) -> PResult<()> {
+        let line = self.cur.line;
+        self.match_token(Token::New)?;
+        if self.cur.token == Token::Dot {
+            self.get_next_token()?;
+            if self.is_keyword("target")? {
+                if self.flags & flags::TARGET == 0 {
+                    return Err(self.error("invalid new.target"));
+                }
+                self.get_next_token()?;
+                self.push_node_struct(0, Token::Target, line)?;
+            } else {
+                return Err(self.error("missing target"));
+            }
+            return Ok(());
+        }
+        self.literal_expression(true)?;
+        self.check_arrow_function(1)?;
+        loop {
+            let member_line = self.cur.line;
+            match self.cur.token {
+                Token::Dot => {
+                    self.get_next_token()?;
+                    if self.cur.token == Token::Identifier {
+                        let sym = self.cur.symbol.clone().unwrap_or_default();
+                        self.push_symbol(sym);
+                        self.push_node_struct(2, Token::Member, member_line)?;
+                        self.get_next_token()?;
+                    } else if self.cur.token == Token::PrivateIdentifier {
+                        let sym = self.cur.symbol.clone().unwrap_or_default();
+                        self.push_symbol(sym);
+                        self.swap_nodes();
+                        self.push_node_struct(2, Token::PrivateMember, member_line)?;
+                        self.get_next_token()?;
+                    } else {
+                        return Err(self.error("missing property"));
+                    }
+                }
+                Token::LeftBracket => {
+                    self.get_next_token()?;
+                    self.comma_expression()?;
+                    self.push_node_struct(2, Token::MemberAt, member_line)?;
+                    self.match_token(Token::RightBracket)?;
+                }
+                Token::Template => {
+                    let (s, r) = self.cur_template_strings();
+                    self.push_string(s, line, false);
+                    self.push_raw(r, line);
+                    self.push_node_struct(2, Token::TemplateMiddle, line)?;
+                    self.get_next_token()?;
+                    self.push_node_list(1)?;
+                    self.push_node_struct(2, Token::Template, line)?;
+                }
+                Token::TemplateHead => {
+                    self.template_expression()?;
+                    self.push_node_struct(2, Token::Template, line)?;
+                }
+                _ => break,
+            }
+        }
+        if self.cur.token == Token::LeftParenthesis {
+            self.parameters()?;
+        } else {
+            self.push_node_list(0)?;
+            self.push_node_struct(1, Token::Params, line)?;
+        }
+        self.push_node_struct(2, Token::New, line)?;
+        Ok(())
+    }
+
+    /// `fxGroupExpression` — a parenthesized expression. The arrow
+    /// cover-grammar reparse (`( a, b ) => …`) is deferred; a group
+    /// followed by `=>` reports [`ParseErrorKind::Unsupported`].
+    fn group_expression(&mut self, _flag: u32) -> PResult<()> {
+        let mut comma_flag = false;
+        let mut count = 0usize;
+        let saved_await_yield = self.flags & (flags::AWAITING | flags::YIELDING);
+        self.flags &= !(flags::AWAITING | flags::YIELDING);
+        self.match_token(Token::LeftParenthesis)?;
+        let mut line;
+        while self.cur.token == Token::Spread || has_flag(self.cur.token, BEGIN_EXPRESSION) {
+            line = self.cur.line;
+            comma_flag = false;
+            if self.cur.token == Token::Spread {
+                self.get_next_token()?;
+                self.assignment_expression()?;
+                self.push_node_struct(1, Token::Spread, line)?;
+            } else {
+                self.assignment_expression()?;
+            }
+            count += 1;
+            if self.cur.token != Token::Comma {
+                break;
+            }
+            self.get_next_token()?;
+            comma_flag = true;
+        }
+        line = self.cur.line;
+        self.match_token(Token::RightParenthesis)?;
+        if !self.cur.crlf && self.cur.token == Token::Arrow {
+            return Err(self.unsupported("arrow function"));
+        }
+        if count == 0 || comma_flag {
+            self.push_null();
+            self.flags |= saved_await_yield;
+            return Err(self.error("missing expression"));
+        }
+        self.push_node_list(count)?;
+        self.push_node_struct(1, Token::Expressions, line)?;
+        self.flags |= saved_await_yield;
+        Ok(())
+    }
+}
+
+/// A short, stable spelling of a token for error messages (XS uses
+/// `gxTokenNames`; this covers the punctuation/keyword tokens the parser
+/// reports as "missing X").
+fn token_debug(token: Token) -> &'static str {
+    use Token::*;
+    match token {
+        Colon => ":",
+        RightBracket => "]",
+        RightParenthesis => ")",
+        RightBrace => "}",
+        LeftParenthesis => "(",
+        In => "in",
+        Import => "import",
+        New => "new",
+        Super => "super",
+        This => "this",
+        Comma => ",",
+        _ => node_name(token),
+    }
+}
+
+#[cfg(test)]
+mod tests;
