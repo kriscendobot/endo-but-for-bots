@@ -99,10 +99,25 @@ int endor_oracle_run(const char *source, txU4 sourceLen, EndorOracleResult *out)
 			 * fxNextHostFunctionProperty install on the realm global; the ids
 			 * intern to the same atoms the program's references use. This is the
 			 * minimal audited extension of the oracle FFI seam the stage-4b
-			 * lockdown/harden child needs to differential-run against the pin. */
+			 * lockdown/harden child needs to differential-run against the pin.
+			 *
+			 * The global MUST be pushed onto the stack first, exactly as xst.c
+			 * does (`mxPush(mxGlobal); global = the->stack;`). fxNextHostFunctionProperty
+			 * reads the new host function's HOME object from `the->stack` at
+			 * entry — it stamps `home.object = the->stack->value.reference`. If
+			 * the global is not the stack top, each installed function gets a
+			 * garbage home.object pointing at whatever stale frame slot happened
+			 * to sit on the stack. That pointer is then dereferenced by the GC's
+			 * XS_HOME_KIND marker (`fxMarkInstance` on home.object) on the next
+			 * collection, and read by the Function.prototype.toString / property
+			 * enumeration path — a use-after/into-garbage that SIGSEGVs the whole
+			 * oracle process under any allocation pressure (the intrinsic-graph
+			 * walk, typed-array construction, Array concat/sort). Pushing the
+			 * global fixes the home linkage for all four installs at once. */
 			{
-				txSlot *global = mxGlobal.value.reference;
-				txSlot *slot = fxLastProperty(the, global);
+				txSlot *slot;
+				mxPush(mxGlobal);
+				slot = fxLastProperty(the, fxToInstance(the, the->stack));
 				slot = fxNextHostFunctionProperty(the, slot, fx_harden, 1,
 					fxID(the, "harden"), XS_DONT_ENUM_FLAG);
 				slot = fxNextHostFunctionProperty(the, slot, fx_lockdown, 0,
@@ -111,6 +126,7 @@ int endor_oracle_run(const char *source, txU4 sourceLen, EndorOracleResult *out)
 					fxID(the, "petrify"), XS_DONT_ENUM_FLAG);
 				slot = fxNextHostFunctionProperty(the, slot, fx_mutabilities, 1,
 					fxID(the, "mutabilities"), XS_DONT_ENUM_FLAG);
+				mxPop();
 			}
 
 			stream.buffer = (txString)source;

@@ -781,7 +781,35 @@ prototype walk, `XS_DONT_MARSHALL_FLAG` left clear). The **oracle shim** is
 extended minimally to install the harden/lockdown/petrify/mutabilities globals
 `xst.c`/`xstFuzz.c` install (the bare `fxCreateMachine` boot does not, so an
 `harden(x)` program was an undefined-reference throw) — the audited FFI-seam
-extension the differential needs. Metering is **allocation-driven**
+extension the differential needs.
+
+**Shim-install crash fix (stage-4 acceptance blocker, re-certified).** The
+first cut of that install skipped the `mxPush(mxGlobal)` xst.c performs before
+its `fxNextHostFunctionProperty` chain. That builder reads the new function's
+**HOME object** from `the->stack` at entry (`home.object =
+the->stack->value.reference`), so with the global not on the stack top each of
+the four installed functions got a **garbage home pointer** — a stale frame
+slot's bits read as a `txSlot*`. The GC's `XS_HOME_KIND` marker dereferences
+`home.object` (`aSlot->flag`, then recurses via `fxMarkInstance`) on the next
+collection, and the `Function.prototype.toString`/enumeration path reads it too,
+so **any** whole-tree dual-run that walked the intrinsic graph
+(`built-ins/Function/prototype/toString/{built-in-function-object,well-known-intrinsic-object-functions}.js`)
+or churned allocations (`built-ins/Array/prototype/{concat,map,sort}`) **SIGSEGV'd
+the whole oracle process (rc=139)** — one root cause behind both reported crash
+classes, and behind the ses-conformance child's separate "`lockdown()` SIGSEGVs
+the bare-boot shim" finding. The fix pushes `mxGlobal` so the home links to the
+real global (mirroring xst.c exactly). Re-certified at the fix, all whole-tree,
+**no process abort**: `built-ins/Function total=511 covered=40 divergent=0`
+(~1 s), `built-ins/Array total=2625 covered=437 divergent=0` (~2 s),
+`built-ins/Object total=3127 covered=176 divergent=0` unchanged (~2 s); a guest
+`lockdown()`/`mutabilities()` call now completes cleanly (`undefined`) on the
+bare-boot shim instead of aborting. The crash is locked out of a future shim
+widening by three named `endor-oracle` cargo tests
+(`shim_intrinsic_walk_and_gc_survive_installed_globals` — a self-contained
+minimal equivalent of the two test262 walkers that walks globalThis, stringifies
+every reachable function, and forces a GC; `shim_lockdown_call_fails_safely_not_segv`;
+`shim_mutabilities_call_fails_safely_not_segv`) that abort the test binary rather
+than a whole-tree run if the home linkage regresses. Metering is **allocation-driven**
 (`xsLockdown.c` calls no `mxMeter`): `petrify` is computron-exact against the
 pin for even own-key counts (a sub-computron boundary wobble at odd counts);
 `harden`'s cost is deterministic per release, but **computron parity over a
@@ -884,10 +912,14 @@ set — the exact tests `packages/test262-runner` runs `xst` against with
 non-lockdown file references the `Compartment` **intrinsic global**, which endor
 does not bind as a JS intrinsic — the Compartment child's
 `compartment:intrinsic-surface` fold; endor's `Compartment` is a Rust host type),
-and `1 oracle-shim-unsafe:lockdown` (the lockdown-tagged file calls `lockdown()`,
-which SIGSEGVs the bare-boot C-XS **oracle shim** — the same `lockdown()` surface
-the harden child folded on the endor side; it is pre-partitioned out and never
-dual-run). endor reaches none of the SES-parity surface end-to-end today, but
+and `1 oracle-shim-unsafe:lockdown` (the lockdown-tagged file calls `lockdown()` —
+the same `lockdown()` surface the harden child folded on the endor side; it is
+pre-partitioned out and never dual-run). The bare-boot shim **no longer SIGSEGVs**
+on `lockdown()` — that abort was the garbage-home shim-install bug the harden
+child's crash-fix above resolved (`lockdown()` now completes cleanly on the
+oracle) — but the file stays pre-partitioned because endor still folds `lockdown`
+as an honest `Halt::Unsupported`, so a dual-run would name-skip on the endor side
+regardless. endor reaches none of the SES-parity surface end-to-end today, but
 lies about none of it; the tally grows as the `Compartment`/`lockdown` intrinsic
 globals land.
 

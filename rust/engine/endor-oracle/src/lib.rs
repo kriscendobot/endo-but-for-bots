@@ -330,4 +330,103 @@ mod tests {
         assert!(o.matched);
         assert_eq!(o.captures[0], (2, 3));
     }
+
+    // ---------------------------------------------------------------------
+    // Locked regression bar for the oracle-shim harden/lockdown/petrify/
+    // mutabilities install (stage-4 acceptance blocker, PR #600).
+    //
+    // The shim installs those four host functions on the bare-boot machine's
+    // global. `fxNextHostFunctionProperty` stamps each new function's HOME
+    // object from `the->stack` at entry, so the global MUST be on the stack
+    // top during the install (as xst.c does). A prior revision skipped the
+    // `mxPush(mxGlobal)`, so every installed function got a garbage home
+    // pointer, which the GC's XS_HOME_KIND marker dereferenced on the next
+    // collection and the Function.prototype.toString / enumeration path read
+    // — a SIGSEGV that killed the whole oracle process during any whole-tree
+    // dual-run that walked the intrinsic graph (built-ins/Function toString)
+    // or churned allocations (built-ins/Array concat/map/sort). A crash here
+    // aborts the test binary, so these named tests fail instead of a
+    // whole-tree acceptance run silently coring. Keep them if the shim's
+    // installed-global set ever widens.
+
+    #[test]
+    fn shim_intrinsic_walk_and_gc_survive_installed_globals() {
+        // A self-contained minimal equivalent of the two crashing test262
+        // walkers (built-ins/Function/prototype/toString/{built-in-function-
+        // object,well-known-intrinsic-object-functions}.js): recursively walk
+        // the well-known-intrinsics graph from globalThis — which reaches the
+        // installed harden/lockdown/petrify/mutabilities — and call
+        // Function.prototype.toString on every function reached (the home-slot
+        // read of crash class 1), then churn allocations to force a GC pass
+        // that marks every reachable instance's home slot (crash class 2).
+        // With a garbage home this SIGSEGVs; with the correct global home it
+        // completes.
+        let src = r#"
+            var seen = [];
+            function walk(obj, depth) {
+                if (obj === null || depth > 4) return;
+                var t = typeof obj;
+                if (t !== "object" && t !== "function") return;
+                if (seen.indexOf(obj) >= 0) return;
+                seen.push(obj);
+                if (t === "function") {
+                    void Function.prototype.toString.call(obj);
+                }
+                var names = Object.getOwnPropertyNames(obj);
+                for (var i = 0; i < names.length; i++) {
+                    var d = Object.getOwnPropertyDescriptor(obj, names[i]);
+                    if (d && ("value" in d)) walk(d.value, depth + 1);
+                }
+            }
+            walk(globalThis, 0);
+            // Force at least one GC that marks the installed host functions'
+            // home slots.
+            var junk = [];
+            for (var i = 0; i < 30000; i++) junk.push({ i: i, s: "x" + i });
+            "walked=" + seen.length + " toString(harden)=" +
+                Function.prototype.toString.call(harden);
+        "#;
+        let o = run(src).expect("oracle machine must start");
+        // Reaching this assertion at all proves the process did not SIGSEGV.
+        assert!(
+            o.completed,
+            "intrinsic walk + GC over the installed globals must complete, got error {:?}",
+            o.error,
+        );
+        assert!(
+            o.result.contains("walked="),
+            "walk should report a coverage count, got {:?}",
+            o.result,
+        );
+    }
+
+    #[test]
+    fn shim_lockdown_call_fails_safely_not_segv() {
+        // The ses-conformance child found `lockdown()` SIGSEGVs the bare-boot
+        // shim. Calling it must fail SAFELY — a catchable throw or a clean
+        // completion — never crash the process. `run()` returning `Some(..)`
+        // at all means the machine ran to a normal outcome; whether lockdown
+        // completes or throws is not asserted (the bare boot models
+        // intrinsics sparsely), only that the process survived.
+        let o = run("try { lockdown(); 'ok'; } catch (e) { 'threw:' + e; }")
+            .expect("oracle machine must start");
+        assert!(
+            o.completed,
+            "a guarded lockdown() call must not abort the process; error {:?}",
+            o.error,
+        );
+    }
+
+    #[test]
+    fn shim_mutabilities_call_fails_safely_not_segv() {
+        // Same contract for the `mutabilities()` global: a guest call must not
+        // SIGSEGV the oracle, whatever value/throw it yields on the bare boot.
+        let o = run("try { mutabilities(); 'ok'; } catch (e) { 'threw:' + e; }")
+            .expect("oracle machine must start");
+        assert!(
+            o.completed,
+            "a guarded mutabilities() call must not abort the process; error {:?}",
+            o.error,
+        );
+    }
 }
