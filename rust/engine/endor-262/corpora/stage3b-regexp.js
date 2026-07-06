@@ -81,3 +81,19 @@ new RegExp("").source
 /\bword\b/.test("a word here")
 /(foo|bar)+/.exec("foobarfoo")
 /\s+/.exec("a   b")
+
+// --- String.prototype.search (Symbol.search protocol → the RegExp worker) --
+"abc".search(/b/)
+"abc".search(/a/)
+"abc".search(/z/)
+"hello world".search(/o/)
+"hello world".search(/\s/)
+"abc123".search(/[0-9]/)
+
+// --- String.prototype.match (non-global; Symbol.match protocol) -----------
+"abc".match(/b(c)/)
+"abc".match(/z/)
+"aXbXc".match(/X(.)/)
+"2026-07".match(/(\d+)-(\d+)/)
+"abc".match(/a/).index
+"abc".match(/b(c)/)[1]

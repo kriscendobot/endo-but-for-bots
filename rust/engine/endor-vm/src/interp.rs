@@ -931,6 +931,21 @@ pub const REGEXP_EXEC_PER_CAPTURE: u64 = 32;
 /// drives (the `test` host frame + the `mxGetID(_exec)` + `mxRunCount(1)`
 /// re-entrant call framing). Calibrated raw-exact.
 pub const REGEXP_TEST_FRAME_METERING: u64 = 147456;
+/// The native residual of `String.prototype.search` (`fx_String_prototype_
+/// search` → `fx_RegExp_prototype_search` via the `Symbol.search` protocol)
+/// BEYOND the `exec` cost it drives: the String host frame, the `withRegexp`
+/// dispatch (`mxGetID(_Symbol_search)` + `mxCall` + `mxRunCount(1)`), and the
+/// worker's `lastIndex` save/reset/restore. Calibrated raw-exact.
+pub const STRING_SEARCH_FRAME_METERING: u64 = 475568;
+/// The extra residual of `search` on a match: the `mxGetID(_index)` read of the
+/// exec-result's `index` (skipped on the `-1` no-match path). Calibrated.
+pub const STRING_SEARCH_INDEX_GET_METERING: u64 = 32768;
+/// The native residual of the non-global `String.prototype.match`
+/// (`fx_String_prototype_match` → `fx_RegExp_prototype_match` via the
+/// `Symbol.match` protocol) BEYOND the `exec` cost it drives: the String host
+/// frame, the `withRegexp` dispatch, and the worker's `flags` get (the
+/// eight-property cascade). Calibrated raw-exact.
+pub const STRING_MATCH_FRAME_METERING: u64 = 1081800;
 /// The extra residual of a `g`/`y` (stateful) `exec`/`test`: the
 /// `fxCacheUnicodeToUTF8Offset` (read `lastIndex`) + `fxCacheUTF8ToUnicode
 /// Offset` (write it back) remap framing. Charged on the advancing path.
@@ -6745,6 +6760,19 @@ impl Interp {
         inst: crate::value::SlotIndex,
         arg0: Slot,
     ) -> Result<Slot, Halt> {
+        Ok(self.regexp_exec_inner(inst, arg0)?.0)
+    }
+
+    /// The `exec` body, returning `(result, Some(match_start))` on a match so
+    /// the String-side `search`/`match` methods (which drive the full `exec`,
+    /// as XS's `fxExecuteRegExp` does) can read the match position without
+    /// re-deriving it from the result array's `index` property (which is
+    /// present only when the program references `index`).
+    fn regexp_exec_inner(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        arg0: Slot,
+    ) -> Result<(Slot, Option<i32>), Halt> {
         self.meter.tick_raw(REGEXP_EXEC_FRAME_METERING);
         let subject_slot = self.to_string_slot_metered(arg0);
         let subject = match subject_slot.value {
@@ -6759,7 +6787,7 @@ impl Interp {
         }
         let (matched, captures) = self.regexp_match_drive(inst, &subject)?;
         if !matched {
-            return Ok(Slot::null());
+            return Ok((Slot::null(), None));
         }
         // On a match XS charges a per-match residual plus a small per-extra-
         // capture residual (the `fxCacheUTF8ToUnicodeOffset` remaps and
@@ -6807,7 +6835,10 @@ impl Interp {
         if let Some(id) = self.regexp_result_ids.groups {
             self.instance_put_raw(result, id, Slot::undefined());
         }
-        Ok(Slot::of(Kind::Reference, Payload::Reference(result)))
+        Ok((
+            Slot::of(Kind::Reference, Payload::Reference(result)),
+            Some(match_start),
+        ))
     }
 
     /// `RegExp.prototype.test(string)` (`fx_RegExp_prototype_test` →
@@ -6825,6 +6856,53 @@ impl Interp {
         self.meter.tick_raw(REGEXP_TEST_FRAME_METERING);
         let result = self.regexp_exec(inst, arg0)?;
         Ok(Slot::boolean(result.kind != Kind::Null))
+    }
+
+    /// `String.prototype.search(regexp)` (`fx_String_prototype_search` →
+    /// `fx_RegExp_prototype_search` via the `Symbol.search` protocol): drive
+    /// the full `exec` from `lastIndex = 0` (temporarily; XS restores it) and
+    /// return the match's `index`, or `-1`. `inst` is the RegExp argument,
+    /// `subject` the receiver string slot. A non-RegExp argument (the
+    /// `withoutRegexp` coerce-to-RegExp path) self-names.
+    fn string_search(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        subject: Slot,
+    ) -> Result<Slot, Halt> {
+        self.meter.tick_raw(STRING_SEARCH_FRAME_METERING);
+        let saved = self.regexps[&inst].last_index;
+        // `search` runs `exec` with `lastIndex` forced to 0, then restores it.
+        self.regexps.get_mut(&inst).unwrap().last_index = 0.0;
+        let (_res, start) = self.regexp_exec_inner(inst, subject)?;
+        self.regexps.get_mut(&inst).unwrap().last_index = saved;
+        match start {
+            Some(s) => {
+                // The `mxGetID(_index)` read of the result's `index`.
+                self.meter.tick_raw(STRING_SEARCH_INDEX_GET_METERING);
+                Ok(Slot::integer(s))
+            }
+            None => Ok(Slot::integer(-1)),
+        }
+    }
+
+    /// `String.prototype.match(regexp)` (`fx_String_prototype_match` →
+    /// `fx_RegExp_prototype_match` via the `Symbol.match` protocol). The
+    /// non-global path returns `exec`'s result (the match array or `null`)
+    /// directly; `inst` is the RegExp argument, `subject` the receiver string.
+    /// The global path (collect every whole match into a fresh array, advancing
+    /// on an empty match) is a later increment — self-named. A non-RegExp
+    /// argument (the `withoutRegexp` coerce-to-RegExp path) self-names.
+    fn string_match(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        subject: Slot,
+    ) -> Result<Slot, Halt> {
+        let global = self.regexps[&inst].program.flags() & endor_regexp::XS_REGEXP_G != 0;
+        if global {
+            return Err(Halt::Unsupported("String.match:global"));
+        }
+        self.meter.tick_raw(STRING_MATCH_FRAME_METERING);
+        Ok(self.regexp_exec_inner(inst, subject)?.0)
     }
 
     /// `RegExp.prototype.toString()` (`fx_RegExp_prototype_toString`): the
@@ -9565,15 +9643,35 @@ impl Interp {
                 };
                 self.regexp_to_string(inst)?
             }
-            // `String.prototype.{match,search,replace,split}` over the matcher
-            // — a later increment; self-name so the runner records an honest
-            // skip rather than a wrong value.
-            NativeMethod::StringMatch => {
-                return Err(Halt::Unsupported("String.prototype.match"))
-            }
+            // `String.prototype.{match,search}` over the matcher (via the
+            // `Symbol.match`/`Symbol.search` protocol to the RegExp workers). A
+            // non-RegExp argument (the `withoutRegexp` coerce path) and the
+            // global `match` collection are honest named skips.
             NativeMethod::StringSearch => {
-                return Err(Halt::Unsupported("String.prototype.search"))
+                if self.string_receiver_bytes(this).is_none() {
+                    return Err(Halt::Unsupported("String.search:non-string-receiver"));
+                }
+                match arg0.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => {
+                        self.string_search(r, this)?
+                    }
+                    _ => return Err(Halt::Unsupported("String.search:non-regexp-arg")),
+                }
             }
+            NativeMethod::StringMatch => {
+                if self.string_receiver_bytes(this).is_none() {
+                    return Err(Halt::Unsupported("String.match:non-string-receiver"));
+                }
+                match arg0.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => {
+                        self.string_match(r, this)?
+                    }
+                    _ => return Err(Halt::Unsupported("String.match:non-regexp-arg")),
+                }
+            }
+            // `String.prototype.{replace,split}` over the matcher — a later
+            // increment (the `$`-substitution grammar / separator splitting);
+            // self-name so the runner records an honest skip.
             NativeMethod::StringReplace => {
                 return Err(Halt::Unsupported("String.prototype.replace"))
             }

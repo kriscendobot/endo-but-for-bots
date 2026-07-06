@@ -803,7 +803,7 @@ pub fn gen_stage3b_regexp_program(data: &[u8]) -> String {
     let flg = js_string_escape(&flags);
     let subj = js_string_escape(&subject);
     // Pick the observed operation from a trailing byte (deterministic).
-    let sel = data.last().copied().unwrap_or(0) % 8;
+    let sel = data.last().copied().unwrap_or(0) % 10;
     let ctor = format!("new RegExp(\"{}\", \"{}\")", pat, flg);
     match sel {
         0 => format!("{}.exec(\"{}\")", ctor, subj),
@@ -813,6 +813,10 @@ pub fn gen_stage3b_regexp_program(data: &[u8]) -> String {
         4 => format!("{}.source", ctor),
         5 => format!("{}.flags", ctor),
         6 => format!("{}.toString()", ctor),
+        // The String-side methods via the Symbol.search/Symbol.match protocol
+        // (the receiver is the subject string, the argument the RegExp).
+        7 => format!("\"{}\".search({})", subj, ctor),
+        8 => format!("\"{}\".match({})", subj, ctor),
         _ => format!("var m = {}.exec(\"{}\"); m ? m.length : 0", ctor, subj),
     }
 }
