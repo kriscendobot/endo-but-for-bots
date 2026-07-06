@@ -331,6 +331,57 @@ mod tests {
     }
 
     #[test]
+    fn utf16_string_sections_have_zero_result_divergence() {
+        // The governing check for the CESU-8 → UTF-16 storage swap over REAL
+        // test262: walk the surrogate-relevant `String.prototype` sections
+        // (charCodeAt/codePointAt/charAt/slice/substring — the code-unit
+        // index/slice surface the swap re-implemented), dual-run each against
+        // the pin, and require ZERO divergence on RESULTS. A test whose value
+        // agrees but whose computrons shift under the recalibration is a NAMED
+        // `builtin-coercion-computron-gap` skip (classify()), NOT a divergence —
+        // exactly the accuracy-over-parity split the swap adopted. Whole-tree
+        // `built-ins/String` (1111 files) is the `test262-language` binary; this
+        // in-`cargo test` slice stays bounded so the oracle RSS is contained.
+        let (root, harness) = match locate_test262() {
+            Some(p) => p,
+            None => {
+                eprintln!("test262 subset absent; skipping the UTF-16 String bar");
+                return;
+            }
+        };
+        let sections = [
+            "built-ins/String/prototype/charCodeAt",
+            "built-ins/String/prototype/codePointAt",
+            "built-ins/String/prototype/charAt",
+            "built-ins/String/prototype/slice",
+            "built-ins/String/prototype/substring",
+        ];
+        let mut files = Vec::new();
+        for s in sections {
+            files.extend(collect_js(&root.join(s)));
+        }
+        assert!(!files.is_empty(), "the UTF-16 String sections must have tests");
+        let rep = run_files(&harness, &root, &files);
+        eprintln!(
+            "test262 String.prototype (UTF-16 sections): total={} covered={} divergent={}",
+            rep.total,
+            rep.covered,
+            rep.divergences.len()
+        );
+        for (reason, n) in rep.skip_summary() {
+            eprintln!("    {:>5}  {}", n, reason);
+        }
+        for (path, detail) in &rep.divergences {
+            eprintln!("  DIVERGENCE {}\n    {}", path, detail);
+        }
+        assert!(
+            rep.met_bar(),
+            "zero RESULT divergence required on the UTF-16 String sections; got {}",
+            rep.divergences.len()
+        );
+    }
+
+    #[test]
     fn covered_grammar_language_subset_has_zero_divergence() {
         // The stage-2 acceptance bar over REAL test262 `language/` files:
         // walk the covered-grammar-adjacent sections (expressions and

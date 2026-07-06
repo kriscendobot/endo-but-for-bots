@@ -308,6 +308,17 @@ pub fn stage3_string_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3-string.js"))
 }
 
+/// UTF-16-swap child — surrogate-pair / index-heavy / lone-surrogate
+/// differential fixtures whose completion is a **scalar** (number/boolean) so
+/// the pin transports it faithfully. Asserts RESULT parity (not computron
+/// equality — the recalibration re-bases string cost off code-unit length);
+/// the storage-layer semantics for astral/lone-surrogate string VALUES (which
+/// the CESU-8→UTF-8 shim decodes lossily) are proven in the endor-vm
+/// `utf16_*` value-layer tests.
+pub fn stage3_string_utf16_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage3-string-utf16.js"))
+}
+
 /// Stage-3 child-4 (text-math-json) curated Number corpus: the Number
 /// statics/predicates, `Number.prototype.toString` (radix 10), `Number(...)`
 /// coercion, and the numeric globals `parseInt`/`parseFloat`/`isNaN`/
@@ -1346,6 +1357,101 @@ mod tests {
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
+    }
+
+    #[test]
+    fn stage3_string_utf16_result_parity_and_determinism() {
+        // The governing check for the UTF-16 storage swap: every surrogate-
+        // pair / index-heavy / lone-surrogate fixture agrees with C-XS on the
+        // completion VALUE (divergent=0 on RESULTS). Each fixture completes
+        // with a scalar, so the pin's result transports faithfully.
+        //
+        // Cross-engine computron equality is NOT asserted (the recalibration
+        // re-bases string cost off code-unit length, so multi-unit cases shift
+        // vs the pin's CESU-8 byte metering). The property that MUST hold —
+        // determinism-per-release — is asserted directly: endor runs the same
+        // bytecode twice and must return identical computrons AND result.
+        let programs = stage3_string_utf16_corpus();
+        assert!(!programs.is_empty(), "the UTF-16 fixture corpus must be non-empty");
+        let mut result_divergences = Vec::new();
+        let mut shifted = 0usize; // fixtures whose computrons differ from the pin
+        for p in &programs {
+            let oracle = match endor_oracle::run(p) {
+                Some(o) => o,
+                None => panic!("oracle machine failed to start for {p:?}"),
+            };
+            let a = run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
+            let b = run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
+            // Determinism-per-release: identical across repeated runs.
+            assert_eq!(a.computrons, b.computrons, "endor computrons deterministic for {p:?}");
+            assert_eq!(a.result, b.result, "endor result deterministic for {p:?}");
+            assert!(a.completed, "endor completes the fixture {p:?} (halt={:?})", a.halt);
+            assert!(oracle.completed, "the pin completes the fixture {p:?}");
+            // RESULT parity — the governing check.
+            if oracle.result != a.result {
+                result_divergences.push(format!(
+                    "{p:?}: oracle={:?} endor={:?}",
+                    oracle.result, a.result
+                ));
+            }
+            if oracle.computrons != a.computrons {
+                shifted += 1;
+            }
+        }
+        assert!(
+            result_divergences.is_empty(),
+            "RESULT divergence(s) on the UTF-16 fixtures (must be zero):\n  {}",
+            result_divergences.join("\n  "),
+        );
+        // The recalibration must be LIVE: at least some multi-unit fixture
+        // meters differently from the pin's CESU-8 byte cost (else the storage
+        // swap would not have re-based anything). This guards against a silent
+        // back-fit to the oracle's byte length.
+        assert!(
+            shifted > 0,
+            "expected the UTF-16 recalibration to shift computrons on some \
+             multi-unit fixture vs the CESU-8 pin; none shifted"
+        );
+    }
+
+    #[test]
+    fn utf16_meter_expectations_are_the_frozen_recalibrated_costs() {
+        // The frozen recalibrated UTF-16 computron costs (the build's re-based
+        // string metering), asserted against endor DIRECTLY — NOT back-fitted
+        // to the pin's CESU-8 byte length nor to the oracle. This locks the
+        // per-release determinism of the meter: these numbers are endor's own
+        // UTF-16 cost and must not drift silently. Where a value differs from
+        // the pin it is noted; the pin equality is neither required nor checked
+        // here. If a legitimate metering change moves one, update it here
+        // deliberately (that is the point of a frozen expectation).
+        let cases: &[(&str, u64)] = &[
+            // scalar reads that meter the same as CESU-8 for this content
+            (r#""𝒜".length"#, 9),
+            (r#""a𝒜b".codePointAt(1)"#, 13),
+            (r#"[..."a𝒜b"].length"#, 93),
+            // multi-unit cases whose cost is re-based off code-unit length
+            // (these differ from the pin — the recalibration witnesses):
+            (
+                r#"var s0 = "a𝒜b"; var t0 = 0; for (var i = 0; i < s0.length; i++) { t0 += s0.charCodeAt(i); } t0"#,
+                159,
+            ),
+            (
+                r#"var s="";for(var i=0;i<3;i++){s=s.concat("𝒜")};s.length"#,
+                105,
+            ),
+            (r#""a𝒜b".slice(1, 2).charCodeAt(0)"#, 19),
+        ];
+        for (src, expected) in cases {
+            let oracle = endor_oracle::run(src).expect("oracle compiles the program");
+            let a = run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
+            let b = run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
+            assert!(a.completed, "endor completes {src:?} (halt={:?})", a.halt);
+            assert_eq!(a.computrons, b.computrons, "determinism-per-release for {src:?}");
+            assert_eq!(
+                a.computrons, *expected,
+                "frozen UTF-16 computron cost for {src:?} (endor's recalibrated value)",
+            );
+        }
     }
 
     #[test]
