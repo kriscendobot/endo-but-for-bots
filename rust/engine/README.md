@@ -13,7 +13,7 @@ so it builds in-repo from the first commit (resolved question 9).
 | `endor-oracle` | audited FFI (the one exception) | Compiles JS to XS bytecode and runs it on C-XS, returning `(bytecode, result, run-only computrons)`. Dev/CI only; never linked into a shipped engine. |
 | `endor-262` | `#![forbid(unsafe_code)]` | Dual-run harness: runs the same bytecode on `endor-vm` and the oracle, recording four-valued + computron agreement. |
 | `endor-fuzz` | `#![forbid(unsafe_code)]` | cargo-fuzz targets 1 (differential source) and 2 (bytecode decoder), authored so the logic is a plain testable lib. |
-| `endor-regexp` | `#![forbid(unsafe_code)]` | Engine-internal port of the XS RegExp engine (`xsre.c`): the pattern compiler (parse → measure → code) and the backtracking match VM, metering-exact against the pin. No JavaScript surface (child 9 integrates). |
+| `endor-regexp` | `#![forbid(unsafe_code)]` | Engine-internal port of the XS RegExp engine (`xsre.c`): the pattern compiler (parse → measure → code) and the backtracking match VM, metering-exact against the pin. The JavaScript `RegExp` surface is child 9, linked from `endor-vm` (§ The JavaScript RegExp surface). |
 
 ## Building the oracle: the `c/moddable` pin
 
@@ -518,3 +518,51 @@ property escapes, V-mode string sets, and their `u`/`v` fold tables),
 (`(?flags:)`), and astral (`> 0xFFFF`) code points. The crate is
 `#![forbid(unsafe_code)]` and Miri-clean
 (`cargo +nightly miri test -p endor-regexp --lib`).
+
+### The JavaScript RegExp surface (stage-3b, child 9)
+
+`endor-vm` links `endor-regexp` as the JavaScript `RegExp` builtin
+(`xsRegExp.c` + the RegExp-consuming `xsString.c` methods), **bit-exact
+(result AND computron) against the pin** end-to-end — construction *and* the
+whole-program run, not just the matcher:
+
+- **Construction**: the `regexp` opcode + a `/.../ ` literal (which XS compiles
+  to `new RegExp(pattern, flags)`), the `RegExp` constructor, the compiled
+  program + source/flags + `lastIndex` in the `regexps` side table. Metering
+  models `fxNewRegExpInstance`'s four `fxNewSlot`s, the `fxCompileRegExp` parse
+  meter, and its two `fxNewChunk` buffers (`code` = `parser->size`, `data` =
+  the capture/name/assertion/quantifier struct-size sum), so it is raw-exact
+  across every pattern shape.
+- **`exec`/`test`**: the match drive from `lastIndex` (g/y), the `[whole,
+  ...captures]` result array with `index`/`input`/`groups`, `lastIndex`
+  advance; `test` drives the full `exec` as XS's `fxExecuteRegExp` does.
+- **Accessors**: `source` (escape-on-read), the composite `flags` (the
+  eight per-flag cascade), the per-flag getters, `lastIndex` get/set, and
+  `toString` (the three growing `fxConcatString` chunks) — special-cased by id
+  in `GET`/`SET_PROPERTY` over the side table.
+- **`String.prototype.{search,match,replace,split}`** via the
+  `Symbol.{search,match,replace,split}` protocol to the RegExp workers:
+  `search` (index or −1), non-global `match` (the exec array), non-global
+  literal-replacement `replace` (the segment-list assembly), and `split` (the
+  sticky-splitter walk). Each carries its calibrated protocol-dispatch +
+  worker residual, raw-exact.
+
+**Corpus + fuzz.** `endor-262/corpora/stage3b-regexp.js` (a curated corpus,
+`stage3b_regexp_corpus_is_bit_exact_against_oracle`) and a whole-program
+differential **fuzz arm** (`differential_regexp_surface`, a 1200-seed sweep
+that pins result + computron end-to-end) complement the matcher-level arm — it
+already earned its keep, driving out a sub-computron construction-metering gap
+(the unmodeled `data` buffer) and the split empty-match corner. Dual-run:
+`built-ins/RegExp/prototype total=407 covered=50 divergent=0`,
+`built-ins/RegExp/prototype/exec covered=33`, `/test covered=15`,
+`language/literals/regexp covered=21` (from 6), and the four
+`built-ins/String/prototype/{search,match,replace,split}` sections
+**divergent=0** with growth.
+
+**Honest, named skips** (each a named `Halt::Unsupported`, never a wrong value
+or a fitted meter): named-group result shaping, a RegExp-valued pattern arg,
+a syntax-error / unsupported-feature throw, a non-ASCII stateful (g/y) subject;
+global `match`/`replace` collection, the `$`-substitution grammar and function
+replacement in `replace`; a limit that truncates, an empty-matching separator,
+and a non-ASCII subject in `split`; and a string (non-RegExp) argument to the
+String methods (the `withoutRegexp` coerce path).
