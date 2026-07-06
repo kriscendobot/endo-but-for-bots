@@ -1,0 +1,45 @@
+//! `endor-compile` — the oracle-locked transliteration of the XS
+//! compiler (design `designs/xs2rust-endor-engine.md` § roadmap row 5).
+//!
+//! Stage 5 of the XS→Rust port replaces the differential-oracle compiler
+//! with a pure-Rust one built in the shape of C-XS: lexer → parser →
+//! scoper → coder, held to a **byte-identical-bytecode** bar against
+//! C-XS on the conformance corpus. This crate is that pipeline; child 1
+//! lands the first stratum, the **lexer** ([`lexer`], [`token`]), plus
+//! the deterministic parse meter ([`meter`]) threaded from the first
+//! token and the structured error surface ([`error`]) the fuzz target
+//! will lean on.
+//!
+//! Everything here is `#![forbid(unsafe_code)]`, like every engine crate
+//! except the audited `endor-oracle` FFI seam.
+
+#![forbid(unsafe_code)]
+
+pub mod error;
+pub mod lexer;
+pub mod meter;
+pub mod token;
+pub mod unicode;
+
+pub use error::{LexError, LexErrorKind};
+pub use lexer::{BigIntLiteral, Lexeme, Lexer};
+pub use meter::ParseMeter;
+pub use token::Token;
+
+/// Scan `source` to completion, returning every [`Lexeme`] up to and
+/// including [`Token::Eof`]. A convenience over driving [`Lexer::next`];
+/// the parser drives the lexer pull-style (with template/regexp
+/// re-entry), so this is primarily for tests and tooling.
+pub fn tokenize(source: &str) -> Result<Vec<Lexeme>, LexError> {
+    let mut lexer = Lexer::new(source);
+    let mut out = Vec::new();
+    loop {
+        let lexeme = lexer.next()?;
+        let eof = lexeme.token == Token::Eof;
+        out.push(lexeme);
+        if eof {
+            break;
+        }
+    }
+    Ok(out)
+}

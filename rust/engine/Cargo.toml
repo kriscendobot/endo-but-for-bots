@@ -12,6 +12,7 @@ members = [
     "endor-262",
     "endor-fuzz",
     "endor-regexp",
+    "endor-compile",
 ]
 
 [workspace.package]

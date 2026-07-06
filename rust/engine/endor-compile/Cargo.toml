@@ -1,0 +1,11 @@
+[package]
+name = "endor-compile"
+description = "Oracle-locked transliteration of the XS compiler (lexer -> parser -> scoper -> coder). Stage 5 of the XS->Rust port; replaces the oracle compiler behind a byte-identical-bytecode bar."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "endor_compile"
+path = "src/lib.rs"
