@@ -273,17 +273,15 @@ fn regexp_vs_divide() {
 }
 
 #[test]
-fn deferred_constructs_report_unsupported_not_panic() {
+fn formerly_deferred_constructs_now_parse() {
     // Arrow / function / class expressions, object methods, and
-    // destructuring assignment targets are deferred to the
-    // statement-grammar child; they must classify as Unsupported, never
-    // panic or mis-parse.
+    // destructuring assignment targets were deferred by child 2; child 3
+    // (this crate's statement grammar) parses them. They must now yield a
+    // tree, not [`ParseErrorKind::Unsupported`].
     for src in ["x => x", "(a, b) => a", "function () {}", "class {}", "({ m() {} })", "[a] = b"] {
         let mut p = Parser::new(src, false, false).unwrap();
-        match p.parse_assignment_expression() {
-            Err(e) => assert_eq!(e.kind, ParseErrorKind::Unsupported, "src {src:?}: {e}"),
-            Ok(item) => panic!("expected Unsupported for {src:?}, got {}", dump(&item)),
-        }
+        let item = p.parse_assignment_expression().unwrap_or_else(|e| panic!("parse {src:?}: {e}"));
+        let _ = dump(&item);
     }
 }
 

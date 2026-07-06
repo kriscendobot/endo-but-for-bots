@@ -30,6 +30,9 @@ pub mod flags {
     pub const C: u32 = 1 << 0;
     /// `mxEvalFlag`. (bit 2)
     pub const EVAL: u32 = 1 << 2;
+    /// `mxProgramFlag` — set while parsing a Script goal (not a Module).
+    /// (bit 3)
+    pub const PROGRAM: u32 = 1 << 3;
     /// `mxStrictFlag`. (bit 4)
     pub const STRICT: u32 = 1 << 4;
     /// `mxSuperFlag`. (bit 5)
@@ -46,6 +49,16 @@ pub mod flags {
     pub const AWAITING: u32 = 1 << 10;
     /// `mxBaseFlag`. (bit 11)
     pub const BASE: u32 = 1 << 11;
+    /// `mxNativeFlag`. (bit 12)
+    pub const NATIVE: u32 = 1 << 12;
+    /// `mxHostFlag`. (bit 13)
+    pub const HOST: u32 = 1 << 13;
+    /// `mxDefaultFlag`. (bit 14)
+    pub const DEFAULT: u32 = 1 << 14;
+    /// `mxFieldFlag`. (bit 15)
+    pub const FIELD: u32 = 1 << 15;
+    /// `mxFunctionFlag`. (bit 16)
+    pub const FUNCTION: u32 = 1 << 16;
     /// `mxDerivedFlag`. (bit 17)
     pub const DERIVED: u32 = 1 << 17;
     /// `mxElisionFlag`. (bit 18)
@@ -60,6 +73,8 @@ pub mod flags {
     pub const GETTER: u32 = 1 << 22;
     /// `mxMethodFlag`. (bit 23)
     pub const METHOD: u32 = 1 << 23;
+    /// `mxNotSimpleParametersFlag`. (bit 24)
+    pub const NOT_SIMPLE_PARAMETERS: u32 = 1 << 24;
     /// `mxSetterFlag`. (bit 25)
     pub const SETTER: u32 = 1 << 25;
     /// `mxShorthandFlag`. (bit 26)
@@ -77,6 +92,11 @@ pub mod flags {
     /// onto every freshly built node (`mxStrictFlag | mxGeneratorFlag |
     /// mxAsyncFlag`).
     pub const INHERITED: u32 = STRICT | GENERATOR | ASYNC;
+
+    /// `mxParserFlags` = `mxCFlag | mxDebugFlag | mxProgramFlag` — the
+    /// harness-context bits `fxFunctionExpression`/`fxGeneratorExpression`
+    /// carry across into a nested function's fresh `parser->flags`.
+    pub const PARSER_FLAGS: u32 = (1 << 0) | (1 << 1) | (1 << 3);
 }
 
 /// A leaf value a node can carry in place of (or beside) children — the
@@ -154,6 +174,9 @@ pub fn node_name(token: Token) -> &'static str {
         Await => "Await",
         Bigint => "BigInt",
         Binding => "Binding",
+        Block => "Block",
+        Body => "Body",
+        Break => "Break",
         BitAnd => "BitAnd",
         BitAndAssign => "BitAndAssign",
         BitNot => "BitNot",
@@ -162,28 +185,39 @@ pub fn node_name(token: Token) -> &'static str {
         BitXor => "BitXor",
         BitXorAssign => "BitXorAssign",
         Call => "Call",
+        Case => "Case",
+        Catch => "Catch",
         Chain => "Chain",
         Class => "Class",
         Coalesce => "Coalesce",
         CoalesceAssign => "CoalesceAssign",
         Const => "Const",
+        Continue => "Continue",
         Current => "Current",
+        Debugger => "Debugger",
         Decrement => "Decrement",
         Define => "Define",
         Delegate => "Delegate",
         Delete => "Delete",
         Divide => "Divide",
         DivideAssign => "DivideAssign",
+        Do => "Do",
         Equal => "Equal",
         Exponentiation => "Exponent",
         ExponentiationAssign => "ExponentAssign",
+        Export => "Export",
         Expressions => "Expressions",
         False => "False",
         Field => "Field",
+        For => "For",
+        ForAwaitOf => "ForAwaitOf",
+        ForIn => "ForIn",
+        ForOf => "ForOf",
         Function => "Function",
         Generator => "Generator",
         Getter => "Getter",
         Host => "Host",
+        If => "If",
         Import => "Import",
         ImportCall => "ImportCall",
         ImportMeta => "ImportMeta",
@@ -191,10 +225,13 @@ pub fn node_name(token: Token) -> &'static str {
         Increment => "Increment",
         Instanceof => "Instanceof",
         Integer => "Integer",
+        Items => "Items",
+        Label => "Label",
         Let => "Let",
         Member => "Member",
         MemberAt => "MemberAt",
         Minus => "Minus",
+        Module => "Module",
         Modulo => "Modulo",
         ModuloAssign => "ModuloAssign",
         More => "More",
@@ -221,6 +258,7 @@ pub fn node_name(token: Token) -> &'static str {
         PrivateIdentifier => "PrivateIdenfifier",
         PrivateMember => "PrivateMember",
         PrivateProperty => "PrivateProperty",
+        Program => "Program",
         Property => "Property",
         PropertyAt => "PropertyAt",
         PropertyBinding => "PropertyBinding",
@@ -228,26 +266,37 @@ pub fn node_name(token: Token) -> &'static str {
         QuestionMark => "QuestionMark",
         Regexp => "Regexp",
         RestBinding => "RestBinding",
+        Return => "Return",
         SignedRightShift => "SignedRightShift",
         SignedRightShiftAssign => "SignedRightShiftAssign",
         SkipBinding => "SkipBinding",
+        Specifier => "Specifier",
         Spread => "Spread",
+        Statement => "Statement",
+        Statements => "Statements",
         StrictEqual => "StrictEqual",
         StrictNotEqual => "StrictNotEqual",
         String => "String",
         Subtract => "Subtract",
         SubtractAssign => "SubtractAssign",
         Super => "Super",
+        Switch => "Switch",
         Target => "Target",
         Template => "Template",
         TemplateMiddle => "TemplateItem",
         This => "This",
+        Throw => "Throw",
         True => "True",
+        Try => "Try",
         Typeof => "Typeof",
         Undefined => "Undefined",
         UnsignedRightShift => "UnsignedRightShift",
         UnsignedRightShiftAssign => "UnsignedRightShiftAssign",
+        Using => "Using",
+        Var => "Var",
         Void => "Void",
+        While => "While",
+        With => "With",
         Yield => "Yield",
         _ => "?",
     }
@@ -263,6 +312,9 @@ const DUMP_FLAGS: &[(u32, &str)] = &[
     (flags::ARROW, "arrow"),
     (flags::ASYNC, "async"),
     (flags::AWAITING, "awaiting"),
+    (flags::BASE, "base"),
+    (flags::FIELD, "field"),
+    (flags::FUNCTION, "function"),
     (flags::DERIVED, "derived"),
     (flags::ELISION, "elision"),
     (flags::EXPRESSION_NO_VALUE, "novalue"),

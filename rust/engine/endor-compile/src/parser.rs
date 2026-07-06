@@ -93,6 +93,10 @@ pub struct Parser {
     flags: u32,
     /// The node-build stack (`parser->root`, top = last pushed).
     stack: Vec<Item>,
+    /// `fxPropertyName`'s `*flag` out-parameter (`mxAsyncFlag` for an
+    /// `async` method key), read by the object/class member loops after a
+    /// [`Self::property_name`] call.
+    property_name_async_flag: u32,
 }
 
 impl Parser {
@@ -112,7 +116,7 @@ impl Parser {
         lexer.set_async(flags & flags::ASYNC != 0);
         lexer.set_generator(flags & flags::GENERATOR != 0);
         let cur = lexer.next()?;
-        Ok(Parser { lexer, cur, ahead: None, flags, stack: Vec::new() })
+        Ok(Parser { lexer, cur, ahead: None, flags, stack: Vec::new(), property_name_async_flag: 0 })
     }
 
     /// Parse a single expression (an `AssignmentExpression` — XS's
@@ -149,14 +153,6 @@ impl Parser {
 
     fn error(&self, message: &str) -> ParseError {
         ParseError { line: self.cur.line, kind: ParseErrorKind::Syntax, message: message.to_string() }
-    }
-
-    fn unsupported(&self, what: &str) -> ParseError {
-        ParseError {
-            line: self.cur.line,
-            kind: ParseErrorKind::Unsupported,
-            message: format!("unsupported in stage-5 child 2: {} (deferred to statement-grammar child)", what),
-        }
     }
 
     // --- token window (fxGetNextToken / fxLookAheadOnce / fxMatchToken) ---
@@ -299,6 +295,54 @@ impl Parser {
         }
     }
 
+    /// Overwrite the top-of-stack node's flags word
+    /// (`parser->root->flags = …`, as the function/class/program tails do).
+    fn set_root_flags(&mut self, value: u32) {
+        if let Some(Item::Node(node)) = self.stack.last_mut() {
+            node.flags = value;
+        }
+    }
+
+    /// Build a fresh childful node stamped with the inherited flag subset,
+    /// exactly as `fxPushNodeStruct` would (used by the off-stack
+    /// cover-grammar binding conversions).
+    fn new_inherited_node(&self, token: Token, line: u32, children: Vec<Item>) -> Item {
+        Item::Node(Box::new(Node { token, line, flags: self.flags & flags::INHERITED, children, value: Value::None }))
+    }
+
+    /// `fxDefineNodeNew(DEFINE, symbol)` + `node->initializer = pop`: pop
+    /// the function/value on top and wrap it in a `Define` node keyed by
+    /// `symbol`.
+    fn push_define(&mut self, symbol: String, line: u32) {
+        let init = self.pop();
+        self.push(Item::Node(Box::new(Node {
+            token: Token::Define,
+            line,
+            flags: 0,
+            children: vec![Item::Symbol(symbol), init],
+            value: Value::None,
+        })));
+    }
+
+    /// Push an already-collected list of items as a `List` slot (the
+    /// module declarations collect their specifiers off-stack).
+    fn push_node_list_from(&mut self, items: Vec<Item>) -> PResult<()> {
+        self.push(Item::List(items));
+        Ok(())
+    }
+
+    /// `parser->states[1].token` — the one-token lookahead's kind, or
+    /// [`Token::NoToken`] if no lookahead is buffered.
+    fn ahead_token(&self) -> Token {
+        self.ahead.as_ref().map(|s| s.token).unwrap_or(Token::NoToken)
+    }
+
+    /// `parser->states[1].crlf` — whether a line terminator precedes the
+    /// buffered lookahead token.
+    fn ahead_crlf(&self) -> bool {
+        self.ahead.as_ref().map(|s| s.crlf).unwrap_or(false)
+    }
+
     /// The symbol of the top-of-stack `Access` node (its `child[0]`), if
     /// any.
     fn top_access_symbol(&self) -> Option<String> {
@@ -342,13 +386,19 @@ impl Parser {
             }
             Some(Token::Member) | Some(Token::MemberAt) | Some(Token::PrivateMember) | Some(Token::Undefined) => Ok(true),
             _ => {
+                if token == Token::Assign {
+                    if t == Some(Token::Array) {
+                        if self.array_binding_from_expression(Token::Access)? {
+                            return Ok(true);
+                        }
+                    } else if t == Some(Token::Object) {
+                        if self.object_binding_from_expression(Token::Access)? {
+                            return Ok(true);
+                        }
+                    }
+                }
                 if token == Token::Delete {
                     return Ok(true);
-                }
-                if token == Token::Assign
-                    && matches!(t, Some(Token::Array) | Some(Token::Object))
-                {
-                    return Err(self.unsupported("destructuring assignment target"));
                 }
                 Ok(false)
             }
@@ -879,8 +929,21 @@ impl Parser {
                 self.get_next_token()?;
             }
             Token::Identifier => self.identifier_literal(line)?,
-            Token::Class => return Err(self.unsupported("class expression")),
-            Token::Function => return Err(self.unsupported("function expression")),
+            Token::Class => {
+                let saved = self.flags & flags::FOR;
+                self.flags &= !flags::FOR;
+                self.class_expression(line, None)?;
+                self.flags |= saved;
+            }
+            Token::Function => {
+                self.match_token(Token::Function)?;
+                if self.cur.token == Token::Multiply {
+                    self.get_next_token()?;
+                    self.generator_expression(line, None, 0)?;
+                } else {
+                    self.function_expression(line, None, 0)?;
+                }
+            }
             Token::New => self.new_expression()?,
             Token::LeftBrace => {
                 let saved = self.flags & flags::FOR;
@@ -992,29 +1055,52 @@ impl Parser {
         Ok(())
     }
 
-    /// An identifier in primary position: `x` → `Access`, or the async
-    /// arrow / `async function` covers (deferred).
+    /// An identifier in primary position: `x` → `Access`, the async
+    /// covers (`async function` / `async (…)` / `async x =>`), or a bare
+    /// single-identifier arrow head (`x =>`). Transliterates the
+    /// `XS_TOKEN_IDENTIFIER` arm of `fxLiteralExpression`.
     fn identifier_literal(&mut self, line: u32) -> PResult<()> {
         let escaped = self.cur.escaped;
         let mut symbol = self.cur.symbol.clone().unwrap_or_default();
         self.get_next_token()?;
+        let mut flag = 0u32;
         if symbol == "async" && !escaped && !self.cur.crlf {
             if self.cur.token == Token::Function {
-                return Err(self.unsupported("async function expression"));
+                self.match_token(Token::Function)?;
+                if self.cur.token == Token::Multiply {
+                    self.get_next_token()?;
+                    self.generator_expression(line, None, flags::ASYNC)?;
+                } else {
+                    self.function_expression(line, None, flags::ASYNC)?;
+                }
+                return Ok(());
             }
             if self.cur.token == Token::LeftParenthesis {
-                return Err(self.unsupported("async arrow / async(...) cover"));
+                self.group_expression(flags::ASYNC)?;
+                return Ok(());
             }
             if self.cur.token == Token::Identifier {
-                // async x => …  — an async arrow head.
-                return Err(self.unsupported("async arrow function"));
+                symbol = self.cur.symbol.clone().unwrap_or_default();
+                self.get_next_token()?;
+                flag = flags::ASYNC;
             }
         }
         if symbol == "await" {
             self.flags |= flags::AWAITING;
         }
         if !self.cur.crlf && self.cur.token == Token::Arrow {
-            return Err(self.unsupported("arrow function"));
+            self.check_strict_symbol(&symbol)?;
+            if flag != 0 && symbol == "await" {
+                return Err(self.error("invalid await"));
+            }
+            // Build a single-parameter ParamsBinding, then the arrow body.
+            self.push_symbol(symbol);
+            self.push_null();
+            self.push_node_struct(2, Token::Arg, line)?;
+            self.push_node_list(1)?;
+            self.push_node_struct(1, Token::ParamsBinding, line)?;
+            self.arrow_expression(flag)?;
+            return Ok(());
         }
         if symbol == "arguments" {
             self.flags |= flags::ARGUMENTS;
@@ -1077,17 +1163,17 @@ impl Parser {
         Ok(())
     }
 
-    /// `fxObjectExpression` — object literal, **data** properties only
-    /// (`k: v`, shorthand `{k}`, cover default `{k = v}`, computed
-    /// `[e]: v`, string/number keys, `...spread`). Method / accessor /
-    /// generator shorthand is deferred (needs function bodies).
+    /// `fxObjectExpression` — object literal: data properties (`k: v`,
+    /// shorthand `{k}`, cover default `{k = v}`, computed `[e]: v`,
+    /// string/number keys, `...spread`) and method / accessor / generator
+    /// / async shorthand (`{ m() {} }`, `{ get x() {} }`, `{ *g() {} }`,
+    /// `{ async f() {} }`).
     fn object_expression(&mut self) -> PResult<()> {
         let mut count = 0usize;
         let line = self.cur.line;
         self.match_token(Token::LeftBrace)?;
         loop {
             let prop_line = self.cur.line;
-            let mut prop_flags = 0u32;
             if self.cur.token == Token::RightBrace {
                 break;
             }
@@ -1097,15 +1183,38 @@ impl Parser {
                 self.push_node_struct(1, Token::Spread, prop_line)?;
             } else {
                 let (symbol, token0, token1, token2) = self.property_name()?;
+                let mut prop_flags = self.property_name_async_flag;
                 if token1 == Token::PrivateProperty {
                     return Err(self.error("invalid private property"));
-                } else if token2 == Token::Getter
-                    || token2 == Token::Setter
-                    || token2 == Token::Generator
-                    || token2 == Token::Function
-                    || self.cur.token == Token::LeftParenthesis
-                {
-                    return Err(self.unsupported("object method / accessor shorthand"));
+                } else if token2 == Token::Getter || token2 == Token::Setter {
+                    prop_flags |= flags::SHORTHAND;
+                    if token2 == Token::Getter {
+                        prop_flags |= flags::GETTER;
+                    } else {
+                        prop_flags |= flags::SETTER;
+                    }
+                    if self.cur.token == Token::LeftParenthesis {
+                        self.function_expression(prop_line, None, flags::SUPER)?;
+                    } else {
+                        return Err(self.error("missing ("));
+                    }
+                } else if token2 == Token::Generator {
+                    prop_flags |= flags::SHORTHAND | flags::METHOD;
+                    if self.cur.token == Token::LeftParenthesis {
+                        self.generator_expression(prop_line, None, flags::SUPER | prop_flags)?;
+                    } else {
+                        return Err(self.error("missing ("));
+                    }
+                } else if token2 == Token::Function {
+                    prop_flags |= flags::SHORTHAND | flags::METHOD;
+                    if self.cur.token == Token::LeftParenthesis {
+                        self.function_expression(prop_line, None, flags::SUPER | prop_flags)?;
+                    } else {
+                        return Err(self.error("missing ("));
+                    }
+                } else if self.cur.token == Token::LeftParenthesis {
+                    prop_flags |= flags::SHORTHAND | flags::METHOD;
+                    self.function_expression(prop_line, None, flags::SUPER | prop_flags)?;
                 } else if self.cur.token == Token::Colon {
                     self.get_next_token()?;
                     self.assignment_expression()?;
@@ -1154,6 +1263,7 @@ impl Parser {
         let mut token1 = Token::NoToken;
         let mut token2 = Token::NoToken;
         let line = self.cur.line;
+        self.property_name_async_flag = 0;
         self.look_ahead_once()?;
         let token0 = self.cur.token;
         if has_flag(token0, IDENTIFIER_NAME) {
@@ -1164,6 +1274,7 @@ impl Parser {
                 self.push_symbol(symbol.clone().unwrap_or_default());
                 token1 = Token::Property;
             } else if self.is_keyword("async")? && !ahead_crlf {
+                self.property_name_async_flag = flags::ASYNC;
                 self.get_next_token()?;
                 if self.cur.token == Token::Multiply {
                     token2 = Token::Generator;
@@ -1212,12 +1323,49 @@ impl Parser {
         }
 
         if token2 != Token::NoToken {
-            // A method / accessor / generator / async key follows the
-            // marker. These forms are deferred (they need a function
-            // body), and `object_expression` rejects them immediately
-            // after this returns, so the exact key parsing is elided —
-            // we do not consume further tokens here.
-            let _ = &mut token1;
+            // A `get`/`set`/`async`/`*` marker was consumed; parse the
+            // real method key that follows.
+            if has_flag(self.cur.token, IDENTIFIER_NAME) {
+                symbol = self.cur.symbol.clone();
+                self.push_symbol(symbol.clone().unwrap_or_default());
+                token1 = Token::Property;
+                self.get_next_token()?;
+            } else if self.cur.token == Token::PrivateIdentifier {
+                symbol = self.cur.symbol.clone();
+                self.push_symbol(symbol.clone().unwrap_or_default());
+                token1 = Token::PrivateProperty;
+                self.get_next_token()?;
+            } else if self.cur.token == Token::Integer {
+                self.push_property_index_integer(self.cur.integer, line);
+                token1 = Token::PropertyAt;
+                self.get_next_token()?;
+            } else if self.cur.token == Token::Number {
+                self.push_property_index_number(self.cur.number, line);
+                token1 = Token::PropertyAt;
+                self.get_next_token()?;
+            } else if self.cur.token == Token::String {
+                let s = self.cur.string.clone().unwrap_or_default();
+                self.push_symbol(s.clone());
+                symbol = Some(s);
+                token1 = Token::Property;
+                self.get_next_token()?;
+            } else if self.cur.token == Token::LeftBracket {
+                self.get_next_token()?;
+                self.comma_expression()?;
+                if self.cur.token != Token::RightBracket {
+                    return Err(self.error("missing ]"));
+                }
+                token1 = Token::PropertyAt;
+                self.get_next_token()?;
+            } else if token2 == Token::Getter || token2 == Token::Setter {
+                // `get` / `set` used as a plain property name.
+                self.push_symbol(symbol.clone().unwrap_or_default());
+                token1 = Token::Property;
+                token2 = Token::NoToken;
+            } else {
+                self.push_null();
+                return Err(self.error("missing identifier"));
+            }
         } else {
             // XS's `else fxGetNextToken(parser)` — consume the key token
             // (or the computed-key `]`, or a literal key) so the caller
@@ -1408,11 +1556,14 @@ impl Parser {
         Ok(())
     }
 
-    /// `fxGroupExpression` — a parenthesized expression. The arrow
-    /// cover-grammar reparse (`( a, b ) => …`) is deferred; a group
-    /// followed by `=>` reports [`ParseErrorKind::Unsupported`].
-    fn group_expression(&mut self, _flag: u32) -> PResult<()> {
+    /// `fxGroupExpression` — a parenthesized expression, and the two
+    /// cover grammars it resolves: an arrow head (`( a, b ) => …`,
+    /// reparsed via [`Self::parameters_binding_from_expressions`]) and,
+    /// when `flag` (async) is set but no `=>` follows, an `async(args)`
+    /// call.
+    fn group_expression(&mut self, flag: u32) -> PResult<()> {
         let mut comma_flag = false;
+        let mut spread_flag = false;
         let mut count = 0usize;
         let saved_await_yield = self.flags & (flags::AWAITING | flags::YIELDING);
         self.flags &= !(flags::AWAITING | flags::YIELDING);
@@ -1425,6 +1576,7 @@ impl Parser {
                 self.get_next_token()?;
                 self.assignment_expression()?;
                 self.push_node_struct(1, Token::Spread, line)?;
+                spread_flag = true;
             } else {
                 self.assignment_expression()?;
             }
@@ -1438,7 +1590,44 @@ impl Parser {
         line = self.cur.line;
         self.match_token(Token::RightParenthesis)?;
         if !self.cur.crlf && self.cur.token == Token::Arrow {
-            return Err(self.unsupported("arrow function"));
+            self.push_node_list(count)?;
+            self.push_node_struct(1, Token::Expressions, line)?;
+            if comma_flag && spread_flag {
+                return Err(self.error("invalid parameters"));
+            }
+            if !self.parameters_binding_from_expressions()? {
+                return Err(self.error("no parameters"));
+            }
+            self.check_strict_binding_top();
+            self.set_top_flags(flag);
+            let mut carry = saved_await_yield;
+            if self.flags & flags::AWAITING != 0 {
+                if flag != 0 || self.flags & flags::ASYNC != 0 {
+                    return Err(self.error("invalid await"));
+                }
+                carry |= flags::AWAITING;
+            }
+            if self.flags & flags::YIELDING != 0 {
+                return Err(self.error("invalid yield"));
+            }
+            self.arrow_expression(flag)?;
+            self.flags |= carry;
+            return Ok(());
+        }
+        if flag != 0 {
+            // `async ( args )` that is NOT an arrow head: an ordinary call
+            // of the identifier `async`.
+            self.push_node_list(count)?;
+            self.push_node_struct(1, Token::Params, line)?;
+            if spread_flag {
+                self.set_top_flags(flags::SPREAD);
+            }
+            self.push_symbol("async".to_string());
+            self.push_node_struct(1, Token::Access, line)?;
+            self.swap_nodes();
+            self.push_node_struct(2, Token::Call, line)?;
+            self.flags |= saved_await_yield;
+            return Ok(());
         }
         if count == 0 || comma_flag {
             self.push_null();
@@ -1472,6 +1661,8 @@ fn token_debug(token: Token) -> &'static str {
         _ => node_name(token),
     }
 }
+
+mod stmt;
 
 #[cfg(test)]
 mod tests;
