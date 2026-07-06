@@ -2276,6 +2276,16 @@ pub enum Halt {
     Return,
     /// The meter host refused more computation.
     MeterAbort,
+    /// The interpreter ran past a caller-supplied **step ceiling** without
+    /// completing — a bounded-execution guard for callers that install no
+    /// metering host (notably the bytecode-decoder fuzz harness, which
+    /// [`run_program`] leaves un-metered). A malformed backward branch that
+    /// targets itself (e.g. `BRANCH_STATUS_1` with offset `-2` at pc 0) or
+    /// any other non-terminating dispatch cycle aborts here in bounded time
+    /// instead of hanging. Carries the dispatch count reached at the abort.
+    /// Never produced by the default-unbounded [`Interp::run`], so it does
+    /// not perturb the oracle-differential paths.
+    StepLimit(u64),
     /// An opcode outside the stage-1 subset was reached. Carries the
     /// mnemonic so the harness can report exactly what to implement
     /// next, rather than papering over it.
@@ -2395,6 +2405,15 @@ pub struct Interp {
     /// the current computron count to it and halts with
     /// [`Halt::MeterAbort`] on refusal.
     meter_host: Option<Box<dyn FnMut(u64) -> bool>>,
+    /// Dispatch-count ceiling. `u64::MAX` (the default) is unbounded, so
+    /// the oracle-differential harness sees exactly the historical
+    /// behavior. A finite value — installed by [`Interp::run_bounded`] /
+    /// [`run_program_bounded`] for un-metered callers such as the decoder
+    /// fuzz harness — makes the dispatch loop halt with [`Halt::StepLimit`]
+    /// once `n_dispatched` reaches it, so a non-terminating program (a
+    /// self-targeting backward branch, an unbounded loop) aborts in bounded
+    /// time rather than wedging the caller.
+    step_limit: u64,
     /// The machine slot heap (design § Value and heap model).
     pub slots: SlotArena,
     /// The machine chunk heap (UTF-16BE strings and later data).
@@ -2903,6 +2922,7 @@ impl Interp {
             meter: Meter::new(),
             cost: crate::cost::CostRecorder::default(),
             meter_host: None,
+            step_limit: u64::MAX,
             slots,
             chunks,
             static_str,
@@ -4187,6 +4207,16 @@ impl Interp {
     }
 
     /// Run a program bytecode buffer to completion.
+    /// Run under a dispatch-count ceiling: identical to [`Self::run`] but
+    /// halts with [`Halt::StepLimit`] if the program dispatches `step_limit`
+    /// opcodes without completing. For un-metered callers (the decoder fuzz
+    /// harness) that must stay total on arbitrary/malformed bytecode without
+    /// wedging on a non-terminating dispatch cycle.
+    pub fn run_bounded(&mut self, code: &[u8], step_limit: u64) -> RunOutcome {
+        self.step_limit = step_limit;
+        self.run(code)
+    }
+
     pub fn run(&mut self, code: &[u8]) -> RunOutcome {
         let mut halt = self.dispatch(code);
         // Pump-loop latch: after the script settles, drain the promise job
@@ -4273,6 +4303,16 @@ impl Interp {
         }
 
         loop {
+            // Bounded-execution guard (default `u64::MAX` = unbounded, so the
+            // oracle-differential paths are untouched). A finite ceiling makes
+            // a non-terminating program — a self-targeting backward branch, an
+            // unbounded loop reached with no metering host armed — abort here
+            // in bounded time instead of spinning forever. Checked at the loop
+            // top so every recursive `dispatch_at` entry (callbacks, promise
+            // jobs) shares the one cumulative ceiling.
+            if self.n_dispatched >= self.step_limit {
+                return Halt::StepLimit(self.n_dispatched);
+            }
             if pc >= len {
                 return Halt::Decode(format!("pc {} past end {}", pc, len));
             }
@@ -16214,6 +16254,7 @@ mod tests {
                 Halt::Return
                 | Halt::Throw(_)
                 | Halt::MeterAbort
+                | Halt::StepLimit(_)
                 | Halt::Unsupported(_)
                 | Halt::StackOverflow(_) => {}
                 Halt::Decode(_) => unreachable!("handled above"),

@@ -813,3 +813,53 @@ global `match`/`replace` collection, the `$`-substitution grammar and function
 replacement in `replace`; a limit that truncates, an empty-matching separator,
 and a non-ASCII subject in `split`; and a string (non-RegExp) argument to the
 String methods (the `withoutRegexp` coerce path).
+
+## Decoder-hang trophy: a malformed backward branch that never terminated (stage-4b)
+
+**Target 2 (bytecode decoder) caught a real non-termination bug — and the
+harness is now wedge-proof against future ones.** At the stage-4a modules tip
+(`e08b83ac3`), `cargo test --workspace` no longer completed: the fuzz test
+`decoder_never_panics_on_arbitrary_bytes` (`endor-fuzz/src/lib.rs`) entered a
+deterministic infinite loop, burning 2h+ of CPU at 99.9% on that single test.
+
+**The input.** Seed 1750 of the test's LCG sweep decodes to the 14-byte string
+`[25 fe 86 1c 28 ee 59 08 a6 f7 ec c0 0d 17]`; the minimal core is the first
+two bytes `[25 fe]`. Byte `0x25` is `XS_CODE_BRANCH_STATUS_1` (the
+generator/async resume epilogue); its 1-byte operand `0xfe` is offset `-2`.
+With a 2-byte instruction at pc 0, `branch_target(0, 2, -2) = 0` — the branch
+**targets its own pc**, a zero-progress self-loop. `disassemble` terminates
+fine (it walks lengths, not control flow); the hang is in the interpreter's
+dispatch loop.
+
+**Root cause and the commit that introduced it.** The interpreter only aborts a
+backward branch through the metering host (`check_meter`), but the fuzz entry
+`run_program` arms **no** metering host (`meter_host: None` → `check_meter`
+always `Continue`). The pre-existing "backward branch off the front"
+regression case `[16 80]` terminates only incidentally — its offset drives the
+pc out of bounds to a `Halt::Decode`. A branch that targets an **in-bounds**
+pc (a legitimate loop shape, but here degenerate) has no out-of-bounds escape
+and spins forever. This became reachable at **`b41446ad7`** (*engine: generator
+functions + iteration protocol, stage-4 child 3/8*): before it, opcode 37 was
+an unimplemented byte that halted with `Halt::Unsupported`; that commit gave it
+a real backward-branch handler. The s8 acceptance of `0b991a8b4` still passed
+the suite `128/0` because its opcode set had not yet armed byte `0x25`.
+
+**The fix (two layers).**
+1. *Root — a total interpreter for un-metered callers.* A dispatch-count
+   ceiling (`Interp::run_bounded` / `run_program_bounded`, `Halt::StepLimit`).
+   The default `run` stays `u64::MAX`-unbounded, so every oracle-differential
+   path is byte-for-byte unchanged; only the fuzz harness installs the finite
+   `DECODER_STEP_LIMIT` (2,000,000 dispatches — far above any well-formed
+   `<= 40`-byte program, so it fires only on a genuine non-terminating cycle).
+   A self-loop now aborts with `Halt::StepLimit` in single-digit milliseconds.
+2. *Lock — the offending input as a named regression case* (both the 14-byte
+   seed string and the 2-byte core) plus a wedge-proofing test
+   `decoder_hang_is_bounded_not_infinite` asserting the self-branch hits the
+   step ceiling rather than completing or hanging. Any **future** decode
+   non-termination now fails loudly in milliseconds instead of wedging the
+   whole workspace bar.
+
+**Bar is tractable again.** `cargo test --workspace -- --test-threads=1`
+completes green — **149 passed, 0 failed** — in **~5 s** wall-clock on a warm
+build (the endor-fuzz binary's own run, including the 2000-seed decoder sweep,
+is 1.3 s). `#![forbid(unsafe_code)]` intact across the workspace.

@@ -49,6 +49,19 @@ pub fn run_program(bytecode: &[u8]) -> RunOutcome {
     Interp::new().run(bytecode)
 }
 
+/// Run a program bytecode buffer under a **dispatch-count ceiling**, halting
+/// with [`Halt::StepLimit`] if the program dispatches `step_limit` opcodes
+/// without completing. The un-metered [`run_program`] is not total on
+/// arbitrary bytecode — a malformed backward branch that targets itself (or
+/// any other non-terminating dispatch cycle) spins forever because no
+/// metering host is armed to refuse it. The bytecode-decoder fuzz harness
+/// runs every arbitrary/malformed input through this bounded entry so a hang
+/// becomes a bounded [`Halt::StepLimit`] in milliseconds instead of wedging
+/// the whole test binary.
+pub fn run_program_bounded(bytecode: &[u8], step_limit: u64) -> RunOutcome {
+    Interp::new().run_bounded(bytecode, step_limit)
+}
+
 /// Run a program bytecode buffer with its C-XS `symbols` atom, so the
 /// program's intrinsic references (`Object`, `Boolean`, the Error
 /// constructors, …) relink to endor's intrinsics by name (design §

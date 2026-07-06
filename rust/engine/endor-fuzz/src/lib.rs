@@ -16,7 +16,7 @@
 //!   interpreter, which must degrade to a `Halt::Decode`, never panic
 //!   (XS treats bytecode as trusted; endor's loader must not).
 
-use endor_vm::{disassemble, run_program};
+use endor_vm::{disassemble, run_program, run_program_bounded};
 
 /// Stage-3b XSRE matcher fuzz arm (child 8/9): a structure-aware regexp
 /// generator + differential check of `endor-regexp` against the pin.
@@ -1647,14 +1647,29 @@ pub fn differential_check_result_only(source: &str) -> Result<(), Divergence> {
     Ok(())
 }
 
-/// Target 2 body: the decoder and interpreter must not panic on
-/// arbitrary bytes. Returns the disassembled length so a caller can
-/// assert liveness; the point is simply that it returns.
+/// A dispatch-count ceiling for the decoder fuzz harness. The un-metered
+/// [`run_program`] is not total on arbitrary bytecode — a malformed
+/// backward branch that targets itself (e.g. `BRANCH_STATUS_1` with offset
+/// `-2` at pc 0, decoded from seed 1750 of
+/// [`decoder_never_panics_on_arbitrary_bytes`]) spins forever with no
+/// metering host armed to refuse it. Bounding execution turns any such hang
+/// into a [`endor_vm::Halt::StepLimit`] in milliseconds. The bound is far
+/// above any well-formed `<= 40`-byte fuzz program's dispatch count, so it
+/// only ever fires on a genuine non-terminating cycle.
+pub const DECODER_STEP_LIMIT: u64 = 2_000_000;
+
+/// Target 2 body: the decoder and interpreter must not panic **or hang** on
+/// arbitrary bytes. Returns the disassembled length so a caller can assert
+/// liveness; the point is simply that it returns — in bounded time.
 pub fn decoder_is_panic_free(bytes: &[u8]) -> usize {
     let dis = disassemble(bytes);
-    // The interpreter must also degrade gracefully (Halt::Decode on a
-    // truncated or invalid stream), never panic.
-    let _ = run_program(bytes);
+    // The interpreter must also degrade gracefully — a `Halt::Decode` on a
+    // truncated/invalid stream, a bounded `Halt::StepLimit` on a
+    // non-terminating dispatch cycle — never panic and never hang. The
+    // bounded entry is the wedge-proofing: without it a self-targeting
+    // backward branch would spin the whole test binary forever (the
+    // stage-4a decoder-hang regression).
+    let _ = run_program_bounded(bytes, DECODER_STEP_LIMIT);
     dis.len()
 }
 
@@ -2527,5 +2542,45 @@ mod tests {
         let _ = decoder_is_panic_free(&[0x8f, 0x00, 0x00]);
         // Backward branch off the front.
         let _ = decoder_is_panic_free(&[0x16, 0x80]);
+        // Regression (stage-4a decoder hang, seed 1750): a `BRANCH_STATUS_1`
+        // (0x25) with offset 0xfe (-2) targets its own pc — a zero-progress
+        // self-loop. The generators child (b41446ad7) gave opcode 37 a real
+        // backward-branch handler; before that it was an unimplemented byte
+        // that halted. With no metering host armed, this spun `run_program`
+        // forever and wedged `cargo test --workspace`. The bounded decoder
+        // entry now aborts it with `Halt::StepLimit`. Full 14-byte seed
+        // string plus the minimal 2-byte core.
+        let _ = decoder_is_panic_free(&[
+            0x25, 0xfe, 0x86, 0x1c, 0x28, 0xee, 0x59, 0x08, 0xa6, 0xf7, 0xec, 0xc0, 0x0d, 0x17,
+        ]);
+        let _ = decoder_is_panic_free(&[0x25, 0xfe]);
+    }
+
+    /// Wedge-proofing lock: the self-targeting backward branch that caused the
+    /// stage-4a decoder hang must abort with a bounded `Halt::StepLimit` — not
+    /// spin — and every fixed malformed case above must return promptly. A
+    /// future non-terminating decode arm fails this in milliseconds (the
+    /// `StepLimit` assertion) instead of hanging the whole workspace bar.
+    #[test]
+    fn decoder_hang_is_bounded_not_infinite() {
+        // The minimal reproducer: `BRANCH_STATUS_1` (0x25), offset -2 → pc 0.
+        let core = run_program_bounded(&[0x25, 0xfe], DECODER_STEP_LIMIT);
+        assert_eq!(
+            core.halt,
+            endor_vm::Halt::StepLimit(DECODER_STEP_LIMIT),
+            "self-targeting backward branch must hit the step ceiling, not complete or hang"
+        );
+        // The full seed-1750 string aborts the same bounded way.
+        let full = run_program_bounded(
+            &[
+                0x25, 0xfe, 0x86, 0x1c, 0x28, 0xee, 0x59, 0x08, 0xa6, 0xf7, 0xec, 0xc0, 0x0d, 0x17,
+            ],
+            DECODER_STEP_LIMIT,
+        );
+        assert!(
+            matches!(full.halt, endor_vm::Halt::StepLimit(_)),
+            "seed-1750 decode must abort under the step ceiling, got {:?}",
+            full.halt
+        );
     }
 }
