@@ -561,6 +561,55 @@ executor, and — stage 4's charter — **async functions / await** (the
 `structural:async-or-can-block` skip dominating the section); each self-names
 `Halt::Unsupported` rather than answer a wrong value or a computron divergence.
 
+The stage-4 **async/await** child (4/8) lands the **promise native-handler
+double-settle keystone** the s7 review ledger blocked the combinators on, all
+bit-exact (result AND computron) against the pin. The `[[AlreadyResolved]]`
+guard is refactored to be per resolving-function **pair** (a `promise_guards`
+index shared by the pair, XS's boolean slot in each `fxPushPromiseFunctions`
+home object) rather than per-promise: resolving a promise with a **thenable**
+does NOT settle it — `fxResolvePromise` acquires a **second** resolving pair
+(with its own fresh guard) and queues a `PromiseResolveThenableJob`, so the
+promise stays pending until the thenable's `then(res, rej)` fires at the drain,
+and the two-level structure makes every **double-settle** (a thenable/executor
+calling `res` twice, or `res` then `rej`, or `rej` then `res`) a metered no-op.
+On that substrate **thenable adoption** lands: `Promise.resolve(thenable)`, an
+executor resolving with a thenable, and a `.then` handler **returning** an
+object-literal thenable — the `mxGetID(_then)` probe metered as one dispatch
+(`1<<16`) on any reference resolve (a non-thenable object fulfills with the
+object as-is), the `fxOnThenable` drain job (`PROMISE_THENABLE_JOB_FRAME_
+METERING`), the second resolving pair's 13 `fxNewSlot`s, and the count-3 job's
+slots. **Long `then`-chains** (each handler's result feeding the next reaction)
+and the **`Promise.resolve(nativePromise)` identity fast path** (`mxGetID(_
+constructor)` + `fxIsSameValue` = `2.5<<16`, previously an untested `0`) land
+bit-exact too. `built-ins/Promise` whole-tree dual-run grows to **`total=474
+covered=9 divergent=0`** (from 7 — the thenable-resolve and identity cases now
+covered), with the acceptance subtrees all `divergent=0`
+(`prototype/then covered=1`, `resolve covered=3`, `reject covered=1`,
+`all/race/allSettled/any/prototype/finally covered≤1`). The curated
+`stage4-async-promises.js` corpus (20 programs) is locked as the cargo bar
+`stage4_async_promises_corpus_is_bit_exact_against_oracle`, and the
+thenable-adoption allocation/drain path is exercised Miri-clean
+(`promise_thenable_adoption_is_miri_clean`). The honest **named skips** are: a
+reaction handler / thenable `then` that **throws** (`promise:handler-throw` /
+`promise:thenable-then-throw` — cleanly unwinding the re-entrant callback frame
+after an internally-caught throw is the throw-family increment, alongside the
+generator throw-into-suspended skips), `resolve(promise-itself)`
+(`promise:resolve-self`, a catchable TypeError), and **adopting a native
+promise** (`promise:adopt-native-thenable`, whose `.then` is
+`%Promise.prototype%.then` — it needs the resolving functions registered as
+**native** reaction handlers). The **reported scope fold**, carried forward to a
+follow-up child (each already a named skip, never a wrong value or a
+divergence): **`Promise.prototype.finally`** and the **`all`/`race`/
+`allSettled`/`any` combinators** (both blocked on the same infrastructure — a
+reaction handler that is a **native** function, which the current drain's
+`run_callback` only-user-function trampoline cannot invoke; `finally`'s
+`finallyAux` and the combinators' `fxCombinePromisesCallback` are both native
+reaction handlers), and the whole **async-function surface** —
+`XS_CODE_ASYNC_FUNCTION`/`await`, `XS_CODE_ASYNC_GENERATOR_FUNCTION`/
+`for-await-of`, and the async-iterator protocol (the designated scope fold). The
+keystone was the gating deliverable ("resolve it first"); it unblocks the folded
+surfaces, which now share one clear prerequisite (native reaction handlers).
+
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
 `endor-vm::symbols`) carries the C-XS compiler's program-local id→name
