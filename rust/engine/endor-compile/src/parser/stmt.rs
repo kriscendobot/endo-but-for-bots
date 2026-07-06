@@ -358,6 +358,7 @@ impl Parser {
             if (has_flag(ahead, BEGIN_BINDING) || ahead == Token::Await || ahead == Token::Yield)
                 && (block_it != 0 || !ahead_crlf || ahead == Token::LeftBracket)
             {
+                self.cur.token = Token::Let;
                 if block_it == 0 {
                     return Err(self.error("no block"));
                 }

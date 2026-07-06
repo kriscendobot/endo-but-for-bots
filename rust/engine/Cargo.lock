@@ -23,6 +23,9 @@ dependencies = [
 [[package]]
 name = "endor-compile"
 version = "0.0.1"
+dependencies = [
+ "endor-oracle",
+]
 
 [[package]]
 name = "endor-fuzz"

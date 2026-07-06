@@ -9,6 +9,21 @@
 use crate::ast::dump;
 use crate::parser::{ParseErrorKind, Parser};
 
+/// Parse `src` as a whole Script (sloppy) and dump the `Program` tree.
+fn prog(src: &str) -> String {
+    let mut p = Parser::new(src, false, false).unwrap_or_else(|e| panic!("lex {src:?}: {e}"));
+    let item = p.parse_program(false).unwrap_or_else(|e| panic!("parse {src:?}: {e}"));
+    dump(&item)
+}
+
+/// A table of `(source, expected-program-dump)` pairs.
+fn check_prog(cases: &[(&str, &str)]) {
+    for (src, want) in cases {
+        let got = prog(src);
+        assert_eq!(&got, want, "\n  source:   {src}\n  expected: {want}\n  got:      {got}");
+    }
+}
+
 /// Parse `src` as an assignment expression (sloppy mode) and dump it.
 fn expr(src: &str) -> String {
     let mut p = Parser::new(src, false, false).unwrap_or_else(|e| panic!("lex {src:?}: {e}"));
@@ -329,4 +344,261 @@ fn no_reference_is_a_syntax_error() {
     let mut p = Parser::new("1 = 2", false, false).unwrap();
     let err = p.parse_assignment_expression().unwrap_err();
     assert_eq!(err.kind, ParseErrorKind::Syntax);
+}
+
+// ============================================================
+// Statement / declaration fixtures (stage-5 child 3). Each dump was read
+// off `xsSyntaxical.c` construct by construct and pins the tree shape —
+// node kind, child order, and the parser flags XS stamps — that the
+// byte-identity coder downstream depends on.
+// ============================================================
+
+/// Parse `src` as a Module and dump the `Module` tree.
+fn module(src: &str) -> String {
+    let mut p = Parser::new(src, false, true).unwrap_or_else(|e| panic!("lex {src:?}: {e}"));
+    let item = p.parse_module().unwrap_or_else(|e| panic!("parse {src:?}: {e}"));
+    dump(&item)
+}
+
+#[test]
+fn variable_declarations() {
+    check_prog(&[
+        ("var x = 1;", "(Program (Binding (Var #x) (Integer 1)))"),
+        ("var x;", "(Program (Var #x))"),
+        (
+            "let a, b = 2;",
+            "(Program (Statements [(Let #a) (Binding (Let #b) (Integer 2))]))",
+        ),
+        ("const k = 3;", "(Program (Binding (Const #k) (Integer 3)))"),
+    ]);
+}
+
+#[test]
+fn destructuring_declarations() {
+    check_prog(&[
+        (
+            "const {a, b: c} = o;",
+            "(Program (Binding (ObjectBinding [(PropertyBinding #a (Const #a)) (PropertyBinding #b (Const #c))]) (Access #o)))",
+        ),
+        (
+            "const [x, , ...y] = a;",
+            "(Program (Binding (ArrayBinding [(Const #x) (SkipBinding) (RestBinding (Const #y))]) (Access #a)))",
+        ),
+        (
+            "var {a} = b, [c] = d;",
+            "(Program (Statements [(Binding (ObjectBinding [(PropertyBinding #a (Var #a))]) (Access #b)) (Binding (ArrayBinding [(Var #c)]) (Access #d))]))",
+        ),
+    ]);
+}
+
+#[test]
+fn destructuring_assignment_target() {
+    // A `[a, b] = c` assignment: `fxCheckReference` reparses the array
+    // literal into an `ArrayBinding`.
+    check_prog(&[(
+        "[a, b] = c",
+        "(Program (Statement (Assign (ArrayBinding [(Access #a) (Access #b)]) (Access #c))))",
+    )]);
+}
+
+#[test]
+fn control_flow_statements() {
+    check_prog(&[
+        (
+            "if (a) b; else c;",
+            "(Program (If (Access #a) (Statement (Access #b)) (Statement (Access #c))))",
+        ),
+        (
+            "while (a) b;",
+            "(Program (Label () (While (Access #a) (Statement (Access #b)))))",
+        ),
+        (
+            "do x; while (a);",
+            "(Program (Label () (Do (Statement (Access #x)) (Access #a))))",
+        ),
+        (
+            "with (o) x;",
+            "(Program (With (Access #o) (Statement (Access #x))))",
+        ),
+        ("debugger;", "(Program (Debugger))"),
+        (
+            "a; b;",
+            "(Program (Statements [(Statement (Access #a)) (Statement (Access #b))]))",
+        ),
+        (
+            "{ let x = 1; }",
+            "(Program (Block (Statements [(Binding (Let #x) (Integer 1))])))",
+        ),
+    ]);
+}
+
+#[test]
+fn loop_headers() {
+    check_prog(&[
+        (
+            "for (var i = 0; i < 10; i++) x;",
+            "(Program (Label () (For (Binding (Var #i) (Integer 0)) (Less (Access #i) (Integer 10)) (Increment (Access #i)) (Statement (Access #x)))))",
+        ),
+        (
+            "for (const k in o) x;",
+            "(Program (Label () (ForIn (Const #k) (Access #o) (Statement (Access #x)))))",
+        ),
+        (
+            "for (const v of a) x;",
+            "(Program (Label () (ForOf (Const #v) (Access #a) (Statement (Access #x)))))",
+        ),
+        (
+            "label: for (;;) break label;",
+            "(Program (Label #label (Label () (For () () () (Break #label)))))",
+        ),
+    ]);
+}
+
+#[test]
+fn switch_and_try() {
+    check_prog(&[
+        (
+            "switch (x) { case 1: a; break; default: b; }",
+            "(Program (Switch (Access #x) [(Case (Integer 1) (Statements [(Statement (Access #a)) (Break ())])) (Case () (Statement (Access #b)))]))",
+        ),
+        (
+            "try { a; } catch (e) { b; } finally { c; }",
+            "(Program (Try (Block (Statements [(Statement (Access #a))])) (Catch (Let #e) (Statements [(Statement (Access #b))])) (Block (Statements [(Statement (Access #c))]))))",
+        ),
+    ]);
+}
+
+#[test]
+fn function_and_arrow_declarations() {
+    check_prog(&[
+        (
+            "function f(a, b) { return a + b; }",
+            "(Program (Define #f (Function :target #f (ParamsBinding [(Arg #a) (Arg #b)]) (Body (Return (Add (Access #a) (Access #b)))))))",
+        ),
+        (
+            "x => x + 1",
+            "(Program (Statement (Function :arrow () (ParamsBinding [(Arg #x ())]) (Body (Return (Add (Access #x) (Integer 1)))))))",
+        ),
+        (
+            "(a, b) => a",
+            "(Program (Statement (Function :arrow () (ParamsBinding [(Arg #a) (Arg #b)]) (Body (Return (Access #a))))))",
+        ),
+        (
+            "async function f() { await x; }",
+            "(Program (Define #f (Function :target :async #f (ParamsBinding :async []) (Body :async (Statement :async (Await :async (Access :async #x)))))))",
+        ),
+        (
+            "function* g() { yield 1; }",
+            "(Program (Define #g (Generator :generator #g (ParamsBinding :generator []) (Body :generator (Statement :generator (Yield :generator (Integer 1)))))))",
+        ),
+    ]);
+}
+
+#[test]
+fn class_declaration() {
+    // Members are parsed faithfully and kept in the `items` list in source
+    // order; the field/static-block → init-function surgery is folded to
+    // the coder (so the two init slots are `()`). Everything inside a class
+    // body is strict, hence the pervasive `:strict`.
+    check_prog(&[(
+        "class C extends B { m() {} static s() {} #p = 1; }",
+        "(Program (Binding (Let #C) (Class :strict #C (Access :strict #B) \
+         [(Property :strict :method #m (Function :strict :super :target :method () (ParamsBinding :strict []) (Body :strict (Statement :strict (Undefined :strict))))) \
+         (Property :strict :method :static #s (Function :strict :super :target :method :static () (ParamsBinding :strict []) (Body :strict (Statement :strict (Undefined :strict))))) \
+         (PrivateProperty :strict ##p (Integer 1))] () () \
+         (Function :strict :super :target :derived :method () (ParamsBinding :strict [(RestBinding :strict (Arg :strict #args ()))]) (Body :strict (Statement :strict (Super :strict (Params :strict :spread [(Spread :strict (Access :strict #args))]))))))))",
+    )]);
+}
+
+#[test]
+fn object_methods_and_accessors() {
+    check_prog(&[(
+        "({ get x() { return 1; }, *gen() {}, async af() {} })",
+        "(Program (Statement (Expressions [(Object \
+         [(Property :getter :shorthand #x (Function :super :target () (ParamsBinding []) (Body (Return (Integer 1))))) \
+         (Property :method :shorthand #gen (Generator :super :generator :method :shorthand () (ParamsBinding :generator []) (Body :generator (Statement :generator (Undefined :generator))))) \
+         (Property :async :method :shorthand #af (Function :super :target :async :method :shorthand () (ParamsBinding :async []) (Body :async (Statement :async (Undefined :async)))))])])))",
+    )]);
+}
+
+#[test]
+fn module_imports() {
+    check_prog_module(&[
+        (
+            "import x from 'm';",
+            "(Module :strict (Import :strict :async [(Specifier :strict :async #*default* #x)] (String \"m\") ()))",
+        ),
+        (
+            "import {a, b as c} from 'm';",
+            "(Module :strict (Import :strict :async [(Specifier :strict :async #a ()) (Specifier :strict :async #b #c)] (String \"m\") ()))",
+        ),
+        (
+            "import * as ns from 'm';",
+            "(Module :strict (Import :strict :async [(Specifier :strict :async () #ns)] (String \"m\") ()))",
+        ),
+    ]);
+}
+
+#[test]
+fn module_exports() {
+    check_prog_module(&[
+        (
+            "export {a, b};",
+            "(Module :strict (Export :strict :async [(Specifier :strict :async #a ()) (Specifier :strict :async #b ())] () ()))",
+        ),
+        (
+            "export * from 'm';",
+            "(Module :strict (Export :strict :async [(Specifier :strict :async () ())] (String \"m\") ()))",
+        ),
+        (
+            "export const x = 1;",
+            "(Module :strict (Statements :strict :async [(Binding :strict :async (Const :strict :async #x) (Integer 1)) (Export :strict :async [(Specifier :strict :async #x ())] () ())]))",
+        ),
+        (
+            "export default 42;",
+            "(Module :strict (Statements :strict :async [(Statement :strict :async (Assign :strict :async (Const :strict :async #*default* ()) (Integer 42))) (Export :strict :async [(Specifier :strict :async #*default* ())] () ())]))",
+        ),
+    ]);
+}
+
+/// `check_prog` for the module goal.
+fn check_prog_module(cases: &[(&str, &str)]) {
+    for (src, want) in cases {
+        let got = module(src);
+        assert_eq!(&got, want, "\n  source:   {src}\n  expected: {want}\n  got:      {got}");
+    }
+}
+
+#[test]
+fn directive_prologue_upgrades_strict() {
+    // A `"use strict"` prologue flips strict mode, which then shows on the
+    // Program root and every subsequently built node (inherited `:strict`).
+    let out = prog("\"use strict\"; x;");
+    assert_eq!(
+        out,
+        "(Program :strict (Statements :strict [(Statement (String \"use strict\")) (Statement :strict (Access :strict #x))]))"
+    );
+}
+
+#[test]
+fn statement_level_early_errors() {
+    // Parser-level early errors XS raises (not scoper/coder ones): a
+    // top-level `return`, and assignment into a literal.
+    for src in ["return 1;", "1 = 2;"] {
+        let mut p = Parser::new(src, false, false).unwrap();
+        let err = p.parse_program(false).unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::Syntax, "src {src:?}");
+    }
+}
+
+#[test]
+fn program_never_panics_on_garbage() {
+    // The whole-program entry upholds the fuzz invariant too.
+    for src in ["}", "for(", "class", "function(", "if", "case 1:", "{{{{", "export", "import"] {
+        let mut p = match Parser::new(src, false, false) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let _ = p.parse_program(false);
+    }
 }

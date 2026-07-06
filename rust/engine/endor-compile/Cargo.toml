@@ -9,3 +9,8 @@ publish.workspace = true
 [lib]
 name = "endor_compile"
 path = "src/lib.rs"
+
+[dev-dependencies]
+# The conformance oracle (C-XS at the pin), used only by the whole-corpus
+# parse-smoke integration test to certify accept/reject agreement.
+endor-oracle = { path = "../endor-oracle" }
