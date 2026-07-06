@@ -1162,6 +1162,32 @@ mod tests {
     }
 
     #[test]
+    fn bound_function_in_call_apply_position_self_names_never_diverges() {
+        // The loaded gun (`FuncInfo::default().body_start = 0`): a bound
+        // function reshaped through `.call`/`.apply` used to dispatch at pc 0
+        // — a SILENT completion divergence (never an abort, so worse than a
+        // crash for the never-a-wrong-value invariant). Exactness is not
+        // affordable now (the correct trampoline stacks the `.call`/`.apply`
+        // re-dispatch onto the bound re-dispatch, two calibrated overheads),
+        // so each must self-name `Halt::Unsupported("bind:bound-callback")` —
+        // an honest skip, never a wrong value and never a dispatch at pc 0.
+        let programs = [
+            "var b=function(v){return v;}.bind(null); b.call(null)",
+            "var b=function(v){return 7;}.bind(null); b.apply(null,[])",
+            "function s(a,b){return a+b} var b=s.bind(null,1); b.call(null,2)",
+            "function s(a,b){return a+b} var b=s.bind(null,1); b.apply(null,[2])",
+        ];
+        for p in programs {
+            let r = dual_run(p).expect("oracle machine available");
+            assert!(
+                matches!(&r.endor_halt, Halt::Unsupported(name) if *name == "bind:bound-callback"),
+                "{p:?}: expected an honest bind:bound-callback skip (no abort, no wrong value), got halt={:?} result_agrees={} computrons_agree={}",
+                r.endor_halt, r.result_agrees, r.computrons_agree,
+            );
+        }
+    }
+
+    #[test]
     fn stage3b_object_statics_corpus_is_bit_exact_against_oracle() {
         // The stage-3b object-statics + intern-table acceptance bar (child
         // 5/9): every `hasOwnProperty` over the global string→id intern table

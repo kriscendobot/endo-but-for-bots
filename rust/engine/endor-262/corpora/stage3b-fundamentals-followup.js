@@ -94,3 +94,20 @@ function f4(a,b,c,d){return a+b+c+d} var g4=f4.bind(undefined,1,2,3,4); g4()
 function f5(a,b,c,d,e){return 0} f5.bind(undefined,1,2).length
 function fmul(a,b){return a*b} var gm=fmul.bind(null,6); gm(7)
 function fd(a){return a} var gd=fd.bind(undefined,5); var hd=gd.bind(undefined); hd.name
+
+// --- bound function in CALLBACK position (trampolines through the target) --
+// A bound function reaching a callback-driving site (Array methods, Map/Set
+// forEach, a then-handler) must dispatch the TARGET with the bound this/args
+// prepended, NOT re-execute the program from pc 0. Regression for the
+// whole-program-from-pc-0 abort (map/forEach/filter/reduce/flatMap crashed
+// the runner) and the divergent then-handler completion.
+[0].map(function(){return 1;}.bind(null))
+[1,2,3].forEach(function(){}.bind(null))
+[1,0,2].filter(function(x){return x;}.bind(null))
+[1,2].reduce(function(a,b){return a+b;}.bind(null))
+[0].flatMap(function(){return 1;}.bind(null))
+function fcadd(a,b){return a+b} var bca=fcadd.bind(null,10); [1,2].map(bca)
+var mcb=new Map(); mcb.set(1,2); mcb.forEach(function(){}.bind(null)); mcb.size
+var scb=new Set(); scb.add(9); scb.forEach(function(){}.bind(null)); scb.size
+Promise.resolve(1).then(function(v){return v;}.bind(null))
+Promise.resolve(5).then(function(v){return v*2;}.bind(null,7))

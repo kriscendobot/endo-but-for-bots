@@ -1115,7 +1115,19 @@ struct BoundData {
 struct FuncInfo {
     /// Start offset of the function body in the program code buffer (the
     /// byte just past the `code` opcode's operand — where `begin_*` sits).
-    body_start: usize,
+    ///
+    /// `None` for any instance that has **no runnable bytecode body**: a
+    /// native/method built-in, and — the trap this `Option` exists to defuse
+    /// — a **bound function** (`f.bind(...)`), whose callability is realized
+    /// only by the bound trampoline ([`Interp::enter_call_bound`] and the
+    /// bound arms of [`Interp::run_callback`]). A plain `usize` here was a
+    /// loaded gun: `FuncInfo::default()` gave a bound entry `body_start = 0`,
+    /// indistinguishable from "program start", so any dispatch site that
+    /// missed the bound gate re-executed the whole program from pc 0 inside
+    /// the callee frame (unbounded recursion → process abort, or a silently
+    /// divergent completion). Now [`Interp::enter_call`] unwraps this with a
+    /// loud `Halt`, so a future missed gate self-names instead of recursing.
+    body_start: Option<usize>,
     /// Length of the body chunk (the `code` opcode's operand).
     body_len: usize,
     /// The captured closure environment (a frame-cell owner), or `NULL`
@@ -1637,7 +1649,7 @@ pub enum NativeMethod {
 impl Default for FuncInfo {
     fn default() -> Self {
         FuncInfo {
-            body_start: 0,
+            body_start: None,
             body_len: 0,
             closures: crate::value::SlotIndex::NULL,
             native: None,
@@ -4582,7 +4594,7 @@ impl Interp {
                         // integer value.)
                         let arity = code.get(body_start + 1).copied().unwrap_or(0) as u32;
                         let info = self.functions.entry(f).or_default();
-                        info.body_start = body_start;
+                        info.body_start = Some(body_start);
                         info.body_len = n;
                         info.arity = arity;
                     }
@@ -5900,7 +5912,16 @@ impl Interp {
             Payload::Reference(f) if self.functions.contains_key(&f) => f,
             _ => return Err(Halt::Throw("call: not a function".into())),
         };
-        let body_start = self.functions[&func].body_start;
+        // The single choke point every user-function dispatch funnels through.
+        // A `None` body means the callee has no runnable bytecode — a bound
+        // function (or any bodyless instance) that reached here past a missed
+        // gate. Fail loud and self-named rather than dispatch at pc 0 (the
+        // whole-program re-execution that aborts / silently diverges); the
+        // in-range gates trampoline bound callees before they get here.
+        let body_start = match self.functions[&func].body_start {
+            Some(bs) => bs,
+            None => return Err(Halt::Unsupported("bind:bound-callback")),
+        };
         let this_val = self.stack[base];
         // Stack-overflow guard (XS's `fxOverflow` on the callee's frame
         // allocation): entering this call suspends the caller (its frame
@@ -5960,22 +5981,50 @@ impl Interp {
         this: Slot,
         args: &[Slot],
     ) -> Result<Slot, Halt> {
-        // Only a user (bytecode) function is driven here; a native callback or
-        // a non-callable is out of the modeled subset.
-        match func.value {
-            Payload::Reference(f)
-                if self.functions.contains_key(&f)
-                    && self.functions[&f].native.is_none()
-                    && self.functions[&f].method.is_none() => {}
+        // Resolve the callee. Only a user (bytecode) function is driven here;
+        // a native callback or a non-callable is out of the modeled subset.
+        let f = match func.value {
+            Payload::Reference(f) if self.functions.contains_key(&f) => f,
             _ => return Err(Halt::Unsupported("callback:non-user-function")),
-        }
-        let argc = args.len();
+        };
+        // A **bound** function (`f.bind(...)`) in callback position must NOT be
+        // entered directly: its `FuncInfo` has no body (`body_start = None`),
+        // so `enter_call` would self-name — and before this gate it re-executed
+        // the whole program from pc 0 (unbounded re-entrant recursion → abort
+        // for `[0].map(g.bind(null))` &c., or a divergent then-handler
+        // completion). Trampoline it exactly as the CALL-opcode path does via
+        // `enter_call_bound`: dispatch the TARGET with the bound `this` and the
+        // bound leading args prepended to the callback args, charging the
+        // calibrated bound-call metering (`BIND_CALL_METERING` + per forwarded
+        // arg) — the same native `fx_Function_prototype_bound` body XS meters
+        // per callback invocation. A bound-of-bound target stays the existing
+        // named skip (`enter_call` does not re-check the target's bound gate).
+        let (this_eff, func_eff, args_eff): (Slot, Slot, Vec<Slot>) =
+            if let Some(data) = self.bound_functions.get(&f).cloned() {
+                if self.bound_functions.contains_key(&data.target) {
+                    return Err(Halt::Unsupported("bind:bound-callback"));
+                }
+                let mut combined = data.args.clone();
+                combined.extend_from_slice(args);
+                let total = combined.len();
+                self.meter
+                    .tick_raw(BIND_CALL_METERING + total as u64 * BIND_CALL_PER_ARG);
+                let target = Slot::of(Kind::Reference, Payload::Reference(data.target));
+                (data.this_arg, target, combined)
+            } else {
+                let fi = &self.functions[&f];
+                if fi.native.is_some() || fi.method.is_some() {
+                    return Err(Halt::Unsupported("callback:non-user-function"));
+                }
+                (this, func, args.to_vec())
+            };
+        let argc = args_eff.len();
         // Push the callee frame geometry [THIS, FUNCTION, RESULT, FRAME] + args.
-        self.push(this);
-        self.push(func);
+        self.push(this_eff);
+        self.push(func_eff);
         self.push(Slot::undefined());
         self.push(Slot::of(Kind::Uninitialized, Payload::None));
-        for a in args {
+        for a in &args_eff {
             self.push(*a);
         }
         let body_start = self.enter_call(argc, 0, false)?;
@@ -7891,7 +7940,16 @@ impl Interp {
             }
             _ => return Err(Halt::Unsupported("call:non-user-function-receiver")),
         };
-        let _ = fref;
+        // A bound-function receiver (`boundF.call(thisArg, …)`) would reshape
+        // into the bound wrapper's **bodyless** frame and dispatch at pc 0 (the
+        // silent completion divergence: `.call`'s `thisArg` is ignored, the
+        // bound `this` wins). Its correct trampoline stacks the `.call`
+        // re-dispatch onto the bound re-dispatch — two calibrated overheads
+        // whose combined metering is not affordable now — so self-name rather
+        // than answer a wrong value.
+        if self.bound_functions.contains_key(&fref) {
+            return Err(Halt::Unsupported("bind:bound-callback"));
+        }
         let this_arg = self
             .stack
             .get(base + 4)
@@ -7948,6 +8006,16 @@ impl Interp {
                     .get(&r)
                     .map_or(false, |fi| fi.native.is_none() && fi.method.is_none()) => {}
             _ => return Err(Halt::Unsupported("apply:non-user-function-receiver")),
+        }
+        // A bound-function receiver (`boundF.apply(thisArg, args)`) reshapes
+        // into the bound wrapper's **bodyless** frame and dispatches at pc 0
+        // (the silent completion divergence). The correct trampoline stacks the
+        // `.apply` re-dispatch onto the bound re-dispatch — combined metering
+        // not affordable now — so self-name rather than answer a wrong value.
+        if let Payload::Reference(r) = f.value {
+            if self.bound_functions.contains_key(&r) {
+                return Err(Halt::Unsupported("bind:bound-callback"));
+            }
         }
         let this_arg = self
             .stack

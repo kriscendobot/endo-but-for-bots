@@ -1237,7 +1237,7 @@ pub fn gen_stage3b_fundamentals_followup_program(data: &[u8]) -> String {
         const K: &[&str] = &["k", "a", "reg", "sym", "x1", "hello"];
         K[(b.next() as usize) % K.len()].to_string()
     };
-    match b.choice(9) {
+    match b.choice(10) {
         // A user function's `.length` (its declared arity).
         0 => {
             let arity = (b.next() % 6) as usize;
@@ -1320,6 +1320,28 @@ pub fn gen_stage3b_fundamentals_followup_program(data: &[u8]) -> String {
                 0 => format!("new AggregateError([{}]).errors.length", elems.join(",")),
                 1 => "new AggregateError([], \"boom\").message".to_string(),
                 _ => format!("new AggregateError([{}]).name", elems.join(",")),
+            }
+        }
+        // A bound function in CALLBACK position: it must trampoline through
+        // the target (dispatch the target with the bound this/args prepended),
+        // NOT re-execute the program from pc 0 (the whole-program-from-pc-0
+        // abort / divergent completion this arm regresses). Emits the
+        // bit-exact callback-driving Array-method sites over a bound callback,
+        // with 0 or 1 bound leading args.
+        8 => {
+            let bound_list = if b.choice(2) == 0 {
+                "null".to_string()
+            } else {
+                format!("null,{}", n(&mut b))
+            };
+            let cnt = 1 + (b.next() % 3) as usize;
+            let elems: Vec<String> = (0..cnt).map(|_| n(&mut b).to_string()).collect();
+            let arr = format!("[{}]", elems.join(","));
+            match b.choice(4) {
+                0 => format!("function cf(a,b){{return a+b}} {}.map(cf.bind({}))", arr, bound_list),
+                1 => format!("function cf(a,b){{return a+b}} {}.forEach(cf.bind({}))", arr, bound_list),
+                2 => format!("function cf(a,b){{return b>0}} {}.filter(cf.bind({}))", arr, bound_list),
+                _ => format!("function cf(a,b){{return a+b}} {}.reduce(cf.bind({}))", arr, bound_list),
             }
         }
         // A bind round-trip through `this`.
@@ -2314,6 +2336,7 @@ mod tests {
         let mut saw_apply = false;
         let mut saw_symbol = false;
         let mut saw_aggregate = false;
+        let mut saw_callback = false;
         let mut distinct = std::collections::BTreeSet::new();
         for seed in 0u32..1200 {
             let data = seed.to_le_bytes();
@@ -2333,6 +2356,10 @@ mod tests {
             saw_apply |= prog.contains(".apply(");
             saw_symbol |= prog.contains("Symbol");
             saw_aggregate |= prog.contains("AggregateError");
+            saw_callback |= prog.contains(".map(cf.bind(")
+                || prog.contains(".forEach(cf.bind(")
+                || prog.contains(".filter(cf.bind(")
+                || prog.contains(".reduce(cf.bind(");
             match differential_check_with_symbols(&prog) {
                 Ok(()) => checked += 1,
                 Err(d) => panic!(
@@ -2353,6 +2380,7 @@ mod tests {
         assert!(saw_apply, "apply arm never generated");
         assert!(saw_symbol, "Symbol arm never generated");
         assert!(saw_aggregate, "AggregateError arm never generated");
+        assert!(saw_callback, "bound-callback arm never generated");
     }
 
     #[test]
