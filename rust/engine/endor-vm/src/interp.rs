@@ -946,6 +946,21 @@ pub const STRING_SEARCH_INDEX_GET_METERING: u64 = 32768;
 /// frame, the `withRegexp` dispatch, and the worker's `flags` get (the
 /// eight-property cascade). Calibrated raw-exact.
 pub const STRING_MATCH_FRAME_METERING: u64 = 1081800;
+/// The native residual of `String.prototype.replace` (`fx_String_prototype_
+/// replace` → `fx_RegExp_prototype_replace` via the `Symbol.replace` protocol)
+/// BEYOND the `exec` cost, the explicit `flags` cascade, the segment-list
+/// `fxNewSlot`s + `split_aux`/substitution chunks, and the final assembly
+/// chunk: the String host frame, the `withRegexp` dispatch, and the worker's
+/// per-match `index`/`0`/`length` gets. Calibrated raw-exact.
+pub const STRING_REPLACE_FRAME_METERING: u64 = 508352;
+/// The extra residual of `replace` on a match: the per-match `mxGetID(_index)`
+/// + `mxGetIndex(0)` + `mxGetID(_length)` reads (skipped on the no-match
+/// unchanged-string path). Calibrated raw-exact.
+pub const STRING_REPLACE_MATCH_METERING: u64 = 311272;
+/// The per-capture-group residual of `replace` on a match: the `for (i=1;
+/// i<c; i++)` capture-push loop (`mxGetIndex(i)` + `fxToString`) feeding the
+/// substitution, one per capture beyond the whole match. Calibrated raw-exact.
+pub const STRING_REPLACE_PER_CAPTURE: u64 = 49152;
 /// The extra residual of a `g`/`y` (stateful) `exec`/`test`: the
 /// `fxCacheUnicodeToUTF8Offset` (read `lastIndex`) + `fxCacheUTF8ToUnicode
 /// Offset` (write it back) remap framing. Charged on the advancing path.
@@ -6905,6 +6920,128 @@ impl Interp {
         Ok(self.regexp_exec_inner(inst, subject)?.0)
     }
 
+    /// `String.prototype.replace(regexp, replacement)` (`fx_String_prototype_
+    /// replace` → `fx_RegExp_prototype_replace` via the `Symbol.replace`
+    /// protocol) for the covered case: a **non-global** RegExp and a **literal**
+    /// (no-`$`) string replacement. XS reads `flags` (the eight-property
+    /// cascade), drives one `exec`, and assembles the result from a segment
+    /// list (`pre` + replacement + `post`), each a `fxNewSlot`, into a final
+    /// `fxNewChunk`. A global flag, a function replacement, or a `$`-bearing
+    /// replacement (the substitution grammar) self-names an honest skip.
+    fn string_replace(
+        &mut self,
+        inst: crate::value::SlotIndex,
+        subject: Slot,
+        replacement: Slot,
+    ) -> Result<Slot, Halt> {
+        let global = self.regexps[&inst].program.flags() & endor_regexp::XS_REGEXP_G != 0;
+        if global {
+            return Err(Halt::Unsupported("String.replace:global"));
+        }
+        // A function replacement drives a callback per match — a later
+        // increment.
+        if let Payload::Reference(r) = replacement.value {
+            if self.functions.contains_key(&r) {
+                return Err(Halt::Unsupported("String.replace:function"));
+            }
+        }
+        let subject_bytes = match self.string_receiver_bytes(subject) {
+            Some(c) => c,
+            None => return Err(Halt::Unsupported("String.replace:non-string-receiver")),
+        };
+        // Coerce the replacement to string; the `$`-substitution grammar is a
+        // later increment, so a `$`-bearing replacement self-names.
+        let repl_bytes = self.to_string_bytes_metered(replacement);
+        if repl_bytes.contains(&b'$') {
+            return Err(Halt::Unsupported("String.replace:dollar-substitution"));
+        }
+        self.meter.tick_raw(STRING_REPLACE_FRAME_METERING);
+        // `mxGetID(_flags)` (the `globalFlag` test) — the eight-property
+        // cascade.
+        self.meter.tick_raw(REGEXP_FLAGS_GETTER_METERING);
+        // `fxNewInstance` for the segment list.
+        self.meter.tick_slot_alloc();
+        // The single `exec`.
+        let (result, start) = self.regexp_exec_inner(inst, subject)?;
+        let assembled: Vec<u8> = match start {
+            None => {
+                // No match: the whole subject is one segment (the `former <
+                // size` tail), then assembled.
+                self.meter.tick_slot_alloc(); // the tail segment slot
+                self.meter.tick_chunk_new((subject_bytes.len() + 1) as u64); // split_aux copy
+                subject_bytes.clone()
+            }
+            Some(pos) => {
+                // The per-match `mxGetID(_index)` + `mxGetIndex(0)` +
+                // `mxGetID(_length)` reads, plus the `for (i=1; i<c; i++)`
+                // capture-push loop (`mxGetIndex(i)` + `fxToString`) XS runs to
+                // feed the substitution — one per capture group beyond the
+                // whole match.
+                self.meter.tick_raw(STRING_REPLACE_MATCH_METERING);
+                let extra_captures = self.regexp_capture_count(result).saturating_sub(1) as u64;
+                self.meter
+                    .tick_raw(STRING_REPLACE_PER_CAPTURE * extra_captures);
+                let pos = pos as usize;
+                // Recover the whole-match length from the result array's
+                // element 0 (`[from,to)`); it is the string at index 0.
+                let match_len = self.regexp_whole_match_len(result);
+                let former = pos + match_len;
+                let mut out = Vec::new();
+                if pos > 0 {
+                    // `pre` segment (`split_aux` copy) + its slot.
+                    self.meter.tick_slot_alloc();
+                    self.meter.tick_chunk_new((pos + 1) as u64);
+                    out.extend_from_slice(&subject_bytes[..pos]);
+                }
+                // The substitution segment (the literal replacement copied) +
+                // its slot.
+                self.meter.tick_slot_alloc();
+                self.meter.tick_chunk_new((repl_bytes.len() + 1) as u64);
+                out.extend_from_slice(&repl_bytes);
+                if former < subject_bytes.len() {
+                    // `post` segment (`split_aux` copy) + its slot.
+                    self.meter.tick_slot_alloc();
+                    self.meter
+                        .tick_chunk_new((subject_bytes.len() - former + 1) as u64);
+                    out.extend_from_slice(&subject_bytes[former..]);
+                }
+                out
+            }
+        };
+        // The final assembly `fxNewChunk(total + 1)`.
+        self.meter.tick_chunk_new((assembled.len() + 1) as u64);
+        let mut buf = assembled;
+        buf.push(0);
+        let off = self.chunks.alloc(&buf);
+        Ok(Slot::of(Kind::String, Payload::String(off)))
+    }
+
+    /// The capture count (result-array length, including the whole match at 0)
+    /// of an `exec` result array.
+    fn regexp_capture_count(&self, result: Slot) -> usize {
+        if let Payload::Reference(r) = result.value {
+            if let Some(a) = self.arrays.get(&r) {
+                return a.length as usize;
+            }
+        }
+        0
+    }
+
+    /// The whole-match byte length from an `exec` result array (its element 0,
+    /// the matched string).
+    fn regexp_whole_match_len(&self, result: Slot) -> usize {
+        if let Payload::Reference(r) = result.value {
+            if let Some(a) = self.arrays.get(&r) {
+                if let Some(s) = a.items.get(&0) {
+                    if let Payload::String(off) = s.value {
+                        return self.str_content(off).len();
+                    }
+                }
+            }
+        }
+        0
+    }
+
     /// `RegExp.prototype.toString()` (`fx_RegExp_prototype_toString`): the
     /// `/source/flags` literal, built from the (escaped) source and the flag
     /// string.
@@ -9669,12 +9806,23 @@ impl Interp {
                     _ => return Err(Halt::Unsupported("String.match:non-regexp-arg")),
                 }
             }
-            // `String.prototype.{replace,split}` over the matcher — a later
-            // increment (the `$`-substitution grammar / separator splitting);
-            // self-name so the runner records an honest skip.
+            // `String.prototype.replace` over the matcher (non-global RegExp +
+            // literal string replacement). A string pattern, a global flag, a
+            // function or `$`-bearing replacement self-name honest skips.
             NativeMethod::StringReplace => {
-                return Err(Halt::Unsupported("String.prototype.replace"))
+                if self.string_receiver_bytes(this).is_none() {
+                    return Err(Halt::Unsupported("String.replace:non-string-receiver"));
+                }
+                let repl = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+                match arg0.value {
+                    Payload::Reference(r) if self.regexps.contains_key(&r) => {
+                        self.string_replace(r, this, repl)?
+                    }
+                    _ => return Err(Halt::Unsupported("String.replace:non-regexp-pattern")),
+                }
             }
+            // `String.prototype.split` over the matcher — a later increment (the
+            // species-constructor + sticky-splitter machinery); self-name.
             NativeMethod::StringSplit => {
                 return Err(Halt::Unsupported("String.prototype.split"))
             }

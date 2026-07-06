@@ -97,3 +97,13 @@ new RegExp("").source
 "2026-07".match(/(\d+)-(\d+)/)
 "abc".match(/a/).index
 "abc".match(/b(c)/)[1]
+
+// --- String.prototype.replace (non-global, literal replacement) -----------
+"abc".replace(/b/, "X")
+"abc".replace(/z/, "X")
+"abc".replace(/a/, "XY")
+"abc".replace(/c/, "")
+"hello".replace(/l/, "L")
+"a1b2".replace(/[0-9]/, "#")
+"x".replace(/(x)/, "y")
+"ab".replace(/(a)(b)/, "z")
