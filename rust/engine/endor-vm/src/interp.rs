@@ -195,6 +195,60 @@ pub const GENERATOR_RESULT_METERING: u64 = 66304;
 /// Calibrated identical for a suspended-start and a suspended-yield resume.
 pub const GENERATOR_RESUME_METERING: u64 = 65536;
 
+// ---- async-function metering (design § async/await, ASYNC-AWAIT-HANDOFF.md) --
+// Like generators, the async opcodes call `mxMeter` nowhere in their bodies, so
+// async metering is entirely allocation-driven, calibrated raw-exact against the
+// pin. The per-AWAIT suspend runs the *identical* C code as `YIELD` (they share
+// the `mxCase`), so it reuses [`GENERATOR_YIELD_METERING`]. The per-resume
+// re-entry into a suspended async body (driven by a native reaction, not a `RUN`
+// trampoline) mirrors the generator resume residual, [`GENERATOR_RESUME_METERING`].
+//
+/// `START_ASYNC` → `fxNewAsyncInstance`'s allocation cluster over and above the
+/// promise/resolving-function sub-clusters this metered explicitly via
+/// [`Interp::new_promise_instance`] (6 slots) and [`Interp::make_resolving_functions`]
+/// (13 slots). The residual covers: the instance slot, the `XS_STACK_KIND`
+/// saved-stack holder, the state-integer property, the result-promise property
+/// copy, the two resolving-function property copies, the two `fxResolveAwait`/
+/// `fxRejectAwait` `fxNewHostFunction`s (5 slots each) and their two property
+/// copies, plus the `fxNewAsyncInstance`/`fxRunAsync`/`fxBeginHost` frame residual.
+/// Calibrated against the oracle (a `START_ASYNC` with no `await` isolates it).
+/// Also carries the once-per-call completion-settle framing (folded here since
+/// both fire exactly once per async call).
+pub const ASYNC_INSTANCE_METERING: u64 = 414600;
+/// The async-function define delta backed out of [`Interp::new_async_function`]:
+/// XS's `XS_CODE_ASYNC_FUNCTION` skips the `fxDefaultFunctionPrototype`
+/// `.prototype` allocation that `new_function`'s [`FUNCTION_DEFINE_METERING`]
+/// includes (async functions are not constructors). Calibrated against a bare
+/// `async function f(){}` define vs a plain function.
+pub const ASYNC_FUNCTION_DEFINE_DELTA: u64 = 33536;
+/// The `fxStepAsync` completion-branch frame: on a body `return`, XS pushes the
+/// result promise's `resolveFunction`, `mxCall`s it with the completion value
+/// (`mxRunCount(1)`), settling the result promise. endor settles the result
+/// promise directly ([`Interp::settle_promise`]); this constant carries the
+/// native call framing (`mxCall`/`mxRunCount`) that direct settle omits.
+/// Calibrated against a bare `async function(){ return v }` (one turn, no await).
+/// Folded into [`ASYNC_INSTANCE_METERING`] (both fire once per async call), 0 here.
+pub const ASYNC_STEP_SETTLE_METERING: u64 = 0;
+/// The `fxStepAsync` await-branch frame: on a body `await`, XS either takes the
+/// native-promise fast path (`mxGetID(_constructor)` + `fxIsSameValue`, then
+/// `fxPromiseThen` with a null capability) or the general path
+/// (`fxNewPromiseCapability` + `fxPromiseThen` null-capability + `mxRunCount(1)`
+/// on the fresh resolve function). This constant is the fast-path frame residual
+/// beyond the null-capability [`Interp::promise_then_native`]; the general path
+/// adds [`ASYNC_AWAIT_GENERAL_METERING`]. Calibrated against `await nativePromise`.
+///
+/// Expressed as a **credit** (`untick`): XS's null-capability `fxPromiseThen`
+/// registers the reaction on the already-settled awaited promise more leanly
+/// than [`Interp::promise_then_native`]'s job-queue accounting (which is shaped
+/// for the general `.then`/`Promise.resolve` path). The credit nets the fast
+/// path bit-exact. Calibrated against `await Promise.resolve(v)`.
+pub const ASYNC_AWAIT_FASTPATH_CREDIT: u64 = 16104;
+/// The `fxStepAsync` general await-branch residual over the fast path: the
+/// `mxNewPromiseCapability` framing plus the `mxCall`/`mxRunCount(1)` on the
+/// capability's resolve function that adopts the awaited value. Calibrated
+/// against `await 1` (a primitive await — one microtask turn).
+pub const ASYNC_AWAIT_GENERAL_METERING: u64 = 147808;
+
 /// The raw 16.16 cost C-XS accrues in `function_environment`
 /// (`fxNewEnvironmentInstance`): the closure environment instance the
 /// function captures its defining scope through. Accrued once per
@@ -2058,6 +2112,32 @@ struct PromiseReaction {
     on_rejected: Slot,
     resolve: Slot,
     reject: Slot,
+    /// What kind of reaction this is (XS distinguishes by which native
+    /// function pair `fxPromiseThen` registered). A `User` reaction runs its
+    /// `on_fulfilled`/`on_rejected` handler and settles the derived promise via
+    /// `resolve`/`reject` (the ordinary `.then` path). A **native** reaction
+    /// (`AsyncAwait` — and later `FinallyReturn`/`Combine`) leaves those slots
+    /// unused and instead drives dedicated C behavior at the drain: an
+    /// `AsyncAwait(inst)` reaction resumes the suspended async instance via
+    /// [`Interp::step_async`]. `fxPromiseThen` allocates only **5** reaction
+    /// slots for a native reaction (no derived-promise `__result__` slot),
+    /// versus 6 for a user reaction.
+    kind: ReactionKind,
+}
+
+/// Which native behavior a [`PromiseReaction`] drives at the promise-job drain
+/// (XS keys this off the specific native `resolveFunction`/`rejectFunction`
+/// pair `fxPromiseThen` was handed). The default `User` is the ordinary `.then`
+/// reaction; the native kinds carry no user handler.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ReactionKind {
+    /// An ordinary `.then`/`.catch` reaction: run the user handler, settle the
+    /// derived promise.
+    User,
+    /// The `fxResolveAwait`/`fxRejectAwait` pair `await` registered on the
+    /// awaited promise: resume the suspended async instance (the payload) with
+    /// the settled value (fulfilled → `NoStatus`, rejected → `Throw`).
+    AsyncAwait(crate::value::SlotIndex),
 }
 
 /// A resolve/reject function's bound data (XS's `fxPushPromiseFunctions`
@@ -2309,6 +2389,14 @@ pub enum Halt {
     /// never seen by the top-level `run`). This is endor's structural
     /// analog of XS's `goto XS_CODE_END_ALL` out of `fxRunID` at a yield.
     Yield(Slot),
+    /// An async-function body reached `XS_CODE_AWAIT` and suspended its
+    /// activation into the `async_instances` side table (design § async/await;
+    /// `ASYNC-AWAIT-HANDOFF.md`). Carries the awaited value; produced only
+    /// inside a [`Self::step_async`] nested dispatch and caught there (never
+    /// seen by the top-level `run`). The async analog of [`Self::Yield`] — XS's
+    /// `XS_CODE_AWAIT` shares the `YIELD` `mxCase` and likewise `goto
+    /// XS_CODE_END_ALL`s out of `fxRunID`.
+    Await(Slot),
 }
 
 /// The result of running one program's bytecode on endor-vm.
@@ -2696,6 +2784,29 @@ pub struct Interp {
     /// [`Self::resume_generator`] dispatch (its top is the innermost). The
     /// `YIELD` arm reads the top to snapshot the right instance.
     gen_run_stack: Vec<GenRunFrame>,
+    /// Per-instance async-function state (design § async/await;
+    /// `ASYNC-AWAIT-HANDOFF.md`): the suspended activation and the result
+    /// promise + resolving functions a `START_ASYNC` created, keyed by the
+    /// async instance's slot index. Modeled on [`Self::generators`]. The
+    /// suspended `frame` and the promise/function slots join the GC root set.
+    async_instances: std::collections::HashMap<crate::value::SlotIndex, AsyncData>,
+    /// The realm's `%AsyncFunction.prototype%` (XS's `mxAsyncFunctionPrototype`
+    /// — a plain object off `%Function.prototype%`). An async function's
+    /// instance `[[Prototype]]` chains to it (see [`Self::new_async_function`]).
+    async_function_proto: crate::value::SlotIndex,
+    /// The stack of async instances currently executing on a nested
+    /// [`Self::step_async`] dispatch (its top is the innermost). The `AWAIT`
+    /// arm reads the top to snapshot the right instance — the async analog of
+    /// [`Self::gen_run_stack`].
+    async_run_stack: Vec<AsyncRunFrame>,
+    /// The resume mode threaded into the `BRANCH_STATUS` epilogue after an
+    /// `AWAIT` resume (XS's `the->status`): `NoStatus` (a fulfilled resume —
+    /// branch by offset, leaving the resolved value on the stack) or `Throw`
+    /// (a rejected resume — set the exception from the top of stack and unwind
+    /// to the innermost handler). `BRANCH_STATUS` reads and clears it. Left
+    /// `NoStatus` outside a `step_async` resume, so the generator `BRANCH_STATUS`
+    /// path (which only ever resumes `NoStatus`) is unchanged.
+    resume_status: ResumeStatus,
     /// A resolve/reject host function's bound data (XS's
     /// `fxPushPromiseFunctions` home object). Keyed by the function
     /// instance's slot; consulted in the `RUN` dispatch when a program calls
@@ -2880,6 +2991,49 @@ struct GenRunFrame {
     jumps_base: usize,
 }
 
+/// Per-instance async-function state in the `async_instances` side table
+/// (modeled on [`GeneratorData`]): the suspended activation (`None` once the
+/// body has run to completion) plus the result promise and its resolve/reject
+/// functions (XS's `fxNewAsyncInstance` internal slots `promise`/
+/// `resolveFunction`/`rejectFunction`), which [`Interp::step_async`] settles
+/// when the body returns or throws.
+struct AsyncData {
+    frame: Option<SavedFrame>,
+    /// The result promise `START_ASYNC` returns to the async call's caller
+    /// (XS's `instance->next->next->next`).
+    result_promise: crate::value::SlotIndex,
+    /// The result promise's resolve function (settles it on body completion).
+    resolve_fn: Slot,
+    /// The result promise's reject function (settles it on body throw).
+    reject_fn: Slot,
+    /// Whether the body has finished (returned or threw). Guards against a
+    /// double resume (a settled awaited promise firing twice).
+    done: bool,
+}
+
+/// The context of an async instance currently executing on a nested
+/// [`Interp::step_async`] dispatch, so the `AWAIT` arm knows which instance to
+/// snapshot into and where its value-stack region begins. The async analog of
+/// [`GenRunFrame`].
+struct AsyncRunFrame {
+    inst: crate::value::SlotIndex,
+    stack_base: usize,
+    jumps_base: usize,
+}
+
+/// The resume mode threaded into the `BRANCH_STATUS` epilogue after an `AWAIT`
+/// resume (XS's `the->status` bits, restricted to the two an async body can see).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResumeStatus {
+    /// A fulfilled await resume (XS's `XS_NO_STATUS`): `BRANCH_STATUS` branches
+    /// by `offset`, leaving the resolved value on the stack as the `await`
+    /// expression's result. Also the state outside any resume.
+    NoStatus,
+    /// A rejected await resume (XS's `XS_THROW_STATUS`): `BRANCH_STATUS` sets
+    /// the exception from the top of stack and unwinds to the innermost handler.
+    Throw,
+}
+
 impl Default for Interp {
     fn default() -> Self {
         Interp::new()
@@ -2983,6 +3137,10 @@ impl Interp {
             generators: std::collections::HashMap::new(),
             generator_proto: crate::value::SlotIndex::NULL,
             gen_run_stack: Vec::new(),
+            async_instances: std::collections::HashMap::new(),
+            async_function_proto: crate::value::SlotIndex::NULL,
+            async_run_stack: Vec::new(),
+            resume_status: ResumeStatus::NoStatus,
             promise_functions: std::collections::HashMap::new(),
             promise_guards: Vec::new(),
             promise_jobs: std::collections::VecDeque::new(),
@@ -3366,6 +3524,14 @@ impl Interp {
             let mf = self.alloc_method(m);
             self.proto_methods.push((generator_proto, name, mf));
         }
+        // `%AsyncFunction.prototype%` (XS's `mxAsyncFunctionPrototype`,
+        // `fxBuildFunction`): a plain object off `%Function.prototype%`. An
+        // async function's instance `[[Prototype]]` chains here rather than to
+        // `%Function.prototype%` (see [`Self::new_async_function`]). The covered
+        // surface only needs its identity (an `x instanceof (async()=>{})`
+        // check reaches it); its own `Symbol.toStringTag` is unread and omitted.
+        let async_function_proto = self.slots.alloc(Slot::instance(self.function_proto));
+        self.async_function_proto = async_function_proto;
         // `Promise.*` statics — own methods of the `Promise` constructor
         // instance (not the prototype).
         if let Some(&promise_ctor) = self.intrinsics.get("Promise") {
@@ -5072,6 +5238,19 @@ impl Interp {
                     self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
                     pc += ilen;
                 }
+                // `async_function` (`XS_CODE_ASYNC_FUNCTION` →
+                // `fxNewFunctionInstance` with `[[Prototype]]` =
+                // `%AsyncFunction.prototype%`): like `function`, but the instance
+                // chains to the async-function prototype and has no own
+                // `.prototype`; the body leads with `START_ASYNC`. The body
+                // range/closures are filled by the following `code`/
+                // `function_environment`, exactly as a plain function.
+                XS_CODE_ASYNC_FUNCTION => {
+                    let name = id!(1);
+                    let f = self.new_async_function(name);
+                    self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
+                    pc += ilen;
+                }
                 // `code N` (`XS_CODE_CODE_*`): `fxNewChunk(N)` copies the N
                 // body bytes into a chunk (metered per byte) and records the
                 // body address on the top-of-stack function; execution skips
@@ -6055,39 +6234,62 @@ impl Interp {
                 // generator/async resume epilogue, right after `YIELD`/`AWAIT`.
                 // XS branches on `the->status` (the resume mode): `next`
                 // (`XS_NO_STATUS`) takes `index + offset` (branch past the
-                // return/throw handling and continue the body); `return` takes
-                // `index` (fall into the `SET_RESULT; END` return handling);
-                // `throw` sets the exception and jumps. endor's
-                // [`Self::resume_generator`] admits ONLY a `next` resume
-                // (`return`/`throw` into a suspended body are named skips there),
-                // so the status reaching here is always `NO_STATUS` → always
-                // branch by `offset`. No allocation; XS meters it as one
-                // dispatch, which endor mirrors (`tick_code` at the loop top).
-                XS_CODE_BRANCH_STATUS_1 => {
-                    let off = s1!(1);
-                    if off < 0 && self.check_meter() == MeterCheck::Abort {
-                        return Halt::MeterAbort;
+                // return/throw handling and continue the body, leaving the sent/
+                // resolved value on the stack as the yield/await expression's
+                // result); `return` takes `index` (fall into the return handling
+                // — never reached: only a generator `.return` sets it, a named
+                // skip); `throw` sets `mxException = *mxStack` (the top = the
+                // rejection value the resume pushed) and `fxJump`s to the
+                // innermost handler. A **generator** resume only ever threads
+                // `NoStatus` (return/throw into a suspended body are named skips
+                // in `resume_generator`), so its behavior is unchanged; an
+                // **async** `await` resume threads `Throw` on a rejected awaited
+                // promise. XS meters this as one dispatch, mirrored at the loop top.
+                XS_CODE_BRANCH_STATUS_1 | XS_CODE_BRANCH_STATUS_2 | XS_CODE_BRANCH_STATUS_4 => {
+                    let off = match op {
+                        XS_CODE_BRANCH_STATUS_1 => s1!(1),
+                        XS_CODE_BRANCH_STATUS_2 => {
+                            i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                        }
+                        _ => i32::from_le_bytes([
+                            code[pc + 1],
+                            code[pc + 2],
+                            code[pc + 3],
+                            code[pc + 4],
+                        ]),
+                    };
+                    let status = self.resume_status;
+                    self.resume_status = ResumeStatus::NoStatus;
+                    match status {
+                        ResumeStatus::Throw => {
+                            // A rejected await resume: the rejection reason is the
+                            // top of stack (pushed as `sent`). `mxException =
+                            // *mxStack` (peek), then unwind to the innermost
+                            // handler — or escape to the host (`Halt::Throw`),
+                            // which `step_async` turns into a result-promise
+                            // rejection.
+                            let v = *self.stack.last().unwrap_or(&Slot::undefined());
+                            self.exception = v;
+                            match self.unwind_to_jump() {
+                                Some(target) => {
+                                    pc = target;
+                                    if self.check_meter() == MeterCheck::Abort {
+                                        return Halt::MeterAbort;
+                                    }
+                                }
+                                None => {
+                                    self.meter_host_escape();
+                                    return Halt::Throw(self.render(&v));
+                                }
+                            }
+                        }
+                        ResumeStatus::NoStatus => {
+                            if off < 0 && self.check_meter() == MeterCheck::Abort {
+                                return Halt::MeterAbort;
+                            }
+                            pc = branch_target(pc, size, off);
+                        }
                     }
-                    pc = branch_target(pc, size, off);
-                }
-                XS_CODE_BRANCH_STATUS_2 => {
-                    let off = i16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    if off < 0 && self.check_meter() == MeterCheck::Abort {
-                        return Halt::MeterAbort;
-                    }
-                    pc = branch_target(pc, size, off);
-                }
-                XS_CODE_BRANCH_STATUS_4 => {
-                    let off = i32::from_le_bytes([
-                        code[pc + 1],
-                        code[pc + 2],
-                        code[pc + 3],
-                        code[pc + 4],
-                    ]);
-                    if off < 0 && self.check_meter() == MeterCheck::Abort {
-                        return Halt::MeterAbort;
-                    }
-                    pc = branch_target(pc, size, off);
                 }
                 // mxBranchElse: the fall-through (cond true) takes INDEX
                 // with no check; only the branch-taken (cond false) path
@@ -6365,6 +6567,88 @@ impl Interp {
                     return Halt::Yield(yielded);
                 }
 
+                // ---- async functions --------------------------------
+                // `start_async` (`XS_CODE_START_ASYNC`, xsRun.c:1094): the
+                // leading opcode of an async-function body. Create the async
+                // instance (result promise + resolving/await functions), snapshot
+                // the fresh activation (resume cursor = just past this opcode),
+                // run the body synchronously to the first `await` or completion
+                // via `step_async`, then return the RESULT PROMISE to the caller
+                // — exactly as `START_GENERATOR` returns the generator. The frame
+                // is CLONED (not taken) so this driver frame survives for the
+                // `leave_call` that returns the promise.
+                XS_CODE_START_ASYNC => {
+                    // `new asyncFn()` is a `TypeError` in XS (async functions are
+                    // not constructors); self-name rather than mis-handle.
+                    if self.cur_target {
+                        return Halt::Unsupported("async:new-target");
+                    }
+                    let resume_pc = pc + size as usize;
+                    let inst = self.new_async_instance(resume_pc);
+                    // Run to the first await/completion. An un-modeled surface in
+                    // the body (a named skip) propagates out as the async call's
+                    // own skip.
+                    if let Err(h) = self.step_async(code, inst, ResumeStatus::NoStatus, Slot::undefined(), true) {
+                        return h;
+                    }
+                    let promise = self.async_instances[&inst].result_promise;
+                    let promise_slot = Slot::of(Kind::Reference, Payload::Reference(promise));
+                    // Return the result promise to the caller, mirroring `END`'s
+                    // boundary/non-boundary split (no construct-return: guarded).
+                    if self.call_stack.len() == return_depth {
+                        if return_depth != 0 {
+                            let _ = self.leave_call();
+                            self.push(promise_slot);
+                        }
+                        return Halt::Return;
+                    }
+                    let resume = self.leave_call();
+                    self.push(promise_slot);
+                    pc = resume;
+                    if self.check_meter() == MeterCheck::Abort {
+                        return Halt::MeterAbort;
+                    }
+                }
+                // `await` (`XS_CODE_AWAIT`, xsRun.c:1212): suspend the running
+                // async instance. Shares XS's `YIELD` `mxCase` — snapshot the
+                // activation (scope + own stack temporaries + resume cursor) into
+                // the `async_instances` table and unwind to the `step_async`
+                // driver via [`Halt::Await`], carrying the awaited value (popped
+                // to the frame result). The per-suspend metering is the identical
+                // C code as `YIELD`, so it reuses [`GENERATOR_YIELD_METERING`].
+                // `await` inside a live `try` needs the jump-chain snapshot/rebase
+                // (the same increment generators defer for `yield-in-try`) — an
+                // honest named skip for now.
+                XS_CODE_AWAIT => {
+                    let (inst, stack_base, jumps_base) = match self.async_run_stack.last() {
+                        Some(a) => (a.inst, a.stack_base, a.jumps_base),
+                        None => return Halt::Unsupported("await:no-async-instance"),
+                    };
+                    if self.jumps.len() > jumps_base {
+                        return Halt::Unsupported("await:await-in-try");
+                    }
+                    let resume_pc = pc + size as usize;
+                    let awaited = self.pop();
+                    let stack_slice = self.stack.split_off(stack_base);
+                    self.meter.tick_raw(GENERATOR_YIELD_METERING);
+                    let frame = SavedFrame {
+                        locals: std::mem::take(&mut self.locals),
+                        id_map: std::mem::take(&mut self.id_map),
+                        args: std::mem::take(&mut self.args),
+                        this_val: self.this_val,
+                        cur_func: self.cur_func,
+                        cur_target: self.cur_target,
+                        strict: self.strict,
+                        result: self.result,
+                        stack_slice,
+                        resume_pc,
+                    };
+                    if let Some(a) = self.async_instances.get_mut(&inst) {
+                        a.frame = Some(frame);
+                    }
+                    return Halt::Await(awaited);
+                }
+
                 // ---- exceptions: the jump-buffer chain --------------
                 // `catch L` (`XS_CODE_CATCH_*`, xsRun.c:1365): establish a
                 // handler. Push a jump recording the resume target
@@ -6600,6 +6884,80 @@ impl Interp {
             GeneratorData {
                 state: GeneratorState::SuspendedStart,
                 frame: Some(frame),
+            },
+        );
+        inst
+    }
+
+    /// Define an async function (`XS_CODE_ASYNC_FUNCTION` →
+    /// `fxNewFunctionInstance`). Like [`Self::new_function`] but the function
+    /// instance's own `[[Prototype]]` chains to `%AsyncFunction.prototype%`
+    /// (XS's `mxAsyncFunctionPrototype`) rather than `%Function.prototype%`, and
+    /// it has **no** own `.prototype`/`constructor` pair (async functions are
+    /// not constructors). The body leads with `START_ASYNC`. Metering: XS runs
+    /// the *same* `fxNewFunctionInstance` as a plain function and skips
+    /// `fxDefaultFunctionPrototype`, so the define cost equals `new_function`'s
+    /// (the spurious `ctor_prototype` object endor's `new_function` allocates is
+    /// unmetered and dropped here) — the calibrated delta is ~0.
+    fn new_async_function(&mut self, name: u16) -> crate::value::SlotIndex {
+        let f = self.new_function(name);
+        // Re-chain the function instance's `[[Prototype]]` to
+        // `%AsyncFunction.prototype%` (XS's `fxNewFunctionInstance` prototype).
+        self.slots.get_mut(f).value = Payload::Reference(self.async_function_proto);
+        // No own `.prototype`: drop the default-prototype object `new_function`
+        // built (unmetered materialization on both sides).
+        self.ctor_prototype.remove(&f);
+        // An async function is not a constructor, so XS's `XS_CODE_ASYNC_FUNCTION`
+        // → `fxNewFunctionInstance` skips the `fxDefaultFunctionPrototype`
+        // `.prototype` object `new_function`'s calibrated
+        // [`FUNCTION_DEFINE_METERING`] cluster includes. Back that allocation
+        // out — the calibrated define delta vs a plain function.
+        self.meter.untick_raw(ASYNC_FUNCTION_DEFINE_DELTA);
+        f
+    }
+
+    /// Allocate an async-function instance (`fxNewAsyncInstance`) for a
+    /// `START_ASYNC`: an internal instance holding the suspended activation, the
+    /// result promise, and the four resolving/await functions. endor materializes
+    /// the result promise + its resolve/reject pair (the sub-clusters this meters
+    /// explicitly) and records the `resume_pc`-cursored frame snapshot in the
+    /// `async_instances` table, cloning the current (freshly-entered) activation
+    /// exactly like [`Self::new_generator_instance`] — a **clone**, not a take,
+    /// so the driver frame survives for `START_ASYNC`'s own `leave_call`. The
+    /// remaining allocation cluster (instance/stack/state/await-function slots +
+    /// frame residual) is the calibrated [`ASYNC_INSTANCE_METERING`].
+    fn new_async_instance(&mut self, resume_pc: usize) -> crate::value::SlotIndex {
+        self.meter.tick_raw(ASYNC_INSTANCE_METERING);
+        // The result promise + its resolve/reject resolving pair (XS's
+        // `fxNewPromiseInstance` + `fxPushPromiseFunctions`, metered by the
+        // helpers).
+        let result_promise = self.new_promise_instance();
+        let (resolve_fn, reject_fn) = self.make_resolving_functions(result_promise);
+        let inst = self.slots.alloc(Slot::instance(crate::value::SlotIndex::NULL));
+        // Snapshot the current (freshly-entered) frame. Like `START_GENERATOR`,
+        // the value stack holds nothing above the frame base at `START_ASYNC`
+        // (`begin` set up `locals`, not temporaries), so `stack_slice` is empty;
+        // `step_async` runs the body from `resume_pc`.
+        let frame = SavedFrame {
+            locals: self.locals.clone(),
+            id_map: self.id_map.clone(),
+            args: self.args.clone(),
+            this_val: self.this_val,
+            cur_func: self.cur_func,
+            cur_target: self.cur_target,
+            strict: self.strict,
+            result: self.result,
+            stack_slice: Vec::new(),
+            resume_pc,
+        };
+        self.async_instances.insert(
+            inst,
+            AsyncData {
+                frame: Some(frame),
+                result_promise,
+                resolve_fn,
+                reject_fn,
+                done: false,
             },
         );
         inst
@@ -6957,6 +7315,222 @@ impl Interp {
                 }
                 Err(other)
             }
+        }
+    }
+
+    /// Run one step of an async-function instance (XS's `fxStepAsync`): install
+    /// the suspended activation, run a nested [`Self::dispatch_at`] to the next
+    /// `await` or completion, then act on the outcome — schedule the await, or
+    /// settle the result promise. Modeled on [`Self::resume_generator`]: the
+    /// ambient activation is suspended onto `call_stack`, the async frame
+    /// installed, and a `return`/`throw` from the body settles the result
+    /// promise via its resolve/reject function.
+    ///
+    /// - `is_start` is the initial synchronous run from `START_ASYNC` (no sent
+    ///   value pushed; runs the body from just past `START_ASYNC`).
+    /// - a resume (`is_start == false`) is driven by an `AsyncAwait` native
+    ///   reaction at the promise-job drain: `sent` is the resolved value (or the
+    ///   rejection reason), pushed as the `await` expression's result, and
+    ///   `status` threads into the `BRANCH_STATUS` epilogue.
+    ///
+    /// Returns `Ok(())` when the step completed (the result promise settled or
+    /// the body re-suspended at another `await`); propagates `Halt::Unsupported`
+    /// / `MeterAbort` / `StackOverflow` when the body hit an un-modeled surface.
+    /// A body `throw` is *not* propagated — it rejects the result promise.
+    fn step_async(
+        &mut self,
+        code: &[u8],
+        inst: crate::value::SlotIndex,
+        status: ResumeStatus,
+        sent: Slot,
+        is_start: bool,
+    ) -> Result<(), Halt> {
+        // A resume of an already-settled instance (a promise firing twice) is a
+        // no-op — the two-level guard XS's resolving functions enforce.
+        if self.async_instances.get(&inst).map(|a| a.done).unwrap_or(true) && !is_start {
+            return Ok(());
+        }
+        let saved = self
+            .async_instances
+            .get_mut(&inst)
+            .and_then(|a| a.frame.take())
+            .ok_or(Halt::Unsupported("async:no-frame"))?;
+        if !is_start {
+            // The per-resume native-frame residual (`fxResolveAwait`/
+            // `fxRejectAwait` → `fxStepAsync` → `fxRunID` re-entry), the async
+            // analog of the generator resume residual.
+            self.meter.tick_raw(GENERATOR_RESUME_METERING);
+        }
+        // Suspend the ambient activation onto `call_stack` (mirroring
+        // `enter_call`/`resume_generator`), then install the async frame.
+        let driver_footprint = FRAME_OVERHEAD_SLOTS + self.args.len() + self.locals.len();
+        self.frame_slots += driver_footprint;
+        self.call_stack.push(CallerState {
+            locals: std::mem::take(&mut self.locals),
+            id_map: std::mem::take(&mut self.id_map),
+            result: self.result,
+            strict: self.strict,
+            args: std::mem::take(&mut self.args),
+            this_val: self.this_val,
+            cur_func: self.cur_func,
+            cur_target: self.cur_target,
+            ret_pc: 0,
+        });
+        let stack_base = self.stack.len();
+        let jumps_base = self.jumps.len();
+        self.locals = saved.locals;
+        self.id_map = saved.id_map;
+        self.args = saved.args;
+        self.this_val = saved.this_val;
+        self.cur_func = saved.cur_func;
+        self.cur_target = saved.cur_target;
+        self.strict = saved.strict;
+        self.result = saved.result;
+        self.stack.extend(saved.stack_slice);
+        // On a resume the sent value becomes the `await` expression's value (XS
+        // writes `the->scratch` at the resume slot in `fxRunID`); the initial
+        // synchronous start pushes nothing (the body runs from a clean frame).
+        if !is_start {
+            self.push(sent);
+        }
+        self.resume_status = if is_start { ResumeStatus::NoStatus } else { status };
+        let return_depth = self.call_stack.len();
+        self.async_run_stack.push(AsyncRunFrame {
+            inst,
+            stack_base,
+            jumps_base,
+        });
+        let outcome = self.dispatch_at(code, saved.resume_pc, return_depth);
+        self.async_run_stack.pop();
+        // Any `BRANCH_STATUS` will have consumed the status; reset defensively.
+        self.resume_status = ResumeStatus::NoStatus;
+        match outcome {
+            Halt::Await(v) => {
+                // The `AWAIT` arm snapshotted the instance and truncated the
+                // stack to `stack_base`; the ambient frame is still suspended —
+                // restore it (its own `leave_call`), then schedule the await.
+                let _ = self.leave_call();
+                self.stack.truncate(stack_base);
+                self.jumps.truncate(jumps_base);
+                self.await_schedule(inst, v)
+            }
+            Halt::Return => {
+                // The body's `END` boundary branch already ran `leave_call`
+                // (ambient restored) and pushed the completion value.
+                let ret = self.pop();
+                self.stack.truncate(stack_base);
+                self.jumps.truncate(jumps_base);
+                if let Some(a) = self.async_instances.get_mut(&inst) {
+                    a.done = true;
+                    a.frame = None;
+                }
+                // Resolve the result promise with the completion value (XS calls
+                // the instance's `resolveFunction` via `mxRunCount(1)`; a thenable
+                // return value adopts). The direct-settle omits the native call
+                // framing, carried by `ASYNC_STEP_SETTLE_METERING`.
+                self.meter.tick_raw(ASYNC_STEP_SETTLE_METERING);
+                let resolve_fn = self.async_instances[&inst].resolve_fn;
+                self.settle_via_function(resolve_fn, ret)
+            }
+            Halt::Throw(_) => {
+                // A body throw that escaped every handler rejects the result
+                // promise (XS's `mxCatch` → `fxRejectException`), not the host.
+                while self.call_stack.len() >= return_depth {
+                    let _ = self.leave_call();
+                }
+                if self.stack.len() > stack_base {
+                    self.stack.truncate(stack_base);
+                }
+                if self.jumps.len() > jumps_base {
+                    self.jumps.truncate(jumps_base);
+                }
+                let reason = self.exception;
+                self.exception = Slot::undefined();
+                if let Some(a) = self.async_instances.get_mut(&inst) {
+                    a.done = true;
+                    a.frame = None;
+                }
+                self.meter.tick_raw(ASYNC_STEP_SETTLE_METERING);
+                let reject_fn = self.async_instances[&inst].reject_fn;
+                self.settle_via_function(reject_fn, reason)
+            }
+            other => {
+                // An un-modeled surface (a named skip), meter abort, or overflow
+                // escaped the body: restore the ambient frame best-effort, mark
+                // the instance done, and propagate — the whole async call becomes
+                // an honest named skip rather than a wrong settlement.
+                while self.call_stack.len() >= return_depth {
+                    let _ = self.leave_call();
+                }
+                if self.stack.len() > stack_base {
+                    self.stack.truncate(stack_base);
+                }
+                if self.jumps.len() > jumps_base {
+                    self.jumps.truncate(jumps_base);
+                }
+                if let Some(a) = self.async_instances.get_mut(&inst) {
+                    a.done = true;
+                    a.frame = None;
+                }
+                Err(other)
+            }
+        }
+    }
+
+    /// Schedule an `await` (XS's `fxStepAsync` await-branch): register the
+    /// instance's `AsyncAwait` native reaction so the body resumes when the
+    /// awaited value settles. Two branches, exactly as C-XS:
+    ///
+    /// - **Native-promise fast path** (`value` is a native `Promise` — its
+    ///   `constructor === %Promise%`): register the `AsyncAwait` reaction
+    ///   directly on `value`'s promise (the identity check meters the same
+    ///   `2.5<<16` the keystone froze for `Promise.resolve(nativePromise)`).
+    /// - **General path**: build a fresh capability, register the reaction on
+    ///   its promise, then call the capability's `resolve` with `value` — which
+    ///   fulfills with a primitive (queuing the resume for the next microtask
+    ///   turn, so a bare `await 1` still costs one turn) or adopts a thenable.
+    fn await_schedule(&mut self, inst: crate::value::SlotIndex, value: Slot) -> Result<(), Halt> {
+        if let Payload::Reference(r) = value.value {
+            if self.promises.contains_key(&r) {
+                // XS's fast path is `mxGetID(_constructor)` + `fxIsSameValue` +
+                // `fxPromiseThen` (null capability, 5 slots) — no capability, no
+                // resolve call. It is *cheaper* than the general path: registering
+                // the native reaction on the (typically already-settled) awaited
+                // promise via `promise_then_native` is the whole cost. The single
+                // calibrated credit nets `promise_then_native`'s settled-promise
+                // job-queue accounting (shaped for the general/`.then` path) down
+                // to XS's leaner null-capability `fxPromiseThen`.
+                self.meter.untick_raw(ASYNC_AWAIT_FASTPATH_CREDIT);
+                self.promise_then_native(r, ReactionKind::AsyncAwait(inst));
+                return Ok(());
+            }
+        }
+        self.meter.tick_raw(ASYNC_AWAIT_GENERAL_METERING);
+        let (derived, resolve, _reject) = self.new_promise_capability();
+        self.promise_then_native(derived, ReactionKind::AsyncAwait(inst));
+        self.settle_via_function(resolve, value)
+    }
+
+    /// Settle a promise through its resolve/reject function directly (the core
+    /// of [`Self::call_promise_function`] without a value-stack frame): consult
+    /// the pair's shared `[[AlreadyResolved]]` guard, and if fresh, trip it and
+    /// settle. Used where XS calls a resolving function via `mxRunCount(1)`
+    /// (async completion, the await general path) rather than from guest code.
+    fn settle_via_function(&mut self, f: Slot, value: Slot) -> Result<(), Halt> {
+        let fref = match f.value {
+            Payload::Reference(r) => r,
+            _ => return Err(Halt::Unsupported("async:bad-resolving-fn")),
+        };
+        let data = match self.promise_functions.get(&fref) {
+            Some(d) => *d,
+            None => return Err(Halt::Unsupported("async:bad-resolving-fn")),
+        };
+        if self.promise_guards.get(data.guard).copied().unwrap_or(true) {
+            self.meter.tick_raw(PROMISE_SETTLE_GUARDED_METERING);
+            Ok(())
+        } else {
+            self.promise_guards[data.guard] = true;
+            self.settle_promise(data.promise, value, data.reject)
         }
     }
 
@@ -8384,6 +8958,7 @@ impl Interp {
             on_rejected,
             resolve,
             reject,
+            kind: ReactionKind::User,
         };
         let state = self.promises[&promise].state;
         match state {
@@ -8405,6 +8980,48 @@ impl Interp {
             }
         }
         Ok(Slot::of(Kind::Reference, Payload::Reference(derived)))
+    }
+
+    /// Register a **native** reaction on `promise` (XS's `fxPromiseThen` with a
+    /// null capability, `resolveFunction == C_NULL`): the path `await`,
+    /// `Promise.prototype.finally`, and the combinators use. Unlike the user
+    /// `.then` path it builds **no** derived promise/capability and allocates
+    /// **5** reaction slots (not 6 — no `__result__` slot; xsPromise.c:580); the
+    /// reaction carries no user handler, only its `kind`, which the drain
+    /// (`run_promise_job`) dispatches on. A pending promise appends the reaction
+    /// (+1 THENS-list slot); an already-settled promise queues the job now.
+    fn promise_then_native(&mut self, promise: crate::value::SlotIndex, kind: ReactionKind) {
+        // `fxPromiseThen` reaction instance: 5 `fxNewSlot`s for a null-capability
+        // reaction (the reaction instance + resolve/reject/onFulfilled/onRejected
+        // slots; the `__result__` derived-promise slot the user path adds is
+        // absent).
+        for _ in 0..5 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(PROMISE_REACTION_METERING);
+        let reaction = PromiseReaction {
+            on_fulfilled: Slot::undefined(),
+            on_rejected: Slot::undefined(),
+            resolve: Slot::undefined(),
+            reject: Slot::undefined(),
+            kind,
+        };
+        let state = self.promises[&promise].state;
+        match state {
+            PromiseState::Pending => {
+                self.meter.tick_slot_alloc();
+                self.promises.get_mut(&promise).unwrap().reactions.push(reaction);
+            }
+            PromiseState::Fulfilled | PromiseState::Rejected => {
+                let value = self.promises[&promise].result;
+                let rejected = state == PromiseState::Rejected;
+                self.queue_promise_job(PromiseJob::Reaction {
+                    reaction,
+                    value,
+                    rejected,
+                });
+            }
+        }
     }
 
     /// A promise resolve/reject function call (XS's `fxResolvePromise`/
@@ -8629,6 +9246,24 @@ impl Interp {
                 reject,
             } => return self.run_thenable_job(code, then, thenable, resolve, reject),
         };
+        // A **native** reaction drives dedicated C behavior rather than a user
+        // handler + derived-promise settle. `AsyncAwait(inst)` resumes the
+        // suspended async instance with the settled value: a fulfilled promise
+        // resumes `NoStatus` (the resolved value becomes the `await` expression's
+        // result), a rejected one resumes `Throw` (the reason is re-thrown into
+        // the body). XS's `fxResolveAwait`/`fxRejectAwait` → `fxStepAsync`.
+        if let ReactionKind::AsyncAwait(inst) = reaction.kind {
+            // The `fxOnResolvedPromise`/`fxOnRejectedPromise` trampoline runs the
+            // native `fxResolveAwait`/`fxRejectAwait` as its handler (a
+            // `mxRunCount` frame), like a user-handler job.
+            self.meter.tick_raw(PROMISE_JOB_FRAME_METERING);
+            let status = if rejected {
+                ResumeStatus::Throw
+            } else {
+                ResumeStatus::NoStatus
+            };
+            return self.step_async(code, inst, status, value, false);
+        }
         let handler = if rejected {
             reaction.on_rejected
         } else {
@@ -16262,6 +16897,9 @@ mod tests {
                 // dispatch and consumed there; it never escapes to a top-level
                 // `run` outcome.
                 Halt::Yield(_) => unreachable!("yield escaped a generator resume"),
+                // `Await` is produced only inside a `step_async` nested dispatch
+                // and consumed there; it never escapes to a top-level outcome.
+                Halt::Await(_) => unreachable!("await escaped a step_async resume"),
             }
         }
     }
