@@ -6,6 +6,7 @@
 | **Author** | endolinbot (prompted) |
 | **Status** | Approved (2026-07-02, program supervisor `port-xs-to-rust-memory-safe-engine`; all ten open questions resolved, see § Resolved Questions) |
 | **Revised** | 2026-07-04 — **metering doctrine: accuracy over parity** (maintainer directive). The meter is endor's own release-versioned deterministic cost model, a proxy for real (wall-clock) execution cost, NOT a reproduction of XS's computron counts. The C-XS differential oracle is retained for **result** correctness only; computron comparison is demoted to advisory telemetry. This selects the "stated determinism-equivalence proof" branch the § Prompt already permitted. See § Metering (requirement 1a) and § Agoric consensus compatibility for the authoritative statement. |
+| **Revised** | 2026-07-06 — **string representation: UTF-16 code units, replacing CESU-8** (the `xs2rust-endor-strings-utf16` revisit enabled by the accuracy-over-parity doctrine). String values are stored as UTF-16 code units in chunks; code-unit indexing becomes intrinsically O(1) and the constant-time-index machinery CESU-8 needs is deleted, not ported. String-op cost-table weights are re-based to code-unit length via the cost-calibration instrumentation, not CESU-8 byte counts. See § Value and heap model, § Metering (string-op weights), and resolved question 4. |
 
 Feasibility, architecture, and a staged roadmap for porting the XS
 JavaScript engine to Rust as a crate the `endor` daemon embeds
@@ -309,10 +310,25 @@ slot graph becomes an index-based arena.
   make the collector safe code: there are no raw pointers to
   invalidate, and a stale index is a logic bug caught by kind
   checks, not undefined behavior.
-- Strings remain CESU-8 in chunks (the `mxCESU8` configuration the
-  endor build already uses), and NaN canonicalization follows
-  `mxCanonicalNaN`, preserving snapshot content and allocation
-  observability.
+- String values are stored as **UTF-16 code units** in chunks
+  (revised 2026-07-06 from the C-XS endor build's CESU-8; resolved
+  question 4). The stored form is exactly what the specification
+  defines a string to be — a sequence of 16-bit code units, lone
+  surrogates included — so every code-unit-addressed operation
+  (`length`, `[i]`, `charCodeAt`, `codePointAt`, iteration, ordering
+  comparison) is **intrinsically O(1) per code-unit access** with no
+  decode step, and the auxiliary constant-time-index machinery a
+  variable-width encoding needs — cached last-access cursors,
+  ASCII/BMP fast paths, index side-tables — is **deleted, not
+  ported**. The trade is explicit: roughly 2 bytes per code unit
+  where CESU-8 spends 1 on ASCII, bought for simpler,
+  obviously-correct indexing. Because string chunk bytes change
+  size, `currentHeapCount` and chunk-growth observables shift
+  relative to C-XS — fine under the accuracy-over-parity meter
+  (§ Metering), but the snapshot-atom round-trip fixtures and the
+  differential harness's allocation-telemetry expectations must be
+  updated **deliberately with this change, not silently**. NaN
+  canonicalization follows `mxCanonicalNaN`.
 
 An index arena also makes snapshots nearly structural: XS's write
 path exists to *convert* pointers into indices and offsets; the
@@ -388,6 +404,23 @@ version; the previous table remains addressable by its version so
 old metered outcomes stay reproducible. Because the table is
 integer and frozen per release, metering is fully deterministic
 without needing to match any external reference.
+
+**String-op weights are re-based to UTF-16 (2026-07-06).** With
+string storage revised to UTF-16 code units (§ Value and heap
+model), the cost-table entries for string operations — concat,
+compare, index, slice, char access — are expressed against the
+representation's real cost shape: **O(n) in code-unit length** for
+the length-proportional operations, **O(1) for a single code-unit
+access** (the cursor and fast-path machinery CESU-8 indexing
+required no longer exists to meter). The weights are derived from
+the cost-calibration instrumentation (sibling plan
+[xs2rust-endor-meter-opcode-cost-instrumentation](xs2rust-endor-meter-opcode-cost-instrumentation.md))
+and the live calibration work
+(`xs2rust-endor-meter-calibration-stage-c1`) measuring the UTF-16
+implementation — **not** CESU-8 byte lengths, and not values chosen
+to match the oracle's counts. Like every other entry they are
+frozen per release and recalibrated only across releases with an
+`endor-meter-N` bump.
 
 **Check points and abort.** Checks happen at XS's loop-closing
 points (backward branch, call, return, catch, generator iteration,
@@ -669,8 +702,12 @@ cargo-fuzz (libFuzzer) targets, in the `endor-fuzz` crate:
 3. **Snapshot round-trip and decoder fuzzing**: write/read
    round-trip invariance, plus malformed-atom inputs against the
    reader.
-4. **CESU-8 codec fuzzing** (round-trip against the xsnap crate's
-   existing `cesu8.rs`).
+4. **String boundary-transcoding fuzzing**: UTF-8 ⇄ UTF-16
+   conversion at the `Machine` API and source boundary, including
+   unpaired-surrogate handling. (Retargeted 2026-07-06 from CESU-8
+   codec round-trip fuzzing when the heap encoding moved to UTF-16;
+   `cesu8.rs` fuzzing remains with the xsnap crate, whose C-XS
+   boundary the codec still serves.)
 5. **RegExp differential fuzzing** against the oracle's `xsre`
    once the RegExp port lands.
 
@@ -738,7 +775,7 @@ the Compartment seam, and bootstraps test262, before any breadth.
 |---|---|---|
 | 1. Thin slice: interpreter core + meter + oracle harness | `endor-vm` arenas and value model; interpreter for the arithmetic/logic/branch/call/stack opcode subset; meter with the release-versioned cost table and XS check points; `endor-oracle` compiling source with C-XS and executing bytecode on both engines; a primordial `Compartment.evaluate` (fresh globals, shared intrinsics seam, no modules); `endor-262` dual-run skeleton with the stage corpus; fuzz targets 1 and 2 | **Result** agreement with the oracle on the stage corpus; meter deterministic per release (identical computrons across repeated runs of the same build); computron-vs-C-XS recorded as advisory telemetry only; `forbid(unsafe_code)` holds outside `endor-oracle` |
 | 2. Object model and control flow | Objects, prototypes, property ops, closures, exceptions (jump-chain with JS/host flags), full 245-opcode coverage (built-ins stubbed); GC v1 (mark-sweep + chunk compaction) | test262 `language/` dual-run agreement on the covered grammar; GC test suite under Miri |
-| 3. Built-ins | Object/Array/String (CESU-8)/Math (canonical NaN)/JSON/Map/Set/TypedArray/BigInt; promises and job queue with the pump-loop latch semantics; RegExp port decision executed (resolved question 6: port `xsre`) | Built-ins sections dual-run **result** agreement; meter deterministic per release (computron-vs-C-XS advisory); the `mxMeterSome` fast-path annotations, where kept, preserve the meter's internal fast/slow-path consistency within an endor release rather than matching XS |
+| 3. Built-ins | Object/Array/String (built CESU-8; re-based to UTF-16 by the 2026-07-06 revision — § Value and heap model)/Math (canonical NaN)/JSON/Map/Set/TypedArray/BigInt; promises and job queue with the pump-loop latch semantics; RegExp port decision executed (resolved question 6: port `xsre`) | Built-ins sections dual-run **result** agreement; meter deterministic per release (computron-vs-C-XS advisory); the `mxMeterSome` fast-path annotations, where kept, preserve the meter's internal fast/slow-path consistency within an endor release rather than matching XS |
 | 4. Hardened JavaScript | `lockdown`, `harden`, `petrify`, `mutabilities`; full native `Compartment` + module machinery (ModuleSource, module maps); async/generators complete | The endor daemon boot bundles (`polyfills.js`, `ses_boot.js`, HandledPromise) run identically on both engines; SES conformance suites pass |
 | 5. Compiler port | `endor-compile`: lexer, parser, scoper, coder replacing the oracle compiler; parse metering | Byte-identical bytecode versus the oracle compiler on the full conformance corpus; parse metering deterministic per release (parse computrons stable across runs; computron-vs-C-XS advisory); parser fuzz target armed |
 | 6. Snapshots | `endor-snapshot` atom writer/reader; `Machine` snapshot surface; suspend/resume through the supervisor; meter state across suspend | Round-trip invariance under fuzzing; supervisor suspend/resume integration test passes on `-e endor-rs` |
@@ -830,8 +867,10 @@ per the accuracy-over-parity doctrine; computron-vs-C-XS is advisory
 telemetry, not gated — the doctrine-transition note above governs;
 the `mxMeterSome` fast-path annotations land here, kept for the
 meter's internal fast/slow-path consistency within a release):
-1. **language** — chunk-backed CESU-8 string *values* (literals, concat
-   with `XS_STRING_METERING`, comparison), the `global` opcode, and the
+1. **language** — chunk-backed string *values*: literals, concat
+   with `XS_STRING_METERING`, comparison (built as CESU-8, the
+   encoding answer of the day; re-based to UTF-16 code units by the
+   2026-07-06 revision, § Value and heap model); the `global` opcode, and the
    remaining language opcodes the `language/` sweeps name as top skip
    reasons (`typeof`, `increment`/`decrement`/`to_numeric`,
    exponentiation, `this`, `let`/`const` closures, `current`/
@@ -852,7 +891,8 @@ meter's internal fast/slow-path consistency within a release):
 3. **arrays** — the Array exotic object (length semantics), literals/
    spread/holes, the iteration protocol (`for-of`/`for-in`, array and
    string iterators; generators stay stage 4), Array.prototype methods.
-4. **text-math-json** — String.prototype (CESU-8 semantics), Number,
+4. **text-math-json** — String.prototype (code-unit semantics; the
+   backing store is UTF-16 per the 2026-07-06 revision), Number,
    Math (canonical NaN), `parseInt`/`parseFloat`, JSON.
 5. **collections** — Map/Set/WeakMap/WeakSet, ArrayBuffer/TypedArray/
    DataView, BigInt (`XS_BIGINT_METERING`).
@@ -993,21 +1033,25 @@ annotations inline mark exactly what changed.
    keeps a future importer bounded; building one now would spend
    a stage on a decoder with no consumer. Revisit only against an
    actual migration need, as its own design amendment.
-4. **Internal string encoding is CESU-8.** The endor build
-   already sets `mxCESU8`, the xsnap crate already carries the
-   codec, and snapshot content stays comparable with the oracle.
-   *(Amended 2026-07-04: this question's original grounds leaned
-   partly on parity — "UTF-8 boundary conversion would perturb
-   chunk sizes and therefore heap accounting" — which the
-   accuracy-over-parity doctrine no longer treats as a constraint,
-   since endor's meter is not pinned to XS's allocation-derived
-   computrons. The encoding choice is therefore reopened as an
-   **accuracy/simplicity** question and delegated to the sibling
-   plan `xs2rust-endor-strings-utf16-replace-cesu8`, which may
-   re-base string metering (and possibly the encoding) for accuracy;
-   snapshot-content compatibility with the oracle remains a genuine
-   consideration there, but heap-accounting parity does not. Until
-   that plan lands, CESU-8 stands.)*
+4. **Internal string encoding is UTF-16 code units.** *(Resolved
+   2026-07-06 by the `xs2rust-endor-strings-utf16` revisit,
+   superseding the original CESU-8 answer.)* The original grounds
+   for CESU-8 leaned on parity — "UTF-8 boundary conversion would
+   perturb chunk sizes and therefore heap accounting" — which the
+   accuracy-over-parity doctrine (2026-07-04 amendment) no longer
+   treats as a constraint. Reopened as an **accuracy/simplicity**
+   question, the answer is UTF-16: storing the spec's own code-unit
+   sequence makes code-unit indexing intrinsically O(1) and deletes
+   the constant-time-index machinery outright (§ Value and heap
+   model), and string metering is re-based to code-unit length
+   derived from calibration measurement (§ Metering). Endor snapshot
+   content diverges from the oracle's CESU-8 chunk bytes; the
+   snapshot fixtures and the differential harness's
+   allocation-telemetry expectations are updated deliberately with
+   the change, and the (out-of-scope, resolved question 3) future
+   C-XS snapshot importer would transcode at import. The xsnap
+   crate's `cesu8.rs` codec remains where it serves the C-XS
+   boundary; it is no longer endor's heap encoding.
 5. **The 32-byte slot-record layout holds.** Kind + flag + ID +
    next-index + 16-byte payload fits in 32 bytes; holding it keeps
    `currentHeapCount` semantics and snapshot slot images aligned
