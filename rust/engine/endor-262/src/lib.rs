@@ -411,6 +411,19 @@ pub fn stage3b_object_statics_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3b-object-statics.js"))
 }
 
+/// The stage-4 object-integrity corpus (child 1/8): the property-attribute
+/// integrity model (`Object.preventExtensions`/`seal`/`freeze` +
+/// `isExtensible`/`isSealed`/`isFrozen`, the slot-arena `XS_DONT_PATCH_FLAG`
+/// and the per-property `XS_DONT_DELETE_FLAG`/`XS_DONT_SET_FLAG` stamps, with
+/// the sloppy-mode write/delete rejection those flags impose) plus the
+/// descriptor-reflection surface (`Object.values`/`entries`/
+/// `getOwnPropertyDescriptors` and `Object.prototype.propertyIsEnumerable`) —
+/// harden's direct prerequisite. Bit-exact (result AND computron) against the
+/// oracle.
+pub fn stage4_object_integrity_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-object-integrity.js"))
+}
+
 /// The stage-3b promises corpus (child 7/9): `Promise` construction + the
 /// executor, `resolve`/`reject` settling, the `Promise.resolve`/`reject`
 /// statics, `then`/`catch` reaction registration, and the microtask job queue
@@ -1227,6 +1240,44 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3b object-statics bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage4_object_integrity_corpus_is_bit_exact_against_oracle() {
+        // The stage-4 object-integrity acceptance bar (child 1/8): the
+        // integrity levels (`preventExtensions`/`seal`/`freeze` +
+        // `isExtensible`/`isSealed`/`isFrozen`) with the slot-arena flag
+        // semantics XS implements — the instance `XS_DONT_PATCH_FLAG` and the
+        // per-property `XS_DONT_DELETE_FLAG`/`XS_DONT_SET_FLAG` stamps — plus
+        // the sloppy-mode write/delete rejection those flags impose, and the
+        // descriptor-reflection surface (`values`/`entries`/
+        // `getOwnPropertyDescriptors`/`propertyIsEnumerable`), all agree with
+        // C-XS on BOTH the completion value AND the computron count. The
+        // strict-mode integrity-violation *throw* (a catchable native
+        // `TypeError`) is an honest named skip, excluded from this corpus.
+        let programs = stage4_object_integrity_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4 object-integrity corpus must be non-empty"
+        );
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-4 object-integrity bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

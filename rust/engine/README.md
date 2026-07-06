@@ -388,6 +388,51 @@ referenced (the incomplete `%Object.prototype%` member set), a
 existing key / a non-object descriptor / a non-boolean attribute / an
 enumerable **novel** key `Object.keys` cannot render to a string.
 
+The stage-4 **object-integrity** child (1/8, harden's direct prerequisite)
+lands the property-attribute **integrity model** and the **descriptor-reflection
+remainder**, all bit-exact (result AND computron) against the pin. The
+integrity levels — `Object.preventExtensions`/`seal`/`freeze` +
+`isExtensible`/`isSealed`/`isFrozen` — carry the slot-arena flag semantics XS
+implements: a non-extensible instance stamps `XS_DONT_PATCH_FLAG` (`1<<4`) on
+its own `XS_INSTANCE_KIND` slot (`mxBehaviorPreventExtensions`/
+`mxBehaviorIsExtensible`), and `seal`/`freeze` additionally stamp
+`XS_DONT_DELETE_FLAG` (seal) or `XS_DONT_DELETE_FLAG|XS_DONT_SET_FLAG` (freeze)
+on every own data property. Metering is allocation-driven (the `xsObject.c`
+bodies call no `mxMeter`): `preventExtensions`/`isExtensible` carry a zero
+native residual over the frame; `seal`/`freeze` charge the `fxNewInstance` keys
+holder + one `mxBehaviorOwnKeys` at-slot (`fxNewSlot`, `1<<8`) per own key
+(`65792` base + `256`/key); `isSealed`/`isFrozen` short-circuit to `false` on an
+extensible instance and otherwise charge the same-shaped `65800` + `256`/key
+walk. Those flags **ripple through the write paths**: an ordinary `o.k = v` to a
+frozen / non-writable property, or a new key on a non-extensible object, is
+rejected by `mxBehaviorSetProperty` (a **sloppy** callee silently ignores it,
+the assignment still evaluating to the RHS; no allocation, so it meters nothing
+beyond dispatch), and a `delete` of a non-configurable own property returns
+`false` without unlinking. The descriptor-reflection remainder adds
+`Object.values`/`entries` (a fresh `Array` of own enumerable values / `[k,v]`
+pairs, `66048` base + a per-key value-read residual — `3<<14` for `values`,
+`1<<16` for `entries`'s pair construct), `Object.getOwnPropertyDescriptors`
+(the plural, `82432` base + `34568`/key), and
+`Object.prototype.propertyIsEnumerable` (the `mxBehaviorGetOwnProperty` probe,
+`1<<16`). `built-ins/Object` whole-tree dual-run grows to **`covered=176
+divergent=0`** (from 63), with the per-section bars all `divergent=0`:
+`built-ins/Object/{freeze covered=12, seal 12, preventExtensions 12, isFrozen
+24, isSealed 19, isExtensible 25}`. The honest **named skips** are: the
+**strict-mode** integrity-violation *throw* — a rejected set/delete under a
+strict callee must throw a *catchable* native `TypeError`, which needs the
+native-error construction endor does not yet model (a wrong uncatchable
+host-abort would diverge from a `try`/`catch`), so it self-names
+`strict-set:integrity-violation` / `strict-delete:non-configurable` rather than
+answer wrongly; and an **exotic receiver** or an **accessor own property**
+across all these surfaces (the same class the object-statics child skips). The
+headline stage-4 surfaces this child does **not** reach — **accessor
+properties** (getter/setter slots, `get x()`/`set x()` object-literal opcodes,
+accessor-descriptor `defineProperty`) and the **full ValidateAndApplyProperty­
+Descriptor** reconfiguration path (`defineProperty` redefine / partial
+descriptors) — remain the reported **scope fold**, carried forward to a
+follow-up child as the honest named skips the object-statics child already
+lists.
+
 The stage-3b **promises** child (7/9) lands `Promise`, the promise **job
 queue**, and the **pump-loop latch** — the host-driven microtask drain the
 endor embedding performs after a crank. `xsPromise.c` calls `mxMeter` exactly

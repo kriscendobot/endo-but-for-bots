@@ -226,12 +226,75 @@ pub const GOPD_ABSENT_RESIDUAL_METERING: u64 = 65560;
 /// loop already meters. Calibrated against the pin via the isolated raw-gap. A
 /// novel key's intern slot is metered separately by [`Interp::intern_key`].
 pub const DEFINE_PROPERTY_NEW_RESIDUAL_METERING: u64 = 622024;
+/// `Object.preventExtensions(o)` native-body residual (constant, no per-key
+/// work): `mxBehaviorPreventExtensions` sets the instance's
+/// `XS_DONT_PATCH_FLAG` and meters nothing beyond the native frame. Calibrated
+/// against the pin via the isolated raw-gap.
+pub const PREVENT_EXTENSIONS_RESIDUAL_METERING: u64 = 0;
+/// `Object.isExtensible(o)` / `isSealed` / `isFrozen` native-body base
+/// residual: the native frame + `mxBehaviorIsExtensible` read. `isSealed`/
+/// `isFrozen` additionally build the `fxNewInstance` keys holder and walk the
+/// own keys — the [`INTEGRITY_QUERY_KEYS_BASE_METERING`] +
+/// [`INTEGRITY_QUERY_PER_KEY_METERING`] added on top.
+pub const IS_EXTENSIBLE_RESIDUAL_METERING: u64 = 0;
+/// `Object.isSealed`/`isFrozen` keys-walk base (the `fxNewInstance` keys
+/// holder + `mxBehaviorOwnKeys` setup + the undefined property scratch), added
+/// when the instance is non-extensible (an extensible instance short-circuits
+/// to `false` before the walk). Measured exact against the pin's raw-gap.
+pub const INTEGRITY_QUERY_KEYS_BASE_METERING: u64 = 65800;
+/// `Object.isSealed`/`isFrozen` per-own-key cost: one `mxBehaviorOwnKeys`
+/// at-slot (`fxNewSlot`, `1<<8`) per own key; the `mxBehaviorGetOwnProperty`
+/// probe copies flags into the reused scratch, allocating nothing.
+pub const INTEGRITY_QUERY_PER_KEY_METERING: u64 = 256;
+/// `Object.seal`/`freeze` keys-walk base: `mxBehaviorPreventExtensions` + the
+/// `fxNewInstance` keys holder (one `fxNewSlot`, `1<<8`) over one `CODE` step
+/// (`1<<16`) = `65792`, measured against the pin's raw-gap.
+pub const INTEGRITY_APPLY_KEYS_BASE_METERING: u64 = 65792;
+/// `Object.seal`/`freeze` per-own-key cost: the `mxBehaviorOwnKeys` at-slot
+/// (`fxNewSlot`, exactly [`crate::meter::SLOT_ALLOCATION_METERING`] = `1<<8`)
+/// per own key. The re-stamp allocates nothing.
+pub const INTEGRITY_APPLY_PER_KEY_METERING: u64 = 256;
+/// `Object.values(o)`/`entries(o)` native-body base (the result `fxNewArray`
+/// + own-keys walk setup), mirroring [`OBJECT_KEYS_FRAME_METERING`]. The
+/// per-key allocations (the value slot, and for `entries` the pair array) are
+/// metered on top.
+pub const OBJECT_VALUES_FRAME_METERING: u64 = 66048;
+pub const OBJECT_ENTRIES_FRAME_METERING: u64 = 66048;
+/// `Object.values(o)` per-own-key native residual beyond the result-array's
+/// per-slot allocation ([`crate::meter::SLOT_ALLOCATION_METERING`]) and the
+/// one-time item chunk: the per-element `mxBehaviorGetProperty` value read
+/// (`3<<14`), measured exact against the pin.
+pub const OBJECT_VALUES_PER_KEY_METERING: u64 = 49152;
+/// `Object.entries(o)` per-own-key native residual beyond the pair array's two
+/// element slots and item chunk: the per-element value read plus the
+/// `fxNewArray(2)` pair-instance construction, `1<<16`, measured exact.
+pub const OBJECT_ENTRIES_PER_KEY_METERING: u64 = 65792;
+/// `Object.getOwnPropertyDescriptors(o)` native-body base: the result object
+/// instance + own-keys walk setup, measured exact against the pin's raw-gap.
+pub const GOPDS_FRAME_METERING: u64 = 82432;
+/// `Object.getOwnPropertyDescriptors(o)` per-own-key cost: the
+/// `fxFromPropertyDescriptor` descriptor-object build plus the key property
+/// slot linking it into the result — folded into one measured residual
+/// (cheaper than the standalone `getOwnPropertyDescriptor`'s
+/// [`GOPD_PRESENT_RESIDUAL_METERING`] because the plural amortizes the native
+/// frame). Calibrated exact against the pin.
+pub const GOPDS_PER_KEY_METERING: u64 = 34568;
+/// `Object.prototype.propertyIsEnumerable(k)` native-body residual: the
+/// `mxBehaviorGetOwnProperty` probe, mirroring `hasOwnProperty`.
+pub const PROPERTY_IS_ENUMERABLE_METERING: u64 = 1 << 16;
 /// XS property flag bits (`xsCommon.h`): a data property's attribute byte.
 pub const XS_DONT_DELETE_FLAG: u8 = 2; // configurable: false
 pub const XS_DONT_ENUM_FLAG: u8 = 4; // enumerable: false
 pub const XS_DONT_SET_FLAG: u8 = 8; // writable: false
 pub const XS_GETTER_FLAG: u8 = 32;
 pub const XS_SETTER_FLAG: u8 = 64;
+/// XS instance-slot flag bit (`xsAll.h`): a non-extensible instance carries
+/// `XS_DONT_PATCH_FLAG` on its own `XS_INSTANCE_KIND` slot's `flag` byte
+/// (`mxBehaviorPreventExtensions` sets it, `mxBehaviorIsExtensible` reads it).
+/// Note the *instance* flag byte reuses bit positions the *property* flag byte
+/// spends on `XS_METHOD_FLAG`/`XS_GETTER_FLAG` — the two are never the same
+/// slot, so the overlap is harmless. Only the extensibility bit is modeled.
+pub const XS_DONT_PATCH_FLAG: u8 = 16;
 /// The fixed re-dispatch overhead `Function.prototype.call` accrues beyond
 /// the visible `.call` opcodes and the callee body (measured as `2<<16`),
 /// plus one built-in step ([`CALL_TRAMPOLINE_PER_ARG`]) per forwarded
@@ -1234,6 +1297,38 @@ pub enum NativeMethod {
     /// descriptor, a redefine of an existing key, or an exotic receiver
     /// self-names.
     ObjectDefineProperty,
+    /// `Object.getOwnPropertyDescriptors(o)` — a fresh object mapping each own
+    /// property key to its descriptor object (the plural of
+    /// `getOwnPropertyDescriptor`).
+    ObjectGetOwnPropertyDescriptors,
+    /// `Object.values(o)` — a fresh `Array` of `o`'s own enumerable
+    /// string-keyed property values, in creation order.
+    ObjectValues,
+    /// `Object.entries(o)` — a fresh `Array` of `[key, value]` two-element
+    /// arrays for `o`'s own enumerable string-keyed properties, in creation
+    /// order.
+    ObjectEntries,
+    /// `Object.preventExtensions(o)` — mark the instance non-extensible
+    /// (`XS_DONT_PATCH_FLAG`), returning it.
+    ObjectPreventExtensions,
+    /// `Object.seal(o)` — prevent extensions and mark every own property
+    /// non-configurable (`XS_DONT_DELETE_FLAG`), returning it.
+    ObjectSeal,
+    /// `Object.freeze(o)` — prevent extensions and mark every own data
+    /// property non-configurable and non-writable
+    /// (`XS_DONT_DELETE_FLAG|XS_DONT_SET_FLAG`), returning it.
+    ObjectFreeze,
+    /// `Object.isExtensible(o)` — whether the instance is still extensible.
+    ObjectIsExtensible,
+    /// `Object.isSealed(o)` — non-extensible and every own property
+    /// non-configurable.
+    ObjectIsSealed,
+    /// `Object.isFrozen(o)` — non-extensible and every own data property
+    /// non-configurable and non-writable.
+    ObjectIsFrozen,
+    /// `Object.prototype.propertyIsEnumerable(k)` — whether `k` is an own
+    /// enumerable property of the receiver.
+    ObjectPropertyIsEnumerable,
     FunctionToString,
     /// `Function.prototype.call` — a re-entrant trampoline: invoke the
     /// receiver function with the first argument as `this` and the rest as
@@ -3045,6 +3140,7 @@ impl Interp {
             ("valueOf", NativeMethod::ObjectValueOf),
             ("hasOwnProperty", NativeMethod::ObjectHasOwnProperty),
             ("isPrototypeOf", NativeMethod::ObjectIsPrototypeOf),
+            ("propertyIsEnumerable", NativeMethod::ObjectPropertyIsEnumerable),
         ];
         for (name, m) in obj_methods {
             let mf = self.alloc_method(m);
@@ -3062,6 +3158,27 @@ impl Interp {
             let defprop = self.alloc_method(NativeMethod::ObjectDefineProperty);
             self.proto_methods
                 .push((object_ctor, "defineProperty", defprop));
+            let gopds = self.alloc_method(NativeMethod::ObjectGetOwnPropertyDescriptors);
+            self.proto_methods
+                .push((object_ctor, "getOwnPropertyDescriptors", gopds));
+            let values = self.alloc_method(NativeMethod::ObjectValues);
+            self.proto_methods.push((object_ctor, "values", values));
+            let entries = self.alloc_method(NativeMethod::ObjectEntries);
+            self.proto_methods.push((object_ctor, "entries", entries));
+            let prevext = self.alloc_method(NativeMethod::ObjectPreventExtensions);
+            self.proto_methods
+                .push((object_ctor, "preventExtensions", prevext));
+            let seal = self.alloc_method(NativeMethod::ObjectSeal);
+            self.proto_methods.push((object_ctor, "seal", seal));
+            let freeze = self.alloc_method(NativeMethod::ObjectFreeze);
+            self.proto_methods.push((object_ctor, "freeze", freeze));
+            let isext = self.alloc_method(NativeMethod::ObjectIsExtensible);
+            self.proto_methods
+                .push((object_ctor, "isExtensible", isext));
+            let issealed = self.alloc_method(NativeMethod::ObjectIsSealed);
+            self.proto_methods.push((object_ctor, "isSealed", issealed));
+            let isfrozen = self.alloc_method(NativeMethod::ObjectIsFrozen);
+            self.proto_methods.push((object_ctor, "isFrozen", isfrozen));
         }
         let fp_tostring = self.alloc_method(NativeMethod::FunctionToString);
         self.proto_methods.push((func_proto, "toString", fp_tostring));
@@ -4370,6 +4487,21 @@ impl Interp {
                             let n = to_number(&value);
                             let clamped = if n.is_nan() || n < 0.0 { 0.0 } else { n.floor() };
                             self.regexps.get_mut(&inst).unwrap().last_index = clamped;
+                        } else if self.ordinary_write_rejected(inst, id) {
+                            // A frozen / non-writable property, or a new key on a
+                            // non-extensible object: XS's `mxBehaviorSetProperty`
+                            // stores nothing. A **sloppy** callee silently
+                            // ignores the failed set (the assignment still
+                            // evaluates to the RHS) — fully modeled, no
+                            // allocation, so it meters nothing beyond its
+                            // dispatch (verified against the pin). A **strict**
+                            // callee must throw a *catchable* `TypeError`, which
+                            // needs the native-error construction endor does not
+                            // yet model (a wrong uncatchable host-abort would
+                            // diverge from a `try`/`catch`), so it self-names.
+                            if self.strict {
+                                return Halt::Unsupported("strict-set:integrity-violation");
+                            }
                         } else {
                             self.instance_put(inst, id, value);
                         }
@@ -4566,6 +4698,16 @@ impl Interp {
                             // allocation-free unlink.
                             self.meter.tick_builtin();
                             let deleted = self.delete_own_property(inst, id);
+                            // A strict `delete` of a non-configurable own
+                            // property throws a *catchable* `TypeError` (XS's
+                            // `fxRunDelete` on a `false` from
+                            // `mxBehaviorDeleteProperty`) — the native-error
+                            // construction endor does not yet model, so it
+                            // self-names. A sloppy `delete` yields `false`
+                            // (fully modeled below).
+                            if !deleted && self.strict {
+                                return Halt::Unsupported("strict-delete:non-configurable");
+                            }
                             if let Some(s) = self.stack.last_mut() {
                                 *s = Slot::boolean(deleted);
                             }
@@ -8583,6 +8725,291 @@ impl Interp {
                 let idx = self.slots.alloc(prop);
                 self.slots.get_mut(inst).next = idx;
                 arg0
+            }
+            // `Object.propertyIsEnumerable(k)` (a prototype method): whether
+            // `k` is an own enumerable property of the receiver. Own-only, no
+            // prototype walk (XS's `fxOrdinaryGetOwnProperty` + the
+            // `XS_DONT_ENUM_FLAG` test) — an absent, inherited, or
+            // non-enumerable own key is `false`.
+            NativeMethod::ObjectPropertyIsEnumerable => {
+                let inst = match this.value {
+                    Payload::Reference(o) if this.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("propertyIsEnumerable:non-object-this")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("propertyIsEnumerable:exotic-object"));
+                }
+                let key = match arg0.value {
+                    Payload::String(off) if arg0.kind == Kind::String => self.str_text(off),
+                    _ => return Err(Halt::Unsupported("propertyIsEnumerable:non-string-key")),
+                };
+                if string_to_index(&key).is_some() {
+                    return Err(Halt::Unsupported("propertyIsEnumerable:index-key"));
+                }
+                if !self.symbol_ids.contains_key(&key) && self.default_keys.contains(key.as_str()) {
+                    return Err(Halt::Unsupported("propertyIsEnumerable:ambiguous-default-key"));
+                }
+                let id = self.intern_key(&key);
+                let r = match self.find_property(inst, id) {
+                    Some(p) => self.slots.get(p).flag & XS_DONT_ENUM_FLAG == 0,
+                    None => false,
+                };
+                self.meter.tick_raw(PROPERTY_IS_ENUMERABLE_METERING);
+                Slot::boolean(r)
+            }
+            // `Object.values(o)` / `Object.entries(o)`: a fresh `Array` of the
+            // own enumerable string-keyed values (or `[key, value]` pairs), in
+            // creation order. Ordinary receivers only — an exotic one skips.
+            NativeMethod::ObjectValues | NativeMethod::ObjectEntries => {
+                let entries = matches!(m, NativeMethod::ObjectEntries);
+                let inst = match arg0.value {
+                    Payload::Reference(o) => o,
+                    _ => {
+                        return Err(Halt::Unsupported(if entries {
+                            "Object.entries:non-object"
+                        } else {
+                            "Object.values:non-object"
+                        }))
+                    }
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported(if entries {
+                        "Object.entries:exotic-object"
+                    } else {
+                        "Object.values:exotic-object"
+                    }));
+                }
+                let ids = match self.own_enumerable_ids(inst) {
+                    Some(v) => v,
+                    None => {
+                        return Err(Halt::Unsupported(if entries {
+                            "Object.entries:unclassified-property"
+                        } else {
+                            "Object.values:unclassified-property"
+                        }))
+                    }
+                };
+                // Read each value now (the property chain is stable across the
+                // result build). An accessor own property would need a getter
+                // invocation; `own_enumerable_ids` already skips such objects.
+                let values: Vec<Slot> = ids
+                    .iter()
+                    .map(|&id| {
+                        let p = self.find_property(inst, id).unwrap();
+                        let s = self.slots.get(p);
+                        Slot::of(s.kind, s.value)
+                    })
+                    .collect();
+                let n = ids.len() as u32;
+                self.meter.tick_raw(if entries {
+                    OBJECT_ENTRIES_FRAME_METERING
+                } else {
+                    OBJECT_VALUES_FRAME_METERING
+                });
+                self.meter.tick_raw(self.array_chunk_size_metering(n));
+                let result = self.slots.alloc(Slot::instance(self.array_proto));
+                let mut data = ArrayData::default();
+                data.length = n;
+                for (i, (&id, val)) in ids.iter().zip(values.iter()).enumerate() {
+                    if entries {
+                        self.meter.tick_raw(OBJECT_ENTRIES_PER_KEY_METERING);
+                        // A `[key, value]` two-element array per own key.
+                        self.meter.tick_raw(self.array_chunk_size_metering(2));
+                        for _ in 0..2 {
+                            self.meter.tick_slot_alloc();
+                        }
+                        let name = self.symbol_names[(id - 1) as usize].clone();
+                        let off = self.alloc_str_text(name.as_bytes());
+                        let pair = self.slots.alloc(Slot::instance(self.array_proto));
+                        let mut pd = ArrayData::default();
+                        pd.length = 2;
+                        pd.items
+                            .insert(0, Slot::of(Kind::String, Payload::String(off)));
+                        pd.items.insert(1, *val);
+                        self.arrays.insert(pair, pd);
+                        data.items
+                            .insert(i as u32, Slot::of(Kind::Reference, Payload::Reference(pair)));
+                    } else {
+                        self.meter.tick_raw(OBJECT_VALUES_PER_KEY_METERING);
+                        self.meter.tick_slot_alloc();
+                        data.items.insert(i as u32, *val);
+                    }
+                }
+                self.arrays.insert(result, data);
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Object.getOwnPropertyDescriptors(o)`: a fresh object mapping
+            // each own property key to its full data descriptor. Ordinary
+            // receivers with ordinary data properties only.
+            NativeMethod::ObjectGetOwnPropertyDescriptors => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) => o,
+                    _ => return Err(Halt::Unsupported("getOwnPropertyDescriptors:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("getOwnPropertyDescriptors:exotic-object"));
+                }
+                let slots = self.own_property_slots(inst);
+                // Snapshot each own property (id, flag, value). Any accessor is
+                // outside the covered data-descriptor shape.
+                let mut props: Vec<(u16, u8, Kind, Payload)> = Vec::new();
+                for &p in &slots {
+                    let s = *self.slots.get(p);
+                    if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                        return Err(Halt::Unsupported(
+                            "getOwnPropertyDescriptors:accessor-property",
+                        ));
+                    }
+                    let name_idx = match (s.id as usize).checked_sub(1) {
+                        Some(i) if i < self.symbol_names.len() => i,
+                        _ => {
+                            return Err(Halt::Unsupported(
+                                "getOwnPropertyDescriptors:unclassified-property",
+                            ))
+                        }
+                    };
+                    let _ = name_idx;
+                    props.push((s.id, s.flag, s.kind, s.value));
+                }
+                self.meter.tick_raw(GOPDS_FRAME_METERING);
+                let result = self.slots.alloc(Slot::instance(self.object_proto));
+                for (id, flag, kind, value) in props {
+                    let writable = flag & XS_DONT_SET_FLAG == 0;
+                    let enumerable = flag & XS_DONT_ENUM_FLAG == 0;
+                    let configurable = flag & XS_DONT_DELETE_FLAG == 0;
+                    self.meter.tick_raw(GOPDS_PER_KEY_METERING);
+                    let desc = self.slots.alloc(Slot::instance(self.object_proto));
+                    self.define_descriptor_field(desc, "value", Slot::of(kind, value));
+                    self.define_descriptor_field(desc, "writable", Slot::boolean(writable));
+                    self.define_descriptor_field(desc, "enumerable", Slot::boolean(enumerable));
+                    self.define_descriptor_field(desc, "configurable", Slot::boolean(configurable));
+                    let head = self.slots.get(result).next;
+                    let mut prop = Slot::of(Kind::Reference, Payload::Reference(desc));
+                    prop.id = id;
+                    prop.next = head;
+                    let idx = self.slots.alloc(prop);
+                    self.slots.get_mut(result).next = idx;
+                }
+                Slot::of(Kind::Reference, Payload::Reference(result))
+            }
+            // `Object.preventExtensions(o)`: mark the instance non-extensible.
+            // Non-object arguments pass through unchanged (spec: return the
+            // argument). Ordinary receivers only.
+            NativeMethod::ObjectPreventExtensions => {
+                if let Payload::Reference(inst) = arg0.value {
+                    if !self.is_ordinary_object(inst) {
+                        return Err(Halt::Unsupported("preventExtensions:exotic-object"));
+                    }
+                    self.meter.tick_raw(PREVENT_EXTENSIONS_RESIDUAL_METERING);
+                    self.slots.get_mut(inst).flag |= XS_DONT_PATCH_FLAG;
+                }
+                arg0
+            }
+            // `Object.seal(o)`: prevent extensions and mark every own property
+            // non-configurable (`XS_DONT_DELETE_FLAG`). Ordinary receivers.
+            NativeMethod::ObjectSeal | NativeMethod::ObjectFreeze => {
+                let freeze = matches!(m, NativeMethod::ObjectFreeze);
+                if let Payload::Reference(inst) = arg0.value {
+                    if !self.is_ordinary_object(inst) {
+                        return Err(Halt::Unsupported(if freeze {
+                            "freeze:exotic-object"
+                        } else {
+                            "seal:exotic-object"
+                        }));
+                    }
+                    let slots = self.own_property_slots(inst);
+                    // A getter/setter own property: freeze/seal do stamp
+                    // DONT_DELETE (and freeze leaves the accessor callable), a
+                    // shape not modeled — honest-skip rather than mis-stamp.
+                    for &p in &slots {
+                        if self.slots.get(p).flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                            return Err(Halt::Unsupported(if freeze {
+                                "freeze:accessor-property"
+                            } else {
+                                "seal:accessor-property"
+                            }));
+                        }
+                    }
+                    self.meter.tick_raw(INTEGRITY_APPLY_KEYS_BASE_METERING);
+                    self.slots.get_mut(inst).flag |= XS_DONT_PATCH_FLAG;
+                    for &p in &slots {
+                        self.meter.tick_raw(INTEGRITY_APPLY_PER_KEY_METERING);
+                        let s = self.slots.get_mut(p);
+                        s.flag |= XS_DONT_DELETE_FLAG;
+                        if freeze {
+                            s.flag |= XS_DONT_SET_FLAG;
+                        }
+                    }
+                }
+                arg0
+            }
+            // `Object.isExtensible(o)`: whether the instance is still
+            // extensible. A non-object argument is `false`.
+            NativeMethod::ObjectIsExtensible => {
+                let r = match arg0.value {
+                    Payload::Reference(inst) if arg0.kind == Kind::Reference => {
+                        if !self.is_ordinary_object(inst) {
+                            return Err(Halt::Unsupported("isExtensible:exotic-object"));
+                        }
+                        self.instance_extensible(inst)
+                    }
+                    _ => false,
+                };
+                self.meter.tick_raw(IS_EXTENSIBLE_RESIDUAL_METERING);
+                Slot::boolean(r)
+            }
+            // `Object.isSealed(o)` / `Object.isFrozen(o)`: non-extensible and
+            // every own property non-configurable (sealed) — and for frozen,
+            // every own data property additionally non-writable. A non-object
+            // argument is `true` (vacuously sealed/frozen).
+            NativeMethod::ObjectIsSealed | NativeMethod::ObjectIsFrozen => {
+                let frozen = matches!(m, NativeMethod::ObjectIsFrozen);
+                let r = match arg0.value {
+                    Payload::Reference(inst) if arg0.kind == Kind::Reference => {
+                        if !self.is_ordinary_object(inst) {
+                            return Err(Halt::Unsupported(if frozen {
+                                "isFrozen:exotic-object"
+                            } else {
+                                "isSealed:exotic-object"
+                            }));
+                        }
+                        self.meter.tick_raw(IS_EXTENSIBLE_RESIDUAL_METERING);
+                        if self.instance_extensible(inst) {
+                            // Extensible short-circuits to false before the walk.
+                            false
+                        } else {
+                            self.meter.tick_raw(INTEGRITY_QUERY_KEYS_BASE_METERING);
+                            let slots = self.own_property_slots(inst);
+                            let mut ok = true;
+                            for &p in &slots {
+                                self.meter.tick_raw(INTEGRITY_QUERY_PER_KEY_METERING);
+                                let f = self.slots.get(p).flag;
+                                if f & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                                    // An accessor's writability is n/a; only the
+                                    // DONT_DELETE bit matters — but the modeled
+                                    // shape carries no accessors, so skip.
+                                    return Err(Halt::Unsupported(if frozen {
+                                        "isFrozen:accessor-property"
+                                    } else {
+                                        "isSealed:accessor-property"
+                                    }));
+                                }
+                                if f & XS_DONT_DELETE_FLAG == 0 {
+                                    ok = false;
+                                }
+                                if frozen && f & XS_DONT_SET_FLAG == 0 {
+                                    ok = false;
+                                }
+                            }
+                            ok
+                        }
+                    }
+                    _ => {
+                        self.meter.tick_raw(IS_EXTENSIBLE_RESIDUAL_METERING);
+                        true
+                    }
+                };
+                Slot::boolean(r)
             }
             // `Array.prototype.push(...items)` — dense fast path only.
             NativeMethod::ArrayPush => {
@@ -13108,6 +13535,45 @@ impl Interp {
         Some(ids)
     }
 
+    /// Whether `inst` is an *ordinary* object — one whose whole own-property
+    /// set lives in the slot-arena property chain, with no exotic side table
+    /// (array/typed-array/collection/buffer/view/wrapper/error). The Object
+    /// statics and integrity operations are modeled only over ordinary
+    /// receivers; an exotic one carries indices/`length`/internal names the
+    /// slot chain does not enumerate, so the caller honest-skips.
+    fn is_ordinary_object(&self, inst: crate::value::SlotIndex) -> bool {
+        !(self.arrays.contains_key(&inst)
+            || self.collections.contains_key(&inst)
+            || self.typed_arrays.contains_key(&inst)
+            || self.array_buffers.contains_key(&inst)
+            || self.data_views.contains_key(&inst)
+            || self.wrapper_data.contains_key(&inst)
+            || self.error_data.contains_key(&inst)
+            || self.regexps.contains_key(&inst))
+    }
+
+    /// The slot indices of every own property of `inst`, in creation
+    /// (insertion) order — XS's `mxBehaviorOwnKeys` over the property chain,
+    /// unfiltered (data and accessor, enumerable or not). Used by the
+    /// integrity operations, which stamp/read a flag on *every* own property.
+    fn own_property_slots(&self, inst: crate::value::SlotIndex) -> Vec<crate::value::SlotIndex> {
+        let mut out = Vec::new();
+        let mut cur = self.slots.get(inst).next;
+        while !cur.is_null() {
+            out.push(cur);
+            cur = self.slots.get(cur).next;
+        }
+        // Newest-first chain → creation order.
+        out.reverse();
+        out
+    }
+
+    /// Whether instance `inst` is extensible (XS's `mxBehaviorIsExtensible`):
+    /// its own `XS_INSTANCE_KIND` slot does not carry `XS_DONT_PATCH_FLAG`.
+    fn instance_extensible(&self, inst: crate::value::SlotIndex) -> bool {
+        self.slots.get(inst).flag & XS_DONT_PATCH_FLAG == 0
+    }
+
     /// Add one field of a synthesized property descriptor object (an own
     /// enumerable data property `name = value`) **without** metering — its
     /// allocation cost is folded into the descriptor build's single measured
@@ -13135,6 +13601,23 @@ impl Interp {
     /// Returns `true` if a new property was created. The property slot
     /// holds the value directly (its `kind`/`value` are the value's),
     /// with `id` the key and `next` the following property.
+    /// Whether an ordinary `[[Set]]` of `id` on `inst` must be *rejected* by
+    /// the integrity flags (XS's `mxBehaviorSetProperty` returning without
+    /// storing): an own data property marked non-writable (`XS_DONT_SET_FLAG`
+    /// — the state `Object.freeze`/`defineProperty(writable:false)` stamps), or
+    /// a genuinely-new key on a non-extensible instance (`XS_DONT_PATCH_FLAG`
+    /// — `preventExtensions`/`seal`/`freeze`). A writable own property, or a
+    /// new key on an extensible instance, accepts the write. Own-property only:
+    /// an inherited non-writable data property or a prototype setter is a later
+    /// increment (the covered grammar's prototypes carry only intrinsic
+    /// methods, none writable-false data).
+    fn ordinary_write_rejected(&self, inst: crate::value::SlotIndex, id: u16) -> bool {
+        match self.find_property(inst, id) {
+            Some(p) => self.slots.get(p).flag & XS_DONT_SET_FLAG != 0,
+            None => !self.instance_extensible(inst),
+        }
+    }
+
     fn instance_put(&mut self, inst: crate::value::SlotIndex, id: u16, value: Slot) -> bool {
         if let Some(p) = self.find_property(inst, id) {
             let s = self.slots.get_mut(p);
@@ -13168,6 +13651,14 @@ impl Interp {
         while !cur.is_null() {
             let s = *self.slots.get(cur);
             if s.id == id {
+                // A non-configurable own property (`XS_DONT_DELETE_FLAG` — the
+                // state `seal`/`freeze`/`defineProperty(configurable:false)`
+                // stamps) refuses deletion: `mxBehaviorDeleteProperty` returns
+                // `false`, leaving the property in place (a strict `delete`
+                // throws on the `false`; a sloppy one yields `false`).
+                if s.flag & XS_DONT_DELETE_FLAG != 0 {
+                    return false;
+                }
                 // Unlink `cur` from the chain and free its slot.
                 self.slots.get_mut(prev).next = s.next;
                 self.slots.free(cur);
