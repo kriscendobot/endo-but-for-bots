@@ -503,6 +503,93 @@ pub fn stage3b_regexp_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3b-regexp.js"))
 }
 
+/// The stage-4b compartment differential corpus (child 3/5): programs
+/// evaluated in TWO compartments over ONE machine's shared intrinsics
+/// (`Compartment::evaluate_with_symbols`), certifying RESULT agreement
+/// with the oracle (evaluate faithfulness + shared-intrinsics identity +
+/// cross-compartment values). Programs that reference the `Compartment`
+/// intrinsic itself are the recorded scope fold
+/// (`compartment:intrinsic-surface`), excluded from this corpus.
+pub fn stage4_compartment_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-compartment.js"))
+}
+
+/// One program's compartment differential record: the oracle result and
+/// the result each of two compartments over one shared-intrinsics machine
+/// produced when it evaluated the oracle's exact bytecode.
+#[derive(Debug, Clone)]
+pub struct CompartmentDualRun {
+    pub source: String,
+    /// The oracle completed normally.
+    pub oracle_completed: bool,
+    pub oracle_result: String,
+    /// Both compartments completed normally.
+    pub both_completed: bool,
+    /// Compartment A's completion value string.
+    pub a_result: String,
+    /// Compartment B's completion value string.
+    pub b_result: String,
+    /// The two compartments referenced the same machine intrinsics graph.
+    pub shared_intrinsics: bool,
+    /// Compartment A's computrons (same bytecode → same as the oracle's
+    /// run-only count for a bit-exact program).
+    pub a_computrons: u64,
+    pub oracle_computrons: u64,
+    pub a_halt: endor_vm::Halt,
+}
+
+impl CompartmentDualRun {
+    /// RESULT agreement (the compartment acceptance bar): the oracle and
+    /// BOTH compartments completed with the same completion value, over
+    /// one shared intrinsics graph. A completion mismatch or a
+    /// cross-compartment disagreement is a divergence, never a silent
+    /// pass.
+    pub fn result_agrees(&self) -> bool {
+        self.oracle_completed
+            && self.both_completed
+            && self.shared_intrinsics
+            && self.a_result == self.oracle_result
+            && self.b_result == self.oracle_result
+    }
+
+    /// The same bytecode evaluated in a compartment reproduces the
+    /// oracle's run-only computron count (stricter telemetry the branch
+    /// runner still gates — the compartment evaluator seeds no globals
+    /// here, so it is byte-identical to the top-level realm run).
+    pub fn computrons_agree(&self) -> bool {
+        self.oracle_completed && self.both_completed && self.a_computrons == self.oracle_computrons
+    }
+}
+
+/// Compile `source` on the oracle, then evaluate its exact bytecode in
+/// two compartments over one machine's shared intrinsics. Returns `None`
+/// only if the oracle machine itself fails to start.
+pub fn compartment_dual_run(source: &str) -> Option<CompartmentDualRun> {
+    use endor_vm::Machine;
+
+    let oracle = endor_oracle::run(source)?;
+    let machine = Machine::new();
+    let a = machine.new_compartment();
+    let b = machine.new_compartment();
+    let shared_intrinsics = std::rc::Rc::ptr_eq(a.intrinsics(), b.intrinsics());
+
+    let ra = a.evaluate_with_symbols(&oracle.bytecode, &oracle.symbols);
+    let rb = b.evaluate_with_symbols(&oracle.bytecode, &oracle.symbols);
+
+    Some(CompartmentDualRun {
+        source: source.to_string(),
+        oracle_completed: oracle.completed,
+        oracle_result: oracle.result,
+        both_completed: ra.completed && rb.completed,
+        a_result: ra.result,
+        b_result: rb.result,
+        shared_intrinsics,
+        a_computrons: ra.computrons,
+        oracle_computrons: oracle.computrons,
+        a_halt: ra.halt,
+    })
+}
+
 /// A summary over a corpus run.
 #[derive(Debug, Default, Clone)]
 pub struct Summary {
@@ -1550,6 +1637,96 @@ mod tests {
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
+    }
+
+    #[test]
+    fn stage4_compartment_corpus_agrees_across_two_compartments() {
+        // The stage-4b compartment acceptance bar (child 3/5): each program
+        // is compiled once on the oracle and evaluated in TWO compartments
+        // over ONE machine's shared intrinsics
+        // (`Compartment::evaluate_with_symbols`). The bar is RESULT agreement
+        // (doctrine: the compartment differential certifies results): both
+        // compartments must complete with the oracle's completion value,
+        // over one shared intrinsics graph — evaluate faithfulness,
+        // shared-intrinsics identity, and cross-compartment value agreement.
+        // The same bytecode also reproduces the oracle's run-only computrons
+        // (no globals seeded here), which we assert too. Programs that name
+        // the `Compartment` intrinsic itself are the recorded scope fold
+        // (`compartment:intrinsic-surface`), excluded from the corpus.
+        let programs = stage4_compartment_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4 compartment corpus must be non-empty"
+        );
+        let mut total = 0usize;
+        let mut agree = 0usize;
+        for p in &programs {
+            let r = compartment_dual_run(p).expect("oracle machine available");
+            total += 1;
+            let ok = r.result_agrees() && r.computrons_agree();
+            if ok {
+                agree += 1;
+            } else {
+                eprintln!(
+                    "COMPARTMENT DIVERGENCE {:?}\n  oracle(completed={} result={:?} computrons={})\n  A(result={:?} computrons={}) B(result={:?}) shared_intrinsics={} both_completed={}\n  A halt={:?}",
+                    r.source, r.oracle_completed, r.oracle_result, r.oracle_computrons,
+                    r.a_result, r.a_computrons, r.b_result, r.shared_intrinsics,
+                    r.both_completed, r.a_halt,
+                );
+            }
+        }
+        assert_eq!(
+            agree, total,
+            "stage-4 compartment result-agreement bar: {agree}/{total} (every program must agree across both compartments and the oracle)"
+        );
+    }
+
+    #[test]
+    fn compartments_isolate_their_own_globals_against_a_seeded_value() {
+        // Global separation, differential against the oracle's notion of a
+        // value: seed the SAME global id with a different value in each of
+        // two compartments over one machine, evaluate the exact bytecode the
+        // oracle emits for a program that reads that global, and confirm each
+        // compartment renders ITS OWN binding — matching the oracle's
+        // `String()` of that value, and diverging between the compartments.
+        use endor_vm::{Machine, Slot};
+
+        // The oracle compiles `x` (a lone global reference) to the read-global
+        // bytecode; we seed `x`'s program-local id per compartment. Two
+        // literals whose `String()` the oracle certifies:
+        let one = endor_oracle::run("String(11)").expect("oracle");
+        let two = endor_oracle::run("String(22)").expect("oracle");
+        assert_eq!(one.result, "11");
+        assert_eq!(two.result, "22");
+
+        // The read-global program addresses the global by its symbol id; we
+        // reuse the compartment unit-test shape via the public seam.
+        let read_x = {
+            use endor_vm::Opcode;
+            let [lo, hi] = 7u16.to_le_bytes();
+            vec![
+                Opcode::XS_CODE_EVAL_REFERENCE as u8, lo, hi,
+                Opcode::XS_CODE_GET_VARIABLE as u8, lo, hi,
+                Opcode::XS_CODE_SET_RESULT as u8,
+                Opcode::XS_CODE_END as u8,
+            ]
+        };
+
+        let machine = Machine::new();
+        let mut a = machine.new_compartment();
+        let mut b = machine.new_compartment();
+        a.define_global_id(7, Slot::integer(11));
+        b.define_global_id(7, Slot::integer(22));
+        let ra = a.evaluate(&read_x);
+        let rb = b.evaluate(&read_x);
+        assert!(ra.completed && rb.completed);
+        // Each compartment observes its own global, matching the oracle's
+        // `String()` of that value...
+        assert_eq!(ra.result, one.result, "compartment A sees its own 11");
+        assert_eq!(rb.result, two.result, "compartment B sees its own 22");
+        // ...and the two compartments diverge over one shared intrinsics graph.
+        assert_ne!(ra.result, rb.result);
+        assert!(std::rc::Rc::ptr_eq(a.intrinsics(), b.intrinsics()));
     }
 
     #[test]
