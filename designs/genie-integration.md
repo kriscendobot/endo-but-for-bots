@@ -3,9 +3,64 @@
 |             |                       |
 | ----------- | --------------------- |
 | **Created** | 2026-05-02            |
-| **Updated** | 2026-06-08            |
+| **Updated** | 2026-07-06            |
 | **Author**  | Kris Kowal (prompted) |
-| **Status**  | Proposed              |
+| **Status**  | Proposed (partially realized — see § Realization Status) |
+
+## Realization Status (2026-07-06)
+
+This survey was written 2026-05-02 and last revised 2026-06-08.
+In the month since, a large fraction of it has been realized **in
+spirit, under different names and a different decomposition than the
+survey proposed** — the direction held, the specific package names and
+shapes did not.
+This section is the reconciliation the maintainer asked for on
+[PR #89](https://github.com/endojs/endo-but-for-bots/pull/89): what has
+landed, what is in flight, and what remains.
+The section-by-section prose below is preserved as the original survey;
+read it through this lens.
+
+The single largest divergence: the survey framed the work as
+"extract **genie's** pi engine into `@endo/llm-engine` and migrate lal
+and fae onto it."
+What actually happened is the mirror image — the shared harness was
+extracted from **`@endo/lal`** into **`@endo/agentry`**, and it is
+`@endo/lal` (not genie) that has adopted it so far.
+Genie remains the un-migrated harness.
+The upstream `@mariozechner/pi-*` dependency the survey names has also
+been replaced repo-wide by the fork **`@earendil-works/pi-agent-core` /
+`@earendil-works/pi-ai` `^0.79.0`**.
+
+| Survey element | Landed as | Status |
+|---|---|---|
+| § 1 Pi engine → new shared package | `@endo/agentry` (extracted from `@endo/lal`, not genie; design [`agentry-agent-builder`](agentry-agent-builder.md)) | **Done, re-sourced.** `defineAgent` + `harness/*` (`makePiAgent`, model resolution, env credential seam, SmallCaps marshal). Not named `@endo/llm-engine`. |
+| § 1 Migrate a consumer onto it | `@endo/lal` on `@endo/agentry/harness` | **Done for lal.** lal's LLM construction, model resolution, and marshalling route through agentry. |
+| § 1 Delete `lal/providers/` | — | **Not done.** `packages/lal/providers/` is now orphaned from the runtime (only a test imports `config.js`) but not deleted. |
+| § 1 Migrate fae; delete `fae/extract-tool-calls.js` | — | **Not done.** fae still reaches the LLM transitively through lal; `extract-tool-calls.js` is intact. |
+| § 1 Migrate genie onto the engine | — | **Not done.** genie still constructs pi directly (`packages/genie/src/agent/index.js`). |
+| § 1 / § 4 Share `loop/`, `observer/`, `reflector/`, `system/`, `tokens.js`, `tools/registry.js` | — | **Not done.** These remain genie-only; agentry instead grew *new* surfaces the survey did not anticipate — a code-mode `execute` tool, `git-loop` presets, and an eval harness. |
+| § 2 Memory off the workspace/VFS/FTS5 stack | daemon `Mount`/`ScratchMount` ([`daemon-mount`](daemon-mount.md)) + `@endo/agent-tools` ([`endo-agent-tools`](endo-agent-tools.md)) + `@endo/platform/fs/extended` | **Partial, diverged.** Daemon `Mount`/`ScratchMount` shipped and genie mints a `workspace-mount`; memory *files* can ride it via a new `vfs-mount.js` adapter. But the VFS was **not** retired (`vfs.js`/`vfs-node.js`/`vfs-memory.js` and `safePath` all remain), the pet-store-as-memory shape (§ 2's recommended default) was **not** taken, and the FTS5 index did **not** graduate to a daemon `memory-index` capability — it is still in-process `better-sqlite3` inside genie. |
+| § 3 Scheduling → daemon capability | daemon interval-scheduler formula, in flight on [PR #609](https://github.com/endojs/endo-but-for-bots/pull/609) | **In flight, not merged.** Trunk still has only the simple `timer` formula. The build (`build/endoclaw-timer-daemon-formula-integration`) adds a 737-line `packages/daemon/src/interval-scheduler.js`, an `interval-scheduler` formula type, and an `interval-tick` mail message — but names it **`interval-scheduler`** (not `scheduler`, as [`scheduler.md`](scheduler.md) settled) and frames it as *endoclaw-timer Phase 1 remainder*. genie's `interval/` prototype is not yet retired; lal and fae still have no scheduling. See [`scheduler.md`](scheduler.md) § Realization Status. |
+
+**What remains** (the honest backlog, in dependency order):
+
+1. **Migrate genie onto `@endo/agentry`** — the survey's original Phase 1
+   target, still open. genie's `agent/index.js`, `system/`, and
+   `utils/tokens.js` are the natural next contributions to agentry.
+2. **Migrate fae onto `@endo/agentry`** and delete
+   `fae/src/extract-tool-calls.js`.
+3. **Delete the orphaned `packages/lal/providers/`** and drop lal's now-
+   redundant `@anthropic-ai/sdk` / `openai` / `ollama` runtime deps.
+4. **Lift the shared harness surfaces** the survey named (`loop/`,
+   `observer/`, `reflector/`, `system/`, `registry.js`) into agentry so
+   all three harnesses share them.
+5. **Land the interval-scheduler daemon formula** (PR #609) and settle
+   the `interval-scheduler`-vs-`scheduler` name; then grant genie a
+   scoped `Interval` and give lal/fae scheduling.
+6. **Resolve the memory shape**: either finish the pet-store-as-typed-
+   namespace migration (§ 2's recommended default) or commit to the
+   `Mount`-backed files shape, retire the VFS and `safePath` either way,
+   and graduate FTS5 into a daemon `memory-index` capability.
 
 ## What is the Problem Being Solved?
 
@@ -170,6 +225,13 @@ here; it shares everything in `loop/` with `main.js`).
 
 ## 1. The Pi Engine
 
+> **Status (2026-07-06):** realized as `@endo/agentry`, extracted from
+> `@endo/lal` rather than genie, and on the `@earendil-works/pi-*` fork
+> rather than `@mariozechner/pi-*`. lal has adopted it; genie and fae
+> have not. `lal/providers/` and `fae/extract-tool-calls.js` are
+> orphaned but not yet deleted. See § Realization Status for the full
+> map; the proposal prose below is the original survey.
+
 ### What pi gives genie today
 
 `@mariozechner/pi-ai` ships a model registry covering Anthropic, Google
@@ -291,6 +353,19 @@ upgrades (new providers, new model families, new reasoning-token APIs)
 to a single chokepoint.
 
 ## 2. Memory
+
+> **Status (2026-07-06):** partially realized and diverged. The daemon
+> `Mount`/`ScratchMount` capability ([`daemon-mount`](daemon-mount.md))
+> shipped, genie mints a `workspace-mount`, and memory files can ride it
+> through a new `vfs-mount.js` adapter. But the pet-store-as-typed-
+> namespace shape recommended below was **not** taken, the VFS and
+> `safePath` were **not** retired (the adapter wraps the VFS rather than
+> replacing it), and FTS5 did **not** graduate into a daemon
+> `memory-index` capability — it remains in-process `better-sqlite3`
+> inside genie. A separate `@endo/agent-tools` catalog and an
+> `@endo/platform/fs/extended` Filesystem seam appeared
+> ([`endo-agent-tools`](endo-agent-tools.md)), consumed by `@endo/agentry`
+> rather than by genie. See § Realization Status.
 
 ### How genie persists and recalls memory today
 
@@ -481,6 +556,17 @@ const hits = await E(index).search('user preferences', { limit: 5 });
 
 ## 3. Scheduling
 
+> **Status (2026-07-06):** in flight on
+> [PR #609](https://github.com/endojs/endo-but-for-bots/pull/609), which
+> adds a daemon `interval-scheduler` formula, `packages/daemon/src/interval-scheduler.js`,
+> and an `interval-tick` mail message — but under the prototype's
+> `interval-scheduler` name rather than the `scheduler` name
+> [`scheduler.md`](scheduler.md) settled on, and framed as *endoclaw-timer
+> Phase 1 remainder*. Not yet merged to trunk (which still has only the
+> simple `timer` formula); genie's `interval/` prototype not yet retired;
+> lal/fae still unscheduled. Detail in [`scheduler.md`](scheduler.md)
+> § Realization Status.
+
 ### How genie schedules work today
 
 Genie has *one* scheduling primitive — the interval scheduler in
@@ -578,7 +664,16 @@ Granular shape and security considerations are in
 
 ## 5. Rollout Sketch
 
-**Phase 1: Extract the engine.**
+> **Status (2026-07-06):** Phase 1 is done but re-sourced (engine
+> extracted from lal into `@endo/agentry`, not from genie into
+> `@endo/llm-engine`); Phase 2 is done for lal only, with the two
+> deletions outstanding and fae/genie not yet migrated; Phase 3 is in
+> flight on [PR #609](https://github.com/endojs/endo-but-for-bots/pull/609);
+> Phases 4–6 are open. Per-phase notes inline below.
+
+**Phase 1: Extract the engine.** _(Done, re-sourced — landed as
+`@endo/agentry` from `@endo/lal`; genie's `agent/`, `system/`, and
+`utils/tokens.js` are still the natural next contributions.)_
 Create `@endo/llm-engine` from `packages/genie/src/agent/` plus
 `tool-gate.js`, `system/`, and `utils/tokens.js`.
 The genie package re-exports the engine for its own consumers.
@@ -586,7 +681,10 @@ Lal and fae keep working unchanged.
 Estimate: **S**, ~1–2 days, mostly file moves and `package.json`
 boilerplate.
 
-**Phase 2: Migrate lal and fae onto the engine.**
+**Phase 2: Migrate lal and fae onto the engine.** _(Partial — lal's LLM
+seam, model resolution, and marshalling are on `@endo/agentry`;
+`lal/providers/` is orphaned but not deleted; fae and its
+`extract-tool-calls.js` are untouched.)_
 Replace `lal/providers/` with the engine's provider resolution.
 Replace lal's and fae's hand-rolled `runAgenticLoop` with
 `runAgentRound`.
@@ -599,7 +697,10 @@ Estimate: **M**, ~3–5 days; the bulk is verifying behavioral parity
 across the four lal providers.
 Blocked on Phase 1.
 
-**Phase 3: Graduate the scheduler into the daemon.**
+**Phase 3: Graduate the scheduler into the daemon.** _(In flight — the
+daemon formula is built on [PR #609](https://github.com/endojs/endo-but-for-bots/pull/609)
+under the `interval-scheduler` name; not yet merged, and genie not yet
+switched off its prototype.)_
 Per [`scheduler.md`](scheduler.md): land the `scheduler` formula
 type with resolve / reschedule semantics, missed-tick coalescing,
 start-to-start timing, host-controlled limits, and tick delivery as
@@ -614,7 +715,11 @@ calls into the engine — independent in terms of the daemon work.
 Estimate: **M-L**, ~1 week, mostly daemon plumbing and
 formula-type integration tests.
 
-**Phase 4: Move memory onto the agent's pet store.**
+**Phase 4: Move memory onto the agent's pet store.** _(Open, with a
+partial detour — daemon `Mount`/`ScratchMount` landed and genie can back
+memory files with a `workspace-mount`, but via a VFS adapter rather than
+the pet-store shape; VFS/`safePath` not retired; no `memory-index`
+capability yet.)_
 Per § 2 above: stand the agent fully on its pet store as a typed
 namespace, retiring `safePath` / `VFS` in `tools/memory.js`.
 Replace `vfs-node.js` / `vfs-memory.js` with calls into the agent's
@@ -631,7 +736,8 @@ Questions selects between this shape and the original `Mount`-backed
 shape; the rest of the rollout is the same.
 Estimate: **L**, ~1–1.5 weeks (under either resolution).
 
-**Phase 5: Make scheduling capabilities granular.**
+**Phase 5: Make scheduling capabilities granular.** _(Open — blocked on
+Phase 3 merging.)_
 Once Phase 3 ships, change the genie plugin to grant each agent a
 *scoped* `Interval` (a single named interval) rather than an
 arbitrary `Scheduler`.
@@ -641,6 +747,7 @@ authors want.
 Estimate: **S-M**, ~2–3 days after Phase 3.
 
 **Phase 6: Retire workspace_template, retire VFS, retire `.heartbeats.log`.**
+_(Open — blocked on Phase 4.)_
 Cleanup pass once Phases 4 and 5 have landed and the workspace
 directory is no longer the source of truth for memory.
 Estimate: **S**, ~1 day.

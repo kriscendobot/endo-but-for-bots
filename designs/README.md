@@ -234,7 +234,7 @@ LLM-agent stack).*
 | [endoclaw-proactive-messages](endoclaw-proactive-messages.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [endoclaw-skill-registry](endoclaw-skill-registry.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [endoclaw-timer](endoclaw-timer.md) | 2026-03-03 | 2026-06-08 | In Progress (Superseded by [scheduler](scheduler.md)) |
-| [scheduler](scheduler.md) | 2026-06-08 | 2026-06-08 | Proposed |
+| [scheduler](scheduler.md) | 2026-06-08 | 2026-07-06 | Proposed (in flight, PR #609) |
 | [endoclaw-voice](endoclaw-voice.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [endoclaw-webhooks](endoclaw-webhooks.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [daemon-locator-terminology](daemon-locator-terminology.md) | 2026-02-24 | 2026-02-24 | Not Started |
@@ -252,7 +252,7 @@ LLM-agent stack).*
 | [familiar-localhttp-protocol](familiar-localhttp-protocol.md) | 2026-02-24 | 2026-02-25 | In Progress (partially implemented) |
 | [familiar-unified-weblet-server](familiar-unified-weblet-server.md) | 2026-02-14 | 2026-05-06 | In Progress |
 | [formula-inspector](formula-inspector.md) | 2026-02-14 | 2026-06-13 | In Progress |
-| [genie-integration](genie-integration.md) | 2026-05-02 | 2026-05-02 | Proposed |
+| [genie-integration](genie-integration.md) | 2026-05-02 | 2026-07-06 | Proposed (partially realized) |
 | [gateway-bearer-token-auth](gateway-bearer-token-auth.md) | 2026-03-02 | 2026-03-06 | **Implemented** |
 | [hardened-text-codecs-shim](hardened-text-codecs-shim.md) | 2026-05-04 | 2026-05-04 | Not Started |
 | [hardened-url-shim](hardened-url-shim.md) | 2026-05-04 | 2026-05-04 | Not Started |
@@ -983,7 +983,7 @@ themselves milestone deliverables.
 
 | Design | Status | Notes |
 |--------|--------|-------|
-| genie-integration | Proposed | Cross-cutting survey of `packages/genie` for opportunities to fold pi engine, memory, and scheduling into the daemon and share with `lal`/`fae`. Six-phase rollout sketch; estimates per phase rather than as one milestone item. Builds on [scheduler](scheduler.md) (M3, supersedes endoclaw-timer) and `daemon-mount` (M3). Memory section reframed 2026-06-08 per maintainer review to stand the agent fully on its pet store (a daemon-native typed namespace) rather than back the agent's memory with a host filesystem through `Mount`. |
+| genie-integration | Proposed (partially realized) | Cross-cutting survey of `packages/genie` for opportunities to fold pi engine, memory, and scheduling into the daemon and share with `lal`/`fae`. Six-phase rollout sketch; estimates per phase rather than as one milestone item. Refreshed 2026-07-06 (PR #89) with a § Realization Status: the pi engine landed as `@endo/agentry` (extracted from `@endo/lal` on the `@earendil-works/pi-*` fork, not from genie as `@endo/llm-engine`; see [agentry-agent-builder](agentry-agent-builder.md)) with lal migrated but genie/fae not; the shared tool catalog landed as `@endo/agent-tools` ([endo-agent-tools](endo-agent-tools.md)); daemon `Mount`/`ScratchMount` landed ([daemon-mount](daemon-mount.md)) though memory kept its VFS/FTS5 stack rather than moving to the pet store; the scheduler graduation is in flight on PR #609. Builds on [scheduler](scheduler.md) (M3, supersedes endoclaw-timer) and `daemon-mount` (M3). |
 
 ---
 

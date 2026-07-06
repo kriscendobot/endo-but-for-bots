@@ -3,10 +3,61 @@
 |                |                                        |
 | -------------- | -------------------------------------- |
 | **Created**    | 2026-06-08                             |
+| **Updated**    | 2026-07-06                             |
 | **Author**     | Kris Kowal (prompted)                  |
-| **Status**     | Proposed                               |
+| **Status**     | Proposed (in flight — see § Realization Status) |
 | **Parent**     | [daemon-capability-bank](daemon-capability-bank.md) |
 | **Supersedes** | [endoclaw-timer](endoclaw-timer.md)    |
+
+## Realization Status (2026-07-06)
+
+The daemon-side graduation this design describes is **in flight but not
+yet merged.** As of the `llm` tip on 2026-07-06 the daemon still carries
+only the simpler `timer` formula (`TimerFormula` / `formulateTimer` /
+`makeTimer`) unchanged; none of the `Scheduler` / `Interval` /
+`SchedulerControl` / `TickResponse` exos, the `interval-tick` mail
+variant, `makeScheduler` on `HostInterface`, or the CLI verbs exist on
+trunk yet, and genie's `packages/genie/src/interval/` prototype
+(`makeIntervalScheduler`) remains the only working scheduler in the repo.
+lal and fae still have no scheduling.
+
+The build lives on
+[PR #609](https://github.com/endojs/endo-but-for-bots/pull/609)
+(`build/endoclaw-timer-daemon-formula-integration`, open, based on `llm`):
+
+- Adds `packages/daemon/src/interval-scheduler.js` (~737 lines) and an
+  `IntervalSchedulerFormula` (`type: 'interval-scheduler'`) to the
+  daemon's formula union and `types.d.ts`.
+- Adds an `interval-tick` message type — the typed-envelope tick delivery
+  this design specifies.
+- Carries the prototype's start-to-start timing, resolve/reschedule,
+  missed-tick coalescing, and persistence forward, and has been through a
+  panel-review fixup pass (reschedule-drift and GC-orphan fixes,
+  validation hardening, added coverage and a changeset).
+
+**Two divergences from this design worth reconciling before merge:**
+
+1. **Name.** This design settled on **`scheduler`** per the maintainer's
+   2026-06-08 review ("Let's simply call it 'scheduler'"). PR #609 ships
+   the formula and message under the prototype's original
+   **`interval-scheduler`** name and frames the work as *endoclaw-timer
+   Phase 1 remainder* rather than as this `scheduler` design. The name
+   should be settled one way or the other — either rename the formula to
+   `scheduler`, or update this design (and its § Capability Shape
+   `Scheduler`/`SchedulerControl` rename note) to accept
+   `interval-scheduler`.
+2. **Lineage framing.** PR #609 is authored against the `endoclaw-timer`
+   lineage; this design is `endoclaw-timer`'s declared successor. Whoever
+   merges #609 should decide whether it lands *as* the realization of
+   this `scheduler` design (updating the Status here to *Implemented*) or
+   whether this design is retired in favor of continuing under the
+   `endoclaw-timer` Phase-1 banner.
+
+**What remains after #609 merges:** the per-`Interval` pet-name granting
+(§ Capability Narrowing), the `serial-jobs`-backed coalescing that
+retires genie's hand-rolled draining, switching genie's heartbeat onto
+the granted `Interval` and deleting the `interval/` prototype, and giving
+lal and fae scheduling (§ 5 of [`genie-integration.md`](genie-integration.md)).
 
 ## What is the Problem Being Solved?
 

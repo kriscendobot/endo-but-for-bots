@@ -3,7 +3,7 @@
 |                  |                                  |
 |------------------|----------------------------------|
 | **Created**      | 2026-03-03                       |
-| **Updated**      | 2026-06-08                       |
+| **Updated**      | 2026-07-06                       |
 | **Author**       | Kris Kowal (prompted)            |
 | **Author**       | Joshua T Corbin (evolving)       |
 | **Status**       | In Progress                      |
@@ -13,7 +13,11 @@
 > Phase 1 of this design shipped as a prototype in
 > `packages/genie/src/interval/`.
 > The daemon-side graduation is the
-> [scheduler](scheduler.md) capability proposed via PR #89; that
+> [scheduler](scheduler.md) capability proposed via PR #89 and now being
+> built on [PR #609](https://github.com/endojs/endo-but-for-bots/pull/609)
+> (as of 2026-07-06, in review, shipping the formula under the
+> `interval-scheduler` name — see [scheduler](scheduler.md)
+> § Realization Status); that
 > design carries forward this document's § Capability Shape,
 > § Resolve/Reschedule Semantics, § Start-to-Start Timing,
 > § Persistence, § Pause and Resume, § Revocation, and § Design
