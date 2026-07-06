@@ -475,6 +475,19 @@ pub fn stage4_async_promises_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage4-async-promises.js"))
 }
 
+/// The stage-4b async-function-surface corpus (child 2/5): the
+/// `XS_CODE_ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT` opcode surface over the
+/// promise keystone — the async function define, `START_ASYNC`'s result-promise
+/// creation, `AWAIT`'s YIELD-shaped suspend, the `AsyncAwait` native-reaction
+/// resume at the pump-loop drain, and `await_schedule`'s primitive/general and
+/// native-promise fast paths — all bit-exact (result AND computron) against the
+/// oracle, INCLUDING the reactions and async resumes run at the drain. `await`
+/// inside a live `try` is the designated named skip (`await:await-in-try`);
+/// async generators / `for-await-of` stay the scope fold — all excluded.
+pub fn stage4_async_await_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-async-await.js"))
+}
+
 /// The stage-3b xsre-integration corpus (child 9/9): the JavaScript `RegExp`
 /// surface over child 8's matcher — literal + constructor construction,
 /// `source`/`flags`/per-flag accessor getters, `exec`/`test` (match, no-match,
@@ -1464,6 +1477,41 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-4 async/promise bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage4_async_await_corpus_is_bit_exact_against_oracle() {
+        // The stage-4b async-function-surface acceptance bar (child 2/5): the
+        // `ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT` opcode surface over the promise
+        // keystone — plain awaits, the native-promise fast path, nested async,
+        // multi-await chains, await-in-loop, async arrows, thenable await, and
+        // rejection paths — all agreeing with C-XS on BOTH the completion value
+        // AND the computron count, INCLUDING the async resumes and reactions run
+        // at the pump-loop drain. `await`-in-`try`, async generators, and
+        // `for-await-of` are honest named skips, excluded.
+        let programs = stage4_async_await_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4b async-await corpus must be non-empty"
+        );
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-4b async-await bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
