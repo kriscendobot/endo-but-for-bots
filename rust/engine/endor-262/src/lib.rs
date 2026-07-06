@@ -424,6 +424,16 @@ pub fn stage4_object_integrity_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage4-object-integrity.js"))
 }
 
+/// The stage-4 `new.target` corpus (child 2/8, the landed slice): the
+/// `XS_CODE_TARGET` opcode with real semantics — the target constructor inside
+/// a construct frame, `undefined` inside a plain call, across the factory-guard
+/// idiom and closure-captured constructors. Bit-exact (result AND computron)
+/// against the oracle. The wider `class` family (definition/methods/extends/
+/// super/private/static) is a reported scope fold that self-names honest skips.
+pub fn stage4_new_target_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-new-target.js"))
+}
+
 /// The stage-3b promises corpus (child 7/9): `Promise` construction + the
 /// executor, `resolve`/`reject` settling, the `Promise.resolve`/`reject`
 /// statics, `then`/`catch` reaction registration, and the microtask job queue
@@ -1278,6 +1288,43 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-4 object-integrity bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage4_new_target_corpus_is_bit_exact_against_oracle() {
+        // The stage-4 `new.target` acceptance bar (child 2/8, the landed
+        // slice): the `XS_CODE_TARGET` opcode reads the running frame's target
+        // constructor inside a construct (`new f()`) and `undefined` inside a
+        // plain call, across the factory-guard idiom and a closure-captured
+        // constructor — all agreeing with C-XS on BOTH the completion value AND
+        // the computron count. The opcode is pure dispatch (XS only allocs a
+        // stack slot and advances), so the generic per-opcode `tick_code` is
+        // the whole cost. The wider `class` family (definition/methods/extends/
+        // super/private/static) is a reported scope fold that self-names honest
+        // skips and is excluded from this corpus.
+        let programs = stage4_new_target_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4 new.target corpus must be non-empty"
+        );
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-4 new.target bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );

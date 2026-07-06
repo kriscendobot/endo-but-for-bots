@@ -5449,6 +5449,25 @@ impl Interp {
                     self.push(t);
                     pc += size as usize;
                 }
+                // `new.target` (XS_CODE_TARGET, xsRun.c:1324): push
+                // `mxFrameTarget` when the running frame was entered as a
+                // construct (`mxFrameHasTarget`), else `undefined`. XS holds
+                // the target constructor in a dedicated frame slot; endor
+                // records it as (`cur_target`, `cur_func`) — for a `new f()`
+                // the target IS the invoked constructor (there is no
+                // `Reflect.construct`/`super()` retargeting in the covered
+                // grammar, both of which self-name elsewhere). Pure dispatch:
+                // XS's handler only allocs a stack slot and advances, so the
+                // generic `tick_code` above is the whole cost.
+                XS_CODE_TARGET => {
+                    if self.cur_target && !self.cur_func.is_null() {
+                        let f = self.cur_func;
+                        self.push(Slot::of(Kind::Reference, Payload::Reference(f)));
+                    } else {
+                        self.push(Slot::undefined());
+                    }
+                    pc += size as usize;
+                }
                 // `current` (XS_CODE_CURRENT, xsRun.c:1308): push the
                 // running function (`*mxFrameFunction`). Defined only inside
                 // a user-function frame; at program level there is no user

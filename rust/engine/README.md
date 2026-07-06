@@ -433,6 +433,44 @@ descriptors) — remain the reported **scope fold**, carried forward to a
 follow-up child as the honest named skips the object-statics child already
 lists.
 
+The stage-4 **classes** child (2/8) lands **`new.target`** (the `XS_CODE_TARGET`
+opcode, which already decoded but had no semantics), bit-exact (result AND
+computron) against the pin. `new.target` reads the running frame's target
+constructor when the frame was entered as a construct (XS's `mxFrameHasTarget`
+→ `mxFrameTarget`) and `undefined` inside a plain call; endor reads it from the
+frame's (`cur_target`, `cur_func`) pair — for a `new f()` the target IS the
+invoked constructor, since the covered grammar has no `Reflect.construct` /
+`super()` retargeting (both of which self-name elsewhere). The opcode is pure
+dispatch (XS's handler only allocs a stack slot and advances), so the generic
+per-opcode `tick_code` is its whole cost and it is metering-exact by
+construction. The curated `stage3b`-style corpus `stage4-new-target.js` (15
+programs — the factory-guard idiom, a closure-captured constructor, and
+construct/plain-call alternation) is locked as the cargo bar
+`stage4_new_target_corpus_is_bit_exact_against_oracle`, all bit-exact.
+`built-ins/Function` grows to **`covered=40 divergent=0`** (from 39 — the
+`new.target`-gated test now covered), and the class dual-run sections agree with
+**zero divergence**: `language/statements/class total=3908 covered=1
+divergent=0 skipped=3907`, `language/expressions/class total=3663 covered=1
+divergent=0 skipped=3662`, every skip named.
+
+The headline **`class` surfaces remain the reported scope fold** (this child
+landed the bounded, metering-trivial `new.target` slice and folded the rest
+rather than ship a half-implemented, divergence-prone class model). The fold
+points self-name as honest skips, dominated by **`to_instance`** (1872 skips in
+`statements/class` alone — the gate opcode of the class-definition path:
+`XS_CODE_CLASS` prototype/constructor wiring, concise methods, static members),
+plus **`extend`** (the `extends` clause), **`super`**/**`set_home`** (home-object
+super dispatch), **`generator`** (generator methods), and the accessor-descriptor
+gaps the object-statics/integrity children already list. Landing the class-
+definition path bit-exact needs (a) making a constructor's `.prototype` /
+`prototype.constructor` real readable own properties with XS's `GET_ONLY`/
+`DONT_ENUM` flags (endor currently keeps `.prototype` in a side map, invisible to
+`GET_PROPERTY`), (b) method-definition non-enumerability through the
+`NEW_PROPERTY` flag byte, and (c) calibrating the `CLASS`/`NAME`/`SET_HOME`
+allocation metering against the pin — each a divergence surface that does not fit
+the one-invocation budget alongside a *green* result, so it is carried forward as
+the next class child's scope.
+
 The stage-3b **promises** child (7/9) lands `Promise`, the promise **job
 queue**, and the **pump-loop latch** — the host-driven microtask drain the
 endor embedding performs after a crank. `xsPromise.c` calls `mxMeter` exactly
