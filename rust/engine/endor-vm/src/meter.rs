@@ -186,6 +186,16 @@ impl Meter {
         self.index += n;
     }
 
+    /// Subtract `n` raw 16.16 units (reverse a prior [`Self::tick_raw`]). Used
+    /// to undo a speculatively-charged host-escape residual when a throw is
+    /// actually caught by a native `mxTry` (a promise reaction handler / a
+    /// thenable `then` that throws — XS never leaves the machine, so the
+    /// host-escape adjustment must be unwound).
+    #[inline]
+    pub fn untick_raw(&mut self, n: u64) {
+        self.index -= n;
+    }
+
     /// Raw fixed-point index (`the->meterIndex`).
     #[inline]
     pub fn raw(&self) -> u64 {

@@ -461,6 +461,20 @@ pub fn stage3b_promises_corpus() -> Vec<String> {
     parse_corpus(include_str!("../corpora/stage3b-promises.js"))
 }
 
+/// The stage-4 async/promise keystone corpus (child 4/8): the promise
+/// native-handler double-settle calibration and the surfaces it unblocks —
+/// thenable adoption (`Promise.resolve(thenable)` / an executor / a handler
+/// resolving with a thenable), the two-level `[[AlreadyResolved]]` guard's
+/// double-settle no-op (res twice, res+rej, rej+res), long `then`-chains, a
+/// handler returning a thenable or a native promise, and the
+/// `Promise.resolve(nativePromise)` identity fast path — all bit-exact (result
+/// AND computron) against the oracle. A throwing handler/`then`,
+/// `resolve(promise-itself)`, and the async-function surface are honest named
+/// skips excluded from this corpus.
+pub fn stage4_async_promises_corpus() -> Vec<String> {
+    parse_corpus(include_str!("../corpora/stage4-async-promises.js"))
+}
+
 /// The stage-3b xsre-integration corpus (child 9/9): the JavaScript `RegExp`
 /// surface over child 8's matcher — literal + constructor construction,
 /// `source`/`flags`/per-flag accessor getters, `exec`/`test` (match, no-match,
@@ -1414,6 +1428,42 @@ mod tests {
         assert!(
             summary.met_bar(),
             "stage-3b promises bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
+            summary.bit_exact, summary.total, summary.result_divergences,
+            summary.computron_divergences, summary.completion_divergences, summary.unsupported,
+        );
+    }
+
+    #[test]
+    fn stage4_async_promises_corpus_is_bit_exact_against_oracle() {
+        // The stage-4 async/promise keystone acceptance bar (child 4/8): the
+        // promise native-handler double-settle calibration and the surfaces it
+        // unblocks — thenable adoption, the two-level `[[AlreadyResolved]]`
+        // guard's double-settle no-op, long `then`-chains, a handler returning a
+        // thenable/native-promise, and the `Promise.resolve(nativePromise)`
+        // identity — all agreeing with C-XS on BOTH the completion value AND the
+        // computron count, INCLUDING the reactions and thenable jobs run at the
+        // pump-loop drain. A throwing handler/`then`, `resolve(promise-itself)`,
+        // and the async-function surface are honest named skips, excluded.
+        let programs = stage4_async_promises_corpus();
+        assert!(
+            !programs.is_empty(),
+            "stage-4 async/promise corpus must be non-empty"
+        );
+        let (runs, summary) = run_corpus(&programs);
+        for r in &runs {
+            if !r.is_bit_exact() {
+                eprintln!(
+                    "DIVERGENCE {:?}\n  agreement={:?} result oracle={:?} endor={:?}\n  computrons oracle={} endor={} (endor dispatched={}) raw oracle={} endor={}\n  endor halt={:?}\n  bytecode={:02x?}",
+                    r.source, r.agreement, r.oracle_result, r.endor_result,
+                    r.oracle_computrons, r.endor_computrons, r.endor_dispatched,
+                    r.oracle_meter_raw, r.endor_meter_raw,
+                    r.endor_halt, r.bytecode,
+                );
+            }
+        }
+        assert!(
+            summary.met_bar(),
+            "stage-4 async/promise bit-exact bar: {}/{} (result_div={}, computron_div={}, completion_div={}, unsupported={})",
             summary.bit_exact, summary.total, summary.result_divergences,
             summary.computron_divergences, summary.completion_divergences, summary.unsupported,
         );
