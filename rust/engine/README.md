@@ -608,7 +608,14 @@ reaction handlers), and the whole **async-function surface** —
 `XS_CODE_ASYNC_FUNCTION`/`await`, `XS_CODE_ASYNC_GENERATOR_FUNCTION`/
 `for-await-of`, and the async-iterator protocol (the designated scope fold). The
 keystone was the gating deliverable ("resolve it first"); it unblocks the folded
-surfaces, which now share one clear prerequisite (native reaction handlers).
+surfaces, which now share one clear prerequisite (native reaction handlers). The
+full implementation map for the folded async-function surface — the
+`ASYNC_FUNCTION`/`START_ASYNC`/`AWAIT`/`BRANCH_STATUS` opcode handlers, the
+`fxStepAsync` → `step_async` model, the 5-slot native-reaction path that also
+unblocks `finally` + the combinators, and the bars to add — is written up for the
+next dedicated invocation in [`ASYNC-AWAIT-HANDOFF.md`](ASYNC-AWAIT-HANDOFF.md).
+The keystone alone consumed a full handler invocation, so the async-function
+surface is sized as its own follow-up child rather than co-fitting here.
 
 The stage-3 built-ins reach
 endor's intrinsics by name: the oracle's `symbols` atom (decoded by
