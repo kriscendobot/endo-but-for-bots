@@ -764,6 +764,59 @@ pub fn gen_stage3b_promise_program(data: &[u8]) -> String {
     format!("var x=0; {}{}; x", source, chain)
 }
 
+/// JS-escape a byte string as a double-quoted string-literal body (for
+/// embedding a fuzzer-generated regexp source or subject into `new
+/// RegExp("…")` / a method argument).
+fn js_string_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Structure-aware generator for the **JavaScript RegExp surface** (child
+/// 9/9): folds fuzzer bytes into a supported-grammar pattern + subject (via
+/// [`gen_regexp`]) and emits a whole-program `new RegExp(pat, flags).<op>(subj)`
+/// (or an accessor read), so the differential check pins the end-to-end run —
+/// construction metering, the `exec`/`test` result shaping, and the computron
+/// calibration — against the pin, not just the matcher. The generated grammar
+/// stays inside the covered subset (no `g`/`y` stateful drive, no named groups,
+/// ASCII subjects), so a divergence is a real finding; an out-of-subset pattern
+/// the port names `Unsupported` is skipped honestly by the differential check.
+/// Rides [`differential_check_with_symbols`] — the RegExp surface resolves
+/// `exec`/`source`/`index`/… by their program-local symbol ids.
+pub fn gen_stage3b_regexp_program(data: &[u8]) -> String {
+    let (pattern, flags, subject, _start) = gen_regexp(data);
+    // Drop any generated `g`/`y` flag: the stateful lastIndex drive needs the
+    // code-unit↔byte remap this arm keeps out of scope. (gen_regexp does not
+    // currently emit them, but guard so a future generator change stays safe.)
+    let flags: String = flags.chars().filter(|c| *c != 'g' && *c != 'y').collect();
+    let pat = js_string_escape(&pattern);
+    let flg = js_string_escape(&flags);
+    let subj = js_string_escape(&subject);
+    // Pick the observed operation from a trailing byte (deterministic).
+    let sel = data.last().copied().unwrap_or(0) % 8;
+    let ctor = format!("new RegExp(\"{}\", \"{}\")", pat, flg);
+    match sel {
+        0 => format!("{}.exec(\"{}\")", ctor, subj),
+        1 => format!("var m = {}.exec(\"{}\"); m ? m[0] : null", ctor, subj),
+        2 => format!("var m = {}.exec(\"{}\"); m ? m.index : -1", ctor, subj),
+        3 => format!("{}.test(\"{}\")", ctor, subj),
+        4 => format!("{}.source", ctor),
+        5 => format!("{}.flags", ctor),
+        6 => format!("{}.toString()", ctor),
+        _ => format!("var m = {}.exec(\"{}\"); m ? m.length : 0", ctor, subj),
+    }
+}
+
 /// Structure-aware generator for **array spread** (`[...arr]`) — which
 /// desugars to the for-of iterator loop appending each element. Emits a single
 /// spread of a dense literal, optionally with leading/trailing plain elements,
@@ -1989,6 +2042,56 @@ mod tests {
             resolved && executor && pending && chained,
             "shapes reached: resolved={} executor={} pending={} chained={}",
             resolved, executor, pending, chained
+        );
+    }
+
+    #[test]
+    fn generated_stage3b_regexp_surface_programs_agree_bit_exact() {
+        // The stage-3b xsre-integration surface (child 9/9): a whole-program
+        // `new RegExp(pat, flags).exec/test/…(subj)` over the covered grammar is
+        // bit-exact (result AND computron) end-to-end against the pin — the
+        // construction metering, the exec/test result shaping, and the accessor
+        // getters. Sweep a spread of seeds, reaching every observed operation.
+        let mut checked = 0;
+        let mut skipped = 0;
+        let (mut execd, mut tested, mut sourced, mut flagged, mut stringed) =
+            (false, false, false, false, false);
+        let mut distinct = std::collections::BTreeSet::new();
+        for seed in 0u32..1200 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(20 + (seed % 48)) {
+                buf.push(
+                    data[(k as usize) % 4]
+                        .wrapping_add((k as u8).wrapping_mul(13))
+                        .wrapping_add((seed as u8).wrapping_mul(5)),
+                );
+            }
+            let prog = gen_stage3b_regexp_program(&buf);
+            distinct.insert(prog.clone());
+            execd |= prog.contains(".exec(");
+            tested |= prog.contains(".test(");
+            sourced |= prog.contains(".source");
+            flagged |= prog.contains(".flags");
+            stringed |= prog.contains(".toString()");
+            // The differential check skips an out-of-subset pattern honestly
+            // (endor halts `Unsupported`, `differential_check` returns Ok
+            // without comparing); count coverage by the checks that ran.
+            match differential_check_with_symbols(&prog) {
+                Ok(()) => checked += 1,
+                Err(d) => panic!("stage-3b regexp-surface differential divergence on {:?}: {:?}", prog, d),
+            }
+            if prog.contains("Unsupported") {
+                skipped += 1;
+            }
+        }
+        let _ = skipped;
+        assert!(checked > 0);
+        assert!(distinct.len() > 60, "regexp sweep too uniform: {} distinct", distinct.len());
+        assert!(
+            execd && tested && sourced && flagged && stringed,
+            "ops reached: exec={} test={} source={} flags={} toString={}",
+            execd, tested, sourced, flagged, stringed
         );
     }
 

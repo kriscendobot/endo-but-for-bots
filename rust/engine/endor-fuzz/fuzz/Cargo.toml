@@ -40,5 +40,11 @@ path = "fuzz_targets/differential_regexp.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "differential_regexp_surface"
+path = "fuzz_targets/differential_regexp_surface.rs"
+test = false
+doc = false
+
 [workspace]
 # Own workspace: cargo-fuzz builds this tree in isolation.

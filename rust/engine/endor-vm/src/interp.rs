@@ -912,9 +912,10 @@ pub const PROMISE_CTOR_FRAME_METERING: u64 = 261888;
 /// `mxRunCount(2)` `mxInitializeRegExpFunction` call framing. Calibrated
 /// raw-exact against the pin.
 pub const REGEXP_CTOR_FRAME_METERING: u64 = 180296;
-/// The per-source-byte residual of `new RegExp` (the pattern walk beyond the
-/// `parser->size` compile meter). Calibrated raw-exact for short patterns.
-pub const REGEXP_CTOR_PER_SOURCE_BYTE: u64 = 16;
+/// `XS_PARSE_REGEXP_METERING` (`xsCommon.h`, `1 << 10`): the raw-per-byte
+/// compile meter. Also the divisor recovering the code-buffer byte size
+/// (`parser->size`) from a program's `compile_meter_raw`.
+pub const XS_PARSE_REGEXP_METERING: u64 = 1 << 10;
 /// The native residual of `RegExp.prototype.exec` (`fx_RegExp_prototype_exec`)
 /// BEYOND the match meter the matcher carries, the result-array `fxNewSlot`s,
 /// and the result-string chunk allocations. Covers the host frame, the
@@ -935,8 +936,22 @@ pub const REGEXP_TEST_FRAME_METERING: u64 = 147456;
 /// Offset` (write it back) remap framing. Charged on the advancing path.
 pub const REGEXP_STATEFUL_METERING: u64 = 81920;
 /// The residual of a RegExp per-flag / `source` accessor getter beyond the
-/// `GET_PROPERTY` dispatch (the getter's `mxMeterOne`, if any). Calibrated.
+/// `GET_PROPERTY` dispatch (the getter's `mxMeterOne`, if any). Measured as
+/// zero against the pin (each reads `code[0]` / the source key with no
+/// built-in step beyond dispatch).
 pub const REGEXP_GETTER_METERING: u64 = 0;
+/// The residual of the composite `flags` getter (`fx_RegExp_prototype_get_
+/// flags`), which reads all eight per-flag properties back through
+/// `mxGetID` + their accessors and assembles the string. Calibrated raw-exact
+/// (constant — the same eight gets regardless of which flags are set).
+pub const REGEXP_FLAGS_GETTER_METERING: u64 = 655368;
+/// The residual of `RegExp.prototype.toString` (`fx_RegExp_prototype_
+/// toString`), which reads `source` + `flags` back through `mxGetID` and their
+/// accessors (the `flags` get itself the eight-property cascade) and builds
+/// the `/source/flags` string. This is the `toString` host frame only; the
+/// `flags`-getter cascade and the three growing concat chunks are charged
+/// explicitly. Calibrated raw-exact.
+pub const REGEXP_TOSTRING_METERING: u64 = 196632;
 /// The non-slot residual of `fxPushPromiseFunctions` beyond the 13 explicit
 /// `fxNewSlot`s [`Interp::make_resolving_functions`] charges (the two
 /// `fxNewHostFunction`s — each instance + CALLBACK + HOME + LENGTH + NAME,
@@ -4365,7 +4380,7 @@ impl Interp {
                                 let (bytes, _alloc) = self.regexp_source_bytes(inst);
                                 self.new_string_metered(&bytes)
                             } else if Some(id) == g.flags {
-                                self.meter.tick_raw(REGEXP_GETTER_METERING);
+                                self.meter.tick_raw(REGEXP_FLAGS_GETTER_METERING);
                                 let flags = self.regexps[&inst].flags.clone();
                                 self.new_string_metered(flags.as_bytes())
                             } else if let Some(bit) = regexp_flag_bit_for(g, id) {
@@ -6622,15 +6637,28 @@ impl Interp {
             self.meter.tick_slot_alloc();
         }
         // `fxCompileRegExp`'s parse meter (`XS_PARSE_REGEXP_METERING` per
-        // byte), carried by the program.
+        // byte of the code buffer), carried by the program.
         self.meter.tick_raw(program.compile_meter_raw);
+        // `fxCompileRegExp` allocates two `fxNewChunk`s: the `code` buffer
+        // (`parser->size` bytes — recoverable as `compile_meter_raw /
+        // XS_PARSE_REGEXP_METERING`) and the `data` scratch buffer, sized from
+        // the term counts (`captureCount*sizeof(txCaptureData) +
+        // nameCount*sizeof(txInteger) + assertionCount*sizeof(txAssertionData)
+        // + quantifierCount*sizeof(txQuantifierData)`, the 64-bit oracle
+        // struct sizes 8/4/16/12). Both scale with the pattern, so modeling
+        // them explicitly keeps construction raw-exact across every pattern
+        // shape (not just the calibration set).
+        let code_bytes = program.compile_meter_raw / XS_PARSE_REGEXP_METERING;
+        self.meter.tick_chunk_new(code_bytes);
+        let data_bytes = (program.capture_count * 8
+            + program.name_count * 4
+            + program.assertion_count * 16
+            + program.quantifier_count * 12) as u64;
+        self.meter.tick_chunk_new(data_bytes);
         // The `fx_RegExp` host frame + `fxGetPrototypeFromConstructor` + the
-        // `mxRunCount(2)` `fxInitializeRegExp` call framing, plus the
-        // per-source-byte residual (the pattern walk in `fxInitializeRegExp`/
-        // `fxCompileRegExp` beyond the `parser->size` compile meter).
+        // `mxRunCount(2)` `fxInitializeRegExp` call framing (the residual
+        // beyond the explicit slot/chunk allocations and the compile meter).
         self.meter.tick_raw(REGEXP_CTOR_FRAME_METERING);
-        self.meter
-            .tick_raw(REGEXP_CTOR_PER_SOURCE_BYTE * pattern.len() as u64);
         let canonical_flags = Self::regexp_flag_string(program.flags());
         let proto = self.regexp_proto;
         let inst = self.slots.alloc(Slot::instance(proto));
@@ -6803,14 +6831,39 @@ impl Interp {
     /// `/source/flags` literal, built from the (escaped) source and the flag
     /// string.
     fn regexp_to_string(&mut self, inst: crate::value::SlotIndex) -> Result<Slot, Halt> {
-        let (source_bytes, _escaped) = self.regexp_source_bytes(inst);
+        // The `toString` host frame (the two `mxGetID` gets + the base
+        // `fxStringX("/")`).
+        self.meter.tick_raw(REGEXP_TOSTRING_METERING);
+        // `mxGetID(_source)` → the source getter: an escaped source allocates a
+        // fresh chunk (charged here); an unescaped source is the interned key.
+        let (source_bytes, source_escaped) = self.regexp_source_bytes(inst);
+        if source_escaped {
+            self.meter.tick_chunk_new((source_bytes.len() + 1) as u64);
+        }
+        // `mxGetID(_flags)` → the composite flags getter (the eight-property
+        // cascade) + its result-string chunk.
+        self.meter.tick_raw(REGEXP_FLAGS_GETTER_METERING);
         let flags = self.regexps[&inst].flags.clone();
-        let mut out = Vec::with_capacity(source_bytes.len() + flags.len() + 2);
+        self.meter.tick_chunk_new((flags.len() + 1) as u64);
+        // The three growing concatenations XS performs
+        // (`fxConcatString`/`fxConcatStringC`): `"/"` + source, + `"/"`, +
+        // flags — each `fxNewChunk` of the running content length.
+        let s = source_bytes.len();
+        let f = flags.len();
+        self.meter.tick_chunk_new((1 + s + 1) as u64); // "/" + source
+        self.meter.tick_chunk_new((1 + s + 1 + 1) as u64); // + "/"
+        self.meter.tick_chunk_new((1 + s + 1 + f + 1) as u64); // + flags
+        let mut out = Vec::with_capacity(s + f + 2);
         out.push(b'/');
         out.extend_from_slice(&source_bytes);
         out.push(b'/');
         out.extend_from_slice(flags.as_bytes());
-        Ok(self.new_string_metered(&out))
+        // The final chunk is the third concat, already metered; allocate it
+        // without re-charging.
+        let mut buf = out;
+        buf.push(0);
+        let off = self.chunks.alloc(&buf);
+        Ok(Slot::of(Kind::String, Payload::String(off)))
     }
 
     /// The `.source` getter's bytes (`fx_RegExp_prototype_get_source`): the
