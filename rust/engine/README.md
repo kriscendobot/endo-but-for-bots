@@ -1285,13 +1285,18 @@ byte-identical vs the oracle:
   object property makes `v` the prototype via `INSTANTIATE` (in place of
   the plain `OBJECT`) and is skipped in the property loop; a shorthand
   `{__proto__}` or computed `['__proto__']` stays a normal property.
+- Slice 27 — **object concise methods + accessors**: a concise method /
+  getter / setter emits its (anonymous) function value with the `FUNCTION`
+  creation-op (the accessor flag rides on the property in the Rust AST, so
+  it is relayed to `code_function` as a staged hint), and the `NEW_PROPERTY`
+  attribute carries the `NAME | METHOD` (+ `GETTER`/`SETTER`) bits.
+  Identifier and computed keys covered; `super` in a method body deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
-`this`/`super`/`target`); object **methods/accessors**,
-anonymous-class name inference, and **direct-`eval` spread**;
-generator/async
+`this`/`super`/`target`); anonymous-class name inference and
+**direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
