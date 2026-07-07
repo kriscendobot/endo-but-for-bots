@@ -282,6 +282,12 @@ pub struct Coder<'a> {
     /// `FUNCTION` operand). Set by the naming site, consumed by
     /// `code_function`.
     pending_name: Option<String>,
+    /// XS's `mxExpressionNoValue`, staged for the *next* dispatched node: a
+    /// statement or `for` iteration discards its expression's value, so a
+    /// trailing increment/decrement or short-circuit assignment skips
+    /// producing one. Captured (and cleared) at the top of `code_node` so
+    /// it applies only to the immediate expression, not nested ones.
+    no_value: bool,
 }
 
 impl<'a> Coder<'a> {
@@ -303,6 +309,7 @@ impl<'a> Coder<'a> {
             decl_index: HashMap::new(),
             defined: std::collections::HashSet::new(),
             pending_name: None,
+            no_value: false,
         }
     }
 
@@ -701,6 +708,10 @@ impl Coder<'_> {
 
     fn code_node(&mut self, node: &Node) {
         use Token::*;
+        // XS's `mxExpressionNoValue` is staged for exactly this (the
+        // statement/for-iteration) expression; capture and clear it so it
+        // never leaks into nested expressions.
+        let no_value = std::mem::take(&mut self.no_value);
         match node.token {
             Program => self.code_program(node),
             Statements => self.code_statements(node),
@@ -795,8 +806,8 @@ impl Coder<'_> {
             AddAssign | SubtractAssign | MultiplyAssign | DivideAssign | ModuloAssign
             | ExponentiationAssign | BitAndAssign | BitOrAssign | BitXorAssign
             | LeftShiftAssign | SignedRightShiftAssign | UnsignedRightShiftAssign
-            | AndAssign | OrAssign | CoalesceAssign => self.code_compound(node),
-            Increment | Decrement => self.code_postfix(node),
+            | AndAssign | OrAssign | CoalesceAssign => self.code_compound(node, no_value),
+            Increment | Decrement => self.code_postfix(node, no_value),
             Delete => self.code_delete(&node.children[0]),
             Object => self.code_object(node),
             Array => self.code_array(node),
@@ -933,18 +944,35 @@ impl Coder<'_> {
         }
     }
 
-    /// `fxStatementNodeCode` (program-flag branch; the ported surface is
-    /// always at program scope for now).
+    /// `fxStatementNodeCode`. A program-level statement sets the program
+    /// result; a function-body statement discards its value with a `POP`,
+    /// except that a trailing `SET_LOCAL`/`SET_CLOSURE` is rewritten in
+    /// place to the fused `PULL_LOCAL`/`PULL_CLOSURE` (store-and-pop).
     fn code_statement(&mut self, node: &Node) {
         if self.program_flag {
             self.code(&node.children[0]);
             self.add_byte(-1, XS_CODE_SET_RESULT);
         } else {
-            // Non-program (function-body) statements pop their value;
-            // the SET_LOCAL/SET_CLOSURE peephole is child 6.
+            // `self->expression->flags |= mxExpressionNoValue`.
+            self.no_value = true;
             self.code(&node.children[0]);
-            self.add_byte(-1, XS_CODE_POP);
+            match self.codes.last().map(|c| c.id) {
+                Some(XS_CODE_SET_CLOSURE_1) => self.fuse_pull(XS_CODE_PULL_CLOSURE_1),
+                Some(XS_CODE_SET_LOCAL_1) => self.fuse_pull(XS_CODE_PULL_LOCAL_1),
+                _ => self.add_byte(-1, XS_CODE_POP),
+            }
         }
+    }
+
+    /// The `fxStatementNodeCode` store-and-pop fusion: retag the last
+    /// record (`SET_LOCAL`→`PULL_LOCAL`, `SET_CLOSURE`→`PULL_CLOSURE`) and
+    /// account for the popped value.
+    fn fuse_pull(&mut self, pull_id: i32) {
+        self.stack_level -= 1;
+        let sl = self.stack_level;
+        let last = self.codes.last_mut().expect("fuse_pull needs a last record");
+        last.id = pull_id;
+        last.stack_level = sl;
     }
 
     /// `fxBlockNodeCode` — a lexical block: code its scope's
@@ -1199,6 +1227,8 @@ impl Coder<'_> {
 
         if !matches!(node.children[2], Item::Null) {
             self.scope_code_refresh(scope);
+            // `self->iteration->flags |= mxExpressionNoValue`.
+            self.no_value = true;
             self.code(&node.children[2]);
             self.add_byte(-1, XS_CODE_POP);
         }
@@ -1293,20 +1323,6 @@ impl Coder<'_> {
         );
     }
 
-    /// Guard a function body to the simple shapes this slice codes:
-    /// expression statements and `return [expr]`. Control-flow statements
-    /// (loops, `if`, `switch`, `try`, labels, nested blocks) and
-    /// declarations reach the non-program loop/return paths and XS's
-    /// branch-threading optimizer, which are later slices.
-    fn assert_simple_function_body(statement: &Item) {
-        for item in Self::statement_items(statement) {
-            let ok = match item {
-                Item::Node(n) => matches!(n.token, Token::Statement | Token::Return),
-                _ => false,
-            };
-            assert!(ok, "non-simple function body statement deferred (later slice)");
-        }
-    }
 
     /// `fxAccessNodeCode`. Child `[symbol]`. At program scope every
     /// identifier is a free (global) reference, so the coder takes the
@@ -1544,19 +1560,9 @@ impl Coder<'_> {
                 d.token
             );
         }
-        if let Item::Node(body) = &node.children[2] {
-            let body_scope = self.scope_of(body);
-            assert_eq!(
-                self.declare_count(body_scope),
-                0,
-                "function body with declarations deferred (later slice)"
-            );
-            // A body with control flow exercises XS's branch-threading
-            // optimizer (not yet ported) and the non-program loop/return
-            // paths; defer it. A simple body is expression statements and
-            // `return expr`.
-            Self::assert_simple_function_body(&body.children[0]);
-        }
+        // Control-flow and declaring function bodies now code correctly
+        // (the ported branch-threading optimizer + the store-and-pop
+        // fusion handle them), so no body-shape guard is needed.
         let is_arrow = flags & f::ARROW != 0;
         let is_strict = flags & f::STRICT != 0;
         let scope_count = *self.tree.scope_counts.get(&scope).unwrap_or(&0);
@@ -1868,8 +1874,8 @@ impl Coder<'_> {
     /// prefix `++x`/`--x` (which the parser flags `EXPRESSION_NO_VALUE` to
     /// skip the old-value save/restore, yielding the new value). Child
     /// `[reference]`.
-    fn code_postfix(&mut self, node: &Node) {
-        let no_value = node.flags & crate::ast::flags::EXPRESSION_NO_VALUE != 0;
+    fn code_postfix(&mut self, node: &Node, stmt_no_value: bool) {
+        let no_value = stmt_no_value || node.flags & crate::ast::flags::EXPRESSION_NO_VALUE != 0;
         self.code_this(&node.children[0], 1);
         let mut value = 0;
         if !no_value {
@@ -2090,8 +2096,9 @@ impl Coder<'_> {
 
     /// `fxCompoundExpressionNodeCode` — `+=`, `-=`, … and the short-circuit
     /// `&&=` / `||=` / `??=`. Children `[reference, value]`.
-    fn code_compound(&mut self, node: &Node) {
+    fn code_compound(&mut self, node: &Node, stmt_no_value: bool) {
         use Token::*;
+        let no_value = stmt_no_value || node.flags & crate::ast::flags::EXPRESSION_NO_VALUE != 0;
         let token = node.token;
         let shortcut = matches!(token, AndAssign | OrAssign | CoalesceAssign);
         let else_target = if shortcut { Some(self.create_target()) } else { None };
@@ -2128,7 +2135,7 @@ impl Coder<'_> {
             self.place_target(0, else_target.unwrap());
             let mut swap = swap;
             while swap > 0 {
-                if node.flags & crate::ast::flags::EXPRESSION_NO_VALUE == 0 {
+                if !no_value {
                     self.add_byte(0, XS_CODE_SWAP);
                 }
                 self.add_byte(-1, XS_CODE_POP);
@@ -2500,29 +2507,95 @@ impl Coder<'_> {
 
 impl Coder<'_> {
     /// `fxCoderOptimize` — the four peephole rewrites XS runs before
-    /// sizing. Only the two that can fire in the ported surface are
-    /// implemented as observable rewrites; the END-folding pair needs the
-    /// function-frame `END*` opcodes (child 6) and is a no-op here.
+    /// sizing, in order. Ported faithfully over the record `Vec`
+    /// (`Payload::Target` records are XS's `XS_NO_CODE` placeholders).
     fn optimize(&mut self) {
-        // "branch to next =>": a `BRANCH_1` whose target is placed as the
-        // immediately following record is dropped.
+        let is_end = |id: i32| (XS_CODE_END..=XS_CODE_END_DERIVED).contains(&id);
+        let skippable = |id: i32| id == XS_NO_CODE || id == XS_CODE_UNWIND_1;
+
+        // Pass 1: branch to (target | unwind)* end => end. A `BRANCH_1`
+        // whose target, after skipping placeholders/unwinds, reaches an
+        // `END*` becomes that `END*` inline (replaced in place).
         let mut i = 0;
         while i < self.codes.len() {
             if self.codes[i].id == XS_CODE_BRANCH_1 {
                 if let Payload::Branch { tid } = self.codes[i].payload {
-                    // Is the next record the placed target for `tid`?
-                    if let Some(next) = self.codes.get(i + 1) {
-                        if let Payload::Target { tid: ntid } = next.payload {
-                            if ntid == tid {
-                                self.codes.remove(i);
-                                continue;
-                            }
+                    if let Some(p) = self.target_pos(tid) {
+                        let mut j = p + 1;
+                        while j < self.codes.len() && skippable(self.codes[j].id) {
+                            j += 1;
+                        }
+                        if j < self.codes.len() && is_end(self.codes[j].id) {
+                            let end_id = self.codes[j].id;
+                            self.codes[i].id = end_id;
+                            self.codes[i].payload = Payload::Byte;
                         }
                     }
                 }
             }
             i += 1;
         }
+
+        // Pass 2: unwind (target | unwind)* end => (target | unwind)* end.
+        // An `UNWIND_1` that reaches an `END*` (over placeholders/unwinds)
+        // is dropped — the frame teardown at `END*` subsumes it.
+        let mut i = 0;
+        while i < self.codes.len() {
+            if self.codes[i].id == XS_CODE_UNWIND_1 {
+                let mut j = i + 1;
+                while j < self.codes.len() && skippable(self.codes[j].id) {
+                    j += 1;
+                }
+                if j < self.codes.len() && is_end(self.codes[j].id) {
+                    self.codes.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Pass 3: end target* end => target* end. A dead `END*` followed
+        // (over placeholders) by the same `END*` is dropped.
+        let mut i = 0;
+        while i < self.codes.len() {
+            if is_end(self.codes[i].id) {
+                let mut j = i + 1;
+                while j < self.codes.len() && self.codes[j].id == XS_NO_CODE {
+                    j += 1;
+                }
+                if j < self.codes.len() && self.codes[j].id == self.codes[i].id {
+                    self.codes.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        // Pass 4: branch to next =>. A `BRANCH_1` whose target is the
+        // immediately following record is dropped.
+        let mut i = 0;
+        while i < self.codes.len() {
+            if self.codes[i].id == XS_CODE_BRANCH_1 {
+                if let Payload::Branch { tid } = self.codes[i].payload {
+                    if let Some(Payload::Target { tid: ntid }) =
+                        self.codes.get(i + 1).map(|c| c.payload.clone())
+                    {
+                        if ntid == tid {
+                            self.codes.remove(i);
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// The record index of a placed target (`Payload::Target { tid }`).
+    fn target_pos(&self, tid: usize) -> Option<usize> {
+        self.codes
+            .iter()
+            .position(|c| matches!(c.payload, Payload::Target { tid: t } if t == tid))
     }
 
     /// `fxParserCode`'s three passes over the record list, producing the

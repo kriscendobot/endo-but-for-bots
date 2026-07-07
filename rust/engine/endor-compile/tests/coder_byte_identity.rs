@@ -496,6 +496,48 @@ fn function_name_inference() {
     ]);
 }
 
+// Non-trivial function bodies (child 6). Once `fxCoderOptimize`'s full
+// four peephole passes are ported (branch→`END*` threading, unwind-before-
+// end removal, dead-end removal, branch-to-next), a function body with
+// control flow or declarations codes byte-identically. The
+// `fxStatementNodeCode` store-and-pop fusion (`SET_LOCAL`/`SET_CLOSURE` +
+// `POP` → `PULL_LOCAL`/`PULL_CLOSURE`) and the `mxExpressionNoValue`
+// increment/compound optimization complete the non-program statement path.
+#[test]
+fn function_control_flow_bodies() {
+    assert_identical(&[
+        // loops / break / continue / return threaded to END
+        "(function(){while(0)break;});", "(()=>{for(;;)break;});",
+        "(function(){while(1)return;});", "(function(){for(;;)return 1;});",
+        "(function(){do break;while(0);});", "(function(){label:while(1)break label;});",
+        // if / return
+        "(function(){if(1)return 1;});", "(function(){if(1)return 1;else return 2;});",
+        "(function(a){if(a)return a;return 0;});", "(()=>{if(1)return 1;});",
+        // switch / try-finally
+        "(function(){switch(1){case 1:break;}});",
+        "(function(){switch(1){case 1:return 1;default:return 0;}});",
+        "(function(){try{return 1;}finally{2;}});",
+    ]);
+}
+
+#[test]
+fn function_declaring_bodies() {
+    assert_identical(&[
+        // var / let / const in a function body
+        "(function(){var x=1;});", "(function(){var x=1;return x;});",
+        "(function(){let x=1;return x;});", "(function(){const c=2;return c;});",
+        "(function(){var x=1,y=2;return x+y;});", "(()=>{let a=1;return a;});",
+        "(function(a){var x=a;return x;});", "(function(){{let x=1;}});",
+        // the store-and-pop fusion (SET_LOCAL;POP => PULL_LOCAL)
+        "(function(){var x;x=1;return x;});", "(function(a){a=a+1;return a;});",
+        // the no-value increment / compound optimization
+        "(function(){let x=0;x++;return x;});", "(function(){var x=0;x+=1;return x;});",
+        // declarations + control flow together
+        "(function(){var x=1;while(x)break;return x;});",
+        "(function(a,b){if(a>b)return a;return b;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
