@@ -1480,12 +1480,13 @@ declarations** (the field function's frame reservation); `using` heads (a
 parser gap); and module import/export linkage + the module-body wrapper.
 These are the remaining child-6/7 surface.
 
-### Stage-5 acceptance evidence (child 7/7): the byte-identity bar
+### Stage-5 acceptance evidence (child 7/7, re-measured by fix-verify 5/5): the byte-identity bar
 
-Child 7 is the acceptance child — it does not port new node kinds; it
-**measures** the byte-identity bar over the whole corpus, arms the parser
-fuzzing, locks parse-meter determinism, and gives the runner a
-compiler-selection seam.
+Child 7 armed the acceptance harness; the four stage-5 **fix children**
+(CESU-8 strings, the four named coder rejects, the class tail, and the
+Module goal) then closed the folds it had measured, and **fix-verify 5/5**
+re-ran the whole bar from a fresh sync of the remote tip. This block records
+the **re-measured** numbers.
 
 **The full-corpus byte-identity differential harness**
 (`endor-262/src/compile_diff.rs`, driven by the `compile-diff` binary and
@@ -1499,59 +1500,101 @@ with the panic hook silenced) — a fold is a named `endor-rejected`, an
 oracle machine-startup failure a named `oracle-unavailable`, never a
 harness abort.
 
-**Measured (this build).** Over the curated conformance corpora
-(`endor-262/corpora`, every non-comment line):
+**Measured (fix-verify re-sync).** Over the curated conformance corpora
+(`endor-262/corpora`, every non-comment line) — the **script** goal:
 
 | metric | count |
 | --- | ---: |
 | total (oracle-classified) | 1711 |
-| **identical** (byte-for-byte) | **1691** |
+| **identical** (byte-for-byte) | **1711** |
 | divergent (both accept, bytes differ) | 0 |
-| endor-rejected (oracle accepts, endor folds) | 20 |
+| endor-rejected (oracle accepts, endor folds) | 0 |
 | oracle-rejected / accept-disagreement | 0 / 0 |
 
-(The `identical`/`divergent` figures are as of the stage-5 **CESU-8 fix
-child**, which closed the 60-divergence string fold below; the child-7
-build that first measured this block read `identical=1631 divergent=60`.)
+…and the **module** goal (`endor-262/corpora-modules`, `// ---`-delimited,
+gated by `module_corpora_byte_identity_no_divergence`):
 
-Spot-checks over **real test262 `language/` subtrees** (the `compile-diff`
-binary, run per-subtree to bound oracle RSS) show **zero byte
-divergence** on every accepted program:
+| metric | count |
+| --- | ---: |
+| total (oracle-classified) | 35 |
+| **identical** (byte-for-byte) | **35** |
+| divergent / endor-rejected / accept-disagreement | 0 / 0 / 0 |
 
-| subtree | total | identical | divergent | endor-rejected | oracle-rejected |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `language/expressions/addition` | 48 | 44 | **0** | 4 | 0 |
-| `language/statements/if` | 69 | 29 | **0** | 0 | 40 |
-| `language/expressions/conditional` | 22 | 20 | **0** | 0 | 2 |
+The curated-corpus bar — `divergent == 0` **and** full accept/reject
+agreement — is now **fully MET on both goals**. The child-7 build read
+`identical=1691 endor-rejected=20`; the coder-reject fix child closed all 20
+folds (→ `1711 / 0`), and the CESU-8 fix child had already closed the 60
+string divergences (`identical=1631` → `1691` → `1711`).
 
-**Stage bar status.** The bar is `divergent == 0` *and* full accept/reject
-agreement over the *full* corpus. The **byte-identity half is now MET**
-(`divergent == 0`); only the accept/reject half remains (one named fold),
-and the supervisor owns the kill-criterion call (design § Feasibility
-Verdict).
+**Broadened real-test262 sweep (fix-verify).** Re-running the three original
+`language/` subtrees and adding five meaty ones (per-subtree, since
+whole-`language/` OOMs the oracle) shows the curated bar does **not** yet
+extend to the full grammar — the broadened sweep surfaces byte divergences
+and accept-disagreements the curated corpora do not exercise:
 
-1. **CESU-8 astral/surrogate string literals — CLOSED (stage-5 fix
-   child).** These were *all 60* of the byte divergences, every one in
-   `stage3-string-utf16.js`. XS stores string literals in the bytecode as
-   **CESU-8** (a non-BMP char is a surrogate pair, each surrogate a 3-byte
-   unit → 6 bytes; a *lone* surrogate is a 3-byte CESU-8 unit that is not
-   valid UTF-8 at all; an embedded NUL is the overlong `0xC0 0x80`),
-   whereas the coder emitted the Rust `String`'s **UTF-8**. The fix carries
-   the string value as **UTF-16 code units end to end** (lexer → ast →
-   coder, mirroring the engine's stage-4 UTF-16 rework) and encodes CESU-8
-   at emit (`fxCESU8Encode`), so astral, lone-surrogate, and embedded-NUL
-   literals are now byte-identical. New byte-identity fixtures live in
-   `endor-compile/tests/coder_byte_identity.rs`
-   (`strings_cesu8_astral_and_surrogates`); the in-crate gate no longer
-   documents any byte-divergence fold.
-2. **Named coder folds** — the 20 `endor-rejected`, each a *deliberate*
-   coder `panic!` on an unported construct: `new.target` (`unsupported
-   node kind Target`, 14), optional chaining `?.` (`unsupported node kind
-   Chain`, 3), and two declaring-scope / function-class-declaration paths
-   (`… reached (…child/slice)`, 3). The in-crate gate asserts **zero byte
-   divergence** and **no panic OUTSIDE these named folds** — any new byte
-   divergence (a regression in a currently-identical program, including a
-   CESU-8 regression) or any accidental (non-fold) panic fails the build.
+| subtree | total | identical | divergent | endor-rej | oracle-rej | accept-disagree |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `expressions/addition` | 48 | 48 | **0** | 0 | 0 | 0 |
+| `statements/if` | 69 | 29 | **0** | 0 | 40 | 0 |
+| `expressions/conditional` | 22 | 20 | **0** | 0 | 2 | 0 |
+| `statements/for-of` | 712 | 596 | **45** | 0 | 71 | 0 |
+| `statements/class` | 3908 | 1535 | **191** | 1572 | 557 | **53** |
+| `expressions/object` | 1049 | 833 | **67** | 14 | 133 | **2** |
+| `statements/try` | 192 | 156 | **10** | 2 | 24 | 0 |
+| `expressions/assignment` | 466 | 385 | **15** | 4 | 62 | 0 |
+
+The three original subtrees stay byte-clean (`addition` even improved to
+`48/48` once the coder-reject child closed its four name-inference rejects).
+The five new subtrees expose the classes below. **The divergences in Class A
+are byte-identity failures NOT attributable to any documented fold** (design
+§ Feasibility Verdict / kill-criterion) — surfaced precisely; the supervisor
+owns the verdict.
+
+1. **Class A — NamedEvaluation not emitted for a function/class default in a
+   destructuring target (a MIS-EMIT, kill-criterion-relevant).** Every
+   `dstr/*-init-fn-name-{arrow,class,cover,fn,gen}` file: an anonymous
+   function/class/arrow/generator used as the `Initializer` default of a
+   destructuring `SingleNameBinding` or assignment element
+   (`catch ({ f = () => {} })`, `[x = function(){}] = a`) must get
+   `SetFunctionName` per `KeyedBindingInitialization`. The oracle emits the
+   name opcode; endor emits `0x00` at the same offset (same length, single
+   opcode diff). This is the dominant divergence in `for-of` (all 45),
+   `try` (all 10), `assignment` (all 15), and the plurality of `object`
+   (~54 of 67). It is a real byte mismatch on programs endor *accepts* — not
+   a loud fold — so it is genuine kill-criterion evidence. It looks narrow
+   and nameable (extend the identifier-LHS name inference the coder-reject
+   child added to destructuring binding/assignment initialization) rather
+   than fundamental, but it is **unclosed** as of this measurement.
+2. **Class B — async-generator `yield*` / async-gen method coding
+   (divergent).** `async-gen-…/yield-star-*` and
+   `object/method-definition/async-gen-yield-*` diverge by byte length. Async
+   generators are stage-4+ surface; their compile coding is not yet
+   byte-exact.
+3. **Class C — class-tail byte-length / numeric-key / direct-eval divergences.**
+   `class/elements/after-same-line-*-literal-names`, numeric accessor names
+   (`literal-numeric-{leading-decimal,non-canonical}`), and
+   `derived-cls-direct-eval-*` / `direct-eval-err-*` (the latter overlapping
+   the documented in-function `eval` fold) account for the `class` subtree's
+   remaining byte-length divergences.
+4. **Class D — documented folds, surfaced as `endor-rejected` at scale.**
+   The 1572 `class` / 14 `object` endor-rejects are the *deliberate* loud
+   folds: async-gen private methods, the private-member **read** path
+   (`this.#x`, `#x in o` — the documented class-tail fold), and in-function
+   `eval` (the documented `dd766cd22` fold). These are rejects (never
+   mis-emits) and are expected until their constructs are ported.
+5. **Class E — missing early-errors (accept-disagreement, endor too
+   permissive).** The 53 `class` / 2 `object` accept-disagreements are
+   endor accepting programs the oracle rejects: field initializers
+   referencing `arguments` (`*-init-err-contains-arguments`), duplicate
+   private names / methods (`grammar-privatemeth-duplicate-*`,
+   `fields-duplicate-privatenames`), and non-simple params under a strict
+   body (`*-param-strict-body`). These are unenforced static-semantics early
+   errors on the accept side.
+
+**`using` (explicit resource management).** The oracle at the pin **rejects**
+`using x = a` (it lexes `using` as an identifier → `SyntaxError: missing ;`);
+endor rejects it identically. Reject-**agreement**, no parser gap — ERM is
+simply not in the pinned grammar.
 
 **Parse-metering determinism** (`endor-compile/tests/parse_meter_determinism.rs`,
 roadmap bar). A locked test: identical parse computrons across 64 repeats
