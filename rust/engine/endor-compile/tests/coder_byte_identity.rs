@@ -861,3 +861,13 @@ fn object_proto() {
         "({['__proto__']:1});",
     ]);
 }
+
+#[test]
+fn generator_functions() {
+    assert_identical(&[
+        "(function*(){});", "(function*(){yield 1;});", "(function*(){yield;});",
+        "(function*(){yield 1;yield 2;});", "(function*(a){yield a;});",
+        "(function*(){return 1;});", "(function*(){let x=yield 1;return x;});",
+        "function*g(){yield 1;}",
+    ]);
+}

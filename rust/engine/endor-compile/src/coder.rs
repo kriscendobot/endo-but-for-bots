@@ -859,6 +859,7 @@ impl Coder<'_> {
             Body => self.code_body(node),
             Return => self.code_return(node),
             ParamsBinding => self.code_params_binding(node),
+            Yield => self.code_yield(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1514,6 +1515,37 @@ impl Coder<'_> {
         self.add_byte(-1, XS_CODE_THROW);
     }
 
+    /// `fxYieldNodeCode` (synchronous). Child `[expression]`. Builds the
+    /// `{ value, done: false }` result object, `YIELD`s it, and — until the
+    /// generator is resumed with `.next()` (the `BRANCH_STATUS` fall-through
+    /// to `target`) — threads a `.return()`/`.throw()` completion out to the
+    /// function's return target. The async form (`await`/`THROW_STATUS`) and
+    /// `yield*` (`Delegate`) are deferred.
+    fn code_yield(&mut self, node: &Node) {
+        assert!(
+            node.flags & crate::ast::flags::ASYNC == 0,
+            "async yield deferred (async slice)"
+        );
+        let target = self.create_target();
+        self.add_byte(1, XS_CODE_OBJECT);
+        self.add_byte(1, XS_CODE_DUB);
+        self.code(&node.children[0]);
+        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "value");
+        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_byte(1, XS_CODE_FALSE);
+        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "done");
+        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+        self.add_byte(0, XS_CODE_YIELD);
+        self.add_branch(1, XS_CODE_BRANCH_STATUS_1, target);
+        self.add_byte(-1, XS_CODE_SET_RESULT);
+        let rt = self.return_target.expect("yield outside a function");
+        self.adjust_environment(rt);
+        self.adjust_scope(rt);
+        self.add_branch(0, XS_CODE_BRANCH_1, rt);
+        self.place_target(0, target);
+    }
+
     /// The symbol name in an `Item::Symbol` child slot.
     fn symbol_of(item: &Item) -> &str {
         match item {
@@ -1777,9 +1809,9 @@ impl Coder<'_> {
         use crate::ast::flags as f;
         let flags = node.flags;
         assert_eq!(
-            flags & (f::ASYNC | f::GENERATOR | f::FIELD | f::BASE | f::DERIVED),
+            flags & (f::ASYNC | f::FIELD | f::BASE | f::DERIVED),
             0,
-            "function flavor {flags:#x} deferred (async/generator/class)"
+            "function flavor {flags:#x} deferred (async/class)"
         );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
@@ -1838,7 +1870,16 @@ impl Coder<'_> {
         let is_accessor = std::mem::take(&mut self.pending_accessor);
         let plain_function =
             is_accessor || flags & (f::ARROW | f::METHOD | f::GETTER | f::SETTER) != 0;
-        let create_op = if plain_function { XS_CODE_FUNCTION } else { XS_CODE_CONSTRUCTOR_FUNCTION };
+        // A generator (`GENERATOR_FUNCTION`) takes precedence over the
+        // plain/constructor split (matching XS's flag order); an async
+        // generator is deferred by the `ASYNC` guard above.
+        let create_op = if flags & f::GENERATOR != 0 {
+            XS_CODE_GENERATOR_FUNCTION
+        } else if plain_function {
+            XS_CODE_FUNCTION
+        } else {
+            XS_CODE_CONSTRUCTOR_FUNCTION
+        };
         self.add_symbol_opt(1, create_op, name.as_deref());
         self.add_branch(0, XS_CODE_CODE_1, target);
 
@@ -1857,6 +1898,11 @@ impl Coder<'_> {
         self.code_function_name(scope);
 
         self.return_target = Some(self.create_target());
+        // A generator body opens by suspending at its start
+        // (`START_GENERATOR`); the async-generator form is deferred.
+        if flags & f::GENERATOR != 0 {
+            self.add_byte(0, XS_CODE_START_GENERATOR);
+        }
         self.code(&node.children[2]); // Body
         let rt = self.return_target.expect("function return target");
         self.place_target(0, rt);
