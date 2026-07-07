@@ -1458,23 +1458,30 @@ impl Coder<'_> {
         self.unuse_temporaries(6);
     }
 
-    /// `fxScopeCodeReset` — reset per-iteration lexical bindings. No-op for
-    /// a non-declaring `for`-head (declaring heads are deferred).
+    /// `fxScopeCodeReset` — reset each per-iteration binding to its
+    /// initial (uninitialized `let`/`const`) state at the top of each
+    /// `for`-loop iteration, so a fresh binding is captured per iteration.
     fn scope_code_reset(&mut self, scope: usize) {
-        assert_eq!(
-            self.declare_count(scope),
-            0,
-            "declaring for-in/of head (per-iteration reset) deferred"
-        );
+        for (id, _, sym, flags) in self.declares_of(scope) {
+            let index = self.declare_index(scope, id);
+            if flags & crate::scoper::dflags::CLOSURE != 0 {
+                self.add_index(0, XS_CODE_RESET_CLOSURE_1, index);
+            } else if sym.is_some() {
+                self.add_index(0, XS_CODE_RESET_LOCAL_1, index);
+            } else {
+                self.add_byte(1, XS_CODE_UNDEFINED);
+                self.add_index(-1, XS_CODE_PULL_LOCAL_1, index);
+            }
+        }
     }
 
-    /// `fxScopeCodeUsedReverse` — run `using` disposers in reverse. No-op
-    /// for a non-declaring scope (declaring / `using` heads are deferred).
+    /// `fxScopeCodeUsedReverse` — run `using` disposers in reverse at scope
+    /// exit. Only `using` declarations emit disposers; plain `let`/`const`
+    /// heads are a no-op. `using` in a `for`-head is deferred.
     fn scope_code_used_reverse(&mut self, scope: usize, _exception: i32, _selector: i32) {
-        assert!(
-            self.tree.scopes[scope].declares.is_empty(),
-            "for-in/of with declarations / using deferred"
-        );
+        for d in &self.tree.scopes[scope].declares {
+            assert_ne!(d.token, Token::Using, "`using` in a for-in/of head deferred");
+        }
     }
 
     /// `fxBreakContinueNodeCode`. Child `[symbol-or-null]`.

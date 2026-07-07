@@ -642,6 +642,22 @@ fn object_methods_and_accessors() {
     ]);
 }
 
+// Declaring `for-in`/`for-of` heads (child 6). `for (let/const x of …)`
+// binds a fresh per-iteration lexical in the loop's block scope: the scope
+// header allocates the slot, `fxScopeCodeReset` (`RESET_LOCAL`) refreshes
+// it each iteration, and the binding assigns via `LET_LOCAL`/`CONST_LOCAL`.
+// Deferred: `for (var …)`, `for await`, and `using` heads.
+#[test]
+fn for_in_of_declaring_heads() {
+    assert_identical(&[
+        "for(let x of a)x;", "for(const x of a)x;", "for(let x in a)x;",
+        "for(let x of[1,2,3])x;", "for(let x of a){}", "for(let x of a)f(x);",
+        "for(let x of a)break;", "for(let k in o){k;}", "for(const c of a)c*2;",
+        "for(let x of a)for(let y of b)x+y;",
+        "(function(){for(let x of a)return x;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
