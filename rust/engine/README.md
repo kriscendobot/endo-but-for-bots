@@ -1447,13 +1447,38 @@ byte-identical vs the oracle:
   static fields, multiple blocks, `super`, control flow, and interleaving
   with methods. Deferred: a block with its own lexical declarations (needs
   the field function's frame reservation).
+- Slice 51 — **the class tail: computed-key fields, private members, and
+  scope-aware field-init functions**. The keystone: XS's `instanceInit` /
+  `constructorInit` field functions are real `mxFieldFlag` functions with a
+  scope, so a computed-key field (`[e] = v`) and a private member (`#x`) can
+  CAPTURE the class-scope closures their init reads. The **scoper**
+  (`fxClassNodeHoist`) now creates those class-body closures — an anonymous
+  `atAccess` per computed field, a named `symbolAccess` (the brand) plus an
+  anonymous `valueAccess` per private member/accessor — in member order,
+  ahead of `instanceInit`. The **coder**'s class member loop evaluates a
+  computed key once (`AT` + `CONST_CLOSURE` into `atAccess`) and binds each
+  private brand/value (`CONST_CLOSURE` into `symbolAccess` / `valueAccess`);
+  the field-init function then `RESERVE`s + `RETRIEVE`s those closures as
+  use-closure aliases and reads them back (`GET_CLOSURE` + `NEW_PROPERTY_AT`
+  for a computed field, `NEW_PRIVATE` for a private), storing each captured
+  closure from the enclosing class frame after creation (`FUNCTION_ENVIRONMENT`
+  / `ENVIRONMENT` + `STORE`). Field-collection order follows XS's two-pass
+  `fxClassExpression` split — private methods/accessors first, then data
+  fields + `static { … }` blocks, both in source order. Byte-identical for
+  computed (instance/static, key expressions, name-inferring/`this` values),
+  private fields, private methods/getters/setters (instance/static), and the
+  cross-construct mix on base and derived-`super` classes. Deferred: a
+  private **read** in a method body (`#x in o`, `this.#x`, `this.#m()` —
+  `NEW_PRIVATE`/`GET_PRIVATE`/`SET_PRIVATE`/`HAS_PRIVATE` on a member access)
+  and a static block with local lexical declarations (still needs the field
+  function's own frame count).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-**private** members and computed-key fields (need the class-scope
-`atAccess` / private declares), and a static block with local declarations;
-`using` heads (a parser gap); and
-module import/export linkage + the module-body wrapper. These are the
-remaining child-6/7 surface.
+a **private member READ** in a method/constructor body (`#x in obj`,
+`this.#x` get/set, `this.#m()`); a **static block with local lexical
+declarations** (the field function's frame reservation); `using` heads (a
+parser gap); and module import/export linkage + the module-body wrapper.
+These are the remaining child-6/7 surface.
 
 ### Stage-5 acceptance evidence (child 7/7): the byte-identity bar
 

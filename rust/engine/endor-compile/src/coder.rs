@@ -139,6 +139,18 @@ const XS_METHOD_FLAG: i32 = 16;
 const XS_GETTER_FLAG: i32 = 32;
 const XS_SETTER_FLAG: i32 = 64;
 
+/// One field's 1-based alias slots into its field-init function's own frame
+/// — the `RETRIEVE` slot each captured class-scope closure lands in. A plain
+/// data field captures nothing; a computed-key field captures `atAccess`; a
+/// private field captures `symbolAccess`; a private method also captures
+/// `valueAccess`.
+#[derive(Clone, Copy, Default)]
+struct FieldPlan {
+    at: Option<i32>,
+    symbol: Option<i32>,
+    value: Option<i32>,
+}
+
 /// The built-in symbols `fxInitializeParser` interns *before* lexing, in
 /// exact source order (`xsScript.c`). They occupy their hash buckets ahead
 /// of every program symbol, so their position is part of the ID contract
@@ -2105,73 +2117,112 @@ impl Coder<'_> {
             self.add_symbol(0, XS_CODE_NAME, n);
         }
 
-        // Members: concise methods / accessors emit inline; fields are
-        // collected for the synthesized init functions.
-        let mut static_fields: Vec<&Node> = Vec::new();
-        let mut instance_fields: Vec<&Node> = Vec::new();
+        // Members: concise **public** methods / accessors emit inline; data
+        // fields, computed-key fields, and **private** members (fields and
+        // methods) are collected for the synthesized init functions. A
+        // computed-key field evaluates its key once here (`AT` +
+        // `CONST_CLOSURE` into `atAccess`); a private member binds its brand
+        // (and, for a private method, its value) into the class-scope
+        // `symbolAccess` / `valueAccess` closures.
+        // XS's parser (`fxClassExpression`) fills the init-function field
+        // lists in TWO passes: private methods/accessors first (in source
+        // order), then data fields + `static { … }` blocks (in source
+        // order). The member-loop `CONST_CLOSURE` emission below stays in
+        // source order; only the collected field order is two-pass.
+        let mut static_methods: Vec<&Node> = Vec::new();
+        let mut static_data: Vec<&Node> = Vec::new();
+        let mut instance_methods: Vec<&Node> = Vec::new();
+        let mut instance_data: Vec<&Node> = Vec::new();
         if let Some(Item::List(items)) = node.children.get(2) {
             for item in items {
                 let p = node_of(item);
-                let is_method =
-                    p.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
-                if !is_method {
-                    // A field (`x = v` / `static x = v`) — collected for
-                    // the synthesized init function, not emitted here.
-                    if p.flags & f::STATIC != 0 {
-                        static_fields.push(p);
+                let is_method = p.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+                let is_static = p.flags & f::STATIC != 0;
+                let is_public_method = is_method && p.token != Token::PrivateProperty;
+                if is_public_method {
+                    // The member target: the constructor (static) or the
+                    // prototype (instance).
+                    if is_static {
+                        self.add_byte(1, XS_CODE_DUB);
                     } else {
-                        instance_fields.push(p);
+                        self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
                     }
+                    let flag = XS_DONT_ENUM_FLAG | Self::property_flag(p);
+                    self.pending_accessor = p.flags & (f::GETTER | f::SETTER) != 0;
+                    match p.token {
+                        Token::Property => {
+                            let key = Self::symbol_of(&p.children[0]).to_string();
+                            self.code(&p.children[1]);
+                            self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
+                        }
+                        Token::PropertyAt => {
+                            // A computed key `[e]`: evaluate the key, `AT`,
+                            // then the method value.
+                            self.code(&p.children[0]);
+                            self.add_byte(0, XS_CODE_AT);
+                            self.code(&p.children[1]);
+                            self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+                        }
+                        other => panic!("coder: unsupported class member {:?}", other),
+                    }
+                    self.add_integer(0, XS_CODE_INTEGER_1, flag);
                     continue;
                 }
-                let is_static = p.flags & f::STATIC != 0;
-                // The member target: the constructor (static) or the
-                // prototype (instance).
-                if is_static {
-                    self.add_byte(1, XS_CODE_DUB);
-                } else {
-                    self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
-                }
-                let flag = XS_DONT_ENUM_FLAG | Self::property_flag(p);
-                self.pending_accessor = p.flags & (f::GETTER | f::SETTER) != 0;
+                // A field / private member: emit its class-scope closure
+                // binding(s), then collect it for the init function.
+                let access = self.tree.class_member_access.get(&node_key(p)).copied();
                 match p.token {
-                    Token::Property => {
-                        let key = Self::symbol_of(&p.children[0]).to_string();
-                        self.code(&p.children[1]);
-                        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
-                    }
                     Token::PropertyAt => {
-                        // A computed key `[e]`: evaluate the key, `AT`, then
-                        // the method value.
+                        // Computed-key field: `at`, `AT`, store the key into
+                        // the `atAccess` closure (kept for the field function).
+                        let at = access.and_then(|a| a.at).expect("computed field atAccess");
                         self.code(&p.children[0]);
                         self.add_byte(0, XS_CODE_AT);
-                        self.code(&p.children[1]);
-                        self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+                        let idx = self.declare_index(class_scope, at);
+                        self.add_index(0, XS_CODE_CONST_CLOSURE_1, idx);
+                        self.add_byte(-1, XS_CODE_POP);
                     }
-                    other => panic!("coder: unsupported class member {:?}", other),
+                    Token::PrivateProperty => {
+                        // Bind the private brand (`symbolAccess`) from the
+                        // constructor already on the stack; a private
+                        // method/accessor also stashes its value.
+                        let a = access.expect("private member access");
+                        let sidx = self.declare_index(class_scope, a.symbol.expect("symbolAccess"));
+                        self.add_index(0, XS_CODE_CONST_CLOSURE_1, sidx);
+                        if is_method {
+                            self.pending_accessor = p.flags & (f::GETTER | f::SETTER) != 0;
+                            self.code(&p.children[1]);
+                            let vidx = self.declare_index(class_scope, a.value.expect("valueAccess"));
+                            self.add_index(0, XS_CODE_CONST_CLOSURE_1, vidx);
+                            self.add_byte(-1, XS_CODE_POP);
+                        }
+                    }
+                    Token::Property | Token::Body => {}
+                    other => panic!("coder: unsupported class field {:?}", other),
                 }
-                self.add_integer(0, XS_CODE_INTEGER_1, flag);
+                let private_method = is_method; // (public methods took the branch above)
+                match (is_static, private_method) {
+                    (true, true) => static_methods.push(p),
+                    (true, false) => static_data.push(p),
+                    (false, true) => instance_methods.push(p),
+                    (false, false) => instance_data.push(p),
+                }
             }
         }
+        // Private methods first, then data fields / static blocks.
+        let instance_fields: Vec<&Node> =
+            instance_methods.into_iter().chain(instance_data).collect();
+        let static_fields: Vec<&Node> =
+            static_methods.into_iter().chain(static_data).collect();
 
         // Instance data fields run through the synthesized `instanceInit`
         // field function stored in the class-body closure. A base constructor
         // calls it on entry; a derived class calls it after `super(...)`
-        // installs `this`. Private / computed-key fields need class-scope
-        // declares — deferred.
+        // installs `this`.
         if !instance_fields.is_empty() {
             assert!(
                 instance_init.is_some(),
                 "instance fields present but no instanceInit declare (scoper)"
-            );
-        }
-        for p in instance_fields.iter().chain(static_fields.iter()) {
-            // A data field (`Property`) or a `static { … }` block (`Body`);
-            // computed (`PropertyAt`) / private (`PrivateProperty`) fields
-            // need class-scope declares and are deferred.
-            assert!(
-                matches!(p.token, Token::Property | Token::Body),
-                "computed / private field deferred (needs class-scope declare)"
             );
         }
 
@@ -2188,7 +2239,7 @@ impl Coder<'_> {
         // captures (`fxClassNodeCode`'s `instanceInit` block).
         if !instance_fields.is_empty() {
             let (iscope, iid) = instance_init.expect("instance-init declare");
-            self.code_field_init_function(&instance_fields);
+            self.code_field_init_function(&instance_fields, class_scope);
             self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
             self.add_byte(-1, XS_CODE_SET_HOME);
             let idx = self.declare_index(iscope, iid);
@@ -2200,7 +2251,7 @@ impl Coder<'_> {
         // function invoked with the constructor as `this`/home.
         if !static_fields.is_empty() {
             self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
-            self.code_field_init_function(&static_fields);
+            self.code_field_init_function(&static_fields, class_scope);
             self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
             self.add_byte(-1, XS_CODE_SET_HOME);
             self.add_byte(1, XS_CODE_CALL);
@@ -2220,9 +2271,14 @@ impl Coder<'_> {
     /// `BEGIN_STRICT_FIELD` body runs `fxFieldNodeCode` for each field with
     /// `this` bound to the target (constructor for static, instance for
     /// instance fields). Mirrors `code_function`'s wrapper (save/restore,
-    /// `CODE`/`END`, environment store) for a scope-free, parameter-free
-    /// synthetic function.
-    fn code_field_init_function(&mut self, fields: &[&Node]) {
+    /// `CODE`/`END`, environment store). Computed-key and private fields
+    /// capture their class-scope closures (`atAccess` / `symbolAccess` /
+    /// `valueAccess`) as use-closure aliases in this function's own frame:
+    /// XS's field function is a real `mxFieldFlag` function with a scope, so
+    /// it `RESERVE`s the alias slots, `RETRIEVE`s the closures at entry, and
+    /// `STORE`s them from the enclosing class frame after creation.
+    fn code_field_init_function(&mut self, fields: &[&Node], class_scope: usize) {
+        use crate::ast::flags as f;
         let saved_return = self.return_target;
         let saved_scope_level = self.scope_level;
         let saved_program = self.program_flag;
@@ -2230,6 +2286,48 @@ impl Coder<'_> {
         let saved_continue = self.first_continue_target;
         let saved_env = self.environment_level;
         let saved_eval = self.eval_flag;
+
+        // Capture plan: class-scope declare ids in alias order (first
+        // reference wins — a private method reads `valueAccess` before
+        // `symbolAccess`), plus each field's 1-based alias slots.
+        let mut caps: Vec<u32> = Vec::new();
+        let mut plans: Vec<FieldPlan> = Vec::with_capacity(fields.len());
+        for field in fields {
+            let access = self.tree.class_member_access.get(&node_key(field)).copied();
+            let is_method = field.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+            let mut plan = FieldPlan::default();
+            // Alias slots are 0-based (the `index + 1` serialization family
+            // adds the one): the slot is the frame position *before* the
+            // push.
+            match field.token {
+                Token::PropertyAt => {
+                    plan.at = Some(caps.len() as i32);
+                    caps.push(access.and_then(|a| a.at).expect("computed field atAccess"));
+                }
+                Token::PrivateProperty => {
+                    let a = access.expect("private member access");
+                    if is_method {
+                        plan.value = Some(caps.len() as i32);
+                        caps.push(a.value.expect("valueAccess"));
+                    }
+                    plan.symbol = Some(caps.len() as i32);
+                    caps.push(a.symbol.expect("symbolAccess"));
+                }
+                Token::Body => {
+                    // A `static { … }` block with its own lexical
+                    // declarations needs those slots reserved in this
+                    // function's frame — the remaining class-tail fold.
+                    let bscope = self.tree.node_scopes.get(&node_key(field)).map(|s| s.0);
+                    assert!(
+                        bscope.map(|s| self.declare_count(s)).unwrap_or(0) == 0,
+                        "static block with lexical declarations deferred"
+                    );
+                }
+                _ => {}
+            }
+            plans.push(plan);
+        }
+        let k = caps.len() as i32;
 
         let target = self.create_target();
         self.program_flag = false;
@@ -2240,20 +2338,36 @@ impl Coder<'_> {
         self.add_symbol_opt(1, XS_CODE_CONSTRUCTOR_FUNCTION, None);
         self.add_branch(0, XS_CODE_CODE_1, target);
         self.add_index(0, XS_CODE_BEGIN_STRICT_FIELD, 0);
+        if k != 0 {
+            self.add_index(0, XS_CODE_RESERVE_1, k);
+            self.add_index(0, XS_CODE_RETRIEVE_1, k);
+        }
         self.return_target = Some(self.create_target());
-        for field in fields {
-            self.code_field(field);
+        for (field, plan) in fields.iter().zip(plans.iter()) {
+            self.code_field(field, plan);
         }
         let rt = self.return_target.expect("field-init return target");
         self.place_target(0, rt);
         self.add_byte(0, XS_CODE_END);
         self.place_target(0, target);
 
-        // The field function captures the class environment (home/`this`);
-        // at eval scope that is a `FUNCTION_ENVIRONMENT` store (no captured
-        // slots for the simple-field surface).
+        // Store the captured closures into the new function's environment,
+        // running in the enclosing class frame (`fxScopeCodeStore`). At eval
+        // scope the environment is a `FUNCTION_ENVIRONMENT`; otherwise a
+        // captured field function needs a plain `ENVIRONMENT`.
         if saved_eval {
             self.add_byte(1, XS_CODE_FUNCTION_ENVIRONMENT);
+            for &cap in &caps {
+                let idx = self.declare_index(class_scope, cap);
+                self.add_index(0, XS_CODE_STORE_1, idx);
+            }
+            self.add_byte(-1, XS_CODE_POP);
+        } else if k != 0 {
+            self.add_byte(1, XS_CODE_ENVIRONMENT);
+            for &cap in &caps {
+                let idx = self.declare_index(class_scope, cap);
+                self.add_index(0, XS_CODE_STORE_1, idx);
+            }
             self.add_byte(-1, XS_CODE_POP);
         }
 
@@ -2266,23 +2380,58 @@ impl Coder<'_> {
         self.environment_level = saved_env;
     }
 
-    /// `fxFieldNodeCode` for a data field: `this`, the initializer value,
-    /// then `NEW_PROPERTY` with the inferred-name flag. Computed / private
-    /// fields (needing `atAccess` / private declares) are deferred.
-    fn code_field(&mut self, p: &Node) {
-        // A `static { … }` block folds into the same `constructorInit`
-        // field-init function as the static data fields (in source order);
-        // it runs its statements directly (no `this`/`NEW_PROPERTY`).
+    /// `fxFieldNodeCode`: `this`, the value (or a captured private-method
+    /// value), then the property-installing op with the inferred-name flag.
+    /// A `Property` is a plain data field; a `PropertyAt` reads its captured
+    /// `atAccess` key (`NEW_PROPERTY_AT`); a `PrivateProperty` installs a
+    /// private (`NEW_PRIVATE`) whose brand is the captured `symbolAccess`.
+    fn code_field(&mut self, p: &Node, plan: &FieldPlan) {
+        use crate::ast::flags as f;
+        // A `static { … }` block runs its statements directly (no
+        // `this`/property install), with `this` bound to the constructor.
         if p.token == Token::Body {
             self.code(&p.children[0]);
             return;
         }
         self.add_byte(1, XS_CODE_THIS);
-        let key = Self::symbol_of(&p.children[0]).to_string();
-        self.code(&p.children[1]);
-        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
-        let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
-        self.add_integer(0, XS_CODE_INTEGER_1, flag);
+        match p.token {
+            Token::Property => {
+                let key = Self::symbol_of(&p.children[0]).to_string();
+                self.code(&p.children[1]);
+                self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
+                let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+                self.add_integer(0, XS_CODE_INTEGER_1, flag);
+            }
+            Token::PropertyAt => {
+                self.add_index(1, XS_CODE_GET_CLOSURE_1, plan.at.expect("atAccess alias"));
+                self.code(&p.children[1]);
+                self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+                let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+                self.add_integer(0, XS_CODE_INTEGER_1, flag);
+            }
+            Token::PrivateProperty => {
+                let is_method = p.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+                if is_method {
+                    self.add_index(1, XS_CODE_GET_CLOSURE_1, plan.value.expect("valueAccess alias"));
+                } else {
+                    self.code(&p.children[1]);
+                }
+                self.add_index(-2, XS_CODE_NEW_PRIVATE_1, plan.symbol.expect("symbolAccess alias"));
+                let flag = if p.flags & f::METHOD != 0 {
+                    XS_NAME_FLAG | XS_METHOD_FLAG
+                } else if p.flags & f::GETTER != 0 {
+                    XS_NAME_FLAG | XS_METHOD_FLAG | XS_GETTER_FLAG
+                } else if p.flags & f::SETTER != 0 {
+                    XS_NAME_FLAG | XS_METHOD_FLAG | XS_SETTER_FLAG
+                } else if Self::infers_name(&p.children[1]) {
+                    XS_NAME_FLAG
+                } else {
+                    0
+                };
+                self.add_integer(0, XS_CODE_INTEGER_1, flag);
+            }
+            other => panic!("coder: unsupported field node {:?}", other),
+        }
     }
 
     fn code_function(&mut self, node: &Node) {

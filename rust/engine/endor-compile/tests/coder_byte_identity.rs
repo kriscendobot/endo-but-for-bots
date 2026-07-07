@@ -1146,6 +1146,66 @@ fn class_instance_fields_derived() {
     ]);
 }
 
+// Computed-key fields (`[e] = v`): the class coder evaluates the key once at
+// class-definition time (`AT` + `CONST_CLOSURE` into the class-scope
+// `atAccess`); the field-init function then captures that closure as a
+// use-closure alias — the keystone scope-aware field function — and reads it
+// back (`RETRIEVE` at entry, `GET_CLOSURE` + `NEW_PROPERTY_AT` per field).
+#[test]
+fn class_computed_fields() {
+    assert_identical(&[
+        "(class{[k]=1;});", "(class{[k]=1;[j]=2;});", "(class{[k+1]=2;});",
+        "(class{[k]=this;});", "(class{[k];});",
+        // interleaved with a plain field, a method, and a static field
+        "(class{x=1;[k]=2;});", "(class{[k]=1;m(){}});", "(class{[k]=1;static y=2;});",
+        // named / derived / static computed key
+        "(class C{[k]=1;});", "(class extends A{[k]=1;});", "(class{static [k]=1;});",
+    ]);
+}
+
+// Private data fields (`#x = v`): the class coder binds the private brand
+// into the class-scope `symbolAccess` closure (`CONST_CLOSURE`); the field
+// function captures it and installs the private on `this` (`NEW_PRIVATE`).
+#[test]
+fn class_private_fields() {
+    assert_identical(&[
+        "(class{#x=1;});", "(class{#x;});", "(class{#x=1;#y=2;});",
+        "(class{#x=this;});", "(class{#x=function(){};});",
+        // interleaved with public data / method / static members
+        "(class{x=1;#y=2;});", "(class{#x=1;m(){}});", "(class{#x=1;static #y=2;});",
+        "(class C{#x=1;});", "(class extends A{#x=1;constructor(){super();}});",
+        "(class{static #x=1;});",
+    ]);
+}
+
+// Private methods / accessors (`#m(){}`, `get #g(){}`, `set #s(v){}`): the
+// class coder stores the method value into the class-scope `valueAccess`
+// closure (`CONST_CLOSURE`), and the field function reads it (`GET_CLOSURE`)
+// to install the private as a method/accessor (`NEW_PRIVATE` with the
+// method/getter/setter attribute). `valueAccess` precedes `symbolAccess` in
+// the field function's alias order, matching `fxFieldNodeCode`.
+#[test]
+fn class_private_methods() {
+    assert_identical(&[
+        "(class{#m(){}});", "(class{#m(){}#n(){}});", "(class{get #g(){}});",
+        "(class{set #s(v){}});", "(class{#m(){}#x=1;});", "(class{static #m(){}});",
+        "(class{#m(){}m(){}});",
+    ]);
+}
+
+// Cross-construct: computed keys + private members + a plain field in one
+// class, on base and derived-`super` shapes — the full class-tail surface in
+// a single init function, exercising the mixed alias/store ordering.
+#[test]
+fn class_tail_mixed() {
+    assert_identical(&[
+        "(class{x=1;#y=2;[z]=3;});",
+        "(class{static a=1;#b=2;[c]=3;m(){}});",
+        "(class extends A{#x=1;[k]=2;constructor(){super();}});",
+        "(class C extends A{a=1;#b=2;[c]=3;#m(){}static #s=9;});",
+    ]);
+}
+
 // `new.target` (`fxValueNodeCode` for a `Target` node → the single
 // `XS_CODE_TARGET` byte). Read in a construct it is the target constructor,
 // in a plain call `undefined`; the coder emits the same byte for both (the

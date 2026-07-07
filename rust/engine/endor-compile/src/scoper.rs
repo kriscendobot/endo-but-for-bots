@@ -226,6 +226,27 @@ pub struct ScopeTree {
     /// the enclosing derived class's `instanceInit` closure. Keyed with
     /// [`node_key`].
     pub super_instance_init: HashMap<usize, (usize, u32)>,
+    /// A class member node address (`PropertyAt` computed field /
+    /// `PrivateProperty`) → the class-scope closure declares XS's
+    /// `fxClassNodeHoist` creates for it (`atAccess` / `symbolAccess` /
+    /// `valueAccess`). The coder reads these to emit the member-loop
+    /// `CONST_CLOSURE` and the field function's `GET_CLOSURE` / `NEW_PRIVATE`.
+    /// Keyed with [`node_key`].
+    pub class_member_access: HashMap<usize, MemberAccess>,
+}
+
+/// The class-scope closure declares XS synthesizes for one computed-key /
+/// private member (`atAccess`, `symbolAccess`, `valueAccess`). Each id
+/// indexes the owning class's body scope.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemberAccess {
+    /// `PropertyAt.atAccess` — the computed key's `const` closure.
+    pub at: Option<u32>,
+    /// `PrivatePropertyNode.symbolAccess` — the private brand `const` closure.
+    pub symbol: Option<u32>,
+    /// `PrivatePropertyNode.valueAccess` — a private method/accessor's value
+    /// `const` closure (absent for a private data field).
+    pub value: Option<u32>,
 }
 
 /// The stable identity the scoper/coder use to associate a scope (and,
@@ -275,6 +296,7 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
         resolutions: s.resolutions,
         class_instance_init: s.class_instance_init,
         super_instance_init: s.super_instance_init,
+        class_member_access: s.class_member_access,
     })
 }
 
@@ -329,6 +351,9 @@ struct Scoper {
     /// `superNode->instanceInitAccess->declaration`). The coder reads it to
     /// call the field initializer after `super(...)` installs `this`.
     super_instance_init: HashMap<usize, (usize, u32)>,
+    /// A class member node address → its synthesized class-scope closure
+    /// declares (`atAccess` / `symbolAccess` / `valueAccess`).
+    class_member_access: HashMap<usize, MemberAccess>,
 }
 
 fn node_ptr(n: &Node) -> usize {
@@ -365,8 +390,22 @@ fn class_has_instance_field(class: &Node) -> bool {
         Some(Item::List(v)) => v,
         _ => return false,
     };
+    // XS's `instanceInitCount`: a non-static **data** field (no method flag)
+    // OR a non-static **private** method/accessor (which desugars to an
+    // instance-init field installing the private on `this`). A public
+    // method/accessor and a `static { … }` block do not count.
     members.iter().any(|item| match item {
-        Item::Node(m) => m.flags & (f::STATIC | f::METHOD | f::GETTER | f::SETTER) == 0,
+        Item::Node(m) => {
+            let is_accessor = m.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+            let is_static = m.flags & f::STATIC != 0;
+            if is_static {
+                false
+            } else if !is_accessor {
+                m.token != Token::Body
+            } else {
+                m.token == Token::PrivateProperty
+            }
+        }
         _ => false,
     })
 }
@@ -662,6 +701,47 @@ impl Scoper {
             self.hoist_item(heritage)?;
         }
         let si = self.scope_new(node, Token::Block);
+        // Per-member class-scope closures (XS's `fxClassNodeHoist` member
+        // loop): a computed-key **field** gets an anonymous `atAccess`
+        // closure (its key, evaluated once at class-definition time); a
+        // **private** member gets a named `symbolAccess` closure (the brand)
+        // and, when it is a method/accessor, a second anonymous `valueAccess`
+        // closure (the installed value). These precede the `instanceInit`
+        // declare so the class-scope declare order — hence the `NEW_CLOSURE`
+        // and `CONST_CLOSURE` slot order — matches XS.
+        if let Some(Item::List(items)) = node.children.get(2) {
+            for item in items {
+                let Item::Node(m) = item else { continue };
+                let is_accessor =
+                    m.flags & (flags::METHOD | flags::GETTER | flags::SETTER) != 0;
+                let mut access = MemberAccess::default();
+                match m.token {
+                    Token::PropertyAt if !is_accessor => {
+                        let sym = Sym::Anon(self.anon);
+                        self.anon += 1;
+                        let mut d = self.new_declare(si, Token::Const, Some(sym), m.line);
+                        d.flags |= dflags::CLOSURE;
+                        access.at = Some(self.scope_add_declare(si, d));
+                    }
+                    Token::PrivateProperty => {
+                        let name = child_sym(m, 0).map(Sym::Named);
+                        let mut d = self.new_declare(si, Token::Const, name, m.line);
+                        d.flags |= dflags::CLOSURE
+                            | (m.flags & (flags::STATIC | flags::GETTER | flags::SETTER));
+                        access.symbol = Some(self.scope_add_declare(si, d));
+                        if is_accessor {
+                            let sym = Sym::Anon(self.anon);
+                            self.anon += 1;
+                            let mut d = self.new_declare(si, Token::Const, Some(sym), m.line);
+                            d.flags |= dflags::CLOSURE;
+                            access.value = Some(self.scope_add_declare(si, d));
+                        }
+                    }
+                    _ => continue,
+                }
+                self.class_member_access.insert(node_ptr(m), access);
+            }
+        }
         // A class with instance data fields synthesizes an `instanceInit`
         // closure (XS's `self->instanceInit` + `instanceInitAccess`): an
         // anonymous `const` closure declare in the class body scope, holding
