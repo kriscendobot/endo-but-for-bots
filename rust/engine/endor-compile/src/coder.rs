@@ -26,6 +26,20 @@
 //! access, object/array/template construction, and destructuring are the
 //! back half, deferred to child 6; the honest fold is named in the
 //! crate README and the completion report.
+//!
+//! **Child 6, first slice: symbol-free control flow.** The loop forms
+//! (`while` / `do` / C-style `for`), labeled statements with break /
+//! continue resolution (XS's `firstBreakTarget` / `firstContinueTarget`
+//! label-target stacks and the environment/scope adjustments), `switch`,
+//! `throw`, `debugger`, and `try` / `catch` / `finally` (including the
+//! alias / finalize / jump target machinery that threads break / continue
+//! / return out through a `finally` via the selector local) are ported
+//! here. What each of these needs and *doesn't* yet have is a symbol
+//! (atom) table: a declaring loop / block / `switch` scope, a `catch(e)`
+//! binding, `for-in` / `for-of` / `for-await-of` (they emit `GET_PROPERTY
+//! next` etc.), and `with` all reach a `NEW_LOCAL` / `SYMBOL` op keyed on
+//! a source name, so they assert loudly and are deferred to the
+//! atom-table slice. `for(let …)` / declaring cases are the same fold.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -82,12 +96,31 @@ struct Code {
 }
 
 /// A branch target — XS's `txTargetCode`. `offset` is the byte position
-/// the target resolves to, recomputed each sizing pass.
+/// the target resolves to, recomputed each sizing pass. The
+/// `environment_level` / `scope_level` / `stack_level` snapshots and the
+/// `labels` / `next_target` / `original` fields are the coder's live
+/// target-stack machinery (`firstBreakTarget` / `firstContinueTarget` /
+/// `returnTarget`), consumed by break/continue resolution and the `try`
+/// finalizer.
 #[derive(Clone, Debug, Default)]
 struct Target {
     index: u32,
     offset: i32,
     used: bool,
+    /// The environment (`with`) nesting the target was created at.
+    environment_level: i32,
+    /// The frame slot level the target was created at.
+    scope_level: i32,
+    /// The stack depth the target was created at.
+    stack_level: i32,
+    /// The label symbols a break/continue target answers to (XS's
+    /// `target->label` `nextLabel` chain). `None` is the anonymous
+    /// (loop / `switch`) label; a `Some(name)` is a labeled statement.
+    labels: Vec<Option<String>>,
+    /// The next target down the break/continue/return stack.
+    next_target: Option<usize>,
+    /// For a `try` alias, the original target it forwards to.
+    original: Option<usize>,
 }
 
 /// The coder — XS's `txCoder`. Holds the record list, the target arena,
@@ -98,9 +131,16 @@ pub struct Coder<'a> {
     targets: Vec<Target>,
     stack_level: i32,
     scope_level: i32,
+    environment_level: i32,
     target_index: u32,
     program_flag: bool,
     eval_flag: bool,
+    /// XS's `coder->firstBreakTarget` / `firstContinueTarget` /
+    /// `returnTarget` — heads of the target stacks the loop / `switch` /
+    /// `try` / label coders push and pop.
+    first_break_target: Option<usize>,
+    first_continue_target: Option<usize>,
+    return_target: Option<usize>,
     tree: &'a ScopeTree,
 }
 
@@ -111,9 +151,13 @@ impl<'a> Coder<'a> {
             targets: Vec::new(),
             stack_level: 0,
             scope_level: 0,
+            environment_level: 0,
             target_index: 0,
             program_flag: false,
             eval_flag: false,
+            first_break_target: None,
+            first_continue_target: None,
+            return_target: None,
             tree,
         }
     }
@@ -155,10 +199,19 @@ impl<'a> Coder<'a> {
         self.add(delta, Payload::BigInt { bytes, measure }, id);
     }
 
+    /// `fxCoderCreateTarget` — a fresh target snapshotting the coder's
+    /// current environment/scope/stack levels (break/continue resolution
+    /// and the `try` finalizer read these back).
     fn create_target(&mut self) -> usize {
         let index = self.target_index;
         self.target_index += 1;
-        self.targets.push(Target { index, offset: 0, used: false });
+        self.targets.push(Target {
+            index,
+            environment_level: self.environment_level,
+            scope_level: self.scope_level,
+            stack_level: self.stack_level,
+            ..Target::default()
+        });
         self.targets.len() - 1
     }
 
@@ -173,6 +226,40 @@ impl<'a> Coder<'a> {
         self.add(delta, Payload::Target { tid }, XS_NO_CODE);
     }
 
+    /// `fxCoderUseTemporaryVariable` — allocate the next frame slot and
+    /// emit a bare `NEW_TEMPORARY` (a 1-byte opcode; its index is coder
+    /// bookkeeping, not serialized). Returns the slot.
+    fn use_temporary(&mut self) -> i32 {
+        let result = self.scope_level;
+        self.scope_level += 1;
+        self.add_index(0, XS_CODE_NEW_TEMPORARY, result);
+        result
+    }
+
+    /// `fxCoderUnuseTemporaryVariables`.
+    fn unuse_temporaries(&mut self, count: i32) {
+        self.add_index(0, XS_CODE_UNWIND_1, count);
+        self.scope_level -= count;
+    }
+
+    /// `fxCoderAdjustEnvironment` — pop `with` environments down to a
+    /// break/continue target's level.
+    fn adjust_environment(&mut self, tid: usize) {
+        let mut count = self.environment_level - self.targets[tid].environment_level;
+        while count != 0 {
+            self.add_byte(0, XS_CODE_WITHOUT);
+            count -= 1;
+        }
+    }
+
+    /// `fxCoderAdjustScope` — unwind frame slots down to a target's level.
+    fn adjust_scope(&mut self, tid: usize) {
+        let count = self.scope_level - self.targets[tid].scope_level;
+        if count != 0 {
+            self.add_index(0, XS_CODE_UNWIND_1, count);
+        }
+    }
+
     // ---- scope helpers ----------------------------------------------
 
     /// The primary scope XS hung off `node`.
@@ -180,8 +267,57 @@ impl<'a> Coder<'a> {
         self.tree.node_scopes.get(&node_key(node)).expect("scope for node").0
     }
 
+    /// The secondary scope XS hung off `node` (`statementScope` /
+    /// `symbolScope`) — e.g. a `catch(e)` binding's block scope, reached
+    /// by the deferred catch-parameter path.
+    #[allow(dead_code)]
+    fn scope_secondary(&self, node: &Node) -> usize {
+        self.tree
+            .node_scopes
+            .get(&node_key(node))
+            .expect("scope for node")
+            .1
+            .expect("secondary scope for node")
+    }
+
     fn declare_count(&self, scope: usize) -> i32 {
         self.tree.scopes[scope].declare_count
+    }
+
+    // ---- scope coding (declare-free surface) ------------------------
+    //
+    // The full `fxScopeCodingBlock` / `fxScopeCoded` / `fxScopeCodeRefresh`
+    // / `fxScopeCodeDefineNodes` emit `NEW_LOCAL` / `NEW_CLOSURE` /
+    // `VAR_LOCAL` clusters keyed on declaration symbols — that needs the
+    // atom table (a later child). Here they are the exact no-ops XS runs
+    // when a scope declares nothing, asserted so a declaring loop / block /
+    // `switch` / `catch` fails loudly rather than emitting wrong bytes.
+
+    /// `fxScopeCodingBlock` for a non-declaring scope (no-op).
+    fn scope_coding_block(&mut self, scope: usize) {
+        assert_eq!(
+            self.declare_count(scope),
+            0,
+            "declaring scope reached in control-flow coder (later child)"
+        );
+    }
+
+    /// `fxScopeCoded` for a non-declaring scope (no-op).
+    fn scope_coded(&mut self, scope: usize) {
+        assert_eq!(self.declare_count(scope), 0, "declaring scope reached (later child)");
+    }
+
+    /// `fxScopeCodeRefresh` for a non-declaring scope (no-op).
+    fn scope_code_refresh(&mut self, scope: usize) {
+        assert_eq!(self.declare_count(scope), 0, "declaring scope reached (later child)");
+    }
+
+    /// `fxScopeCodeDefineNodes` for a scope with no define nodes (no-op).
+    fn scope_code_define_nodes(&mut self, scope: usize) {
+        assert!(
+            self.tree.scopes[scope].defines.is_empty(),
+            "define nodes reached in control-flow coder (later child)"
+        );
     }
 }
 
@@ -291,6 +427,17 @@ impl Coder<'_> {
             Coalesce => self.code_coalesce(node),
             QuestionMark => self.code_question_mark(node),
             Expressions => self.code_expressions(node),
+            // control flow (symbol-free surface)
+            Label => self.code_label(node),
+            While => self.code_while(node),
+            Do => self.code_do(node),
+            For => self.code_for(node),
+            Break | Continue => self.code_break_continue(node),
+            Throw => self.code_throw(node),
+            Debugger => self.add_byte(0, XS_CODE_DEBUGGER),
+            Switch => self.code_switch(node),
+            Try => self.code_try(node),
+            Catch => self.code_catch(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -306,11 +453,17 @@ impl Coder<'_> {
         // The oracle compiles with `mxEvalFlag`, so the header is the
         // eval shape (`fxScopeCodingEval`).
         self.code_scope_eval(node);
+        // `coder->returnTarget` — the program's implicit return point.
+        // It must live on the coder so a `try`/`return` inside the body
+        // can alias it (the alias count feeds the `try` selector, so a
+        // missing return target skews every `try` selection by one).
         let return_target = self.create_target();
+        self.return_target = Some(return_target);
         // `fxScopeCodeDefineNodes` — no define nodes in the ported
         // surface (function/var defines are child 6).
         self.code(&node.children[0]);
-        self.place_target(0, return_target);
+        let rt = self.return_target.take().expect("program return target");
+        self.place_target(0, rt);
         self.add_byte(0, XS_CODE_RETURN);
     }
 
@@ -473,6 +626,389 @@ impl Coder<'_> {
                 }
                 self.code(item);
             }
+        }
+    }
+
+    // ------------------------- control flow --------------------------
+
+    /// `fxLabelNodeCode`. A `Label` wraps its statement (loops carry an
+    /// anonymous label). Nested labels are collapsed into one break /
+    /// continue target answering to the whole symbol chain, exactly as XS
+    /// folds `former->nextLabel = self`.
+    fn code_label(&mut self, node: &Node) {
+        // Descend the label chain to the wrapped statement, collecting the
+        // label symbols. XS's collapsed `nextLabel` order is innermost
+        // first, so we reverse the outermost-first descent.
+        let mut labels: Vec<Option<String>> = Vec::new();
+        let mut cur = node;
+        loop {
+            labels.push(match &cur.children[0] {
+                Item::Symbol(s) => Some(s.clone()),
+                _ => None,
+            });
+            match &cur.children[1] {
+                Item::Node(n) if n.token == Token::Label => cur = n.as_ref(),
+                _ => break,
+            }
+        }
+        labels.reverse();
+        // Dispatch the wrapped statement by reference — the scoper keys
+        // scopes by node address, so a clone would miss its registration.
+        let statement = &cur.children[1];
+        // `self->symbol` after the collapse is the innermost label's.
+        let inner_has_symbol = labels[0].is_some();
+
+        let break_target = self.create_target();
+        self.targets[break_target].labels = labels.clone();
+        self.targets[break_target].next_target = self.first_break_target;
+        self.first_break_target = Some(break_target);
+
+        if inner_has_symbol {
+            self.code(statement);
+        } else {
+            let continue_target = self.create_target();
+            self.targets[continue_target].labels = labels;
+            self.targets[continue_target].next_target = self.first_continue_target;
+            self.first_continue_target = Some(continue_target);
+            self.code(statement);
+            self.first_continue_target = self.targets[continue_target].next_target;
+        }
+        self.place_target(0, break_target);
+        self.first_break_target = self.targets[break_target].next_target;
+    }
+
+    /// `fxWhileNodeCode`. Children `[expression, statement]`; break /
+    /// continue targets come from the enclosing `Label`.
+    fn code_while(&mut self, node: &Node) {
+        let cont = self.first_continue_target.expect("while continue target");
+        let brk = self.first_break_target.expect("while break target");
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        self.place_target(0, cont);
+        self.code(&node.children[0]);
+        self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, brk);
+        self.code(&node.children[1]);
+        self.add_branch(0, XS_CODE_BRANCH_1, cont);
+    }
+
+    /// `fxDoNodeCode`. Children `[statement, expression]`.
+    fn code_do(&mut self, node: &Node) {
+        let cont = self.first_continue_target.expect("do continue target");
+        let loop_target = self.create_target();
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        self.place_target(0, loop_target);
+        self.code(&node.children[0]);
+        self.place_target(0, cont);
+        self.code(&node.children[1]);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, loop_target);
+    }
+
+    /// `fxForNodeCode` — the C-style loop. Children `[initialization,
+    /// expression, iteration, statement]` (any of the first three may be
+    /// `Null`).
+    fn code_for(&mut self, node: &Node) {
+        let scope = self.scope_of(node);
+        // Detach the loop's own continue target from the stack for the
+        // header, re-inserting it around the body (XS's swap).
+        let continue_target = self.first_continue_target.expect("for continue target");
+        self.first_continue_target = self.targets[continue_target].next_target;
+        self.targets[continue_target].next_target = None;
+
+        self.scope_coding_block(scope);
+        self.scope_code_define_nodes(scope);
+        let next_target = self.create_target();
+        let done_target = self.create_target();
+        if !matches!(node.children[0], Item::Null) {
+            self.code(&node.children[0]);
+        }
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        self.scope_code_refresh(scope);
+        self.place_target(0, next_target);
+        if !matches!(node.children[1], Item::Null) {
+            self.code(&node.children[1]);
+            self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, done_target);
+        }
+
+        self.targets[continue_target].environment_level = self.environment_level;
+        self.targets[continue_target].scope_level = self.scope_level;
+        self.targets[continue_target].stack_level = self.stack_level;
+        self.targets[continue_target].next_target = self.first_continue_target;
+        self.first_continue_target = Some(continue_target);
+        self.code(&node.children[3]);
+        self.place_target(0, continue_target);
+        self.first_continue_target = self.targets[continue_target].next_target;
+        self.targets[continue_target].next_target = None;
+
+        if !matches!(node.children[2], Item::Null) {
+            self.scope_code_refresh(scope);
+            self.code(&node.children[2]);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+        self.add_branch(0, XS_CODE_BRANCH_1, next_target);
+        self.place_target(0, done_target);
+        self.scope_coded(scope);
+
+        self.targets[continue_target].next_target = self.first_continue_target;
+        self.first_continue_target = Some(continue_target);
+    }
+
+    /// `fxBreakContinueNodeCode`. Child `[symbol-or-null]`.
+    fn code_break_continue(&mut self, node: &Node) {
+        let symbol = match node.children.first() {
+            Some(Item::Symbol(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let is_break = node.token == Token::Break;
+        let mut target = if is_break {
+            self.first_break_target
+        } else {
+            self.first_continue_target
+        };
+        while let Some(t) = target {
+            if self.targets[t].labels.iter().any(|l| *l == symbol) {
+                self.adjust_environment(t);
+                self.adjust_scope(t);
+                self.add_branch(0, XS_CODE_BRANCH_1, t);
+                return;
+            }
+            target = self.targets[t].next_target;
+        }
+        panic!("coder: invalid {}", if is_break { "break" } else { "continue" });
+    }
+
+    /// `fxThrowNodeCode`. Child `[expression]`.
+    fn code_throw(&mut self, node: &Node) {
+        self.code(&node.children[0]);
+        self.add_byte(-1, XS_CODE_THROW);
+    }
+
+    /// `fxSwitchNodeCode`. Children `[expression, List(cases)]`; each
+    /// `Case` is `[test-or-null, body-or-null]`.
+    fn code_switch(&mut self, node: &Node) {
+        let scope = self.scope_of(node);
+        self.code(&node.children[0]);
+        self.scope_coding_block(scope);
+        let break_target = self.create_target();
+        // XS gives the switch break target a zeroed (anonymous) label so a
+        // bare `break;` matches it.
+        self.targets[break_target].labels = vec![None];
+        self.targets[break_target].next_target = self.first_break_target;
+        self.first_break_target = Some(break_target);
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        // Reference the case nodes in place (the scoper keys scopes by
+        // node address, so cloning would miss registrations).
+        let cases: Vec<&Node> = match &node.children[1] {
+            Item::List(items) => items.iter().map(node_of).collect(),
+            _ => Vec::new(),
+        };
+        let mut case_targets = Vec::with_capacity(cases.len());
+        let mut default_target: Option<usize> = None;
+        for case in &cases {
+            let t = self.create_target();
+            case_targets.push(t);
+            if !matches!(case.children[0], Item::Null) {
+                self.add_byte(1, XS_CODE_DUB);
+                self.code(&case.children[0]);
+                self.add_byte(-1, XS_CODE_STRICT_EQUAL);
+                self.add_branch(-1, XS_CODE_BRANCH_IF_1, t);
+            } else {
+                default_target = Some(t);
+            }
+        }
+        match default_target {
+            Some(dt) => self.add_branch(0, XS_CODE_BRANCH_1, dt),
+            None => self.add_branch(0, XS_CODE_BRANCH_1, break_target),
+        }
+        for (i, case) in cases.iter().enumerate() {
+            self.place_target(0, case_targets[i]);
+            if !matches!(case.children[1], Item::Null) {
+                self.code(&case.children[1]);
+            }
+        }
+        self.place_target(0, break_target);
+        self.first_break_target = self.targets[break_target].next_target;
+        self.scope_coded(scope);
+        self.add_byte(-1, XS_CODE_POP);
+    }
+
+    /// `fxCatchNodeCode`. Children `[parameter-or-null, statements]`. The
+    /// parameter-binding branch emits `NEW_LOCAL` (a symbol op) and is
+    /// deferred to the atom-table child; the bare `catch {}` form is here.
+    fn code_catch(&mut self, node: &Node) {
+        assert!(
+            matches!(node.children[0], Item::Null),
+            "catch binding reached in control-flow coder (later child)"
+        );
+        let statement_scope = self.scope_of(node);
+        self.scope_coding_block(statement_scope);
+        self.scope_code_define_nodes(statement_scope);
+        self.code(&node.children[1]);
+        self.scope_coded(statement_scope);
+    }
+
+    /// `fxTryNodeCode`. Children `[tryBlock, catch-or-null, finally-or-null]`.
+    fn code_try(&mut self, node: &Node) {
+        let exception = self.use_temporary();
+        let selector = self.use_temporary();
+        let result = self.use_temporary();
+
+        self.first_break_target = self.alias_targets(self.first_break_target);
+        self.first_continue_target = self.alias_targets(self.first_continue_target);
+        self.return_target = self.alias_targets(self.return_target);
+        let mut catch_target = self.create_target();
+        let normal_target = self.create_target();
+        let finally_target = self.create_target();
+
+        self.add_integer(1, XS_CODE_INTEGER_1, 0);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, selector);
+        self.add_byte(-1, XS_CODE_POP);
+
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        self.code(&node.children[0]);
+        self.add_branch(0, XS_CODE_BRANCH_1, normal_target);
+        if !matches!(node.children[1], Item::Null) {
+            self.add_byte(0, XS_CODE_UNCATCH);
+            self.place_target(0, catch_target);
+            catch_target = self.create_target();
+            self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+            if self.program_flag {
+                self.add_byte(1, XS_CODE_UNDEFINED);
+                self.add_byte(-1, XS_CODE_SET_RESULT);
+            }
+            self.code(&node.children[1]);
+            self.add_branch(0, XS_CODE_BRANCH_1, normal_target);
+        }
+
+        let mut selection = 1;
+        self.first_break_target =
+            self.finalize_targets(self.first_break_target, selector, &mut selection, finally_target);
+        self.first_continue_target = self.finalize_targets(
+            self.first_continue_target,
+            selector,
+            &mut selection,
+            finally_target,
+        );
+        self.return_target =
+            self.finalize_targets(self.return_target, selector, &mut selection, finally_target);
+        self.place_target(0, normal_target);
+        self.add_integer(1, XS_CODE_INTEGER_1, selection);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, selector);
+        self.add_byte(-1, XS_CODE_POP);
+        self.place_target(0, finally_target);
+        self.add_byte(0, XS_CODE_UNCATCH);
+        self.place_target(0, catch_target);
+        self.add_byte(1, XS_CODE_EXCEPTION);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, exception);
+        self.add_byte(-1, XS_CODE_POP);
+        if !matches!(node.children[2], Item::Null) {
+            if self.program_flag {
+                self.add_byte(1, XS_CODE_GET_RESULT);
+                self.add_index(-1, XS_CODE_PULL_LOCAL_1, result);
+                self.add_byte(1, XS_CODE_UNDEFINED);
+                self.add_byte(-1, XS_CODE_SET_RESULT);
+            }
+            self.code(&node.children[2]);
+            if self.program_flag {
+                self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+                self.add_byte(-1, XS_CODE_SET_RESULT);
+            }
+        }
+        let end_catch = self.create_target();
+        self.add_index(1, XS_CODE_GET_LOCAL_1, selector);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, end_catch);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, exception);
+        self.add_byte(-1, XS_CODE_THROW);
+        self.place_target(0, end_catch);
+        let mut selection = 1;
+        let bt = self.first_break_target;
+        self.jump_targets(bt, selector, &mut selection);
+        let ct = self.first_continue_target;
+        self.jump_targets(ct, selector, &mut selection);
+        let rt = self.return_target;
+        self.jump_targets(rt, selector, &mut selection);
+        self.unuse_temporaries(3);
+    }
+
+    /// `fxCoderAliasTargets` — parallel alias chain for the `try` unwind.
+    fn alias_targets(&mut self, head: Option<usize>) -> Option<usize> {
+        let mut result = None;
+        let mut prev: Option<usize> = None;
+        let mut cur = head;
+        while let Some(t) = cur {
+            let a = self.create_target();
+            self.targets[a].labels = self.targets[t].labels.clone();
+            self.targets[a].original = Some(t);
+            if prev.is_none() {
+                result = Some(a);
+            } else {
+                self.targets[prev.unwrap()].next_target = Some(a);
+            }
+            prev = Some(a);
+            cur = self.targets[t].next_target;
+        }
+        result
+    }
+
+    /// `fxCoderFinalizeTargets`.
+    fn finalize_targets(
+        &mut self,
+        alias: Option<usize>,
+        selector: i32,
+        selection: &mut i32,
+        finally_target: usize,
+    ) -> Option<usize> {
+        let mut result = None;
+        if let Some(first) = alias {
+            result = self.targets[first].original;
+            let mut a = alias;
+            while let Some(al) = a {
+                if self.targets[al].used {
+                    self.place_target(0, al);
+                    self.add_integer(1, XS_CODE_INTEGER_1, *selection);
+                    self.add_index(-1, XS_CODE_PULL_LOCAL_1, selector);
+                    self.add_branch(0, XS_CODE_BRANCH_1, finally_target);
+                    let orig = self.targets[al].original.unwrap();
+                    self.targets[orig].used = true;
+                }
+                a = self.targets[al].next_target;
+                *selection += 1;
+            }
+        }
+        result
+    }
+
+    /// `fxCoderJumpTargets`.
+    fn jump_targets(&mut self, target: Option<usize>, selector: i32, selection: &mut i32) {
+        let mut t = target;
+        while let Some(tt) = t {
+            if self.targets[tt].used {
+                let else_target = self.create_target();
+                self.add_integer(1, XS_CODE_INTEGER_1, *selection);
+                self.add_index(1, XS_CODE_GET_LOCAL_1, selector);
+                self.add_byte(-1, XS_CODE_STRICT_EQUAL);
+                self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, else_target);
+                self.adjust_environment(tt);
+                self.adjust_scope(tt);
+                self.add_branch(0, XS_CODE_BRANCH_1, tt);
+                self.place_target(0, else_target);
+            }
+            t = self.targets[tt].next_target;
+            *selection += 1;
         }
     }
 }

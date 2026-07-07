@@ -190,6 +190,75 @@ fn statements_if_block() {
     ]);
 }
 
+// NB: `endor_oracle::run` *executes* the program, so every fixture must
+// terminate. Byte-identity is about compilation, not the runtime value,
+// so a `while(0)` / `for(;0;)` head exercises the same emission as a
+// `while(1)` head without spinning the oracle; `break` bodies also
+// terminate. Both forms are covered.
+#[test]
+fn control_flow_loops() {
+    assert_identical(&[
+        // while / do-while
+        "while(0)2;", "while(0);", "while(0){2;}", "while(1)break;",
+        "while(0)continue;", "do 1;while(0);", "do{1;}while(0);",
+        "do break;while(1);", "do continue;while(0);",
+        // C-style for
+        "for(;;)break;", "for(;1;)break;", "for(;0;)1;",
+        "for(1;;)break;", "for(1;0;2)3;", "for(;;){1;break;}",
+        "for(;0;)continue;",
+        // nested loops + break/continue
+        "while(1){while(2)break;break;}", "while(0){while(2)break;continue;}",
+        "for(;;){for(;;)break;break;}",
+    ]);
+}
+
+#[test]
+fn control_flow_labels() {
+    assert_identical(&[
+        "a:while(1)break a;", "a:while(0)continue a;",
+        "a:for(;;)break a;", "a:for(;0;)continue a;",
+        "a:b:while(1)break a;", "a:b:while(0)continue b;",
+        "a:while(1)while(2)break a;", "a:while(0)while(2)continue a;",
+        "a:1;", "a:{1;}", "a:{break a;}",
+        "foo:while(0){continue foo;}",
+    ]);
+}
+
+#[test]
+fn control_flow_switch() {
+    assert_identical(&[
+        "switch(1){}", "switch(1){case 1:break;}",
+        "switch(1){case 1:2;break;case 2:3;}",
+        "switch(1){default:1;}", "switch(1){case 1:break;default:2;}",
+        "switch(1){case 1:case 2:3;break;default:4;}",
+        "switch(1){case 1:{2;}break;}",
+        "switch(1){case 1:while(2)break;break;}",
+    ]);
+}
+
+#[test]
+fn control_flow_throw_debugger() {
+    assert_identical(&[
+        "throw 1;", "throw 1+2;", "throw\"x\";", "debugger;",
+        "if(1)throw 2;", "while(1)throw 2;",
+    ]);
+}
+
+#[test]
+fn control_flow_try() {
+    assert_identical(&[
+        "try{1;}catch{2;}", "try{1;}finally{2;}",
+        "try{1;}catch{2;}finally{3;}", "try{}catch{}",
+        "try{}finally{}", "try{throw 1;}catch{2;}",
+        "try{1;}catch{}finally{}",
+        // break/continue crossing a finally (target finalization)
+        "while(1){try{break;}finally{1;}}",
+        "while(0){try{continue;}finally{1;}}",
+        "for(;;){try{break;}finally{2;}}",
+        "try{try{1;}finally{2;}}finally{3;}",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
