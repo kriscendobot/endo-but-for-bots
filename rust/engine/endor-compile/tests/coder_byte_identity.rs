@@ -1023,3 +1023,13 @@ fn class_computed_method_keys() {
         "(class C{[k](){}});",
     ]);
 }
+
+#[test]
+fn anonymous_class_name_inference() {
+    assert_identical(&[
+        "let C=class{};", "const D=class{};", "var E=class{};",
+        "x=class{};", "let C=class{m(){}};", "let C=class extends B{};",
+        // a named class keeps its own name (no inference)
+        "let K=class C{};",
+    ]);
+}

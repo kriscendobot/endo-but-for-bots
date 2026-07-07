@@ -1798,12 +1798,11 @@ impl Coder<'_> {
         if !Self::infers_name(value) {
             return;
         }
-        // Only anonymous *functions* are handled here; anonymous classes
-        // and the coder `NAME`-op fallback remain deferred.
-        assert!(
-            Self::is_anon_function_value(value),
-            "anonymous class name inference deferred (later slice)"
-        );
+        // An anonymous function or class takes the target identifier as its
+        // name: a function via its creation operand, an anonymous class via
+        // its constructor's creation operand (`code_class` leaves
+        // `pending_name` for the constructor `code_function` to consume, and
+        // emits no `NAME` op since the class itself is unnamed).
         let name = match target {
             Item::Node(n) => match n.token {
                 Token::Var | Token::Let | Token::Const | Token::Using | Token::Arg => {
@@ -1816,28 +1815,6 @@ impl Coder<'_> {
         };
         assert!(name.is_some(), "non-identifier name-inference target deferred (later slice)");
         self.pending_name = name;
-    }
-
-    /// Whether `value` (possibly a single-item parenthesization) is an
-    /// anonymous function/arrow value eligible for name inference here.
-    fn is_anon_function_value(value: &Item) -> bool {
-        match value {
-            Item::Node(n) => match n.token {
-                Token::Expressions => {
-                    if let Some(Item::List(items)) = n.children.first() {
-                        if items.len() == 1 {
-                            return Self::is_anon_function_value(&items[0]);
-                        }
-                    }
-                    false
-                }
-                Token::Function | Token::Generator => {
-                    matches!(n.children.first(), Some(Item::Null))
-                }
-                _ => false,
-            },
-            _ => false,
-        }
     }
 
     /// `fxDeclareNodeCode` — a bare declaration with no initializer. `var`
