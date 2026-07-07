@@ -1673,6 +1673,131 @@ pub fn decoder_is_panic_free(bytes: &[u8]) -> usize {
     dis.len()
 }
 
+// ======================= stage-5 compiler fuzzing =======================
+//
+// Two targets over `endor-compile`, the stage-5 pure-Rust compiler
+// (design § roadmap row 5; Fuzzability). Both keep their substance here in
+// the `forbid(unsafe_code)` lib so they build and unit-test without a
+// libFuzzer toolchain.
+//
+//  - **Parser fuzz** ([`parse_is_panic_free`]): a structure-aware program
+//    (or arbitrary bytes) driven through `endor_compile::Parser`, which
+//    must return a `Result` — a structured `ParseError`/`LexError`, never
+//    a panic. Totality of the parser is the invariant the whole compiler
+//    (scoper, coder) and the differential target below lean on.
+//  - **Compile differential** ([`compile_differential_check`]): the same
+//    source through `endor_compile::compile` and the C-XS oracle compiler,
+//    comparing accept/reject agreement and — on accepts — byte identity.
+//    An oracle process crash (`run` returns `None`) is a NAMED outcome
+//    ([`CompileFuzzOutcome::OracleUnavailable`]), not a harness abort.
+
+/// A structure-aware source program for the compiler fuzz targets. Folds
+/// raw fuzzer bytes into a program drawn from the richest generators the
+/// corpus has — statements, the stage-2b object/call/closure/exception
+/// surface, and (for coverage of the operator grammar) a bare expression.
+pub fn gen_compile_program(data: &[u8]) -> String {
+    let mut b = Bytes::new(data);
+    match b.choice(4) {
+        0 => gen_program(data),
+        1 => gen_statement_program(data),
+        2 => gen_stage2b_program(data),
+        _ => gen_object_program(&mut b),
+    }
+}
+
+/// **Parser fuzz target body.** `source` must drive the parser to a
+/// `Result` — an accept or a *structured* rejection — never a panic and
+/// never a hang (the parser is finite over finite input). Returns `true`
+/// if the parser accepted, `false` if it rejected; either is a valid
+/// outcome. The property the fuzzer enforces is simply that this function
+/// *returns* (a panic aborts the libFuzzer run and is the finding).
+///
+/// Both a Script and a Module goal are attempted so the module-only
+/// grammar (`import`/`export`) is on the fuzzed surface too.
+pub fn parse_is_panic_free(source: &str) -> bool {
+    let script = parse_once(source, false, false);
+    let _module = parse_once(source, false, true);
+    script
+}
+
+fn parse_once(source: &str, strict: bool, module: bool) -> bool {
+    match endor_compile::Parser::new(source, strict, module) {
+        Ok(mut p) => p.parse_program(strict).is_ok(),
+        Err(_) => false, // a lex error before the first token is a rejection
+    }
+}
+
+/// The outcome of one compile-differential comparison. Every arm is a
+/// NAMED, non-aborting classification — including an oracle process crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileFuzzOutcome {
+    /// Both accept; bytes are byte-identical (the bar holds).
+    Identical,
+    /// Both accept; bytes differ — a real finding.
+    ByteDivergence { detail: String },
+    /// Both reject (accept/reject agreement in the reject direction).
+    BothReject,
+    /// The oracle accepted but endor rejected (a coder/parser fold) — a
+    /// finding for the accept/reject bar.
+    EndorRejected { detail: String },
+    /// endor accepted but the oracle rejected — a finding.
+    OracleRejected,
+    /// The oracle machine failed to start (`run` returned `None`) — a
+    /// NAMED outcome, never a harness abort.
+    OracleUnavailable,
+}
+
+/// **Compile-differential fuzz target body.** Compile `source` on endor and
+/// the C-XS oracle; classify accept/reject agreement and, on a shared
+/// accept, byte identity. `Ok(outcome)` is always returned (never a panic
+/// escaping): a coder fold is caught and named `EndorRejected`, an oracle
+/// crash is named `OracleUnavailable`. The libFuzzer wrapper turns a
+/// `ByteDivergence` / `EndorRejected` / `OracleRejected` into the finding.
+pub fn compile_differential_check(source: &str) -> CompileFuzzOutcome {
+    let oracle = match endor_oracle::run(source) {
+        Some(o) => o,
+        None => return CompileFuzzOutcome::OracleUnavailable,
+    };
+    // The oracle "accepted" (parsed) unless it aborted with a SyntaxError.
+    let oracle_accepts = oracle.completed || !oracle.error.contains("SyntaxError");
+
+    // The coder still `panic!`s on unported constructs; catch it so a fold
+    // is a named rejection, not a fuzzer abort.
+    let endor = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        endor_compile::compile(source)
+    }));
+    let endor_bytes: Option<Vec<u8>> = match &endor {
+        Ok(Ok(b)) => Some(b.clone()),
+        _ => None,
+    };
+
+    match (oracle_accepts, endor_bytes) {
+        (true, Some(bytes)) => {
+            if bytes == oracle.bytecode {
+                CompileFuzzOutcome::Identical
+            } else {
+                CompileFuzzOutcome::ByteDivergence {
+                    detail: format!(
+                        "len oracle={} endor={}",
+                        oracle.bytecode.len(),
+                        bytes.len()
+                    ),
+                }
+            }
+        }
+        (true, None) => {
+            let detail = match endor {
+                Ok(Err(e)) => format!("parse/scope reject: {:?}", e),
+                Err(_) => "coder panic (ported-surface fold)".to_string(),
+                _ => unreachable!(),
+            };
+            CompileFuzzOutcome::EndorRejected { detail }
+        }
+        (false, Some(_)) => CompileFuzzOutcome::OracleRejected,
+        (false, None) => CompileFuzzOutcome::BothReject,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2582,5 +2707,70 @@ mod tests {
             "seed-1750 decode must abort under the step ceiling, got {:?}",
             full.halt
         );
+    }
+
+    #[test]
+    fn parser_is_total_over_generated_and_arbitrary_bytes() {
+        // The armed parser fuzz target's invariant, exercised as a bounded
+        // smoke run: neither a structure-aware generated program nor raw
+        // arbitrary bytes may drive `endor_compile::Parser` to a panic —
+        // only a `Result` (accept or structured reject).
+        let mut accepted = 0usize;
+        for seed in 0u32..512 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(4 + (seed % 24)) {
+                buf.push(data[(k as usize) % 4].wrapping_add(k as u8));
+            }
+            // Generated programs.
+            let prog = gen_compile_program(&buf);
+            if parse_is_panic_free(&prog) {
+                accepted += 1;
+            }
+            // Arbitrary bytes as UTF-8 (lossy) — the parser must not panic
+            // on ill-formed source either.
+            let raw = String::from_utf8_lossy(&buf);
+            let _ = parse_is_panic_free(&raw);
+        }
+        assert!(accepted > 0, "some generated programs should parse");
+    }
+
+    #[test]
+    fn compile_differential_smoke() {
+        // The armed compile-differential target as a bounded smoke run:
+        // over a spread of generated programs, every outcome is one of the
+        // NAMED classifications and a genuine `ByteDivergence` /
+        // `OracleRejected` (endor accepting what XS rejects) is a finding.
+        // `EndorRejected` (a coder fold) and `OracleUnavailable` (an oracle
+        // startup failure) are expected, non-fatal outcomes here — the
+        // point of this smoke is that the harness never panics and never
+        // surfaces a false byte divergence, not that the fold is closed.
+        let mut identical = 0usize;
+        let mut findings: Vec<(String, CompileFuzzOutcome)> = Vec::new();
+        for seed in 0u32..256 {
+            let data = seed.to_le_bytes();
+            let mut buf = Vec::new();
+            for k in 0..(4 + (seed % 16)) {
+                buf.push(data[(k as usize) % 4].wrapping_add(k as u8));
+            }
+            let prog = gen_compile_program(&buf);
+            let outcome = compile_differential_check(&prog);
+            match outcome {
+                CompileFuzzOutcome::Identical => identical += 1,
+                CompileFuzzOutcome::ByteDivergence { .. } | CompileFuzzOutcome::OracleRejected => {
+                    findings.push((prog, outcome))
+                }
+                // Expected non-fatal outcomes in a bounded smoke.
+                CompileFuzzOutcome::BothReject
+                | CompileFuzzOutcome::EndorRejected { .. }
+                | CompileFuzzOutcome::OracleUnavailable => {}
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "compile-differential findings (byte divergence or endor-only accept): {:#?}",
+            findings
+        );
+        assert!(identical > 0, "some generated programs should compile byte-identically");
     }
 }

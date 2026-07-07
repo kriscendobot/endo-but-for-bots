@@ -46,5 +46,17 @@ path = "fuzz_targets/differential_regexp_surface.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "differential_compile"
+path = "fuzz_targets/differential_compile.rs"
+test = false
+doc = false
+
 [workspace]
 # Own workspace: cargo-fuzz builds this tree in isolation.

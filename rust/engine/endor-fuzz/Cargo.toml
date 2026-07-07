@@ -14,3 +14,4 @@ path = "src/lib.rs"
 endor-vm = { path = "../endor-vm" }
 endor-oracle = { path = "../endor-oracle" }
 endor-regexp = { path = "../endor-regexp" }
+endor-compile = { path = "../endor-compile" }

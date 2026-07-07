@@ -36,6 +36,19 @@ pub use parser::{ParseError, ParseErrorKind, Parser};
 pub use scoper::{scope_module, scope_program, ScopeTree};
 pub use token::Token;
 
+/// Parse `source` as a Script and return the whole-parse **parse-meter
+/// computrons** ([`meter::ParseMeter::computrons`]) on success, or `None`
+/// if it does not parse. This is endor's own release-versioned parse cost
+/// ([`meter::PARSE_METER_RELEASE`]), the figure the parse-metering
+/// determinism bar locks: deterministic per build for a given source
+/// (design § Metering; the accuracy-over-parity doctrine). The `strict`
+/// argument mirrors [`compile_with`]'s Script strictness.
+pub fn parse_computrons(source: &str, strict: bool) -> Option<u64> {
+    let mut parser = Parser::new(source, strict, false).ok()?;
+    parser.parse_program(strict).ok()?;
+    Some(parser.meter().computrons())
+}
+
 /// Scan `source` to completion, returning every [`Lexeme`] up to and
 /// including [`Token::Eof`]. A convenience over driving [`Lexer::next`];
 /// the parser drives the lexer pull-style (with template/regexp
