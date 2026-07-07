@@ -286,6 +286,24 @@ fn calls_and_computed_member() {
 }
 
 #[test]
+fn assignment_and_new() {
+    assert_identical(&[
+        // plain assignment to a global / member / computed member
+        "x=1;", "x=y;", "a.b=1;", "a.b=c;", "o.x=o.y;", "a[b]=1;",
+        "a[0]=x;", "x=y=1;", "a.b.c=1;", "x=1+2;",
+        // compound assignment
+        "x+=1;", "x-=2;", "x*=3;", "x/=2;", "x%=2;", "x**=2;",
+        "x&=1;", "x|=2;", "x^=3;", "x<<=1;", "x>>=1;", "x>>>=1;",
+        "a.b+=1;", "a[b]+=c;", "o.count+=1;",
+        // short-circuit assignment
+        "x&&=1;", "x||=2;", "x??=3;", "a.b||=c;",
+        // new
+        "new X;", "new X();", "new X(1);", "new X(1,2);",
+        "new a.b();", "new a.b.c(1);", "x=new Y(1);",
+    ]);
+}
+
+#[test]
 fn untagged_templates() {
     assert_identical(&[
         "``;", "`abc`;", "`a\nb`;",

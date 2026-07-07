@@ -615,7 +615,13 @@ impl Coder<'_> {
             Member => self.code_member(node),
             MemberAt => self.code_member_at(node),
             Call => self.code_call(node),
+            New => self.code_new(node),
             Params => self.code_params(node),
+            Assign => self.code_assign_node(node),
+            AddAssign | SubtractAssign | MultiplyAssign | DivideAssign | ModuloAssign
+            | ExponentiationAssign | BitAndAssign | BitOrAssign | BitXorAssign
+            | LeftShiftAssign | SignedRightShiftAssign | UnsignedRightShiftAssign
+            | AndAssign | OrAssign | CoalesceAssign => self.code_compound(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1028,6 +1034,14 @@ impl Coder<'_> {
         self.code(&node.children[1]);
     }
 
+    /// `fxNewNodeCode`. Children `[reference, params]`: the constructor,
+    /// `NEW`, then the argument list + `RUN`.
+    fn code_new(&mut self, node: &Node) {
+        self.code(&node.children[0]);
+        self.add_byte(2, XS_CODE_NEW);
+        self.code(&node.children[1]);
+    }
+
     /// `fxParamsNodeCode`, the non-spread / non-eval branch. Children
     /// `[List(items)]`; each arg is pushed then a single `RUN_1 count`
     /// pops callee+this+args and leaves the result. Spread arguments and
@@ -1108,9 +1122,10 @@ impl Coder<'_> {
         let is_super = self.node_is_super(&node.children[0]);
         let mut flag = flag;
         if flag != 0 {
-            // fxMemberAtNodeCodeReference: reference then at
+            // fxMemberAtNodeCodeReference(flag=0): reference, at, then AT.
             self.code(&node.children[0]);
             self.code(&node.children[1]);
+            self.add_byte(0, if is_super { XS_CODE_SUPER_AT } else { XS_CODE_AT });
             self.add_byte(2, XS_CODE_DUB_AT);
             flag = 2;
         } else {
@@ -1137,6 +1152,137 @@ impl Coder<'_> {
         self.add_byte(1, XS_CODE_UNDEFINED);
         self.code_node(node);
         1
+    }
+
+    // ---- assignment: the codeReference / codeAssign families --------
+
+    /// `fxAssignNodeCode` — plain `=`. Children `[reference, value]`:
+    /// prepare the reference, evaluate the value, store.
+    fn code_assign_node(&mut self, node: &Node) {
+        self.code_reference(&node.children[0], 1);
+        self.code(&node.children[1]);
+        self.code_assign(&node.children[0], 1);
+    }
+
+    /// `fxCompoundExpressionNodeCode` — `+=`, `-=`, … and the short-circuit
+    /// `&&=` / `||=` / `??=`. Children `[reference, value]`.
+    fn code_compound(&mut self, node: &Node) {
+        use Token::*;
+        let token = node.token;
+        let shortcut = matches!(token, AndAssign | OrAssign | CoalesceAssign);
+        let else_target = if shortcut { Some(self.create_target()) } else { None };
+        let end_target = if shortcut { Some(self.create_target()) } else { None };
+        let swap = self.code_this(&node.children[0], 1);
+        match token {
+            AndAssign => {
+                self.add_byte(1, XS_CODE_DUB);
+                self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, else_target.unwrap());
+                self.add_byte(-1, XS_CODE_POP);
+                self.code(&node.children[1]);
+                self.code_compound_name(node);
+            }
+            CoalesceAssign => {
+                self.add_branch(-1, XS_CODE_BRANCH_COALESCE_1, else_target.unwrap());
+                self.code(&node.children[1]);
+                self.code_compound_name(node);
+            }
+            OrAssign => {
+                self.add_byte(1, XS_CODE_DUB);
+                self.add_branch(-1, XS_CODE_BRANCH_IF_1, else_target.unwrap());
+                self.add_byte(-1, XS_CODE_POP);
+                self.code(&node.children[1]);
+                self.code_compound_name(node);
+            }
+            _ => {
+                self.code(&node.children[1]);
+                self.add_byte(-1, compound_op(token));
+            }
+        }
+        self.code_assign(&node.children[0], 0);
+        if shortcut {
+            self.add_branch(0, XS_CODE_BRANCH_1, end_target.unwrap());
+            self.place_target(0, else_target.unwrap());
+            let mut swap = swap;
+            while swap > 0 {
+                if node.flags & crate::ast::flags::EXPRESSION_NO_VALUE == 0 {
+                    self.add_byte(0, XS_CODE_SWAP);
+                }
+                self.add_byte(-1, XS_CODE_POP);
+                swap -= 1;
+            }
+            self.place_target(0, end_target.unwrap());
+        }
+    }
+
+    /// `fxCompoundExpressionNodeCodeName` — name an anonymous function /
+    /// class assigned to a plain identifier. Its trigger nodes (function /
+    /// class values) are not in the ported surface, so it is a no-op here.
+    fn code_compound_name(&mut self, node: &Node) {
+        if let Item::Node(r) = &node.children[0] {
+            if r.token == Token::Access && node_code_name(&node.children[1]) {
+                let name = Self::symbol_of(&r.children[0]).to_string();
+                self.add_symbol(0, XS_CODE_NAME, &name);
+            }
+        }
+    }
+
+    /// `fxNodeDispatchCodeReference` — prepare a store target.
+    fn code_reference(&mut self, item: &Item, flag: i32) {
+        match item {
+            Item::Node(n) => match n.token {
+                Token::Access => {
+                    let name = Self::symbol_of(&n.children[0]).to_string();
+                    if self.eval_flag {
+                        self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
+                    } else {
+                        self.add_symbol(1, XS_CODE_PROGRAM_REFERENCE, &name);
+                    }
+                }
+                Token::Member => {
+                    // fxMemberNodeCodeReference: just the object.
+                    self.code(&n.children[0]);
+                }
+                Token::MemberAt => {
+                    let is_super = self.node_is_super(&n.children[0]);
+                    self.code(&n.children[0]);
+                    self.code(&n.children[1]);
+                    if flag == 0 {
+                        self.add_byte(0, if is_super { XS_CODE_SUPER_AT } else { XS_CODE_AT });
+                    }
+                }
+                // fxNodeCodeReference: nothing.
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// `fxNodeDispatchCodeAssign` — store into the prepared reference.
+    fn code_assign(&mut self, item: &Item, flag: i32) {
+        match item {
+            Item::Node(n) => match n.token {
+                Token::Access => {
+                    // Unresolved (global) → SET_VARIABLE; resolved store is
+                    // the declaration slice.
+                    let name = Self::symbol_of(&n.children[0]).to_string();
+                    self.add_symbol(-1, XS_CODE_SET_VARIABLE, &name);
+                }
+                Token::Member => {
+                    let is_super = self.node_is_super(&n.children[0]);
+                    let name = Self::symbol_of(&n.children[1]).to_string();
+                    self.add_symbol(-1, if is_super { XS_CODE_SET_SUPER } else { XS_CODE_SET_PROPERTY }, &name);
+                }
+                Token::MemberAt => {
+                    let is_super = self.node_is_super(&n.children[0]);
+                    if flag != 0 {
+                        self.add_byte(0, if is_super { XS_CODE_SUPER_AT_2 } else { XS_CODE_AT_2 });
+                    }
+                    self.add_byte(-2, if is_super { XS_CODE_SET_SUPER_AT } else { XS_CODE_SET_PROPERTY_AT });
+                }
+                other => panic!("coder: no reference for assignment target {:?}", other),
+            },
+            _ => panic!("coder: no reference for assignment target"),
+        }
     }
 
     /// `fxTemplateNodeCode`, untagged branch. Children `[reference,
@@ -1968,6 +2114,34 @@ fn unary_code(token: Token) -> i32 {
         Token::Plus => XS_CODE_PLUS,
         Token::Typeof => XS_CODE_TYPEOF,
         _ => unreachable!("not a unary op: {:?}", token),
+    }
+}
+
+/// `fxNodeCodeName` — whether an assigned value is an anonymous
+/// function / generator / class that should receive an inferred `.name`.
+/// The trigger node kinds are not in the ported surface, so this is
+/// always `false` for now (a named edge for the function/class slice).
+fn node_code_name(_value: &Item) -> bool {
+    false
+}
+
+/// The arithmetic opcode a compound assignment folds with
+/// (`description->code` for the `*Assign` tokens).
+fn compound_op(token: Token) -> i32 {
+    match token {
+        Token::AddAssign => XS_CODE_ADD,
+        Token::SubtractAssign => XS_CODE_SUBTRACT,
+        Token::MultiplyAssign => XS_CODE_MULTIPLY,
+        Token::DivideAssign => XS_CODE_DIVIDE,
+        Token::ModuloAssign => XS_CODE_MODULO,
+        Token::ExponentiationAssign => XS_CODE_EXPONENTIATION,
+        Token::BitAndAssign => XS_CODE_BIT_AND,
+        Token::BitOrAssign => XS_CODE_BIT_OR,
+        Token::BitXorAssign => XS_CODE_BIT_XOR,
+        Token::LeftShiftAssign => XS_CODE_LEFT_SHIFT,
+        Token::SignedRightShiftAssign => XS_CODE_SIGNED_RIGHT_SHIFT,
+        Token::UnsignedRightShiftAssign => XS_CODE_UNSIGNED_RIGHT_SHIFT,
+        _ => unreachable!("not a compound-assign op: {:?}", token),
     }
 }
 
