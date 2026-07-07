@@ -1489,10 +1489,14 @@ These are the remaining child-6/7 surface.
 > residual**: `eval-code` (accept-disagree 4 to 0) and `arguments-object`
 > (divergent 1 to 0) are now fully byte-clean, `expressions/optional-chaining`
 > divergent 1 to 0, and `expressions/arrow-function` 6 to **1** divergent. **FULL
-> STAGE-5 BAR: NOT MET**, now held open by two narrow, fully-attributed
-> residuals: the **enclosing-function synthetic capture-closure** fold (1 file:
-> `arrow-function/arrow/binding-tests-3.js`) and the deferred **tagged-template**
-> feature (2 `endor-rejected` in `optional-chaining`). The fix2/fix3/fix4/fix5
+> STAGE-5 BAR: NOT MET**, now held open by the **enclosing-function synthetic
+> capture-closure** fold (1 file: `arrow-function/arrow/binding-tests-3.js`).
+> **fix5 2/5 landed the tagged-template surface**: `expressions/tagged-template`
+> is now byte-clean (26 `endor-rejected` → **0**, 27/27 identical) — the tagged
+> branch of `fxTemplateNodeCode` (the `TEMPLATE_CACHE.#<tag>`-guarded frozen
+> template object, cooked/raw arrays, and the tag call) is ported into
+> `coder.rs`, with the illegal-escape cooked slot carried as the parser's
+> `mxStringErrorFlag` (bit 1) and emitted as `undefined`. The fix2/fix3/fix4/fix5
 > blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix

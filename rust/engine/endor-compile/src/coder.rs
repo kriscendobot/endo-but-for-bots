@@ -375,6 +375,12 @@ pub struct Coder<'a> {
     /// module; `false` for the static import/export surface.
     import_flag: bool,
     import_meta_flag: bool,
+    /// XS's `the->tag` — the per-machine counter `fxGenerateTag` reads to
+    /// mint a tagged template's unique cache-site symbol (`#0`, `#1`, …).
+    /// The oracle compiles each program on a fresh machine (tag 0) with no
+    /// source path, so a tagged template's cache symbol is `#<tag>`; the
+    /// counter bumps at each tagged-template code site, in code order.
+    tag: i32,
     /// The enclosing class's `instanceInit` closure declare `(scope, id)`,
     /// set while coding a class's constructor so its base-flag body can find
     /// the capturing alias and call the field initializer on entry (XS's
@@ -409,7 +415,18 @@ impl<'a> Coder<'a> {
             pending_accessor: false,
             no_value: false,
             tail: false,
+            tag: 0,
         }
+    }
+
+    /// `fxGenerateTag(console, buffer, size, C_NULL)` — mint the next
+    /// tagged-template cache symbol (`#<tag>`) and bump the counter. The
+    /// oracle passes no path (no `//# sourceURL=` comment), so the tag has
+    /// no `@path` suffix.
+    fn generate_tag(&mut self) -> String {
+        let s = format!("#{}", self.tag);
+        self.tag += 1;
+        s
     }
 
     /// The declaration `(scope, id)` a node's symbol binds to (XS's
@@ -984,7 +1001,7 @@ impl Coder<'_> {
             // was not entered as a construct). A single stack-pushing byte.
             Target => self.add_byte(1, XS_CODE_TARGET),
             Regexp => self.code_regexp(node),
-            Template => self.code_template(node),
+            Template => self.code_template(node, tail),
             Access => self.code_access(node),
             Chain => self.code_chain(node),
             Option => self.code_option(node, tail),
@@ -4624,22 +4641,23 @@ impl Coder<'_> {
         }
     }
 
-    /// `fxTemplateNodeCode`, untagged branch. Children `[reference,
-    /// List(items)]`; the items alternate `TemplateMiddle` (a cooked +
-    /// raw string pair) with substitution expressions. The tagged branch
-    /// builds the raw/cooked cache via `GET_PROPERTY` symbols and is
-    /// deferred to the atom-table slice.
-    fn code_template(&mut self, node: &Node) {
-        assert!(
-            matches!(node.children[0], Item::Null),
-            "tagged template reached in control-flow coder (later child)"
-        );
+    /// `fxTemplateNodeCode`. Children `[reference, List(items)]`; the items
+    /// alternate `TemplateMiddle` (a cooked + raw string pair) with
+    /// substitution expressions. A `Null` reference is an untagged template
+    /// (string concatenation); a real reference is a tagged template — a
+    /// call `tag(strings, ...substitutions)` where `strings` is the frozen
+    /// template object (`strings.raw` the raw array), cached per call site.
+    fn code_template(&mut self, node: &Node, tail: bool) {
         let items = match &node.children[1] {
             Item::List(v) => v,
             _ => panic!("template without items list"),
         };
-        // The first item is always a `TemplateMiddle`; emit its cooked
-        // string, then fold each following part in with `+`.
+        if !matches!(node.children[0], Item::Null) {
+            self.code_tagged_template(node, items, tail);
+            return;
+        }
+        // Untagged: the first item is always a `TemplateMiddle`; emit its
+        // cooked string, then fold each following part in with `+`.
         self.code(&node_of(&items[0]).children[0]);
         for item in &items[1..] {
             let n = node_of(item);
@@ -4651,6 +4669,94 @@ impl Coder<'_> {
             }
             self.add_byte(-1, XS_CODE_ADD);
         }
+    }
+
+    /// `fxTemplateNodeCode`, tagged branch. Builds (once per call site,
+    /// guarded by a `TEMPLATE_CACHE.#<tag>` lookup) the frozen template
+    /// object: a `strings` array of the cooked values (`undefined` for an
+    /// illegal escape), a `raws` array of the raw values, `strings.raw =
+    /// raws`, then `TEMPLATE` to freeze. The cached object is argument 0 of
+    /// the tag call, followed by each substitution expression.
+    fn code_tagged_template(&mut self, node: &Node, items: &[Item], tail: bool) {
+        let cache_target = self.create_target();
+        // Number of `TemplateMiddle` items = (items.length / 2) + 1.
+        let string_count = (items.len() as i32 / 2) + 1;
+        let raws = self.use_temporary();
+        let strings = self.use_temporary();
+        // XS_DONT_DELETE_FLAG (2) | XS_DONT_SET_FLAG (8): each cooked/raw
+        // slot is a frozen own property.
+        let prop_flag: i32 = 2 | 8;
+
+        self.code_this(&node.children[0], 0);
+        self.add_byte(1, XS_CODE_CALL);
+
+        let symbol = self.generate_tag();
+        self.add_byte(1, XS_CODE_TEMPLATE_CACHE);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, &symbol);
+        self.add_branch(0, XS_CODE_BRANCH_COALESCE_1, cache_target);
+        self.add_byte(1, XS_CODE_TEMPLATE_CACHE);
+
+        self.add_byte(1, XS_CODE_ARRAY);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, strings);
+        self.add_integer(1, XS_CODE_INTEGER_1, string_count);
+        self.add_symbol(-1, XS_CODE_SET_PROPERTY, "length");
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_byte(1, XS_CODE_ARRAY);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, raws);
+        self.add_integer(1, XS_CODE_INTEGER_1, string_count);
+        self.add_symbol(-1, XS_CODE_SET_PROPERTY, "length");
+        self.add_byte(-1, XS_CODE_POP);
+
+        let mut i: i32 = 0;
+        for item in items {
+            let n = node_of(item);
+            if n.token != Token::TemplateMiddle {
+                continue;
+            }
+            self.add_index(1, XS_CODE_GET_LOCAL_1, strings);
+            self.add_integer(1, XS_CODE_INTEGER_1, i);
+            self.add_byte(0, XS_CODE_AT);
+            // An illegal escape makes the cooked slot `undefined`; the raw
+            // slot is still emitted verbatim.
+            if node_of(&n.children[0]).flags & crate::ast::flags::STRING_ERROR != 0 {
+                self.add_byte(1, XS_CODE_UNDEFINED);
+            } else {
+                self.code(&n.children[0]);
+            }
+            self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+            self.add_integer(0, XS_CODE_INTEGER_1, prop_flag);
+
+            self.add_index(1, XS_CODE_GET_LOCAL_1, raws);
+            self.add_integer(1, XS_CODE_INTEGER_1, i);
+            self.add_byte(0, XS_CODE_AT);
+            self.code(&n.children[1]);
+            self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+            self.add_integer(0, XS_CODE_INTEGER_1, prop_flag);
+
+            i += 1;
+        }
+        self.add_index(1, XS_CODE_GET_LOCAL_1, strings);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, raws);
+        self.add_symbol(-1, XS_CODE_SET_PROPERTY, "raw");
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, strings);
+        self.add_byte(0, XS_CODE_TEMPLATE);
+
+        self.add_symbol(-1, XS_CODE_SET_PROPERTY, &symbol);
+
+        self.place_target(0, cache_target);
+
+        // The template object is argument 0; each substitution expression
+        // follows.
+        let mut count: i32 = 1;
+        for item in items {
+            if node_of(item).token != Token::TemplateMiddle {
+                self.code(item);
+                count += 1;
+            }
+        }
+        self.add_integer(-2 - count, if tail { XS_CODE_RUN_TAIL_1 } else { XS_CODE_RUN_1 }, count);
+        self.unuse_temporaries(2);
     }
 
     /// `fxRegexpNodeCode`. A `new RegExp(pattern, flags)` via the

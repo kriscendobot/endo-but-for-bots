@@ -540,6 +540,39 @@ fn untagged_templates() {
     ]);
 }
 
+// Tagged templates (fix5 2/5, slice 1). The tagged branch of
+// `fxTemplateNodeCode` builds the frozen template object once per call
+// site (a `TEMPLATE_CACHE.#<tag>` lookup guards the build), fills the
+// cooked `strings` and `raws` arrays via `NEW_PROPERTY_AT` with the
+// frozen `DONT_DELETE|DONT_SET` flag, sets `strings.raw = raws`,
+// `TEMPLATE`-freezes, caches under the per-site `#<tag>` symbol, then
+// calls the tag with the object as argument 0. Every one of those bytes
+// — the tag symbol id, the temporary slots, the branch displacement,
+// the `RUN_1` arity — is pinned here.
+#[test]
+fn tagged_templates() {
+    assert_identical(&[
+        // no substitutions: object is the sole argument
+        "var t = s => s; t`abc`;",
+        "var t = s => s; t``;",
+        // one and more substitutions bump the `RUN_1` arity
+        "var t = (s, a) => a; t`x${1}y`;",
+        "var t = (s, a, b) => a; t`${1}${2}`;",
+        "var t = (s, a, b) => b; t`a${1}b${2}c`;",
+        // member-reference tag exercises the receiver dance
+        "var o = { t(s) { return s; } }; o.t`hi`;",
+        // two sites in one program mint distinct `#0` / `#1` cache symbols
+        "var t = s => s; t`a`; t`b`;",
+        // cooked value is `undefined` for an illegal escape; raw is kept
+        "var t = s => s.raw[0]; t`\\unicode`;",
+        "var t = s => s[0]; t`\\xZZ`;",
+        // a legal escape still cooks
+        "var t = s => s[0]; t`a\\tb`;",
+        // tail position: `return tag`...`` emits `RUN_TAIL_1`
+        "var t = s => s; function f(){ return t`z`; }",
+    ]);
+}
+
 #[test]
 fn control_flow_try() {
     assert_identical(&[

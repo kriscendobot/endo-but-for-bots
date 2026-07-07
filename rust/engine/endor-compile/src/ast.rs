@@ -28,6 +28,11 @@ use crate::token::Token;
 pub mod flags {
     /// `mxCFlag` — host (`@`) mode. (bit 0)
     pub const C: u32 = 1 << 0;
+    /// `mxStringErrorFlag` — a template/string cooked value that carries an
+    /// illegal escape sequence. In a tagged template the cooked slot becomes
+    /// `undefined` (the raw slot is still emitted); anywhere else `fxStringNodeCode`
+    /// turns it into a SyntaxError. (bit 1)
+    pub const STRING_ERROR: u32 = 1 << 1;
     /// `mxEvalFlag`. (bit 2)
     pub const EVAL: u32 = 1 << 2;
     /// `mxProgramFlag` — set while parsing a Script goal (not a Module).

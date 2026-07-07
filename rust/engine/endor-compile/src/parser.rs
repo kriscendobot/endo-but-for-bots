@@ -235,13 +235,23 @@ impl Parser {
     }
 
     fn push_string(&mut self, value: Vec<u16>, line: u32, escaped: bool) {
-        // `fxPushStringNode` sets `flags = states[0].escaped`
-        // (`mxStringEscapeFlag`, bit 0). Kept faithful; not surfaced in
-        // the dump.
+        self.push_string_flagged(value, line, escaped, false);
+    }
+
+    /// `fxPushStringNode` sets `flags = states[0].escaped`
+    /// (`mxStringEscapeFlag`, bit 0). A template cooked value additionally
+    /// carries `mxStringErrorFlag` (bit 1) when its escape scan failed, so
+    /// the coder can turn it into `undefined` (tagged) or a SyntaxError
+    /// (everywhere else). Kept faithful; not surfaced in the dump.
+    fn push_string_flagged(&mut self, value: Vec<u16>, line: u32, escaped: bool, error: bool) {
+        let mut flags = if escaped { 1 } else { 0 };
+        if error {
+            flags |= flags::STRING_ERROR;
+        }
         self.push(Item::Node(Box::new(Node {
             token: Token::String,
             line,
-            flags: if escaped { 1 } else { 0 },
+            flags,
             children: Vec::new(),
             value: Value::Str(value),
         })));
@@ -822,7 +832,8 @@ impl Parser {
                             return Err(self.error("invalid template"));
                         }
                         let (s, r) = self.cur_template_strings();
-                        self.push_string(s, line, false);
+                        let err = self.cur.string_error;
+                        self.push_string_flagged(s, line, false, err);
                         self.push_raw(r, line);
                         self.push_node_struct(2, Token::TemplateMiddle, line)?;
                         self.get_next_token()?;
@@ -961,7 +972,8 @@ impl Parser {
             Token::Template => {
                 self.push_null();
                 let (s, r) = self.cur_template_strings();
-                self.push_string(s, line, false);
+                let err = self.cur.string_error;
+                self.push_string_flagged(s, line, false, err);
                 self.push_raw(r, line);
                 self.push_node_struct(2, Token::TemplateMiddle, line)?;
                 self.get_next_token()?;
@@ -1450,7 +1462,8 @@ impl Parser {
         let mut count = 0usize;
         let line = self.cur.line;
         let (s, r) = self.cur_template_strings();
-        self.push_string(s, line, false);
+        let err = self.cur.string_error;
+        self.push_string_flagged(s, line, false, err);
         self.push_raw(r, line);
         self.push_node_struct(2, Token::TemplateMiddle, line)?;
         count += 1;
@@ -1467,7 +1480,8 @@ impl Parser {
             let part = self.lexer.next_template_part()?;
             self.cur = part;
             let (s, r) = self.cur_template_strings();
-            self.push_string(s, line, false);
+            let err = self.cur.string_error;
+            self.push_string_flagged(s, line, false, err);
             self.push_raw(r, line);
             self.push_node_struct(2, Token::TemplateMiddle, line)?;
             count += 1;
@@ -1582,7 +1596,8 @@ impl Parser {
                 }
                 Token::Template => {
                     let (s, r) = self.cur_template_strings();
-                    self.push_string(s, line, false);
+                    let err = self.cur.string_error;
+                    self.push_string_flagged(s, line, false, err);
                     self.push_raw(r, line);
                     self.push_node_struct(2, Token::TemplateMiddle, line)?;
                     self.get_next_token()?;
