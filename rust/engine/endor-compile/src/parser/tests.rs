@@ -602,3 +602,88 @@ fn program_never_panics_on_garbage() {
         let _ = p.parse_program(false);
     }
 }
+
+/// Parse `src` as a whole Script and return the early error (or panic if it
+/// was accepted). Used by the negative-fixture cases below.
+fn prog_err(src: &str) -> crate::parser::ParseError {
+    let mut p = Parser::new(src, false, false).unwrap_or_else(|e| panic!("lex {src:?}: {e}"));
+    p.parse_program(false)
+        .err()
+        .unwrap_or_else(|| panic!("expected a syntax error for {src:?}"))
+}
+
+/// Assert `src` parses without an early error.
+fn prog_ok(src: &str) {
+    let mut p = Parser::new(src, false, false).unwrap_or_else(|e| panic!("lex {src:?}: {e}"));
+    assert!(p.parse_program(false).is_ok(), "expected {src:?} to parse");
+}
+
+#[test]
+fn nonsimple_params_with_use_strict_body_is_error() {
+    // `fxBody`: a `"use strict"` directive with a non-simple parameter list
+    // is a Syntax Error even when the function is ALREADY strict (a class
+    // method, whose body inherits the class's strictness) — the regression
+    // this slice fixes. Also covered: a plain strict-by-directive function
+    // and default / rest / destructuring parameters.
+    for src in [
+        r#"class C { m(a, ...rest) { "use strict"; } }"#,
+        r#"class C { m(a = 1) { "use strict"; } }"#,
+        r#"class C { static m({x}) { "use strict"; } }"#,
+        r#"function f(a = 1) { "use strict"; }"#,
+        r#"(function (...a) { "use strict"; })"#,
+    ] {
+        let err = prog_err(src);
+        assert_eq!(err.kind, ParseErrorKind::Syntax, "src {src:?}");
+        assert!(err.message.contains("invalid directive"), "{src:?}: {}", err.message);
+    }
+    // A simple parameter list with a `"use strict"` body stays legal.
+    prog_ok(r#"function f(a, b) { "use strict"; }"#);
+}
+
+#[test]
+fn arguments_in_class_field_initializer_is_error() {
+    // The field branch of `fxClassExpression`: `arguments` in a field
+    // initializer (ContainsArguments) is a Syntax Error — directly, inside a
+    // nested arrow (which does not bind its own `arguments`), and for static
+    // and private fields.
+    for src in [
+        "class C { x = arguments; }",
+        "class C { x = typeof arguments; }",
+        "class C { x = () => arguments; }",
+        "class C { static x = arguments; }",
+        "class C { #x = arguments; }",
+    ] {
+        let err = prog_err(src);
+        assert_eq!(err.kind, ParseErrorKind::Syntax, "src {src:?}");
+        assert!(err.message.contains("invalid arguments"), "{src:?}: {}", err.message);
+    }
+    // A nested ordinary function has its own `arguments`, so it is legal.
+    prog_ok("class C { x = function () { return arguments; }; }");
+}
+
+#[test]
+fn arguments_and_await_in_static_block_are_errors() {
+    // A static initialization block is a field context: `arguments` and a
+    // top-level `await` are Syntax Errors.
+    let err = prog_err("class C { static { arguments; } }");
+    assert!(err.message.contains("invalid arguments"), "{}", err.message);
+    let err = prog_err("class C { static { await 1; } }");
+    assert!(err.message.contains("invalid await"), "{}", err.message);
+}
+
+#[test]
+#[should_panic(expected = "invalid initializer")]
+fn cover_initialized_name_as_expression_is_error() {
+    // `fxBindingNodeCode`: a shorthand-with-initializer (CoverInitializedName)
+    // in an object literal used as a real expression — never refined to a
+    // destructuring pattern — is a Syntax Error (raised at code time, like
+    // XS's `fxReportParserError`).
+    let _ = crate::coder::compile("({ a = 1 });");
+}
+
+#[test]
+fn cover_initialized_name_as_destructuring_target_is_ok() {
+    // The same shape as a destructuring assignment target is legal.
+    assert!(crate::coder::compile("({ a = 1 } = {});").is_ok());
+    assert!(crate::coder::compile("var { a = 1 } = {};").is_ok());
+}

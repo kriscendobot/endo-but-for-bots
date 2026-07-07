@@ -191,13 +191,21 @@ impl Parser {
             },
             _ => return Ok(false),
         };
-        if is_use_strict && self.flags & flags::STRICT == 0 {
+        if is_use_strict {
+            // `fxBody`: the non-simple-parameter-list check fires on every
+            // `"use strict"` directive, INDEPENDENT of whether strict mode is
+            // already on — a class/method body is already strict, yet a
+            // non-simple parameter list plus a `"use strict"` prologue is
+            // still a Syntax Error. (`fxProgram` never sets the flag, so the
+            // shared helper stays faithful for the top-level program.)
             if self.flags & flags::NOT_SIMPLE_PARAMETERS != 0 {
                 return Err(self.error("invalid directive"));
             }
-            self.flags |= flags::STRICT;
-            if self.cur.token == Token::Identifier {
-                self.check_strict_keyword()?;
+            if self.flags & flags::STRICT == 0 {
+                self.flags |= flags::STRICT;
+                if self.cur.token == Token::Identifier {
+                    self.check_strict_keyword()?;
+                }
             }
         }
         Ok(true)
@@ -1438,6 +1446,14 @@ impl Parser {
                         self.statements()?;
                         self.match_token(Token::RightBrace)?;
                         self.push_node_struct(1, Token::Body, prop_line)?;
+                        // A static initialization block is a field context:
+                        // `arguments` and top-level `await` are Syntax Errors.
+                        if self.flags & flags::ARGUMENTS != 0 {
+                            return Err(self.error("invalid arguments"));
+                        }
+                        if self.flags & flags::AWAITING != 0 {
+                            return Err(self.error("invalid await"));
+                        }
                         self.flags = block_saved;
                         self.set_top_flags(flags::STATIC);
                         count += 1;
@@ -1529,6 +1545,14 @@ impl Parser {
                 | flags::FIELD;
             self.get_next_token()?;
             self.assignment_expression()?;
+            // `arguments` is a Syntax Error inside a field initializer
+            // (ContainsArguments of Initializer): the flag survived the
+            // `assignment_expression` (arrows propagate it out; regular
+            // functions absorb it) because `FIELD` flags were reset above
+            // without carrying `ARGUMENTS`.
+            if self.flags & flags::ARGUMENTS != 0 {
+                return Err(self.error("invalid arguments"));
+            }
             self.flags = saved;
         } else {
             self.push_node_struct(0, Token::Undefined, prop_line)?;

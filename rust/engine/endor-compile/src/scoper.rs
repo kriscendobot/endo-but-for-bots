@@ -813,6 +813,22 @@ impl Scoper {
                     }
                     Token::PrivateProperty => {
                         let name = child_sym(m, 0).map(Sym::Named);
+                        // `fxClassNodeHoist`: PrivateBoundNames must not
+                        // contain a duplicate, unless it is used exactly once
+                        // as a (same-static) getter and once as a setter. The
+                        // XOR of the two members' {static,getter,setter} bits
+                        // is `getter|setter` in precisely that allowed case.
+                        if let Some(sym_ref) = &name {
+                            if let Some(existing_id) = self.scope_get_declare(si, sym_ref) {
+                                let existing = self.declare_ref(si, existing_id).flags
+                                    & (flags::STATIC | flags::GETTER | flags::SETTER);
+                                let current =
+                                    m.flags & (flags::STATIC | flags::GETTER | flags::SETTER);
+                                if existing ^ current != (flags::GETTER | flags::SETTER) {
+                                    return Err(err(m.line, "duplicate"));
+                                }
+                            }
+                        }
                         let mut d = self.new_declare(si, Token::Const, name, m.line);
                         d.flags |= dflags::CLOSURE
                             | (m.flags & (flags::STATIC | flags::GETTER | flags::SETTER));
@@ -1919,6 +1935,29 @@ impl Scoper {
 
     fn bind_object(&mut self, node: &Node) -> Result<(), ParseError> {
         self.push_variables(1);
+        // `fxObjectNodeBind`: copy each property's method/getter/setter flag
+        // onto its value function node before binding it, so the parameter
+        // arity early error (getter → 0 params, setter → 1 non-rest) fires
+        // for object-literal accessors — whose parser leaves those flags on
+        // the *property*, not the function. Recorded in `node_extra` (not the
+        // AST) exactly as XS's binder mutates the node in place; the coder
+        // relays the accessor bit from the property, so bytecode is unchanged.
+        if let Some(Item::List(items)) = child(node, 0) {
+            for item in items {
+                let Item::Node(p) = item else { continue };
+                if p.token != Token::Property && p.token != Token::PropertyAt {
+                    continue;
+                }
+                if let Some(Item::Node(value)) = p.children.get(1) {
+                    if value.token == Token::Function || value.token == Token::Generator {
+                        let bits = p.flags & (flags::METHOD | flags::GETTER | flags::SETTER);
+                        if bits != 0 {
+                            self.add_extra(node_ptr(value), bits);
+                        }
+                    }
+                }
+            }
+        }
         self.bind_children(node)?;
         self.pop_variables(1);
         Ok(())
@@ -1944,6 +1983,32 @@ impl Scoper {
     }
 
     fn bind_params_binding(&mut self, node: &Node) -> Result<(), ParseError> {
+        // `fxParamsBindingNodeBind`: getter/setter/plain parameter-count
+        // early errors — a getter takes no parameters, a setter exactly one
+        // non-rest parameter, and any other function at most 255.
+        if let Some(fscope) = self.scope {
+            let nf = self.scope_node_flags(fscope);
+            let items: &[Item] = match child(node, 0) {
+                Some(Item::List(items)) => items,
+                _ => &[],
+            };
+            let count = items.len();
+            if nf & flags::GETTER != 0 {
+                if count != 0 {
+                    return Err(err(node.line, "invalid getter arguments"));
+                }
+            } else if nf & flags::SETTER != 0 {
+                let first_rest = matches!(
+                    items.first(),
+                    Some(Item::Node(n)) if n.token == Token::RestBinding
+                );
+                if count != 1 || first_rest {
+                    return Err(err(node.line, "invalid setter arguments"));
+                }
+            } else if count > 255 {
+                return Err(err(node.line, "too many arguments"));
+            }
+        }
         // `fxParamsBindingNodeBind`: a *mapped* `arguments` object (a sloppy
         // function that references `arguments` and has a simple parameter
         // list) aliases the named parameters, so each parameter is promoted

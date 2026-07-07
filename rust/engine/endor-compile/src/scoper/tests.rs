@@ -450,3 +450,68 @@ a -> global
 ",
     );
 }
+
+// -------- fxParamsBindingNodeBind: getter / setter parameter arity --------
+
+#[test]
+fn getter_must_take_no_parameters() {
+    // `fxParamsBindingNodeBind`: a getter with any formal parameter is a
+    // Syntax Error — for a class accessor and an object-literal accessor
+    // alike (the object case flows through `fxObjectNodeBind` copying the
+    // getter flag onto the value function).
+    for src in [
+        "class C { get a(x) {} }",
+        "class C { get a(x = 1) {} }",
+        "class C { static get a(x) {} }",
+        "({ get a(x) {} });",
+        "(0, { get a(param = null) {} });",
+    ] {
+        assert_eq!(scope_err(src), "invalid getter arguments", "src {src}");
+    }
+    // A zero-parameter getter is legal.
+    assert!(scope_program("({ get a() { return 1; } });", false).is_ok());
+}
+
+#[test]
+fn setter_must_take_exactly_one_nonrest_parameter() {
+    // `fxParamsBindingNodeBind`: a setter must take exactly one parameter,
+    // and it may not be a rest element.
+    for src in [
+        "class C { set a() {} }",
+        "class C { set a(x, y) {} }",
+        "class C { set a(...x) {} }",
+        "({ set a() {} });",
+        "({ set a(...x) {} });",
+    ] {
+        assert_eq!(scope_err(src), "invalid setter arguments", "src {src}");
+    }
+    // Exactly one (possibly defaulted or destructured) parameter is legal.
+    assert!(scope_program("({ set a(v) {} });", false).is_ok());
+    assert!(scope_program("({ set a(v = 1) {} });", false).is_ok());
+    assert!(scope_program("({ set a({x}) {} });", false).is_ok());
+}
+
+// -------- fxClassNodeHoist: duplicate PrivateBoundNames --------
+
+#[test]
+fn duplicate_private_names_are_error() {
+    // PrivateBoundNames of a class body must have no duplicate, unless the
+    // name is used once as a getter and once as a setter (same static-ness).
+    for src in [
+        "class C { #m() {} #m() {} }",
+        "class C { get #m() {} #m() {} }",
+        "class C { #m() {} get #m() {} }",
+        "class C { get #m() {} get #m() {} }",
+        "class C { set #m(v) {} set #m(v) {} }",
+        "class C { #m; #m; }",
+        "class C { #m() {} static #m() {} }", // instance vs static: still a duplicate
+    ] {
+        assert_eq!(scope_err(src), "duplicate", "src {src}");
+    }
+    // The single sanctioned exception: one getter and one setter.
+    assert!(scope_program("class C { get #m() { return 1; } set #m(v) {} }", false).is_ok());
+    assert!(
+        scope_program("class C { static get #m() { return 1; } static set #m(v) {} }", false)
+            .is_ok()
+    );
+}

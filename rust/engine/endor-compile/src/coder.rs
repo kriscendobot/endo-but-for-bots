@@ -2089,10 +2089,18 @@ impl Coder<'_> {
     }
 
     /// `fxBindingNodeCode` — `target = initializer` in a declaration
-    /// (`var`/`let`/`const` with an initializer). The target is a
-    /// declaration node (an `Access` target would be `invalid
-    /// initializer`, a syntax error the parser already rejects here).
+    /// (`var`/`let`/`const` with an initializer). A `Binding` reaching the
+    /// value-coding path with an `Access` target is a CoverInitializedName
+    /// used as a real expression (`({ a = 1 })` / `[a = 1]`) that was never
+    /// refined to a destructuring pattern — a Syntax Error (`invalid
+    /// initializer`). A pattern context codes the binding through the
+    /// Assign/Reference path instead, which never lands here.
     fn code_binding(&mut self, node: &Node) {
+        if let Item::Node(t) = &node.children[0] {
+            if t.token == Token::Access {
+                panic!("coder: invalid initializer");
+            }
+        }
         // Name inference: `var/let/const f = function(){}` names the
         // anonymous value `f` (its name lands in the function-creation
         // operand). Only a simple identifier target supplies a name.
