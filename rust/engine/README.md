@@ -2046,6 +2046,33 @@ path has endor reject or the bytes differ, so the exact-match guard fails (the
 `genuine_parse_rejection_is_not_reclassified` lock both directions; the module
 goal (`compile_one_module`, a parse+code path with no run) is untouched.
 
+**fix5 1/5 slice 2 (the `optional-chaining` divergence) — the optional-CALL
+receiver-drop, CLOSED.** `expressions/optional-chaining/optional-chain.js`
+diverged at the `fn?.(10, 20)` optional call (first diff @289,
+`byte-length/endor-shorter` by 6). When a `?.` link is the *reference* of a
+call, XS routes it through `fxOptionNodeCodeThis`/`fxChainNodeCodeThis` (the
+`this`-variants), which push a receiver/value pair and, on a nullish base,
+`BRANCH_CHAIN` to a swap target that `SWAP`/`POP`s the dead receiver before
+`BRANCH`ing the whole chain to `undefined`. endor's `code_this` dispatch had no
+`Chain`/`Option` arms, so an optional callee fell through to the plain-value
+fallback (`code_node_this`) and emitted the shorter stream (missing the
+branch/swap/pop dance). The fix adds `code_chain_this`/`code_option_this`
+(structural mirrors) and the two dispatch arms; `optional-chain.js` is now
+byte-identical (392 = 392). Locked in `optional_call_reference_is_byte_identical`
+(bare-reference call, member-reference call, chained `a?.b?.()`, and a further
+`?.().c` continuation). `optional-chaining` divergent **1 → 0**.
+
+The subtree's **2 remaining `endor-rejected`** (`call-expression.js`,
+`member-expression.js`) are a **separate deferred FEATURE, not this fold**:
+both use a **tagged template** in an optional-chain assertion
+(`fn7()`​`` `hello` ``​`?.a`), and endor's coder `panic`s at the tagged branch of
+`code_template` (`"tagged template reached in control-flow coder"`) — the
+raw/cooked template-cache atom table is unported (an explicitly deferred slice,
+tracked at `code_template`). Closing these needs the tagged-template feature,
+not an optional-chaining change; attributed here, out of this slice's scope.
+`optional-chaining` is thus at `divergent=0 accept-disagree=0`,
+`endor-rejected=2` (both the tagged-template deferral).
+
 **Remaining fix5 1/5 residual — a DISTINCT mechanism (2 files, attributed).**
 `expressions/arrow-function/arrow/binding-tests-3.js` (`function foo(){ return
 ()=>eval("this"); }`) and `arguments-object/10.5-1-s.js` (`(function fun(){

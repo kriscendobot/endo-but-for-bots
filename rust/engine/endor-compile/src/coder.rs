@@ -3811,6 +3811,39 @@ impl Coder<'_> {
         self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, target);
     }
 
+    /// `fxChainNodeCodeThis` — the call-reference variant of
+    /// [`Coder::code_chain`]: install a fresh short-circuit target, code the
+    /// chain's `this`/value pair, place the target, restore the outer target.
+    fn code_chain_this(&mut self, node: &Node, flag: i32) -> i32 {
+        let saved = self.chain_target;
+        let target = self.create_target();
+        self.chain_target = Some(target);
+        let flag = self.code_this(&node.children[0], flag);
+        self.place_target(0, target);
+        self.chain_target = saved;
+        flag
+    }
+
+    /// `fxOptionNodeCodeThis` — one `?.` link whose value is a call callee.
+    /// Unlike the plain [`Coder::code_option`], the callee left a
+    /// receiver/value pair on the stack, so a nullish base must drop the
+    /// receiver (`SWAP`/`POP`) before short-circuiting the whole chain to
+    /// `undefined`; a present base skips that dance and continues the call.
+    fn code_option_this(&mut self, node: &Node, flag: i32) -> i32 {
+        let swap_target = self.create_target();
+        let skip_target = self.create_target();
+        let flag = self.code_this(&node.children[0], flag);
+        let chain_target = self.chain_target.expect("optional `?.` outside a chain");
+        self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, swap_target);
+        self.add_branch(1, XS_CODE_BRANCH_1, skip_target);
+        self.place_target(0, swap_target);
+        self.add_byte(0, XS_CODE_SWAP);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_branch(0, XS_CODE_BRANCH_1, chain_target);
+        self.place_target(0, skip_target);
+        flag
+    }
+
     fn code_member(&mut self, node: &Node) {
         self.code(&node.children[0]);
         let is_super = self.node_is_super(&node.children[0]);
@@ -4278,6 +4311,13 @@ impl Coder<'_> {
                 Token::PrivateMember => self.code_private_member_this(n, flag),
                 Token::MemberAt => self.code_member_at_this(n, flag),
                 Token::Expressions => self.code_expressions_this(n, flag),
+                // An optional call (`fn?.(…)`, `a?.b()`): the callee is a
+                // `Chain`/`Option` in call-reference position, so it must code
+                // the `this`/value pair and short-circuit the whole chain when
+                // a base is nullish — not fall through to the plain-value
+                // fallback (which would drop the receiver dance).
+                Token::Chain => self.code_chain_this(n, flag),
+                Token::Option => self.code_option_this(n, flag),
                 _ => self.code_node_this(item, flag),
             },
             _ => self.code_node_this(item, flag),

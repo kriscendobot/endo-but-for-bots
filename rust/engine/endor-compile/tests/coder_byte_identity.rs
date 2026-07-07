@@ -1925,3 +1925,25 @@ fn arrow_receiver_capture_under_eval() {
         "var f = ([a], ...b) => { eval('a'); };",
     ]);
 }
+
+// Optional **call** (`fn?.(…)`, `a?.b?.()`) — the fix5 optional-chain
+// call-reference slice. When a `?.` link is the *reference* of a call, the
+// callee is pushed as a receiver/value pair, so `fxOptionNodeCodeThis` must
+// short-circuit the whole chain with a `SWAP`/`POP` receiver drop when the
+// base is nullish — not the plain `fxOptionNodeCode` `BRANCH_CHAIN`. endor's
+// `code_this` dispatch lacked the `Chain`/`Option` arms and fell through to the
+// plain-value fallback, emitting the shorter (missing branch/swap/pop) stream.
+#[test]
+fn optional_call_reference_is_byte_identical() {
+    assert_identical(&[
+        // optional call on a bare (non-member) reference
+        "var fn = () => 1; fn?.();",
+        "var fn = (a, b) => a + b; fn?.(10, 20);",
+        // optional call on a member reference
+        "var a = { b() { return 1; } }; a.b?.();",
+        // chained: optional access then optional call
+        "var a = { b: () => 1 }; a?.b?.();",
+        // optional call whose result is further chained
+        "var a = { b: () => ({ c: 3 }) }; a?.b?.().c;",
+    ]);
+}
