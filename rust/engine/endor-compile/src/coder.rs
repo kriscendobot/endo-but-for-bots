@@ -1003,6 +1003,8 @@ impl Coder<'_> {
             Delegate => self.code_delegate(node),
             Class => self.code_class(node),
             Super => self.code_super(node),
+            ImportCall => self.code_import_call(node),
+            ImportMeta => self.code_import_meta(node),
             // `fxImportNodeCode` / `fxExportNodeCode` are both empty in XS:
             // the module's import/export *linkage* is emitted from the
             // module scope's declares (`fxScopeCodeSpecifierNodes`), so the
@@ -2109,6 +2111,26 @@ impl Coder<'_> {
         self.code(&node.children[1]);
         self.code_assign(&node.children[0], 0);
         self.add_byte(-1, XS_CODE_POP);
+    }
+
+    /// `fxImportCallNodeCode` — a dynamic `import(specifier[, options])`.
+    /// Code the specifier, then the options (or `UNDEFINED` when absent),
+    /// mark the module header's `mxImportFlag`, and emit `IMPORT`.
+    fn code_import_call(&mut self, node: &Node) {
+        self.code(&node.children[0]);
+        match &node.children[1] {
+            Item::Node(_) => self.code(&node.children[1]),
+            _ => self.add_byte(1, XS_CODE_UNDEFINED),
+        }
+        self.import_flag = true;
+        self.add_byte(-1, XS_CODE_IMPORT);
+    }
+
+    /// `fxImportMetaNodeCode` — `import.meta`: mark the header's
+    /// `mxImportMetaFlag` and push the meta object.
+    fn code_import_meta(&mut self, _node: &Node) {
+        self.import_meta_flag = true;
+        self.add_byte(1, XS_CODE_IMPORT_META);
     }
 
     /// If `value` is an anonymous function/class and `target` is a simple
