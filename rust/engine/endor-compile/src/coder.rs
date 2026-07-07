@@ -1523,22 +1523,29 @@ impl Coder<'_> {
     /// function's return target. The async form (`await`/`THROW_STATUS`) and
     /// `yield*` (`Delegate`) are deferred.
     fn code_yield(&mut self, node: &Node) {
-        assert!(
-            node.flags & crate::ast::flags::ASYNC == 0,
-            "async yield deferred (async slice)"
-        );
+        let is_async = node.flags & crate::ast::flags::ASYNC != 0;
         let target = self.create_target();
-        self.add_byte(1, XS_CODE_OBJECT);
-        self.add_byte(1, XS_CODE_DUB);
-        self.code(&node.children[0]);
-        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "value");
-        self.add_integer(0, XS_CODE_INTEGER_1, 0);
-        self.add_byte(1, XS_CODE_DUB);
-        self.add_byte(1, XS_CODE_FALSE);
-        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "done");
-        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+        if is_async {
+            // Async generators yield the raw value; the async runtime wraps
+            // and awaits it.
+            self.code(&node.children[0]);
+        } else {
+            self.add_byte(1, XS_CODE_OBJECT);
+            self.add_byte(1, XS_CODE_DUB);
+            self.code(&node.children[0]);
+            self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "value");
+            self.add_integer(0, XS_CODE_INTEGER_1, 0);
+            self.add_byte(1, XS_CODE_DUB);
+            self.add_byte(1, XS_CODE_FALSE);
+            self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "done");
+            self.add_integer(0, XS_CODE_INTEGER_1, 0);
+        }
         self.add_byte(0, XS_CODE_YIELD);
         self.add_branch(1, XS_CODE_BRANCH_STATUS_1, target);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
         self.add_byte(-1, XS_CODE_SET_RESULT);
         let rt = self.return_target.expect("yield outside a function");
         self.adjust_environment(rt);
@@ -1831,10 +1838,6 @@ impl Coder<'_> {
             0,
             "function flavor {flags:#x} deferred (class)"
         );
-        assert!(
-            !(flags & f::ASYNC != 0 && flags & f::GENERATOR != 0),
-            "async generator deferred (async slice)"
-        );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
         // possibly captured) and closure aliases (a `NoToken` use-closure
@@ -1892,11 +1895,14 @@ impl Coder<'_> {
         let is_accessor = std::mem::take(&mut self.pending_accessor);
         let plain_function =
             is_accessor || flags & (f::ARROW | f::METHOD | f::GETTER | f::SETTER) != 0;
-        // Create-op precedence matches XS's flag order: async first
-        // (async generators are deferred above), then generator, then the
-        // plain/constructor split.
+        // Create-op precedence matches XS's flag order: async (generator or
+        // not) first, then generator, then the plain/constructor split.
         let create_op = if flags & f::ASYNC != 0 {
-            XS_CODE_ASYNC_FUNCTION
+            if flags & f::GENERATOR != 0 {
+                XS_CODE_ASYNC_GENERATOR_FUNCTION
+            } else {
+                XS_CODE_ASYNC_FUNCTION
+            }
         } else if flags & f::GENERATOR != 0 {
             XS_CODE_GENERATOR_FUNCTION
         } else if plain_function {
@@ -1928,9 +1934,15 @@ impl Coder<'_> {
 
         self.return_target = Some(self.create_target());
         // A generator body opens by suspending at its start
-        // (`START_GENERATOR`); the async-generator form is deferred.
+        // (`START_GENERATOR`, or `START_ASYNC_GENERATOR` for an async
+        // generator).
         if flags & f::GENERATOR != 0 {
-            self.add_byte(0, XS_CODE_START_GENERATOR);
+            let op = if flags & f::ASYNC != 0 {
+                XS_CODE_START_ASYNC_GENERATOR
+            } else {
+                XS_CODE_START_GENERATOR
+            };
+            self.add_byte(0, op);
         }
         self.code(&node.children[2]); // Body
         let rt = self.return_target.expect("function return target");

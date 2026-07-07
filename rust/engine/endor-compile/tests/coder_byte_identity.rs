@@ -882,3 +882,12 @@ fn async_functions() {
         "(async function(){let x=await 1;return x;});",
     ]);
 }
+
+#[test]
+fn async_generators() {
+    assert_identical(&[
+        "(async function*(){});", "(async function*(){yield 1;});",
+        "(async function*(){yield await 1;});", "(async function*(){await 1;yield 2;});",
+        "async function*g(){yield 1;}", "(async function*(a){yield a;});",
+    ]);
+}
