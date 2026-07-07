@@ -194,6 +194,34 @@ fn eval_scope_in_function() {
     ]);
 }
 
+// A parameter literally named `arguments`. When the function references
+// `arguments`, `fxFunctionNodeHoist` still injects the synthetic `arguments`
+// `Var` *after* the parameter, so `fxScopeGetDeclareNode(functionScope,
+// arguments)` (which `fxParamsBindingNodeCode` stores the object into) returns
+// the **parameter**, not the `Var`. In the mapped (sloppy, simple-parameter)
+// case the parameter is a closure slot, so the object is stored with
+// `VAR_CLOSURE`, not the `Var`'s `VAR_LOCAL` — Class α, the mis-emit that
+// surfaced on `statements/function/S13_A15_T1,T3`. A parameter merely *named*
+// `arguments` in a function that never reads it injects no `Var` and stores no
+// object (the empty-body cases).
+#[test]
+fn mapped_arguments_parameter_named_arguments() {
+    assert_identical(&[
+        // sloppy, arguments referenced → mapped: object stored into the
+        // parameter's closure slot (`VAR_CLOSURE`).
+        "function __func(arguments){ return arguments; }; __func(42);",
+        "(function(arguments){ return arguments; });",
+        "(function(arguments, b){ return arguments; });",
+        // sloppy, arguments referenced, parameter NOT named arguments →
+        // object stored into the synthetic `Var` (still `VAR_CLOSURE`, mapped).
+        "(function(a){ return arguments; });",
+        // empty body: `arguments` never referenced → no `Var`, no object.
+        "function foo(arguments){}",
+        // strict: not mapped (object is unmapped, parameters stay local).
+        "'use strict'; (function(a){ return arguments; });",
+    ]);
+}
+
 #[test]
 fn literals_and_operators() {
     assert_identical(&[

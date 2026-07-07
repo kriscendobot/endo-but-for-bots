@@ -3311,14 +3311,33 @@ impl Coder<'_> {
     /// the parameter count) and store it into that slot. Emitted between
     /// `fxScopeCodingParams` and the parameter binding loop.
     fn code_arguments_object(&mut self, scope: usize, func: &Node, is_strict: bool) {
-        // The synthetic `arguments` slot: the sole `Var` in a function
-        // scope (parameters are `Arg`; a named-expr name is `Define`).
+        // Emit the object only when the function references `arguments` —
+        // i.e. `fxFunctionNodeHoist` injected the synthetic `arguments` `Var`
+        // (XS's `mxArgumentsFlag`, the gate `fxParamsBindingNodeBind` uses to
+        // set `self->declaration`, and `fxParamsBindingNodeCode` guards the
+        // object on). A parameter merely *named* `arguments` in a function
+        // that never reads it injects no `Var`, so no object is stored.
+        let has_var = self.tree.scopes[scope].declares.iter().any(|d| {
+            d.token == Token::Var
+                && matches!(&d.symbol, Some(crate::scoper::Sym::Named(s)) if s == "arguments")
+        });
+        if !has_var {
+            return;
+        }
+        // The `arguments` slot the object stores into: XS's
+        // `fxParamsBindingNodeCode` writes to `self->declaration`, which
+        // `fxParamsBindingNodeBind` set to `fxScopeGetDeclareNode(functionScope,
+        // arguments)` — the **first** `arguments`-named declare in the scope.
+        // Normally that is the synthetic `arguments` `Var`; but a parameter
+        // literally named `arguments` is hoisted *before* the injected `Var`
+        // (`fxFunctionNodeHoist`), so it comes first and, in the mapped case,
+        // carries the closure slot the object aliases (`var_closure`, not the
+        // `Var`'s `var_local`). Match first-in-list, any token.
         let args = self.tree.scopes[scope]
             .declares
             .iter()
             .find(|d| {
-                d.token == Token::Var
-                    && matches!(&d.symbol, Some(crate::scoper::Sym::Named(s)) if s == "arguments")
+                matches!(&d.symbol, Some(crate::scoper::Sym::Named(s)) if s == "arguments")
             })
             .map(|d| (d.id, d.flags));
         let Some((id, flags)) = args else { return };
