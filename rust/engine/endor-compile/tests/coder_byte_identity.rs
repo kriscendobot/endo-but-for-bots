@@ -790,6 +790,32 @@ fn object_destructuring_rest_and_computed() {
     ]);
 }
 
+// `super` in object methods, and arrow capture of `this`/`super`/`target`
+// (child 6). A concise method's `super.x` reads through `GET_SUPER` on the
+// method's home object (already covered by the member coder's super path);
+// an arrow that transitively uses `this`/`super`/`target` captures them via
+// the arrow-default `RETRIEVE_TARGET`/`RETRIEVE_THIS` (and `STORE_ARROW` on
+// creation). Deferred: `super` in class bodies / derived-constructor
+// `super(...)` (those need the class surface).
+#[test]
+fn super_in_methods_and_arrows() {
+    assert_identical(&[
+        // super member read / call / store / delete / computed, in methods
+        "({m(){return super.x;}});", "({m(){super.f();}});",
+        "({m(){super.a=1;}});", "({m(){return super[k];}});",
+        "({get g(){return super.v;}});", "({m(){return super.a+super.b;}});",
+        "({m(){delete super.x;}});",
+        // super in async / generator methods, and multiple methods
+        "({async m(){return super.x;}});", "({*m(){return super.x;}});",
+        "({m(){return super.x;},n(){return super.y;}});",
+        // arrow capturing this / super / target (the arrow-default path)
+        "({m(){return()=>super.x;}});", "({m(){return()=>this;}});",
+        "({m(){return()=>this.x;}});", "({m(){return()=>super.f();}});",
+        "({m(a){return()=>a+super.x;}});", "({m(){return()=>()=>this;}});",
+        "(function(){return()=>this;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

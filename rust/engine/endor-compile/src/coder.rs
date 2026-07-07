@@ -2128,13 +2128,14 @@ impl Coder<'_> {
                 count += 1;
             }
         }
-        // Arrow functions that use `this`/`super`/`target` additionally
-        // retrieve those (RETRIEVE_TARGET/THIS); deferred with `super`.
-        assert!(
-            !self.tree.scopes[scope].arrow_default,
-            "arrow-default retrieval deferred (super slice)"
-        );
-        if count != 0 {
+        // An arrow that transitively uses `this`/`super`/`target` also
+        // retrieves the captured receiver and target — and always emits the
+        // `RETRIEVE_1`, even for a zero closure count.
+        if self.tree.scopes[scope].arrow_default {
+            self.add_index(0, XS_CODE_RETRIEVE_1, count);
+            self.add_byte(0, XS_CODE_RETRIEVE_TARGET);
+            self.add_byte(0, XS_CODE_RETRIEVE_THIS);
+        } else if count != 0 {
             self.add_index(0, XS_CODE_RETRIEVE_1, count);
         }
     }
@@ -2156,10 +2157,11 @@ impl Coder<'_> {
             let index = self.declare_index(ascope, aid);
             self.add_index(0, XS_CODE_STORE_1, index);
         }
-        assert!(
-            !self.tree.scopes[scope].arrow_default,
-            "arrow-default store (STORE_ARROW) deferred (super slice)"
-        );
+        // Store the captured receiver/target into a `this`/`super`/`target`
+        // arrow's environment.
+        if self.tree.scopes[scope].arrow_default {
+            self.add_byte(0, XS_CODE_STORE_ARROW);
+        }
     }
 
     /// `fxScopeCodingParams` — give each positional parameter (`Arg`) its
