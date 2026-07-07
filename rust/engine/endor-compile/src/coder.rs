@@ -2122,19 +2122,79 @@ impl Coder<'_> {
         self.unuse_temporaries(1);
     }
 
-    /// `fxArrayNodeCode`, the non-spread branch. Children `[List(items)]`
-    /// (expressions and `Elision` holes). The array lives in a temporary;
-    /// `length` is set to the item count, then each non-elided element is
-    /// `NEW_PROPERTY_AT`'d at its index. Spread elements are deferred.
+    /// `fxArrayNodeCode`. Children `[List(items)]` (expressions, `Elision`
+    /// holes, and `...Spread`). The array lives in a temporary. Without a
+    /// spread, `length` is set to the item count and each non-elided
+    /// element is `NEW_PROPERTY_AT`'d at its index. With a spread, a
+    /// running `counter` slot indexes appends and each `...expr` is
+    /// iterated with the `for-of` protocol (`FOR_OF` + a `next()`/`done`
+    /// loop) into the array.
     fn code_array(&mut self, node: &Node) {
-        assert!(
-            node.flags & crate::ast::flags::SPREAD == 0,
-            "array spread reached (later child)"
-        );
         let array = self.use_temporary();
         self.add_byte(1, XS_CODE_ARRAY);
         self.add_index(0, XS_CODE_SET_LOCAL_1, array);
-        if let Some(Item::List(items)) = node.children.first() {
+        let Some(Item::List(items)) = node.children.first() else {
+            self.unuse_temporaries(1);
+            return;
+        };
+        if node.flags & crate::ast::flags::SPREAD != 0 {
+            let counter = self.use_temporary();
+            self.add_integer(1, XS_CODE_INTEGER_1, 0);
+            self.add_index(-1, XS_CODE_PULL_LOCAL_1, counter);
+            for item in items {
+                let n = node_of(item);
+                if n.token == Token::Spread {
+                    let iterator = self.use_temporary();
+                    let result = self.use_temporary();
+                    let next_target = self.create_target();
+                    let done_target = self.create_target();
+                    self.code(&n.children[0]);
+                    self.add_byte(0, XS_CODE_FOR_OF);
+                    self.add_index(0, XS_CODE_SET_LOCAL_1, iterator);
+                    self.add_byte(-1, XS_CODE_POP);
+                    self.place_target(0, next_target);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+                    self.add_byte(1, XS_CODE_DUB);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, "next");
+                    self.add_byte(1, XS_CODE_CALL);
+                    self.add_integer(-2, XS_CODE_RUN_1, 0);
+                    self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+                    self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, array);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+                    self.add_byte(0, XS_CODE_AT);
+                    self.add_index(0, XS_CODE_GET_LOCAL_1, result);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+                    self.add_byte(-2, XS_CODE_SET_PROPERTY_AT);
+                    self.add_byte(-1, XS_CODE_POP);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+                    self.add_byte(0, XS_CODE_INCREMENT);
+                    self.add_index(-1, XS_CODE_PULL_LOCAL_1, counter);
+                    self.add_branch(0, XS_CODE_BRANCH_1, next_target);
+                    self.place_target(1, done_target);
+                    self.unuse_temporaries(2);
+                } else if n.token != Token::Elision {
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, array);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+                    self.add_byte(0, XS_CODE_AT);
+                    self.code(item);
+                    self.add_byte(-2, XS_CODE_SET_PROPERTY_AT);
+                    self.add_byte(-1, XS_CODE_POP);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+                    self.add_byte(0, XS_CODE_INCREMENT);
+                    self.add_index(-1, XS_CODE_PULL_LOCAL_1, counter);
+                } else {
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, array);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+                    self.add_byte(0, XS_CODE_INCREMENT);
+                    self.add_index(0, XS_CODE_SET_LOCAL_1, counter);
+                    self.add_symbol(-1, XS_CODE_SET_PROPERTY, "length");
+                    self.add_byte(-1, XS_CODE_POP);
+                }
+            }
+            self.unuse_temporaries(1);
+        } else {
             let count = items.len() as i32;
             self.add_index(1, XS_CODE_GET_LOCAL_1, array);
             self.add_integer(1, XS_CODE_INTEGER_1, count);
