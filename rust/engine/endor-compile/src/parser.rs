@@ -1307,9 +1307,18 @@ impl Parser {
             token1 = Token::PropertyAt;
         } else if self.cur.token == Token::String {
             let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
-            self.push_symbol(s.clone());
-            symbol = Some(s);
-            token1 = Token::Property;
+            // `fxStringToIndex`: a string key that is a canonical array
+            // index ("0", "1", … up to 2^32-2) codes through the
+            // integer-index (`PropertyAt`) path, exactly as XS does; a
+            // non-canonical string ("01", "1.0", "x") stays a symbol.
+            if let Some(index) = string_key_to_index(&s) {
+                self.push_property_index(index, line);
+                token1 = Token::PropertyAt;
+            } else {
+                self.push_symbol(s.clone());
+                symbol = Some(s);
+                token1 = Token::Property;
+            }
         } else if self.cur.token == Token::LeftBracket {
             self.get_next_token()?;
             self.comma_expression()?;
@@ -1345,9 +1354,14 @@ impl Parser {
                 self.get_next_token()?;
             } else if self.cur.token == Token::String {
                 let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
-                self.push_symbol(s.clone());
-                symbol = Some(s);
-                token1 = Token::Property;
+                if let Some(index) = string_key_to_index(&s) {
+                    self.push_property_index(index, line);
+                    token1 = Token::PropertyAt;
+                } else {
+                    self.push_symbol(s.clone());
+                    symbol = Some(s);
+                    token1 = Token::Property;
+                }
                 self.get_next_token()?;
             } else if self.cur.token == Token::LeftBracket {
                 self.get_next_token()?;
@@ -1390,6 +1404,17 @@ impl Parser {
             self.push_integer(value as i32, line);
         } else {
             self.push_number(value, line);
+        }
+    }
+
+    /// `fxPushIndexNode`: a `txIndex` that fits a signed integer (below
+    /// 2^31) becomes an `Integer` node; a larger index becomes a `Number`
+    /// node. Used for the string-key integer-index path (`fxStringToIndex`).
+    fn push_property_index(&mut self, index: u32, line: u32) {
+        if (index as i32) >= 0 {
+            self.push_integer(index as i32, line);
+        } else {
+            self.push_number(index as f64, line);
         }
     }
 
@@ -1659,6 +1684,33 @@ fn token_debug(token: Token) -> &'static str {
         This => "this",
         Comma => ",",
         _ => node_name(token),
+    }
+}
+
+/// `fxStringToIndex` (`xsCommon.c`): whether a property-key string is a
+/// canonical array-index representation, returning that index. XS parses
+/// the string to a number, casts to a `txIndex`, bounds it below
+/// 2^32-1, and confirms the number renders back to the *exact* original
+/// string (so "01", "1.0", "+1", " 1" are rejected — they do not
+/// round-trip). For the property-key surface that reduces to: a
+/// non-empty run of ASCII digits, no leading zero (except "0" itself),
+/// with value below 2^32-1. Matches `endor_vm::string_to_index`.
+fn string_key_to_index(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 10 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'0' && s.len() > 1 {
+        return None; // no leading zeros
+    }
+    if !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = s.parse().ok()?;
+    if n < 4_294_967_295 {
+        Some(n as u32)
+    } else {
+        None
     }
 }
 

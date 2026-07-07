@@ -529,6 +529,40 @@ mod tests {
     }
 
     #[test]
+    fn integer_index_object_keys_are_byte_identical() {
+        // Class δ (fix3): an integer-valued object-literal key codes through
+        // the integer-index property path (`INTEGER`/`AT`/`NEW_PROPERTY_AT`),
+        // exactly as XS's `fxPropertyName`/`fxStringToIndex` classifies it. A
+        // string key that is a canonical array index ("0", "1", "10") flips to
+        // that path too; a non-canonical string ("01", "1.5", the 2^32-1
+        // sentinel, a signed form) stays a string atom (`NEW_PROPERTY`). Each
+        // program is compile-only byte-identical against the C-XS oracle (the
+        // stage-limited endor-vm cannot yet *run* integer-index property
+        // access, so these live here, not in a dual-run corpus).
+        let programs = [
+            // The stage-5 divergence that motivated the fix: numeric `0`,
+            // canonical-string `"1"`, and a plain identifier key together.
+            r#"var o = {0 : 1, "1" : "x", o : {}};"#,
+            r#"var o = {0: 1, "1": 2, "10": 3, 10: 4};"#,
+            // Canonical string index at the top of the small-int range flips
+            // to the integer path, matching the identical numeric key.
+            r#"var o = {"2147483647": 1, 2147483647: 2};"#,
+            // Non-canonical strings stay string atoms (never the index path).
+            r#"var o = {"01": 1, "1.5": 2, "4294967295": 3, "-1": 4, "+1": 5};"#,
+            // A getter/setter/method with a canonical-index name also flips.
+            r#"var o = {get "1"() { return 7; }};"#,
+            r#"var o = {"2"() { return 8; }};"#,
+        ];
+        for src in programs {
+            assert_eq!(
+                compile_one(src),
+                CompileVerdict::Identical,
+                "integer-index object key must be byte-identical to the oracle: {src}",
+            );
+        }
+    }
+
+    #[test]
     fn module_corpora_byte_identity_no_divergence() {
         // The stage-5 **module** byte-identity gate: every curated module
         // program (`corpora-modules/*.js`, delimiter-split) must compile to

@@ -1563,11 +1563,14 @@ now compile (moving them from the reject column into the divergent column,
 where their coding is not yet byte-exact; see Class β below).
 
 **Residual divergences (all attributed — no unexplained byte divergence).**
-`divergent == 0` is **not yet MET everywhere**: `class` (113), `object` (1),
-`assignment` (2), `function` (2) still diverge. Every residual is attributed
-to a **named, narrow** coder mechanism below (disassembled and identified,
-opcode by opcode); **none is an unexplained byte divergence**, so there is no
-new kill-criterion evidence in this sweep. The classes:
+At identification (the first fix3 sweep) `divergent == 0` was **not yet MET
+everywhere**: `class` (113), `object` (1), `assignment` (2), `function` (2)
+diverged. fix3's γ + δ children have since closed `object`, `assignment`, and
+`function` entirely (live numbers in the status paragraph below); only `class`
+still diverges. Every residual is attributed to a **named, narrow** coder
+mechanism below (disassembled and identified, opcode by opcode); **none is an
+unexplained byte divergence**, so there is no new kill-criterion evidence in
+this sweep. The classes:
 
 1. **Class α — closure-vs-local scope classification (a MIS-EMIT).** endor
    codes a binding with `new_local` / `let_local` / `const_local` /
@@ -1634,20 +1637,46 @@ new kill-criterion evidence in this sweep. The classes:
    `caps` path — hand-roll the params publish + store-all with the exact
    class-frame `node->declaration` gate; deferred as a larger scoper+coder
    fold to avoid regressing the byte-clean class corpora.
-4. **Class δ — integer-index object-literal key coding (divergent).**
-   `expressions/object/S11.1.5_A3.js` (`{0 : 1, "1" : "x", o : {}}`): the
-   oracle codes an integer-valued key via the integer-index property path
-   (`integer` / `at` / `new_property_at`); endor codes it through the
-   string-atom path (`string` / `new_property`), one byte shorter. The lone
-   `object` divergence.
-5. **Class ε — class field-initializer scope/ordering (divergent).** The
-   static-field initializer's `this` / home-object handling and field-init
-   ordering are not byte-exact:
-   `class/elements/static-field-init-with-this.js` (oracle wraps the
-   initializer in a `with` scope; endor emits `this`/`new_property` directly)
-   and `class/elements/init-value-incremental.js` (same-length instruction
-   ordering diff). 2 of the `class` divergences (the third field-init file,
-   `intercalated-…`, is folded into Class α above).
+4. **Class δ — integer-index object-literal key coding — CLOSED (fix3).**
+   `expressions/object/S11.1.5_A3.js` (`{0 : 1, "1" : "x", o : {}}`). The
+   real divergence was the **string** key `"1"`, not the numeric `0` (endor
+   already coded `0` through the integer path). XS's `fxPropertyName` runs a
+   literal string key through `fxStringToIndex`: a canonical array-index
+   string ("0", "1", "10", up to 2^32-2) becomes a `PropertyAt` index node
+   (`integer` / `at` / `new_property_at`), exactly as a numeric key does; a
+   non-canonical string ("01", "1.5", the 2^32-1 sentinel, a signed form)
+   stays a string atom (`new_property`). endor's `property_name` skipped the
+   `fxStringToIndex` classification and always symbol-coded a string key. Now
+   ported (`string_key_to_index` + `push_property_index`, both String
+   branches — plain and the `get`/`set`/method form). `expressions/object`
+   divergent 1 → 0; the whole `object` subtree is byte-clean. (The earlier
+   note that `"1"` does *not* flip was wrong — disassembly against the pin
+   shows the oracle DOES flip it, consistent with `fxStringToIndex("1")`.)
+5. **Class ε — class field-initializer scope/ordering (divergent, deferred).**
+   The synthesized `instanceInit`/`constructorInit` field function's frame is
+   not byte-exact. Root cause: endor synthesizes the field function inline and
+   reserves only `k` (the captured computed-key/private-brand closures),
+   whereas XS binds a **real `instanceInit` function node** whose
+   `scopeCount == scopeMaximum` = the captured closures **plus the peak
+   temporary depth** of the field-value expressions (`fxFunctionNodeBind` →
+   `binder->scopeMaximum`). endor models that real scope only for the
+   **all-plain-data-field** class (the `class_field_init_inst` / `fi` path);
+   for a computed-key / private / static class it falls to the `k`-only
+   synthesized path, under-`RESERVE`s, and lands its body temporaries at the
+   wrong frame index.
+     - `class/elements/init-value-incremental.js` (`[x++] = x++; [x++] = x++`):
+       oracle `RESERVE 3` / `RETRIEVE 2` (2 `atAccess` closures + 1 peak
+       temporary) vs endor `RESERVE 2`; the `to_numeric` temporary then lands
+       at local 1 vs the oracle's 3 (5 operand bytes differ, same length).
+     - `class/elements/static-field-init-with-this.js` (`static h =
+       eval('this.g')`): the whole static section diverges — the static
+       initializer is additionally entangled with the direct-eval field
+       family (Class γ, deferred), where the oracle wraps the field function
+       body in a `with`/`SCOPE_EVAL` prelude endor omits.
+   Both close together with the deferred larger scoper+coder fold that gives
+   every instance/static field class a real field-init function scope (the
+   Class γ field-init work). 2 of the `class` divergences (the third
+   field-init file, `intercalated-…`, is folded into Class α above).
 
 **Residual `endor-rejected` — CLOSED.** The former loud fold (`coder panic:
 eval in a parameter default (parameter var-environment) deferred`, 8 `object`
@@ -1657,23 +1686,24 @@ ported it: a direct `eval` in a parameter default poisons the parameter scope
 `with` and `fxScopeCodedBody` unwinds those frames with the two `WITHOUT` —
 keyed on the FUNCTION node's eval flag, not the body's. `statements/function`
 endor-rejected 4 → 0 (subtree byte-clean), `expressions/object` endor-rejected
-8 → 0 (its lone remaining divergence is Class δ). The sweep now has **no
-`endor-rejected` at all**.
+8 → 0. With fix3's δ child the whole `object` subtree is now byte-clean
+(divergent 1 → 0). The sweep now has **no `endor-rejected` at all**.
 
 **Stage-5 byte-identity bar — status.** On the **curated + module corpora**
 (the gated in-crate bars) the bar is **MET**: `1711/1711` and `45/45`
 byte-identical, `divergent == 0`, full accept/reject agreement. On the
 **broadened real-test262 sweep**, `accept-disagree == 0` is **MET on every
-subtree** and `endor-rejected == 0` is now **MET** (the eval-in-parameter-default
-fold is closed); but `divergent == 0` is **NOT yet MET** — after fix3's γ child
-the residual divergences are `class` 62 (all the direct-eval field-initializer
-γ family) + `object` 1 (Class δ), with `assignment` and `function` now byte-clean
-(`assignment` 2 → 0, `function` rejects 4 → 0). **Every residual is attributed**
-to one of the named, narrow coder mechanisms above (Classes γ field-init, δ) —
-there is **no unexplained / unattributed byte divergence, hence no new
-kill-criterion evidence**. The remaining work is the class field-initializer
-direct-eval scope (Class γ) and integer-index keys (Class δ), not a feasibility
-wall.
+subtree** and `endor-rejected == 0` is **MET**; `expressions/object` is now
+byte-clean too (`divergent 1 → 0`, Class δ). `divergent == 0` is **NOT yet MET**
+only on `class`: after fix3's γ + δ children the residual divergences are
+`class` 62 (the direct-eval field-initializer γ family plus the 2 Class ε
+field-init-scope files), with `object`, `assignment`, and `function` all
+byte-clean (`object` 1 → 0, `assignment` 2 → 0, `function` rejects 4 → 0).
+**Every residual is attributed** to one of the named, narrow coder mechanisms
+above (Classes γ field-init, ε) — there is **no unexplained / unattributed
+byte divergence, hence no new kill-criterion evidence**. The remaining work is
+the class field-initializer direct-eval scope + real field-init function scope
+(Classes γ, ε), not a feasibility wall.
 
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →

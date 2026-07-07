@@ -251,6 +251,19 @@ fn object_literals() {
         ("({[d]: 3})", "(Expressions [(Object [(PropertyAt (Access #d) (Integer 3))])])"),
         ("({\"s\": 1})", "(Expressions [(Object [(Property #s (Integer 1))])])"),
         ("({0: 1})", "(Expressions [(Object [(PropertyAt (Integer 0) (Integer 1))])])"),
+        // `fxStringToIndex`: a string key that is a canonical array index
+        // codes through the integer (`PropertyAt`) path, exactly as `0`
+        // does; a non-canonical string stays a symbol (`Property`).
+        ("({\"1\": 1})", "(Expressions [(Object [(PropertyAt (Integer 1) (Integer 1))])])"),
+        ("({\"0\": 1})", "(Expressions [(Object [(PropertyAt (Integer 0) (Integer 1))])])"),
+        // Negative cases: a leading zero, a fractional string, and the
+        // 2^32-1 sentinel are NOT canonical indexes — they stay symbols.
+        ("({\"01\": 1})", "(Expressions [(Object [(Property #01 (Integer 1))])])"),
+        ("({\"1.5\": 1})", "(Expressions [(Object [(Property #1.5 (Integer 1))])])"),
+        (
+            "({\"4294967295\": 1})",
+            "(Expressions [(Object [(Property #4294967295 (Integer 1))])])",
+        ),
         ("({...e})", "(Expressions [(Object [(Spread (Access #e))])])"),
     ]);
 }
