@@ -2690,6 +2690,15 @@ impl Coder<'_> {
                 };
                 plans.push(plan);
             }
+            // `fxScopeCodingParams` (xsCode.c: fxFunctionNodeCode calls it
+            // right after `fxScopeCodeRetrieve`): a field-init function whose
+            // initializer contains a direct `eval` is reached by the scope's
+            // `mxEvalFlag` (set on `fi` during the hoist-time poison walk, now
+            // that sibling 1 creates the field-init scope at hoist), so it
+            // publishes its (empty) parameter set into a `with` environment —
+            // the strict-mode `undefined; with; pop` eval prelude. A field-init
+            // scope declares only closure aliases, so this is the sole effect.
+            self.scope_coding_params(fi);
         } else if k != 0 {
             self.add_index(0, XS_CODE_RESERVE_1, k);
             self.add_index(0, XS_CODE_RETRIEVE_1, k);

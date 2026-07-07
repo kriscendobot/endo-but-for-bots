@@ -1763,6 +1763,31 @@ fn class_field_init_function_scope() {
     ]);
 }
 
+// Class γ — a class-field initializer containing a direct `eval(...)`. XS's
+// field-init function (`instanceInit` / `constructorInit`) is reached by the
+// scope's `mxEvalFlag` (the hoist-time poison walk now reaches the field-init
+// scope sibling 1 creates at hoist), so `fxScopeCodingParams` opens the field
+// function body with the strict eval prelude (`undefined; with; pop`) and
+// `fxScopeCodeStore` captures the whole enclosing class frame (store-all). These
+// pin the plain, derived-with-super, static, and private-adjacent shapes.
+#[test]
+fn class_field_init_direct_eval() {
+    assert_identical(&[
+        // plain instance field
+        "class C { x = eval('1'); }",
+        // a field capturing an outer binding the eval can read
+        "class C { a; b = eval('a'); }",
+        // derived class: the eval sees `super`
+        "class A {} class C extends A { x = eval('super.x'); }",
+        // static field (constructorInit) eval reading `this`
+        "class C { static h = eval('this.g'); }",
+        // private-adjacent: a `this.#m` visible to the direct eval
+        "class C { #m = 44; v = eval('this.#m'); }",
+        // static private brand adjacent to a static eval field
+        "class C { static #s = 1; static q = eval('C'); }",
+    ]);
+}
+
 #[test]
 fn module_default_and_reexport() {
     assert_identical_module(&[

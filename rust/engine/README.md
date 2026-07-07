@@ -1794,6 +1794,32 @@ residual literal-numeric-key + captured-`arguments` scope classification — bot
 separate, narrow scoper folds (sibling / later work), each fully attributed;
 no unexplained byte divergence, hence no new kill-criterion evidence.
 
+**fix4 followup (the field-init direct-eval prelude) — Class γ CLOSED.** The
+class field-initializer **direct-eval** sub-shape is closed. With sibling 1's
+real field-init function scope created **at hoist**, the hoist-time poison walk
+(`fxScopeEval`) now reaches the `instanceInit` / `constructorInit` scope, so its
+own `mxEvalFlag` is set when an initializer contains a direct `eval(...)`. The
+coder's field-init function (`code_field_init_function`) was the last omission:
+it ran `fxScopeCodeRetrieve` but skipped `fxScopeCodingParams` (xsCode.c
+`fxFunctionNodeCode` calls both in order). Adding that call opens the field
+function body with the strict eval prelude (`undefined; with; pop`), and the
+store side already ran `fxScopeCodeStore`'s store-all under the same
+`mxEvalFlag`, so the whole enclosing class frame is captured for the eval. This
+closed the whole `class` direct-eval family — `elements/*direct-eval*`,
+`*-visible-to-direct-eval-on-initializer`, `derived-cls-direct-eval-*`,
+`direct-eval-err-contains-{arguments,newtarget}`,
+`privatename-not-valid-eval-earlyerr-3` and their `expressions/class` mirrors,
+plus `static-field-init-with-this`'s eval half. Result (re-measured on the pin):
+`statements/class` divergent **25 → 5**, `expressions/class` **19 → 4**; the
+curated corpora stay **1711/1711 divergent=0**, the module gate +
+`cargo test --workspace` (`--test-threads=1`) stay green, `#![forbid(unsafe_code)]`
+intact, and **no new `endor-rejected`**. New byte-identity fixtures
+(`coder_byte_identity.rs::class_field_init_direct_eval`) pin the plain,
+derived-with-`super`, static, and private-adjacent shapes. The remaining 5
+`statements/class` (4 `expressions/class`) are all **Class α** (the
+literal-numeric accessor-key + `arguments-callee` scope classification), a
+separate narrow scoper fold; no unexplained byte divergence.
+
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
 `SyntaxError: missing ;`); endor rejects it identically (`missing ;`) at
