@@ -347,36 +347,31 @@ mod tests {
     fn corpora_byte_identity_no_undocumented_divergence() {
         // The bounded, in-`cargo test` regression gate for the stage-5
         // byte-identity bar over the curated conformance corpora (every
-        // non-comment line). The **stage bar** is `divergent == 0` with
-        // full accept/reject agreement over the FULL corpus — which is
-        // NOT yet met, and is the supervisor's kill-criterion call (design
-        // § Feasibility Verdict). Two named folds remain, reported to the
-        // supervisor with evidence, not hidden:
+        // non-comment line). The byte-identity half of the **stage bar** is
+        // `divergent == 0` — now MET: the CESU-8 string-literal fold is
+        // CLOSED (stage-5 fix child). The coder carries string values as
+        // UTF-16 code units and emits XS's CESU-8 (an astral scalar as a
+        // 6-byte surrogate pair, a lone surrogate as a 3-byte unit, an
+        // embedded NUL as `0xC0 0x80`), so `stage3-string-utf16.js` is
+        // byte-identical and there is **no documented byte-divergence fold
+        // left**. One named fold remains — the accept/reject side, reported
+        // to the supervisor with evidence, not hidden:
         //
-        //   1. **CESU-8 astral/surrogate string literals.** XS stores
-        //      string literals in the bytecode as CESU-8 (a non-BMP char
-        //      is a surrogate pair, each surrogate a 3-byte sequence; a
-        //      lone surrogate is a 3-byte CESU-8 unit that is not valid
-        //      UTF-8 at all), whereas the coder currently emits the Rust
-        //      `String`'s UTF-8. Every byte divergence is one of these and
-        //      lives in `stage3-string-utf16.js`. Fixing it is a string-
-        //      value representation change across lexer/ast/coder — a
-        //      child-6-shape coder task, not this acceptance child.
-        //   2. **Named coder folds** — constructs the coder still folds on
-        //      with a *deliberate* panic (`unsupported node kind Target`
-        //      for `new.target`, `... Chain` for optional chaining, and
-        //      the `... reached (…child/slice)` declaring-scope /
-        //      function-class-declaration paths) — endor-rejects where the
-        //      oracle accepts. A panic that is NOT one of these deliberate
-        //      fold markers (e.g. an index-out-of-bounds) is a real bug and
-        //      fails this gate.
+        //   - **Named coder folds** — constructs the coder still folds on
+        //     with a *deliberate* panic (`unsupported node kind Target`
+        //     for `new.target`, `... Chain` for optional chaining, and
+        //     the `... reached (…child/slice)` declaring-scope /
+        //     function-class-declaration paths) — endor-rejects where the
+        //     oracle accepts. A panic that is NOT one of these deliberate
+        //     fold markers (e.g. an index-out-of-bounds) is a real bug and
+        //     fails this gate.
         //
-        // This gate asserts there is **no divergence or rejection outside
-        // those two documented folds** — so any NEW byte divergence (a
-        // regression in a currently-identical program) or any new coder
-        // panic on a new construct fails the build. The whole-`language/`
-        // sweep lives in the `compile-diff` binary (bounded per subtree to
-        // contain oracle RSS).
+        // This gate asserts **zero byte divergence** and **no rejection
+        // outside the named coder folds** — so any NEW byte divergence (a
+        // regression in a currently-identical program, including a CESU-8
+        // regression) or any new coder panic on a new construct fails the
+        // build. The whole-`language/` sweep lives in the `compile-diff`
+        // binary (bounded per subtree to contain oracle RSS).
         let programs = corpora_programs();
         assert!(!programs.is_empty(), "curated corpora must contain programs");
         let report = compile_diff_programs(&programs);
@@ -384,20 +379,15 @@ mod tests {
         print_report(&mut buf, &report, "corpora").unwrap();
         eprintln!("{}", String::from_utf8_lossy(&buf));
 
-        // Fold 1: every byte divergence is a CESU-8 astral/surrogate
-        // string literal, all of which live in `stage3-string-utf16.js`.
-        let undocumented_div: Vec<_> = report
-            .divergences
-            .iter()
-            .filter(|(id, _, _)| !id.starts_with("stage3-string-utf16.js"))
-            .collect();
-        assert!(
-            undocumented_div.is_empty(),
-            "undocumented byte divergence(s) outside the CESU-8 string fold: {:#?}",
-            undocumented_div
+        // Byte identity: zero divergence over the whole curated corpus —
+        // the CESU-8 string fold is closed, no fold remains on this axis.
+        assert_eq!(
+            report.divergent, 0,
+            "byte divergence(s) (the CESU-8 string fold must stay closed): {:#?}",
+            report.divergences
         );
 
-        // Fold 2: every endor-rejection is a *deliberate* coder fold —
+        // Every endor-rejection is a *deliberate* coder fold —
         // recognizable by its panic marker, not an accidental bug panic.
         let named = ["unsupported node kind", "reached (", "declaring scope"];
         let undocumented_rej: Vec<_> = report

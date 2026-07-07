@@ -55,10 +55,13 @@ pub struct Lexeme {
     /// A `\` escape occurred in this token (identifier or string) — XS's
     /// `state.escaped` low bit.
     pub escaped: bool,
-    /// The cooked string value, for `String`/`Template*`/regexp body.
-    pub string: Option<String>,
-    /// The raw (pre-cook) string value, for `String`/`Template*`.
-    pub raw: Option<String>,
+    /// The cooked string value, for `String`/`Template*`/regexp body,
+    /// carried as UTF-16 code units so lone surrogates from `\u` escapes
+    /// survive to the coder's CESU-8 emission (see [`ast::Value::Str`]).
+    pub string: Option<Vec<u16>>,
+    /// The raw (pre-cook) string value, for `String`/`Template*`, likewise
+    /// UTF-16 code units.
+    pub raw: Option<Vec<u16>>,
     /// Regexp flags (the `modifier`), for `Regexp`.
     pub modifier: Option<String>,
     /// The number value, for `Number` (and available for `Integer`).
@@ -971,14 +974,16 @@ impl Lexer {
                 }
             }
         }
-        st.raw = Some(raw.clone());
+        st.raw = Some(crate::ast::str_to_units(&raw));
         if st.escaped {
             let (cooked, legacy, error) = self.cook_string(&raw, c == b'`' as u32);
             st.legacy_octal = legacy;
             st.string_error = error;
             st.string = Some(cooked);
         } else {
-            st.string = Some(raw);
+            // The raw body is verbatim UTF-8 source (no lone surrogates),
+            // so its code units are the cooked value too.
+            st.string = Some(crate::ast::str_to_units(&raw));
         }
         Ok(())
     }
@@ -986,9 +991,9 @@ impl Lexer {
     /// Port of `fxGetNextString`'s cooking pass: resolve escapes in `raw`,
     /// returning `(cooked, legacy_octal, error)`. `template` gates the
     /// legacy-octal-in-template error XS raises.
-    fn cook_string(&self, raw: &str, template: bool) -> (String, bool, bool) {
+    fn cook_string(&self, raw: &str, template: bool) -> (Vec<u16>, bool, bool) {
         let chars: Vec<char> = raw.chars().collect();
-        let mut out = String::new();
+        let mut out: Vec<u16> = Vec::new();
         let mut legacy = false;
         let mut error = false;
         let mut i = 0usize;
@@ -1009,33 +1014,33 @@ impl Lexer {
                         }
                     }
                     'b' => {
-                        out.push('\u{8}');
+                        out.push(0x08);
                         i += 1;
                     }
                     'f' => {
-                        out.push('\u{c}');
+                        out.push(0x0C);
                         i += 1;
                     }
                     'n' => {
-                        out.push('\n');
+                        out.push(0x0A);
                         i += 1;
                     }
                     'r' => {
-                        out.push('\r');
+                        out.push(0x0D);
                         i += 1;
                     }
                     't' => {
-                        out.push('\t');
+                        out.push(0x09);
                         i += 1;
                     }
                     'v' => {
-                        out.push('\u{b}');
+                        out.push(0x0B);
                         i += 1;
                     }
                     'x' => {
                         i += 1;
                         if let Some(ch) = parse_hex_escape(&chars, &mut i) {
-                            push_scalar(&mut out, ch);
+                            push_unit(&mut out, ch);
                         } else {
                             error = true;
                         }
@@ -1043,7 +1048,7 @@ impl Lexer {
                     'u' => {
                         i += 1;
                         if let Some(ch) = parse_unicode_escape(&chars, &mut i) {
-                            push_scalar(&mut out, ch);
+                            push_unit(&mut out, ch);
                         } else {
                             error = true;
                         }
@@ -1054,7 +1059,7 @@ impl Lexer {
                         let next_is_digit =
                             i < chars.len() && ('0'..='9').contains(&chars[i]);
                         if first == 0 && !next_is_digit {
-                            out.push('\0');
+                            out.push(0);
                         } else {
                             legacy = true;
                             let mut value = first;
@@ -1068,21 +1073,21 @@ impl Lexer {
                                 value = value * 8 + (chars[i] as u32 - '0' as u32);
                                 i += 1;
                             }
-                            push_scalar(&mut out, value);
+                            push_unit(&mut out, value);
                         }
                     }
                     '8' | '9' => {
                         legacy = true;
-                        out.push(chars[i]);
+                        push_char_unit(&mut out, chars[i]);
                         i += 1;
                     }
                     other => {
-                        out.push(other);
+                        push_char_unit(&mut out, other);
                         i += 1;
                     }
                 }
             } else {
-                out.push(chars[i]);
+                push_char_unit(&mut out, chars[i]);
                 i += 1;
             }
         }
@@ -1175,7 +1180,7 @@ impl Lexer {
             c = self.ch;
             first = false;
         }
-        st.string = Some(body);
+        st.string = Some(crate::ast::str_to_units(&body));
         // Flags: XS advances past the closing '/', then reads id-continue.
         let mut flags = String::new();
         loop {
@@ -1324,6 +1329,28 @@ fn hex_of(c: char, value: &mut u32) -> bool {
 /// CESU-8) by substituting the replacement char in endor's UTF-8 world.
 fn push_scalar(out: &mut String, value: u32) {
     out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+}
+
+/// Push a cooked scalar (from a `\x`/`\u` escape) as UTF-16 code units — a
+/// BMP scalar or a *lone surrogate* (`\uD800`, which a JS string may carry
+/// unpaired) is one unit; an astral scalar (a combined `\uXXXX\uXXXX` pair
+/// or `\u{…}` above the BMP) is its surrogate pair. XS's cook stores the
+/// same units (it re-splits astral scalars in `fxCESU8Encode`).
+fn push_unit(out: &mut Vec<u16>, value: u32) {
+    if value < 0x1_0000 {
+        out.push(value as u16);
+    } else {
+        let v = value - 0x1_0000;
+        out.push((0xD800 + (v >> 10)) as u16);
+        out.push((0xDC00 + (v & 0x3FF)) as u16);
+    }
+}
+
+/// Push a verbatim source `char` (astral scalars are single `char`s in
+/// valid UTF-8 input) as its UTF-16 code units.
+fn push_char_unit(out: &mut Vec<u16>, c: char) {
+    let mut buf = [0u16; 2];
+    out.extend_from_slice(c.encode_utf16(&mut buf));
 }
 
 /// Port of `fxParseHexEscape`: exactly two hex digits from `chars[*i]`.

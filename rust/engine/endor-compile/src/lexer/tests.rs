@@ -6,6 +6,12 @@ use crate::lexer::Lexer;
 use crate::token::Token;
 use crate::{tokenize, LexErrorKind};
 
+/// A `&str` as UTF-16 code units — the lexer's cooked/raw string
+/// representation, so a fixture can spell an expected value as text.
+fn w(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
 /// The token kinds of `source`, dropping the trailing EOF.
 fn kinds(source: &str) -> Vec<Token> {
     let mut v: Vec<Token> = tokenize(source).expect("lex ok").into_iter().map(|l| l.token).collect();
@@ -172,20 +178,19 @@ fn separator_errors() {
 #[test]
 fn strings_and_escapes() {
     let toks = tokenize(r#" "a\n\t\x41B\u{1F600}" "#).unwrap();
-    let s = toks[0].string.as_deref().unwrap();
-    assert_eq!(s, "a\n\tAB\u{1F600}");
+    assert_eq!(toks[0].string.as_deref(), Some(w("a\n\tAB\u{1F600}").as_slice()));
     assert!(toks[0].escaped);
     // Raw keeps the escapes verbatim.
-    assert_eq!(toks[0].raw.as_deref().unwrap(), r"a\n\t\x41B\u{1F600}");
+    assert_eq!(toks[0].raw.as_deref(), Some(w(r"a\n\t\x41B\u{1F600}").as_slice()));
 }
 
 #[test]
 fn string_legacy_octal_escape() {
     // `\101` is 'A' with the legacy flag; `\0` alone is NUL, no flag.
     let toks = tokenize(r#" "\101" "\0" "#).unwrap();
-    assert_eq!(toks[0].string.as_deref(), Some("A"));
+    assert_eq!(toks[0].string.as_deref(), Some(w("A").as_slice()));
     assert!(toks[0].legacy_octal);
-    assert_eq!(toks[1].string.as_deref(), Some("\0"));
+    assert_eq!(toks[1].string.as_deref(), Some(w("\0").as_slice()));
     assert!(!toks[1].legacy_octal);
 }
 
@@ -193,7 +198,7 @@ fn string_legacy_octal_escape() {
 fn string_surrogate_pair_escape() {
     // Two \u escapes forming a surrogate pair combine into one astral char.
     let toks = tokenize(r#" "😀" "#).unwrap();
-    assert_eq!(toks[0].string.as_deref(), Some("\u{1F600}"));
+    assert_eq!(toks[0].string.as_deref(), Some(w("\u{1F600}").as_slice()));
 }
 
 #[test]
@@ -222,7 +227,7 @@ fn template_head_and_parts() {
     let mut lexer = Lexer::new("`a${x}b${y}c`");
     let head = lexer.next().unwrap();
     assert_eq!(head.token, Token::TemplateHead);
-    assert_eq!(head.string.as_deref(), Some("a"));
+    assert_eq!(head.string.as_deref(), Some(w("a").as_slice()));
     let x = lexer.next().unwrap();
     assert_eq!(x.token, Token::Identifier);
     // The parser, having consumed `x` and the `}`, re-enters for the middle.
@@ -230,21 +235,21 @@ fn template_head_and_parts() {
     assert_eq!(rbrace.token, Token::RightBrace);
     let middle = lexer.next_template_part().unwrap();
     assert_eq!(middle.token, Token::TemplateMiddle);
-    assert_eq!(middle.string.as_deref(), Some("b"));
+    assert_eq!(middle.string.as_deref(), Some(w("b").as_slice()));
     let y = lexer.next().unwrap();
     assert_eq!(y.token, Token::Identifier);
     let rbrace2 = lexer.next().unwrap();
     assert_eq!(rbrace2.token, Token::RightBrace);
     let tail = lexer.next_template_part().unwrap();
     assert_eq!(tail.token, Token::TemplateTail);
-    assert_eq!(tail.string.as_deref(), Some("c"));
+    assert_eq!(tail.string.as_deref(), Some(w("c").as_slice()));
 }
 
 #[test]
 fn plain_template_no_substitution() {
     let toks = tokenize("`hello`").unwrap();
     assert_eq!(toks[0].token, Token::Template);
-    assert_eq!(toks[0].string.as_deref(), Some("hello"));
+    assert_eq!(toks[0].string.as_deref(), Some(w("hello").as_slice()));
 }
 
 #[test]
@@ -252,7 +257,7 @@ fn template_multiline_raw_cooked() {
     // A `\r\n` in a template cooks to `\n` in both raw and cooked; a
     // line continuation `\<newline>` disappears from the cooked value.
     let toks = tokenize("`a\r\nb\\\nc`").unwrap();
-    assert_eq!(toks[0].string.as_deref(), Some("a\nbc"));
+    assert_eq!(toks[0].string.as_deref(), Some(w("a\nbc").as_slice()));
 }
 
 #[test]
@@ -264,7 +269,7 @@ fn regexp_vs_divide() {
     assert_eq!(slash.token, Token::Divide);
     let re = lexer.read_regexp(false).unwrap();
     assert_eq!(re.token, Token::Regexp);
-    assert_eq!(re.string.as_deref(), Some("ab[/]cd"));
+    assert_eq!(re.string.as_deref(), Some(w("ab[/]cd").as_slice()));
     assert_eq!(re.modifier.as_deref(), Some("gi"));
 }
 
@@ -275,7 +280,7 @@ fn regexp_after_divide_assign() {
     let t = lexer.next().unwrap();
     assert_eq!(t.token, Token::DivideAssign);
     let re = lexer.read_regexp(true).unwrap();
-    assert_eq!(re.string.as_deref(), Some("=x"));
+    assert_eq!(re.string.as_deref(), Some(w("=x").as_slice()));
     assert_eq!(re.modifier.as_deref(), Some("g"));
 }
 

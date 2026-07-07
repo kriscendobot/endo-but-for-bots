@@ -87,6 +87,35 @@ enum Payload {
     BigInt { bytes: Vec<u8>, measure: i32 },
 }
 
+/// Encode UTF-16 code `units` as XS's CESU-8 string-literal payload,
+/// byte-for-byte with `fxCESU8Encode` (`c/moddable/xs/sources/xsCommon.c`):
+/// each code unit is its own 1–3 byte sequence, so a surrogate half is a
+/// 3-byte unit (a lone surrogate survives; an astral scalar, stored as a
+/// surrogate pair, is 6 bytes) and — the modified-UTF-8 corner — an embedded
+/// NUL is the overlong `0xC0 0x80` rather than a raw `0x00`, so the coder's
+/// own trailing `0x00` terminator stays unambiguous. This is the exact
+/// inverse of the engine's `cesu8_to_units` decoder.
+fn units_to_cesu8(units: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(units.len());
+    for &u in units {
+        let c = u as u32;
+        if c == 0 {
+            out.push(0xC0);
+            out.push(0x80);
+        } else if c < 0x80 {
+            out.push(c as u8);
+        } else if c < 0x800 {
+            out.push(0xC0 | (c >> 6) as u8);
+            out.push(0x80 | (c & 0x3F) as u8);
+        } else {
+            out.push(0xE0 | (c >> 12) as u8);
+            out.push(0x80 | ((c >> 6) & 0x3F) as u8);
+            out.push(0x80 | (c & 0x3F) as u8);
+        }
+    }
+    out
+}
+
 // ============================= atom table ==============================
 
 /// XS's `parserTableModulo` at the oracle pin (the shim's creation record,
@@ -794,11 +823,11 @@ impl Coder<'_> {
                 self.add_number(1, XS_CODE_NUMBER, v);
             }
             String => {
-                let s = match &node.value {
-                    Value::Str(s) => s,
+                let units = match &node.value {
+                    Value::Str(units) => units,
                     _ => panic!("String node without string value"),
                 };
-                let mut bytes = s.clone().into_bytes();
+                let mut bytes = units_to_cesu8(units);
                 bytes.push(0);
                 self.add_string(1, XS_CODE_STRING_1, bytes);
             }

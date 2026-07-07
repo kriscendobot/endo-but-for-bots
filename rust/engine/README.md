@@ -1480,10 +1480,14 @@ harness abort.
 | metric | count |
 | --- | ---: |
 | total (oracle-classified) | 1711 |
-| **identical** (byte-for-byte) | **1631** |
-| divergent (both accept, bytes differ) | 60 |
+| **identical** (byte-for-byte) | **1691** |
+| divergent (both accept, bytes differ) | 0 |
 | endor-rejected (oracle accepts, endor folds) | 20 |
 | oracle-rejected / accept-disagreement | 0 / 0 |
+
+(The `identical`/`divergent` figures are as of the stage-5 **CESU-8 fix
+child**, which closed the 60-divergence string fold below; the child-7
+build that first measured this block read `identical=1631 divergent=60`.)
 
 Spot-checks over **real test262 `language/` subtrees** (the `compile-diff`
 binary, run per-subtree to bound oracle RSS) show **zero byte
@@ -1495,29 +1499,34 @@ divergence** on every accepted program:
 | `language/statements/if` | 69 | 29 | **0** | 0 | 40 |
 | `language/expressions/conditional` | 22 | 20 | **0** | 0 | 2 |
 
-**Stage bar status — NOT yet met; the supervisor owns the kill-criterion
-call** (design § Feasibility Verdict). The bar is `divergent == 0` *and*
-full accept/reject agreement over the *full* corpus. Two named folds
-remain, reported with evidence, never hidden:
+**Stage bar status.** The bar is `divergent == 0` *and* full accept/reject
+agreement over the *full* corpus. The **byte-identity half is now MET**
+(`divergent == 0`); only the accept/reject half remains (one named fold),
+and the supervisor owns the kill-criterion call (design § Feasibility
+Verdict).
 
-1. **CESU-8 astral/surrogate string literals** — *all 60* byte
-   divergences, every one in `stage3-string-utf16.js`. XS stores string
-   literals in the bytecode as **CESU-8** (a non-BMP char is a surrogate
-   pair, each surrogate a 3-byte unit → 6 bytes; a *lone* surrogate is a
-   3-byte CESU-8 unit that is not valid UTF-8 at all), whereas the coder
-   currently emits the Rust `String`'s **UTF-8** (astral char → 4 bytes;
-   lone surrogates unrepresentable). Fixing it is a **string-value
-   representation change across lexer → ast → coder** (the value must be
-   carried as UTF-16 code units / WTF-8, not a Rust `String`) — a
-   child-6-shape coder task, out of this acceptance child's scope.
+1. **CESU-8 astral/surrogate string literals — CLOSED (stage-5 fix
+   child).** These were *all 60* of the byte divergences, every one in
+   `stage3-string-utf16.js`. XS stores string literals in the bytecode as
+   **CESU-8** (a non-BMP char is a surrogate pair, each surrogate a 3-byte
+   unit → 6 bytes; a *lone* surrogate is a 3-byte CESU-8 unit that is not
+   valid UTF-8 at all; an embedded NUL is the overlong `0xC0 0x80`),
+   whereas the coder emitted the Rust `String`'s **UTF-8**. The fix carries
+   the string value as **UTF-16 code units end to end** (lexer → ast →
+   coder, mirroring the engine's stage-4 UTF-16 rework) and encodes CESU-8
+   at emit (`fxCESU8Encode`), so astral, lone-surrogate, and embedded-NUL
+   literals are now byte-identical. New byte-identity fixtures live in
+   `endor-compile/tests/coder_byte_identity.rs`
+   (`strings_cesu8_astral_and_surrogates`); the in-crate gate no longer
+   documents any byte-divergence fold.
 2. **Named coder folds** — the 20 `endor-rejected`, each a *deliberate*
    coder `panic!` on an unported construct: `new.target` (`unsupported
    node kind Target`, 14), optional chaining `?.` (`unsupported node kind
    Chain`, 3), and two declaring-scope / function-class-declaration paths
-   (`… reached (…child/slice)`, 3). The in-crate gate asserts there is
-   **no divergence or panic OUTSIDE these two documented folds** — any new
-   byte divergence (a regression in a currently-identical program) or any
-   accidental (non-fold) panic fails the build.
+   (`… reached (…child/slice)`, 3). The in-crate gate asserts **zero byte
+   divergence** and **no panic OUTSIDE these named folds** — any new byte
+   divergence (a regression in a currently-identical program, including a
+   CESU-8 regression) or any accidental (non-fold) panic fails the build.
 
 **Parse-metering determinism** (`endor-compile/tests/parse_meter_determinism.rs`,
 roadmap bar). A locked test: identical parse computrons across 64 repeats

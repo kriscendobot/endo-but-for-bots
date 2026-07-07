@@ -168,6 +168,31 @@ fn literals_and_operators() {
     ]);
 }
 
+// String literals are stored in the bytecode as XS's CESU-8, NOT the Rust
+// `String`'s UTF-8: an astral scalar is a 6-byte surrogate pair (each half
+// a 3-byte unit), a lone surrogate is a 3-byte unit that is not valid UTF-8
+// at all, and an embedded NUL is the overlong `0xC0 0x80`. The coder carries
+// string values as UTF-16 code units end to end and encodes CESU-8 at emit
+// (`fxCESU8Encode`), so these must be byte-identical to the oracle. Each
+// fixture is an expression statement whose value the oracle can execute.
+#[test]
+fn strings_cesu8_astral_and_surrogates() {
+    assert_identical(&[
+        // astral scalar, literal in (UTF-8) source: 𝒜 = U+1D49C = D835 DC9C
+        "\"𝒜\"", "\"a𝒜b\"", "\"𝒜𝒷𝒜𝒷\"",
+        // astral via \u{…} and via a combined surrogate-pair escape
+        "\"\\u{1D49C}\"", "\"\\uD835\\uDC9C\"", "\"a\\u{1D49C}b\"",
+        // lone surrogates (WTF-16 — a JS string need not be well-formed)
+        "\"\\uD834\"", "\"\\uDD1E\"", "\"A\\uD800B\"", "\"\\uD800\\uD801\"",
+        // a lone high surrogate NOT combined (no low surrogate follows)
+        "\"\\uD834x\"", "\"\\uD835\\u0041\"",
+        // BMP two-byte / three-byte CESU-8 boundaries
+        "\"\\u00A9\"", "\"\\u07FF\"", "\"\\u0800\"", "\"é\"", "\"€\"",
+        // embedded NUL → overlong 0xC0 0x80 (not a raw 0x00 terminator)
+        "\"a\\x00b\"", "\"\\0\"", "\"\\u0000z\"",
+    ]);
+}
+
 #[test]
 fn logical_conditional_sequence() {
     assert_identical(&[

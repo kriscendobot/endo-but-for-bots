@@ -234,7 +234,7 @@ impl Parser {
         self.push(Item::Node(Box::new(Node { token: Token::Number, line, flags: 0, children: Vec::new(), value: Value::Number(value) })));
     }
 
-    fn push_string(&mut self, value: String, line: u32, escaped: bool) {
+    fn push_string(&mut self, value: Vec<u16>, line: u32, escaped: bool) {
         // `fxPushStringNode` sets `flags = states[0].escaped`
         // (`mxStringEscapeFlag`, bit 0). Kept faithful; not surfaced in
         // the dump.
@@ -247,7 +247,7 @@ impl Parser {
         })));
     }
 
-    fn push_raw(&mut self, value: String, line: u32) {
+    fn push_raw(&mut self, value: Vec<u16>, line: u32) {
         self.push(Item::Node(Box::new(Node { token: Token::String, line, flags: 0, children: Vec::new(), value: Value::Str(value) })));
     }
 
@@ -917,7 +917,7 @@ impl Parser {
                 self.cur = rx;
                 let modifier = self.cur.modifier.clone().unwrap_or_default();
                 let body = self.cur.string.clone().unwrap_or_default();
-                self.push_string(modifier, line, false);
+                self.push_string(crate::ast::str_to_units(&modifier), line, false);
                 self.push_string(body, line, false);
                 self.push_node_struct(2, Token::Regexp, line)?;
                 self.get_next_token()?;
@@ -983,7 +983,7 @@ impl Parser {
 
     /// The cooked / raw strings of the current `Template`/`TemplateHead`
     /// lexeme.
-    fn cur_template_strings(&self) -> (String, String) {
+    fn cur_template_strings(&self) -> (Vec<u16>, Vec<u16>) {
         (self.cur.string.clone().unwrap_or_default(), self.cur.raw.clone().unwrap_or_default())
     }
 
@@ -1306,7 +1306,7 @@ impl Parser {
             self.push_property_index_number(self.cur.number, line);
             token1 = Token::PropertyAt;
         } else if self.cur.token == Token::String {
-            let s = self.cur.string.clone().unwrap_or_default();
+            let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
             self.push_symbol(s.clone());
             symbol = Some(s);
             token1 = Token::Property;
@@ -1344,7 +1344,7 @@ impl Parser {
                 token1 = Token::PropertyAt;
                 self.get_next_token()?;
             } else if self.cur.token == Token::String {
-                let s = self.cur.string.clone().unwrap_or_default();
+                let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
                 self.push_symbol(s.clone());
                 symbol = Some(s);
                 token1 = Token::Property;

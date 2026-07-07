@@ -109,9 +109,15 @@ pub enum Value {
     Integer(i32),
     /// `txNumberNode.value`.
     Number(f64),
-    /// `txStringNode.value` (cooked). Length is `value.chars().count()`
-    /// on the endor side (UTF-8, not CESU-8).
-    Str(String),
+    /// `txStringNode.value` (cooked), carried as UTF-16 code units — the
+    /// same representation the engine (`endor-vm`) settled on at stage 4.
+    /// A `String` cannot hold the lone surrogates a JS string literal may
+    /// contain (`"\uD800"`), and the coder must emit XS's CESU-8 (an astral
+    /// scalar is a 6-byte surrogate pair, a lone surrogate a 3-byte unit),
+    /// which is a per-code-unit encoding — so the value is code units end
+    /// to end, encoded to CESU-8 only at the coder ([`str_to_units`] /
+    /// [`units_to_cesu8`]).
+    Str(Vec<u16>),
     /// `txBigIntNode` — the scanned literal (digits + radix).
     BigInt(crate::lexer::BigIntLiteral),
 }
@@ -410,7 +416,23 @@ fn dump_number(v: f64) -> String {
     }
 }
 
-fn dump_string(s: &str) -> String {
+/// Encode a Rust `&str` as UTF-16 code units — the AST/coder string
+/// representation. Astral scalars become a surrogate pair, mirroring how
+/// XS's CESU-8 storage splits them.
+pub fn str_to_units(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// Render UTF-16 code units back to a Rust `String` for the text/symbol
+/// boundary (property keys, module specifiers, directives). Lone
+/// surrogates fold to U+FFFD (`from_utf16_lossy`); every well-formed key —
+/// which is all the corpus interns — round-trips exactly.
+pub fn units_to_string(u: &[u16]) -> String {
+    String::from_utf16_lossy(u)
+}
+
+fn dump_string(units: &[u16]) -> String {
+    let s = units_to_string(units);
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

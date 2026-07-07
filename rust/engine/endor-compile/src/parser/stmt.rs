@@ -184,7 +184,8 @@ impl Parser {
                 Some(Item::Node(expr)) if expr.token == Token::String => {
                     // `mxStringEscapeFlag` is bit 0 of the String node.
                     let escaped = expr.flags & 1 != 0;
-                    !escaped && matches!(&expr.value, Value::Str(s) if s == "use strict")
+                    !escaped
+                        && matches!(&expr.value, Value::Str(s) if crate::ast::units_to_string(s) == "use strict")
                 }
                 _ => return Ok(false),
             },
@@ -802,7 +803,7 @@ impl Parser {
                 self.push_property_index_number(self.cur.number, prop_line);
                 a_token = Token::PropertyBindingAt;
             } else if self.cur.token == Token::String {
-                let s = self.cur.string.clone().unwrap_or_default();
+                let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
                 self.push_symbol(s);
                 a_symbol = true;
             } else if self.cur.token == Token::LeftBracket {
