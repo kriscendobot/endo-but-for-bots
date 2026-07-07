@@ -2791,18 +2791,11 @@ impl Coder<'_> {
         let scope_count = *self.tree.scope_counts.get(&scope).unwrap_or(&0);
         let scope_eval = self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0;
 
-        // A direct `eval` inside a **parameter default** needs the parameter
-        // var-environment split (an `EVAL_ENVIRONMENT` after the parameters,
-        // per `fxParamsBindingNodeCode`), which this slice does not port. The
-        // function node is direct-`eval`-marked but its body scope is not
-        // (the eval lives in the parameters, not the body); a body-level
-        // direct `eval` marks both and codes correctly. Guard the parameter
-        // case as a loud fold rather than mis-emit.
-        if self.tree.scopes[scope].direct_eval
-            && !self.tree.scopes[self.scope_of(node_of(&node.children[2]))].direct_eval
-        {
-            panic!("eval in a parameter default (parameter var-environment) deferred");
-        }
+        // A direct `eval` inside a **parameter default** poisons the
+        // parameter scope (`fxScopeCodingParams` publishes the parameters into
+        // a `with` environment) but not the body scope; the enclosing `with`
+        // frames are unwound by `fxScopeCodedBody` (see [`Coder::code_body`],
+        // keyed on the function node's eval flag).
 
         // Save the coder's per-function state.
         let saved_env = self.environment_level;
@@ -3563,17 +3556,28 @@ impl Coder<'_> {
         // sets the *scope* flag but leaves the node clean). Keying on the
         // node flag keeps a `with`-only body on the ordinary block path,
         // where the parameter-scope `with` dance already suffices.
-        let is_eval = self.tree.scopes[scope].direct_eval;
+        let body_eval = self.tree.scopes[scope].direct_eval;
         let strict = self.tree.scopes[scope].flags & crate::ast::flags::STRICT != 0;
-        if is_eval && !strict {
+        // `fxScopeCodingBody` keys the body's own two-`with` publish on the
+        // BODY node's direct eval.
+        if body_eval && !strict {
             self.scope_coding_body_eval(scope);
-            self.code_define_nodes(&node.children[0]);
-            self.code(&node.children[0]);
-            self.scope_coded_body_eval(scope);
         } else {
             self.scope_coding_block(scope);
-            self.code_define_nodes(&node.children[0]);
-            self.code(&node.children[0]);
+        }
+        self.code_define_nodes(&node.children[0]);
+        self.code(&node.children[0]);
+        // `fxScopeCodedBody` keys the two-`WITHOUT` teardown on the enclosing
+        // FUNCTION node's eval flag, not the body's — so the `with` frames a
+        // direct `eval` in a **parameter default** pushed (`fxScopeCodingParams`'
+        // eval branch) unwind even though the body itself is not eval-scoped.
+        let function_eval = self.tree.scopes[scope]
+            .parent
+            .map(|p| self.tree.scopes[p].direct_eval)
+            .unwrap_or(false);
+        if function_eval && !strict {
+            self.scope_coded_body_eval(scope);
+        } else {
             self.scope_coded(scope);
         }
     }

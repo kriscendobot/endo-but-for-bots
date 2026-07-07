@@ -247,6 +247,28 @@ fn nested_function_eval_captures_enclosing_frame() {
     ]);
 }
 
+// A direct `eval` in a **parameter default** poisons the parameter scope
+// (not the body): `fxScopeCodingParams`' eval branch publishes the parameters
+// into a `with` environment, and `fxScopeCodedBody` — keyed on the FUNCTION
+// node's eval flag, not the body's — unwinds those `with` frames with the two
+// `WITHOUT` even though the body is coded as an ordinary block. Closes the
+// `scope-*-param-*-var-*` reject fold (`statements/function` 4 rejects,
+// `expressions/object` 8 rejects → 0).
+#[test]
+fn eval_in_parameter_default() {
+    assert_identical(&[
+        // sloppy: eval in the first default reads a name it creates; the two
+        // parameter `with` frames unwind at body end.
+        "function f(a = (eval(\"var b = 1;\"), b), c = 2) { return a + c; }; f();",
+        // the reject-family shape: two elem defaults, a function-valued probe.
+        "var probe1, probe2; function f(_ = (eval('var x = 1;'), probe1 = function() { return x; }), __ = probe2 = function() { return x; }) {}; f();",
+        // strict: no leading `null` `with`; still a parameter var-environment.
+        "'use strict'; function f(a = (eval(\"a\"), 1)) { return a; }; f();",
+        // a rest parameter after an eval default.
+        "function f(a = (eval('1'), 2), ...rest) { return a; }; f();",
+    ]);
+}
+
 #[test]
 fn literals_and_operators() {
     assert_identical(&[
