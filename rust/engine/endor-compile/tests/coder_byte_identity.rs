@@ -941,3 +941,17 @@ fn yield_star_delegate() {
         "function*g(){yield* h();}",
     ]);
 }
+
+#[test]
+fn direct_eval() {
+    assert_identical(&[
+        "eval(x);", "eval(1);", "eval(1,2);", "eval();",
+        "eval(a,b,c);", "eval(x+1);",
+        // eval spread + eval as sub-expression
+        "eval(...a);", "eval(1,...a);", "y=eval(x);",
+        // NOT direct eval: member call / shadowed-by-property
+        "a.eval(x);", "o.eval(1,2);",
+        // eval-poisoned scope with declarations (program/block level) still matches
+        "let y=1;eval(y);", "{let z=1;eval(z);}", "var v=1;eval(v);",
+    ]);
+}

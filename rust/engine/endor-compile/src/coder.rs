@@ -842,7 +842,7 @@ impl Coder<'_> {
             MemberAt => self.code_member_at(node),
             Call => self.code_call(node),
             New => self.code_new(node),
-            Params => self.code_params(node),
+            Params => self.code_params(node, false),
             Assign => self.code_assign_node(node),
             AddAssign | SubtractAssign | MultiplyAssign | DivideAssign | ModuloAssign
             | ExponentiationAssign | BitAndAssign | BitOrAssign | BitXorAssign
@@ -2635,9 +2635,21 @@ impl Coder<'_> {
     /// `fxCallNodeCode`. Children `[reference, params]`: set up the callee
     /// and its `this`, `CALL`, then the argument list + `RUN`.
     fn code_call(&mut self, node: &Node) {
+        // A syntactic `eval(...)` call (the callee is the identifier
+        // `eval` — XS keys on the name, not resolution) closes with the
+        // `EVAL` intrinsic instead of `RUN`; the scoper has already
+        // poisoned the surrounding scopes.
+        let is_eval = Self::is_direct_eval(&node.children[0]);
         self.code_this(&node.children[0], 0);
         self.add_byte(1, XS_CODE_CALL);
-        self.code(&node.children[1]);
+        self.code_params(node_of(&node.children[1]), is_eval);
+    }
+
+    /// Whether a call's reference is the `eval` identifier
+    /// (`fxCallNodeHoist`'s syntactic test).
+    fn is_direct_eval(item: &Item) -> bool {
+        matches!(item, Item::Node(n) if n.token == Token::Access
+            && matches!(n.children.first(), Some(Item::Symbol(s)) if s == "eval"))
     }
 
     /// `fxObjectNodeCode`, the data-property surface. Children
@@ -2928,14 +2940,15 @@ impl Coder<'_> {
     fn code_new(&mut self, node: &Node) {
         self.code(&node.children[0]);
         self.add_byte(2, XS_CODE_NEW);
-        self.code(&node.children[1]);
+        // `new` is never a direct-`eval` call.
+        self.code_params(node_of(&node.children[1]), false);
     }
 
     /// `fxParamsNodeCode`, the non-spread / non-eval branch. Children
     /// `[List(items)]`; each arg is pushed then a single `RUN_1 count`
     /// pops callee+this+args and leaves the result. Spread arguments and
     /// direct-`eval` parameter passing (the `EVAL` opcode) are deferred.
-    fn code_params(&mut self, node: &Node) {
+    fn code_params(&mut self, node: &Node, is_eval: bool) {
         let items: &[Item] = match node.children.first() {
             Some(Item::List(v)) => v,
             _ => &[],
@@ -2943,9 +2956,8 @@ impl Coder<'_> {
         if node.flags & crate::ast::flags::SPREAD != 0 {
             // A `...spread` argument makes the count dynamic: a `counter`
             // slot accumulates the argument count (bumped per fixed arg and
-            // per spread element), and the call closes with a plain `RUN`
-            // (no static count operand). Direct-`eval` spread (`EVAL`) is
-            // deferred.
+            // per spread element). The call closes with `GET_LOCAL counter`
+            // then `RUN` (or `EVAL` for a direct `eval(...)`).
             let counter = self.use_temporary();
             self.add_integer(1, XS_CODE_INTEGER_1, 0);
             self.add_index(0, XS_CODE_SET_LOCAL_1, counter);
@@ -2966,7 +2978,7 @@ impl Coder<'_> {
                 }
             }
             self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
-            self.add_byte(-3 - c, XS_CODE_RUN);
+            self.add_byte(-3 - c, if is_eval { XS_CODE_EVAL } else { XS_CODE_RUN });
             self.unuse_temporaries(1);
         } else {
             let mut c: i32 = 0;
@@ -2974,7 +2986,13 @@ impl Coder<'_> {
                 self.code(item);
                 c += 1;
             }
-            self.add_integer(-2 - c, XS_CODE_RUN_1, c);
+            if is_eval {
+                // The arg count is pushed, then `EVAL` consumes it.
+                self.add_integer(1, XS_CODE_INTEGER_1, c);
+                self.add_byte(-3 - c, XS_CODE_EVAL);
+            } else {
+                self.add_integer(-2 - c, XS_CODE_RUN_1, c);
+            }
         }
     }
 
