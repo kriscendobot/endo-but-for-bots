@@ -306,6 +306,13 @@ pub struct ScopeTree {
     /// get/set accessor pair shares one brand slot (the `symbolAccess`
     /// use-closure dedups by symbol). Keyed with [`node_key`].
     pub class_member_fi: HashMap<usize, MemberAccess>,
+    /// A class node address → its synthesized **static** field-init function
+    /// scope (XS's `constructorInit` function node scope), when the class has
+    /// static fields / `static { … }` blocks. Analogous to
+    /// [`ScopeTree::class_field_init_inst`]; the coder reads it to drive the
+    /// static field function's `RESERVE`/`RETRIEVE`/`STORE`. Keyed with
+    /// [`node_key`].
+    pub class_field_init_static: HashMap<usize, usize>,
 }
 
 /// The class-scope closure declares XS synthesizes for one computed-key /
@@ -372,6 +379,7 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
         class_member_access: s.class_member_access,
         class_field_init_inst: s.class_field_init_inst,
         class_member_fi: s.class_member_fi,
+        class_field_init_static: s.class_field_init_static,
     })
 }
 
@@ -443,6 +451,13 @@ struct Scoper {
     /// function, not the class scope). The bind pass re-enters this scope to
     /// bind the values and create the member-access use-closure aliases.
     class_field_init_hoist: HashMap<usize, usize>,
+    /// A class node address → the **static** field-init function scope (XS's
+    /// `constructorInit`) created at hoist time, holding the static field
+    /// values and `static { … }` block bodies.
+    class_field_init_static_hoist: HashMap<usize, usize>,
+    /// A class node address → its bind-time static field-init function scope
+    /// (see [`ScopeTree::class_field_init_static`]).
+    class_field_init_static: HashMap<usize, usize>,
 }
 
 fn node_ptr(n: &Node) -> usize {
@@ -527,6 +542,34 @@ fn class_has_instance_field(class: &Node) -> bool {
         _ => false,
     })
 }
+/// Whether the class has ≥1 member XS moves into the `constructorInit` field
+/// function (`constructorInitCount`): a **static** data field, a **static**
+/// private method/accessor, or a `static { … }` block. A public static method
+/// does not count.
+fn class_has_constructor_init_member(class: &Node) -> bool {
+    use crate::ast::flags as f;
+    let members = match class.children.get(2) {
+        Some(Item::List(v)) => v,
+        _ => return false,
+    };
+    members.iter().any(|item| match item {
+        Item::Node(m) => {
+            if m.token == Token::Body {
+                return true; // static block
+            }
+            let is_accessor = m.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+            let is_static = m.flags & f::STATIC != 0;
+            if !is_static {
+                false
+            } else if !is_accessor {
+                true // static data field
+            } else {
+                m.token == Token::PrivateProperty // static private method
+            }
+        }
+        _ => false,
+    })
+}
 /// A class member that is a **plain instance data field**: a non-static,
 /// non-method/getter/setter `Property` (literal key). These are the members
 /// whose initializers XS moves into the `instanceInit` function.
@@ -580,6 +623,43 @@ impl Scoper {
         let id = self.scopes.len();
         self.scopes.push(sc);
         id
+    }
+
+    /// Create a field-init function scope (XS's `instanceInit` /
+    /// `constructorInit`) at hoist time, parented to the current (class body)
+    /// scope, and hoist each member's value (or, for a `static { … }` block,
+    /// its body) inside it so their inner scopes chain through the field
+    /// function. `is_static` members carry a `Body` static block whose body is
+    /// child 0; a data field's value is child 1. Returns the scope index.
+    fn hoist_field_init_scope(
+        &mut self,
+        members: &[&Node],
+        is_static: bool,
+    ) -> Result<usize, ParseError> {
+        let parent = self.scope;
+        let mut sc = Scope::new(parent, Token::Function, 0, SCOPE_STRICT);
+        sc.flags |= SCOPE_STRICT;
+        let fi = self.scopes.len();
+        self.scopes.push(sc);
+        self.scope = Some(fi);
+        let fs = self.function_scope;
+        let bs = self.body_scope;
+        self.function_scope = Some(fi);
+        self.body_scope = None;
+        for m in members {
+            if is_static && m.token == Token::Body {
+                // A static block: hoist its statements (child 0) directly.
+                if let Some(body) = m.children.first() {
+                    self.hoist_item(body)?;
+                }
+            } else if let Some(v) = m.children.get(1) {
+                self.hoist_item(v)?;
+            }
+        }
+        self.function_scope = fs;
+        self.body_scope = bs;
+        self.fx_scope_hoisted(fi);
+        Ok(fi)
     }
 
     /// Look a class-member closure (identified by its class-scope declare id
@@ -987,15 +1067,16 @@ impl Scoper {
         }
         // Hoist each member's class-definition-time part under the class body
         // scope. XS moves every instance field's VALUE into the `instanceInit`
-        // function (`fxClassExpression`), so under the class scope we hoist
-        // only the member stubs — a computed key, a private method's function
-        // — and defer each instance data field's value to the field function
-        // scope below. Static field values and public methods hoist here (the
-        // static/member-closure path is unchanged). Collect the instance data
-        // fields whose value moves into the field function (source order = XS's
-        // `instanceInit` second pass; private methods contribute no value).
+        // function and every static field's value / `static { … }` block into
+        // the `constructorInit` function (`fxClassExpression`), so under the
+        // class scope we hoist only the member stubs — a computed key, a
+        // private method's function — and defer each field's value (and each
+        // static block's body) to the matching field-init function scope. The
+        // field values are collected in source order (XS's second-pass order;
+        // private methods contribute no value).
         let engage = class_has_instance_field(node);
         let mut inst_data_values: Vec<&Node> = Vec::new();
+        let mut static_ci_values: Vec<&Node> = Vec::new();
         if let Some(Item::List(items)) = node.children.get(2) {
             for item in items {
                 let Item::Node(m) = item else {
@@ -1006,56 +1087,59 @@ impl Scoper {
                     m.flags & (flags::METHOD | flags::GETTER | flags::SETTER) != 0;
                 let is_static = m.flags & flags::STATIC != 0;
                 let is_public_method = is_accessor && m.token != Token::PrivateProperty;
-                if engage && !is_static && !is_public_method && m.token != Token::Body {
-                    match m.token {
-                        Token::PropertyAt => {
-                            // Computed data field: hoist the key (child 0) under
-                            // the class scope; the value moves to the field fn.
-                            if let Some(key) = m.children.first() {
-                                self.hoist_item(key)?;
-                            }
-                            inst_data_values.push(m);
-                        }
-                        Token::PrivateProperty if is_accessor => {
-                            // Private method: hoist its function under the class
-                            // scope (no value moves to the field function).
-                            if let Some(v) = m.children.get(1) {
-                                self.hoist_item(v)?;
-                            }
-                        }
-                        Token::PrivateProperty | Token::Property => {
-                            // Private/plain data field: value moves to field fn.
-                            inst_data_values.push(m);
-                        }
-                        _ => self.hoist_item(item)?,
-                    }
+                if is_public_method {
+                    self.hoist_item(item)?;
                     continue;
                 }
-                self.hoist_item(item)?;
-            }
-        }
-        // The instance field function scope (XS's `instanceInit`, hoisted after
-        // the items). Created here so the field values' inner scopes chain
-        // through it; the bind pass re-enters it.
-        if engage {
-            let parent = self.scope;
-            let mut sc = Scope::new(parent, Token::Function, 0, SCOPE_STRICT);
-            sc.flags |= SCOPE_STRICT;
-            let fi = self.scopes.len();
-            self.scopes.push(sc);
-            self.scope = Some(fi);
-            let fs = self.function_scope;
-            let bs = self.body_scope;
-            self.function_scope = Some(fi);
-            self.body_scope = None;
-            for m in &inst_data_values {
-                if let Some(v) = m.children.get(1) {
-                    self.hoist_item(v)?;
+                // A `static { … }` block's body runs inside the constructorInit
+                // function scope.
+                if m.token == Token::Body {
+                    static_ci_values.push(m);
+                    continue;
+                }
+                match m.token {
+                    Token::PropertyAt => {
+                        // Computed data field: hoist the key (child 0) under the
+                        // class scope; the value moves to the field function.
+                        if let Some(key) = m.children.first() {
+                            self.hoist_item(key)?;
+                        }
+                        if is_static {
+                            static_ci_values.push(m);
+                        } else {
+                            inst_data_values.push(m);
+                        }
+                    }
+                    Token::PrivateProperty if is_accessor => {
+                        // Private method: hoist its function under the class
+                        // scope (no value moves to the field function).
+                        if let Some(v) = m.children.get(1) {
+                            self.hoist_item(v)?;
+                        }
+                    }
+                    Token::PrivateProperty | Token::Property => {
+                        // Private/plain data field: value moves to field fn.
+                        if is_static {
+                            static_ci_values.push(m);
+                        } else {
+                            inst_data_values.push(m);
+                        }
+                    }
+                    _ => self.hoist_item(item)?,
                 }
             }
-            self.function_scope = fs;
-            self.body_scope = bs;
-            self.fx_scope_hoisted(fi);
+        }
+        // The instance field function scope (XS's `instanceInit`) and the
+        // static field function scope (XS's `constructorInit`), hoisted after
+        // the items. Created here so the field values' / static blocks' inner
+        // scopes chain through them; the bind pass re-enters them. XS hoists
+        // `constructorInit` before `instanceInit`.
+        if class_has_constructor_init_member(node) {
+            let ci = self.hoist_field_init_scope(&static_ci_values, true)?;
+            self.class_field_init_static_hoist.insert(node_ptr(node), ci);
+        }
+        if engage {
+            let fi = self.hoist_field_init_scope(&inst_data_values, false)?;
             self.class_field_init_hoist.insert(node_ptr(node), fi);
         }
         self.class_node = former;
@@ -1770,11 +1854,17 @@ impl Scoper {
         // part (a computed key, a private method function) stays bound at the
         // class scope, while its VALUE binds inside the field function.
         let engage = class_has_instance_field(node);
-        // Instance field members, split for the field function's two-pass
-        // order (`fxClassExpression`: private methods/accessors first, then
-        // data fields, both in source order). References into the AST.
+        // Field members split for each field function's two-pass order
+        // (`fxClassExpression`: private methods/accessors first, then data
+        // fields + `static { … }` blocks, both in source order), instance vs
+        // static. A member's class-definition-time part (a computed key, a
+        // private method function) binds at the class scope now; its value (or
+        // a static block's body) defers to the field function pass. References
+        // into the AST.
         let mut inst_methods: Vec<&Node> = Vec::new();
         let mut inst_data: Vec<&Node> = Vec::new();
+        let mut static_methods: Vec<&Node> = Vec::new();
+        let mut static_data: Vec<&Node> = Vec::new();
         if let Some(Item::List(items)) = node.children.get(2) {
             for item in items {
                 let Item::Node(m) = item else {
@@ -1785,47 +1875,45 @@ impl Scoper {
                     m.flags & (flags::METHOD | flags::GETTER | flags::SETTER) != 0;
                 let is_static = m.flags & flags::STATIC != 0;
                 let is_public_method = is_accessor && m.token != Token::PrivateProperty;
-                // An instance field member (contributes to `instanceInit`):
-                // classify it and bind only its class-scope part now, deferring
-                // its value to the field-function pass below.
-                if engage && !is_static && !is_public_method && m.token != Token::Body {
-                    match m.token {
-                        Token::PropertyAt => {
-                            // Computed data field: bind the KEY (child 0) at
-                            // class scope (evaluated once at class definition);
-                            // its value binds in the field function.
-                            if let Some(key) = m.children.first() {
-                                self.bind_item(key)?;
-                            }
-                            inst_data.push(m);
-                        }
-                        Token::PrivateProperty if is_accessor => {
-                            // Private method/accessor: its function value binds
-                            // at class scope; the field function only aliases
-                            // the value/brand closures (no value bind).
-                            if let Some(v) = m.children.get(1) {
-                                self.bind_item(v)?;
-                            }
-                            inst_methods.push(m);
-                        }
-                        Token::PrivateProperty => {
-                            // Private data field: value binds in the field
-                            // function; the brand is class-hoisted.
-                            inst_data.push(m);
-                        }
-                        Token::Property => {
-                            // Plain data field: value binds in the field
-                            // function; nothing at class scope.
-                            inst_data.push(m);
-                        }
-                        _ => self.bind_item(item)?,
-                    }
+                if is_public_method {
+                    self.bind_item(item)?;
                     continue;
                 }
-                // Static members, public methods, and static blocks bind fully
-                // at the class scope (their static field function is the
-                // separate member-closure path, deferred).
-                self.bind_item(item)?;
+                // A `static { … }` block: its body binds inside constructorInit.
+                if m.token == Token::Body {
+                    static_data.push(m);
+                    continue;
+                }
+                let (methods, data) = if is_static {
+                    (&mut static_methods, &mut static_data)
+                } else {
+                    (&mut inst_methods, &mut inst_data)
+                };
+                match m.token {
+                    Token::PropertyAt => {
+                        // Computed data field: bind the KEY (child 0) at class
+                        // scope; its value binds in the field function.
+                        if let Some(key) = m.children.first() {
+                            self.bind_item(key)?;
+                        }
+                        data.push(m);
+                    }
+                    Token::PrivateProperty if is_accessor => {
+                        // Private method/accessor: its function value binds at
+                        // class scope; the field function only aliases the
+                        // value/brand closures (no value bind).
+                        if let Some(v) = m.children.get(1) {
+                            self.bind_item(v)?;
+                        }
+                        methods.push(m);
+                    }
+                    Token::PrivateProperty | Token::Property => {
+                        // Private/plain data field: value binds in the field
+                        // function; the brand is class-hoisted.
+                        data.push(m);
+                    }
+                    _ => self.bind_item(item)?,
+                }
             }
         }
         if let Some(constructor_init) = child(node, 3) {
@@ -1834,62 +1922,27 @@ impl Scoper {
         if let Some(instance_init) = child(node, 4) {
             self.bind_item(instance_init)?;
         }
-        // The field function scope (XS's `instanceInit`): per field, look its
-        // member accesses (`atAccess` / `valueAccess` / `symbolAccess`) up from
-        // inside the function scope — creating use-closure aliases in field
-        // order (`fxFieldNodeBind`) — then bind the value (whose own outer
-        // captures interleave). `scopeCount == scopeMaximum` = the captured
-        // closures plus the peak temporary depth of the field values.
+        // Bind the static field function (XS's `constructorInit`) first, then
+        // the instance field function (`instanceInit`) — XS's `fxClassNodeBind`
+        // order.
+        if !static_methods.is_empty() || !static_data.is_empty() {
+            let ci = *self
+                .class_field_init_static_hoist
+                .get(&node_ptr(node))
+                .expect("static field function scope hoisted");
+            let ordered: Vec<&Node> =
+                static_methods.iter().chain(static_data.iter()).copied().collect();
+            self.bind_field_init_scope(ci, si, &ordered)?;
+            self.class_field_init_static.insert(node_ptr(node), ci);
+        }
         if engage {
             let fi = *self
                 .class_field_init_hoist
                 .get(&node_ptr(node))
                 .expect("instance field function scope hoisted");
-            let saved_level = self.scope_level;
-            let saved_maximum = self.scope_maximum;
-            self.scope_level = 0;
-            self.scope_maximum = 0;
-            self.fx_scope_binding(fi);
             let ordered: Vec<&Node> =
                 inst_methods.iter().chain(inst_data.iter()).copied().collect();
-            for m in ordered {
-                let access = self.class_member_access.get(&node_ptr(m)).copied().unwrap_or_default();
-                let is_accessor =
-                    m.flags & (flags::METHOD | flags::GETTER | flags::SETTER) != 0;
-                let mut fi_slot = MemberAccess::default();
-                match m.token {
-                    Token::PropertyAt => {
-                        if let Some(cid) = access.at {
-                            fi_slot.at = self.field_init_alias(fi, si, cid);
-                        }
-                    }
-                    Token::PrivateProperty => {
-                        if is_accessor {
-                            if let Some(cid) = access.value {
-                                fi_slot.value = self.field_init_alias(fi, si, cid);
-                            }
-                        }
-                        if let Some(cid) = access.symbol {
-                            fi_slot.symbol = self.field_init_alias(fi, si, cid);
-                        }
-                    }
-                    _ => {}
-                }
-                self.class_member_fi.insert(node_ptr(m), fi_slot);
-                // A private method has no value in the field function (its
-                // function bound at the class scope); every other field's
-                // value binds here.
-                let private_method = m.token == Token::PrivateProperty && is_accessor;
-                if !private_method {
-                    if let Some(v) = m.children.get(1) {
-                        self.bind_item(v)?;
-                    }
-                }
-            }
-            self.fx_scope_bound(fi);
-            self.scope_counts.insert(fi, self.scope_maximum);
-            self.scope_maximum = saved_maximum;
-            self.scope_level = saved_level;
+            self.bind_field_init_scope(fi, si, &ordered)?;
             self.class_field_init_inst.insert(node_ptr(node), fi);
         }
         self.class_node = former;
@@ -1898,6 +1951,73 @@ impl Scoper {
             self.fx_scope_bound(ss);
         }
         self.pop_variables(2);
+        Ok(())
+    }
+
+    /// Bind a field-init function scope (XS's `instanceInit` /
+    /// `constructorInit`): enter the (hoist-created) scope `fi`, and per field
+    /// in two-pass order look its member accesses (`atAccess` / `valueAccess` /
+    /// `symbolAccess`) up from inside it — creating use-closure aliases in
+    /// field order (`fxFieldNodeBind`) — then bind the value (whose own outer
+    /// captures interleave), or, for a `static { … }` block, its body.
+    /// `scopeCount == scopeMaximum` = the captured closures plus the peak
+    /// temporary depth of the field values. Records each member's fi aliases.
+    fn bind_field_init_scope(
+        &mut self,
+        fi: usize,
+        class_scope: usize,
+        ordered: &[&Node],
+    ) -> Result<(), ParseError> {
+        let saved_level = self.scope_level;
+        let saved_maximum = self.scope_maximum;
+        self.scope_level = 0;
+        self.scope_maximum = 0;
+        self.fx_scope_binding(fi);
+        for m in ordered {
+            // A `static { … }` block runs its body (child 0) directly inside
+            // the field function — no member access, no value install.
+            if m.token == Token::Body {
+                if let Some(body) = m.children.first() {
+                    self.bind_item(body)?;
+                }
+                continue;
+            }
+            let access = self.class_member_access.get(&node_ptr(m)).copied().unwrap_or_default();
+            let is_accessor =
+                m.flags & (flags::METHOD | flags::GETTER | flags::SETTER) != 0;
+            let mut fi_slot = MemberAccess::default();
+            match m.token {
+                Token::PropertyAt => {
+                    if let Some(cid) = access.at {
+                        fi_slot.at = self.field_init_alias(fi, class_scope, cid);
+                    }
+                }
+                Token::PrivateProperty => {
+                    if is_accessor {
+                        if let Some(cid) = access.value {
+                            fi_slot.value = self.field_init_alias(fi, class_scope, cid);
+                        }
+                    }
+                    if let Some(cid) = access.symbol {
+                        fi_slot.symbol = self.field_init_alias(fi, class_scope, cid);
+                    }
+                }
+                _ => {}
+            }
+            self.class_member_fi.insert(node_ptr(m), fi_slot);
+            // A private method has no value in the field function (its function
+            // bound at the class scope); every other field's value binds here.
+            let private_method = m.token == Token::PrivateProperty && is_accessor;
+            if !private_method {
+                if let Some(v) = m.children.get(1) {
+                    self.bind_item(v)?;
+                }
+            }
+        }
+        self.fx_scope_bound(fi);
+        self.scope_counts.insert(fi, self.scope_maximum);
+        self.scope_maximum = saved_maximum;
+        self.scope_level = saved_level;
         Ok(())
     }
 

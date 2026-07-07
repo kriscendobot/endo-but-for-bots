@@ -2522,8 +2522,9 @@ impl Coder<'_> {
         // Static fields run through a synthesized `constructorInit` field
         // function invoked with the constructor as `this`/home.
         if !static_fields.is_empty() {
+            let ci = self.tree.class_field_init_static.get(&node_key(node)).copied();
             self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
-            self.code_field_init_function(&static_fields, class_scope, None);
+            self.code_field_init_function(&static_fields, class_scope, ci);
             self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
             self.add_byte(-1, XS_CODE_SET_HOME);
             self.add_byte(1, XS_CODE_CALL);
