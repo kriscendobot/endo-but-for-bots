@@ -1471,15 +1471,18 @@ impl Coder<'_> {
             "function flavor {flags:#x} deferred (async/generator/method/accessor/class)"
         );
         let scope = self.scope_of(node);
-        // Deferred: named function expressions (the scope binds the name to
-        // `CURRENT`) and parameters both add function-scope declares; a
-        // function body that declares `var`/`let`/`const` has a distinct
-        // frame/return-target interaction. Guard both as named gaps.
-        assert_eq!(
-            self.declare_count(scope),
-            0,
-            "named function expression / parameters deferred (later slice)"
-        );
+        // The function scope may declare positional parameters (`Arg`), but
+        // deferred features add other declares: a named function expression
+        // adds a `Define` (the `CURRENT` name binding), an `arguments`
+        // reference adds a `Var`, and a captured parameter carries the
+        // closure flag. Guard each as a named gap.
+        for d in &self.tree.scopes[scope].declares {
+            assert!(
+                d.token == Token::Arg && d.flags & crate::scoper::dflags::CLOSURE == 0,
+                "function-scope declare {:?} deferred (named-expr / arguments / closures)",
+                d.token
+            );
+        }
         if let Item::Node(body) = &node.children[2] {
             let body_scope = self.scope_of(body);
             assert_eq!(
@@ -1602,28 +1605,43 @@ impl Coder<'_> {
         }
     }
 
-    /// `fxScopeCodingParams` — bind parameters into frame slots. This slice
-    /// only reaches the empty-parameter / no-eval case (nothing emitted);
-    /// declaring parameters assert.
+    /// `fxScopeCodingParams` — give each positional parameter (`Arg`) its
+    /// frame slot with a `NEW_LOCAL`. Captured parameters (`NEW_CLOSURE`),
+    /// `arguments` (`Var`), and eval-scope params are deferred and were
+    /// guarded in `code_function`; this reaches only the plain `Arg` case.
     fn scope_coding_params(&mut self, scope: usize) {
-        for d in &self.tree.scopes[scope].declares {
-            assert!(
-                !matches!(d.token, Token::Arg | Token::Var | Token::Const),
-                "parameter binding deferred (params slice)"
-            );
-        }
         assert!(
             self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL == 0,
             "eval-scope params deferred"
         );
+        for (id, token, sym, _) in self.declares_of(scope) {
+            assert_eq!(token, Token::Arg, "non-Arg parameter declare deferred (params slice)");
+            let index = self.set_declare_index(scope, id);
+            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+        }
     }
 
-    /// `fxParamsBindingNodeCode` — the empty-parameter case (no
-    /// `arguments` object, no items) emits nothing. Non-empty parameter
-    /// lists and the `arguments` object are the params slice.
+    /// `fxParamsBindingNodeCode` — bind each positional parameter: pull
+    /// `ARGUMENT i` and store it into the parameter's slot. Defaults
+    /// (a `Binding` item), destructuring (`ArrayBinding`/`ObjectBinding`),
+    /// rest (`RestBinding`), and the `arguments` object are deferred.
     fn code_params_binding(&mut self, node: &Node) {
-        if let Some(Item::List(items)) = node.children.first() {
-            assert!(items.is_empty(), "non-empty parameter list deferred (params slice)");
+        let Some(Item::List(items)) = node.children.first() else { return };
+        for (index, item) in items.iter().enumerate() {
+            let Item::Node(arg) = item else {
+                panic!("coder: unexpected parameter slot {item:?}");
+            };
+            assert_eq!(arg.token, Token::Arg, "parameter pattern/default/rest deferred (params slice)");
+            // A bare `Arg` is `[symbol]` or `[symbol, ()]` (a null default);
+            // a real default makes the second slot a node.
+            assert!(
+                arg.children.get(1).map(|c| matches!(c, Item::Null)).unwrap_or(true),
+                "default parameter deferred (params slice)"
+            );
+            self.code_reference(item, 0);
+            self.add_index(1, XS_CODE_ARGUMENT, index as i32);
+            self.code_assign(item, 0);
+            self.add_byte(-1, XS_CODE_POP);
         }
     }
 
@@ -2072,7 +2090,7 @@ impl Coder<'_> {
             Item::Node(n) => match n.token {
                 // fxDeclareNodeCodeReference: a declaration target (a
                 // `var`/`let`/`const` binding) — nothing when resolved.
-                Token::Var | Token::Let | Token::Const | Token::Using => {
+                Token::Var | Token::Let | Token::Const | Token::Using | Token::Arg => {
                     self.code_declare_reference(n);
                 }
                 Token::Access => {
@@ -2113,7 +2131,7 @@ impl Coder<'_> {
             Item::Node(n) => match n.token {
                 // fxDeclareNodeCodeAssign: a declaration target stores with
                 // its binding op (`VAR_LOCAL`/`LET_LOCAL`/`CONST_LOCAL`).
-                Token::Var | Token::Let | Token::Const | Token::Using => {
+                Token::Var | Token::Let | Token::Const | Token::Using | Token::Arg => {
                     self.code_declare_assign(n);
                 }
                 Token::Access => {

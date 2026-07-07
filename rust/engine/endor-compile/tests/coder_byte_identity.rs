@@ -454,6 +454,28 @@ fn function_expressions_and_declarations() {
     ]);
 }
 
+// Function parameters (child 6, params slice). Positional parameters
+// (`Arg`) each get a frame slot (`NEW_LOCAL` in `fxScopeCodingParams`)
+// then bind from the incoming argument (`ARGUMENT i` / `VAR_LOCAL` / `POP`
+// in `fxParamsBindingNodeCode`); `BEGIN` carries the parameter count.
+// Deferred (asserted): defaults, destructuring, rest, the `arguments`
+// object, and captured (closure) parameters.
+#[test]
+fn function_parameters() {
+    assert_identical(&[
+        // single and multiple positional parameters, used and unused
+        "(function(a){});", "(function(a){return a;});", "(function(a){a;});",
+        "(function(a,b){return a;});", "(function(a,b){b;a;});",
+        "(function(a,b,c){return a+b+c;});", "(function(first,second){return second;});",
+        // parameters feeding expressions
+        "(function(a){return a+1;});", "(function(x){return x*x;});",
+        // arrow parameters
+        "(a=>a);", "(a=>a+1);", "((a,b)=>a);", "(a=>{return a;});",
+        // called (argument binding exercised end to end)
+        "(function(x){return x;})(5);",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
