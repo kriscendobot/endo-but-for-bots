@@ -1291,6 +1291,13 @@ byte-identical vs the oracle:
   it is relayed to `code_function` as a staged hint), and the `NEW_PROPERTY`
   attribute carries the `NAME | METHOD` (+ `GETTER`/`SETTER`) bits.
   Identifier and computed keys covered; `super` in a method body deferred.
+- Slice 28 — **declaring `for-in`/`for-of` heads**: `for (let/const x of …)`
+  binds a fresh per-iteration lexical in the loop's block scope — the scope
+  header allocates the slot, a per-iteration `fxScopeCodeReset`
+  (`RESET_LOCAL`/`RESET_CLOSURE`) refreshes it, the binding assigns via
+  `LET_LOCAL`/`CONST_LOCAL`, and the scope unwinds it. `let`/`const`,
+  `for-in`, nesting, and use inside functions covered; `for (var …)`,
+  `for await`, and `using` heads stay deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
@@ -1299,6 +1306,6 @@ mapped/closure parameters); home-object/`super` (and arrow capture of
 **direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
-declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
+`for (var … of/in …)` / `for await` / `using` heads; and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
