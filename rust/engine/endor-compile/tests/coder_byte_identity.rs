@@ -993,3 +993,12 @@ fn named_classes() {
         "(class C{m(){return C;}});", "(class C{static s(){return C;}});",
     ]);
 }
+
+#[test]
+fn class_computed_method_keys() {
+    assert_identical(&[
+        "(class{[k](){}});", "(class{static [k](){}});", "(class{[k+1](){}});",
+        "(class{[k](){}m(){}});", "(class{get [k](){}});", "(class{*[k](){}});",
+        "(class C{[k](){}});",
+    ]);
+}

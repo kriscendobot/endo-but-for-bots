@@ -2016,19 +2016,32 @@ impl Coder<'_> {
                 let is_method =
                     p.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
                 assert!(is_method, "class field / private member deferred");
-                assert_eq!(p.token, Token::Property, "computed-key class member deferred");
                 let is_static = p.flags & f::STATIC != 0;
+                // The member target: the constructor (static) or the
+                // prototype (instance).
                 if is_static {
                     self.add_byte(1, XS_CODE_DUB);
                 } else {
                     self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
                 }
-                let key = Self::symbol_of(&p.children[0]).to_string();
-                self.pending_accessor = p.flags & (f::GETTER | f::SETTER) != 0;
-                self.code(&p.children[1]);
-                self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
-                // Class members are non-enumerable (`XS_DONT_ENUM_FLAG`).
                 let flag = XS_DONT_ENUM_FLAG | Self::property_flag(p);
+                self.pending_accessor = p.flags & (f::GETTER | f::SETTER) != 0;
+                match p.token {
+                    Token::Property => {
+                        let key = Self::symbol_of(&p.children[0]).to_string();
+                        self.code(&p.children[1]);
+                        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
+                    }
+                    Token::PropertyAt => {
+                        // A computed key `[e]`: evaluate the key, `AT`, then
+                        // the method value.
+                        self.code(&p.children[0]);
+                        self.add_byte(0, XS_CODE_AT);
+                        self.code(&p.children[1]);
+                        self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+                    }
+                    other => panic!("coder: unsupported class member {:?}", other),
+                }
                 self.add_integer(0, XS_CODE_INTEGER_1, flag);
             }
         }
