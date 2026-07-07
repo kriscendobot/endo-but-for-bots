@@ -662,3 +662,12 @@ fn object_property_name_inference() {
         "({a:1,b:2});",
     ]);
 }
+
+#[test]
+fn object_shorthand() {
+    assert_identical(&[
+        "({x});", "({x,y});", "({a,b,c});",
+        "let x=1;({x});", "let a=1,b=2;({a,b});",
+        "({x,y:2});", "({a:1,b});",
+    ]);
+}

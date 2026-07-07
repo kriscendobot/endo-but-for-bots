@@ -2071,18 +2071,21 @@ impl Coder<'_> {
                 let p = node_of(item);
                 assert!(
                     p.flags
-                        & (crate::ast::flags::SHORTHAND
-                            | crate::ast::flags::METHOD
+                        & (crate::ast::flags::METHOD
                             | crate::ast::flags::GETTER
                             | crate::ast::flags::SETTER
                             | crate::ast::flags::SPREAD)
                         == 0,
-                    "object method/shorthand/spread reached (later child)"
+                    "object method/accessor/spread reached (later child)"
                 );
                 match p.token {
                     Token::Property => {
                         let key = Self::symbol_of(&p.children[0]).to_string();
-                        assert!(key != "__proto__", "__proto__ property reached (later child)");
+                        // A shorthand `{x}` is a normal `x: x` property; only
+                        // a written `__proto__:` sets the prototype (deferred).
+                        if p.flags & crate::ast::flags::SHORTHAND == 0 {
+                            assert!(key != "__proto__", "__proto__ property reached (later child)");
+                        }
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
                         self.code(&p.children[1]);
                         self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
