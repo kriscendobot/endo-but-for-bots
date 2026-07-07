@@ -860,6 +860,7 @@ impl Coder<'_> {
             Return => self.code_return(node),
             ParamsBinding => self.code_params_binding(node),
             Yield => self.code_yield(node),
+            Await => self.code_await(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1546,6 +1547,23 @@ impl Coder<'_> {
         self.place_target(0, target);
     }
 
+    /// `fxAwaitNodeCode`. Child `[expression]`. Evaluate the awaited value,
+    /// `AWAIT`, and (until the async job resumes — `BRANCH_STATUS`
+    /// fall-through) thread the rejection/completion out to the return
+    /// target.
+    fn code_await(&mut self, node: &Node) {
+        let target = self.create_target();
+        self.code(&node.children[0]);
+        self.add_byte(0, XS_CODE_AWAIT);
+        self.add_branch(1, XS_CODE_BRANCH_STATUS_1, target);
+        self.add_byte(-1, XS_CODE_SET_RESULT);
+        let rt = self.return_target.expect("await outside a function");
+        self.adjust_environment(rt);
+        self.adjust_scope(rt);
+        self.add_branch(0, XS_CODE_BRANCH_1, rt);
+        self.place_target(0, target);
+    }
+
     /// The symbol name in an `Item::Symbol` child slot.
     fn symbol_of(item: &Item) -> &str {
         match item {
@@ -1809,9 +1827,13 @@ impl Coder<'_> {
         use crate::ast::flags as f;
         let flags = node.flags;
         assert_eq!(
-            flags & (f::ASYNC | f::FIELD | f::BASE | f::DERIVED),
+            flags & (f::FIELD | f::BASE | f::DERIVED),
             0,
-            "function flavor {flags:#x} deferred (async/class)"
+            "function flavor {flags:#x} deferred (class)"
+        );
+        assert!(
+            !(flags & f::ASYNC != 0 && flags & f::GENERATOR != 0),
+            "async generator deferred (async slice)"
         );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
@@ -1870,10 +1892,12 @@ impl Coder<'_> {
         let is_accessor = std::mem::take(&mut self.pending_accessor);
         let plain_function =
             is_accessor || flags & (f::ARROW | f::METHOD | f::GETTER | f::SETTER) != 0;
-        // A generator (`GENERATOR_FUNCTION`) takes precedence over the
-        // plain/constructor split (matching XS's flag order); an async
-        // generator is deferred by the `ASYNC` guard above.
-        let create_op = if flags & f::GENERATOR != 0 {
+        // Create-op precedence matches XS's flag order: async first
+        // (async generators are deferred above), then generator, then the
+        // plain/constructor split.
+        let create_op = if flags & f::ASYNC != 0 {
+            XS_CODE_ASYNC_FUNCTION
+        } else if flags & f::GENERATOR != 0 {
             XS_CODE_GENERATOR_FUNCTION
         } else if plain_function {
             XS_CODE_FUNCTION
@@ -1893,6 +1917,11 @@ impl Coder<'_> {
         }
         self.scope_code_retrieve(scope);
         self.scope_coding_params(scope);
+        // An async (non-generator) function suspends into its async job at
+        // entry (`START_ASYNC`), before the parameter bindings.
+        if flags & f::ASYNC != 0 && flags & f::GENERATOR == 0 {
+            self.add_byte(0, XS_CODE_START_ASYNC);
+        }
         self.code_arguments_object(scope, node, is_strict);
         self.code(&node.children[1]); // ParamsBinding
         self.code_function_name(scope);

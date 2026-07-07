@@ -871,3 +871,14 @@ fn generator_functions() {
         "function*g(){yield 1;}",
     ]);
 }
+
+#[test]
+fn async_functions() {
+    assert_identical(&[
+        "(async function(){});", "(async function(){await 1;});",
+        "(async function(){return await 1;});", "(async function(a){await a;});",
+        "(async ()=>await 1);", "(async ()=>{await 1;await 2;});",
+        "async function f(){await 1;}",
+        "(async function(){let x=await 1;return x;});",
+    ]);
+}
