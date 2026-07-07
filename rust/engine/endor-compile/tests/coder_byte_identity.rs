@@ -989,5 +989,7 @@ fn named_classes() {
         "(class C{m(){}n(){}});", "(class C{static s(){}});",
         "(class C{get x(){}set x(v){}});", "(class C{constructor(){}});",
         "let K=class C{};", "(class C{*g(){}async a(){}});",
+        // class body references its own name (USE_CLOSURE)
+        "(class C{m(){return C;}});", "(class C{static s(){return C;}});",
     ]);
 }

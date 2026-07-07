@@ -1389,8 +1389,7 @@ byte-identical vs the oracle:
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 `extends` / derived constructors +
 `super(...)`, class **fields** and **private** members, static blocks,
-computed method keys, anonymous-class name inference, and a class body that
-references its own name (the `USE_CLOSURE` retrieve path) — these need more
+computed method keys, and anonymous-class name inference — these need more
 class-hoisting scoper work; `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
