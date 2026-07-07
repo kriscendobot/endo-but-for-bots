@@ -1130,7 +1130,7 @@ completes green — **149 passed, 0 failed** — in **~5 s** wall-clock on a war
 build (the endor-fuzz binary's own run, including the 2000-seed decoder sweep,
 is 1.3 s). `#![forbid(unsafe_code)]` intact across the workspace.
 
-## Stage 5: the compiler port (`endor-compile` coder, child 5/7)
+## Stage 5: the compiler port (`endor-compile` coder, children 5–7)
 
 Stage 5 replaces the differential-oracle compiler with a pure-Rust one in
 XS's own shape (lexer → parser → scoper → **coder**), held to a
@@ -1454,3 +1454,104 @@ byte-identical vs the oracle:
 `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
+
+### Stage-5 acceptance evidence (child 7/7): the byte-identity bar
+
+Child 7 is the acceptance child — it does not port new node kinds; it
+**measures** the byte-identity bar over the whole corpus, arms the parser
+fuzzing, locks parse-meter determinism, and gives the runner a
+compiler-selection seam.
+
+**The full-corpus byte-identity differential harness**
+(`endor-262/src/compile_diff.rs`, driven by the `compile-diff` binary and
+gated in-crate by `corpora_byte_identity_no_undocumented_divergence`). For
+every corpus source where the C-XS oracle compiler *accepts* the file, it
+asserts `endor_compile::compile(src)` equals `endor_oracle::run(src).bytecode`
+**byte for byte**, reporting `total / identical / divergent /
+oracle-rejected / endor-rejected` with **named** divergence classes and
+per-file identification. It is total over the coder's folds (`catch_unwind`
+with the panic hook silenced) — a fold is a named `endor-rejected`, an
+oracle machine-startup failure a named `oracle-unavailable`, never a
+harness abort.
+
+**Measured (this build).** Over the curated conformance corpora
+(`endor-262/corpora`, every non-comment line):
+
+| metric | count |
+| --- | ---: |
+| total (oracle-classified) | 1711 |
+| **identical** (byte-for-byte) | **1631** |
+| divergent (both accept, bytes differ) | 60 |
+| endor-rejected (oracle accepts, endor folds) | 20 |
+| oracle-rejected / accept-disagreement | 0 / 0 |
+
+Spot-checks over **real test262 `language/` subtrees** (the `compile-diff`
+binary, run per-subtree to bound oracle RSS) show **zero byte
+divergence** on every accepted program:
+
+| subtree | total | identical | divergent | endor-rejected | oracle-rejected |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `language/expressions/addition` | 48 | 44 | **0** | 4 | 0 |
+| `language/statements/if` | 69 | 29 | **0** | 0 | 40 |
+| `language/expressions/conditional` | 22 | 20 | **0** | 0 | 2 |
+
+**Stage bar status — NOT yet met; the supervisor owns the kill-criterion
+call** (design § Feasibility Verdict). The bar is `divergent == 0` *and*
+full accept/reject agreement over the *full* corpus. Two named folds
+remain, reported with evidence, never hidden:
+
+1. **CESU-8 astral/surrogate string literals** — *all 60* byte
+   divergences, every one in `stage3-string-utf16.js`. XS stores string
+   literals in the bytecode as **CESU-8** (a non-BMP char is a surrogate
+   pair, each surrogate a 3-byte unit → 6 bytes; a *lone* surrogate is a
+   3-byte CESU-8 unit that is not valid UTF-8 at all), whereas the coder
+   currently emits the Rust `String`'s **UTF-8** (astral char → 4 bytes;
+   lone surrogates unrepresentable). Fixing it is a **string-value
+   representation change across lexer → ast → coder** (the value must be
+   carried as UTF-16 code units / WTF-8, not a Rust `String`) — a
+   child-6-shape coder task, out of this acceptance child's scope.
+2. **Named coder folds** — the 20 `endor-rejected`, each a *deliberate*
+   coder `panic!` on an unported construct: `new.target` (`unsupported
+   node kind Target`, 14), optional chaining `?.` (`unsupported node kind
+   Chain`, 3), and two declaring-scope / function-class-declaration paths
+   (`… reached (…child/slice)`, 3). The in-crate gate asserts there is
+   **no divergence or panic OUTSIDE these two documented folds** — any new
+   byte divergence (a regression in a currently-identical program) or any
+   accidental (non-fold) panic fails the build.
+
+**Parse-metering determinism** (`endor-compile/tests/parse_meter_determinism.rs`,
+roadmap bar). A locked test: identical parse computrons across 64 repeats
+of the same source on the same build, over a spread of the ported grammar,
+pinned against the frozen meter release `endor-meter-0`. Per the
+accuracy-over-parity doctrine the meter is endor's own table — the oracle
+certifies bytes; compile-computron-vs-oracle stays advisory telemetry.
+`endor_compile::parse_computrons(src, strict)` exposes the figure.
+
+**Parser & compile-differential fuzz targets armed** (`endor-fuzz`). Two
+new libFuzzer targets over `endor-compile`, their substance in the
+`forbid(unsafe_code)` lib with bounded unit-test smoke runs
+(`parser_is_total_over_generated_and_arbitrary_bytes`,
+`compile_differential_smoke`):
+
+- `fuzz/fuzz_targets/parser.rs` — a structure-aware program (or arbitrary
+  lossy-UTF-8 bytes) driven through `endor_compile::Parser`, which must
+  return a structured `Result`, **never panic**.
+- `fuzz/fuzz_targets/differential_compile.rs` — `endor_compile::compile`
+  vs the C-XS oracle: accept/reject agreement + byte identity on accepts.
+  An oracle **process crash** is the *named* `OracleUnavailable` outcome (a
+  harness classification, not an abort); a coder fold is the named
+  `EndorRejected`. A real byte divergence or an endor-only accept is the
+  finding.
+
+A long fuzz campaign (`cargo +nightly fuzz run parser` /
+`differential_compile`) needs the cargo-fuzz + nightly toolchain and is
+follow-up work, not this child's budget.
+
+**The pipeline seam** (`endor-262`, `Compiler` + `dual_run_with`). The
+dual-run runner takes an explicit `Compiler` selection `{Oracle, Endor}`:
+`Oracle` (the default) runs the exact C-XS bytes; `Endor` runs
+`endor-compile`'s own output (the oracle is still consulted for the
+reference result). The default stays `Oracle` until the supervisor accepts
+stage 5 — later stages flip it with a one-line change and no runner
+surgery. The `Endor` path is total over coder folds (`catch_unwind` → empty
+bytecode → a clean endor-vm abort, never a harness panic).
