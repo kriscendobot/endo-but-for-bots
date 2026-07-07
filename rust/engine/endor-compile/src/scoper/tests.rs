@@ -1,0 +1,345 @@
+//! Scoper fixture tests — the numbering / scope-shape contract for the
+//! coder child. Each asserts the [`ScopeTree::dump`] of a representative
+//! program: the scope kinds and nesting, the declare-list order (the
+//! coder's slot order via `node->index = coder->scopeLevel++`), the
+//! closure / useClosure flags (capture analysis), the per-function
+//! `scopeCount` (frame slot count), and the access resolutions. Expected
+//! values are derived by reading `c/moddable/xs/sources/xsScope.c` at the
+//! oracle pin; they are the explicit, readable contract the job asks for,
+//! and a divergence here is a byte-identity failure downstream.
+
+use super::scope_program;
+use crate::parser::ParseErrorKind;
+
+fn dump(src: &str) -> String {
+    scope_program(src, false).expect("scopes").dump()
+}
+
+/// Assert the dump equals `want` (leading newline in `want` trimmed for
+/// readable raw-string fixtures).
+fn assert_dump(src: &str, want: &str) {
+    let got = dump(src);
+    assert_eq!(got, want.trim_start_matches('\n'), "\n--- source ---\n{src}\n--- got ---\n{got}");
+}
+
+// ---- program-level var / function are global (closure) slots ----
+
+#[test]
+fn program_var_and_function_are_global() {
+    // Program `var`/function declares survive in the program scope for the
+    // coder to create globals, but `declareCount` discounts them (0) and
+    // fxScopeBound marks them closure|useClosure; accesses route to the
+    // global object, not a frame slot.
+    assert_dump(
+        "var x = 1; function f() { return x; }",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 VAR x closure useClosure
+  d1 DEFINE f closure useClosure
+  define f
+  s1 FUNCTION scopeCount=0 declareCount=0
+    s2 BLOCK declareCount=0
+--- accesses ---
+x -> global
+f -> global
+x -> global
+",
+    );
+}
+
+// ---- lexical nesting: each block reserves a frame level ----
+
+#[test]
+fn nested_blocks_bump_scope_count() {
+    assert_dump(
+        "{ let y = 1; { let z = 2; y; } }",
+        "\
+s0 PROGRAM scopeCount=2 declareCount=0
+  s1 BLOCK declareCount=1
+    d0 LET y
+    s2 BLOCK declareCount=1
+      d0 LET z
+--- accesses ---
+y -> s1:d0
+z -> s2:d0
+y -> s1:d0
+",
+    );
+}
+
+// ---- function params + var: the frame slot count ----
+
+#[test]
+fn function_params_and_var() {
+    // args live in the FUNCTION scope (2 slots), the `var` in the body
+    // BLOCK (1 more) → scopeCount=3.
+    assert_dump(
+        "function g(a, b) { var c; return a + b + c; }",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 DEFINE g closure useClosure
+  define g
+  s1 FUNCTION scopeCount=3 declareCount=2
+    d0 ARG a
+    d1 ARG b
+    s2 BLOCK declareCount=1
+      d0 VAR c
+--- accesses ---
+g -> global
+a -> s1:d0
+b -> s1:d1
+c -> s2:d0
+a -> s1:d0
+b -> s1:d1
+c -> s2:d0
+",
+    );
+}
+
+// ---- closure capture: the alias node + closureCount ----
+
+#[test]
+fn closure_capture_creates_alias() {
+    // `inner` captures `v`; `v` is marked closure in the body block, and
+    // `inner`'s scope gains a NoToken closure alias (closureCount=1) that
+    // forwards to it — the alias is a real frame slot (scopeCount=1).
+    assert_dump(
+        "function outer() { var v = 1; function inner() { return v; } return inner; }",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 DEFINE outer closure useClosure
+  define outer
+  s1 FUNCTION scopeCount=2 declareCount=0
+    s2 BLOCK declareCount=2
+      d0 VAR v closure
+      d1 DEFINE inner
+      define inner
+      s3 FUNCTION scopeCount=1 declareCount=1 closureCount=1
+        d0 alias v closure useClosure -> s2:d0
+        s4 BLOCK declareCount=0
+--- accesses ---
+outer -> global
+v -> s2:d0
+inner -> s2:d1
+v -> s3:d0
+inner -> s2:d1
+",
+    );
+}
+
+// ---- var hoists out of a plain block to the function/program body ----
+
+#[test]
+fn var_hoists_out_of_block() {
+    assert_dump(
+        "{ var w = 1; } w;",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 VAR w closure useClosure
+  s1 BLOCK declareCount=0
+--- accesses ---
+w -> global
+w -> global
+",
+    );
+}
+
+// ---- direct eval poisons the whole scope chain ----
+
+#[test]
+fn direct_eval_poisons_scopes() {
+    assert_dump(
+        "function f() { var x; eval('x'); }",
+        "\
+s0 PROGRAM eval scopeCount=0 declareCount=0
+  d0 DEFINE f closure useClosure
+  define f
+  s1 FUNCTION eval scopeCount=1 declareCount=0
+    s2 BLOCK eval declareCount=1
+      d0 VAR x closure
+--- accesses ---
+f -> global
+x -> s2:d0
+eval -> global
+",
+    );
+}
+
+// ---- with poisons enclosing scopes; accesses inside route dynamic ----
+
+#[test]
+fn with_poisons_and_shadows() {
+    assert_dump(
+        "function f() { var x; with (obj) { x; } }",
+        "\
+s0 PROGRAM eval scopeCount=0 declareCount=0
+  d0 DEFINE f closure useClosure
+  define f
+  s1 FUNCTION eval scopeCount=1 declareCount=0
+    s2 BLOCK eval declareCount=1
+      d0 VAR x closure
+      s3 WITH declareCount=0
+        s4 BLOCK declareCount=0
+--- accesses ---
+f -> global
+x -> s2:d0
+obj -> global
+x -> global
+",
+    );
+}
+
+// ---- try / catch: parameter scope, body scope, and the try push ----
+
+#[test]
+fn try_catch_with_parameter() {
+    assert_dump(
+        "try { g(); } catch (e) { e; }",
+        "\
+s0 PROGRAM scopeCount=4 declareCount=0
+  s1 BLOCK declareCount=0
+  s2 BLOCK declareCount=1
+    d0 LET e
+    s3 BLOCK declareCount=0
+--- accesses ---
+g -> global
+e -> s2:d0
+e -> s2:d0
+",
+    );
+}
+
+#[test]
+fn try_catch_no_parameter() {
+    assert_dump(
+        "try { g(); } catch { h(); }",
+        "\
+s0 PROGRAM scopeCount=3 declareCount=0
+  s1 BLOCK declareCount=0
+  s2 BLOCK declareCount=0
+--- accesses ---
+g -> global
+h -> global
+",
+    );
+}
+
+// ---- arrow using `this` is marked default (needs enclosing this) ----
+
+#[test]
+fn arrow_capturing_this_is_default() {
+    assert_dump(
+        "function f() { return () => this; }",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 DEFINE f closure useClosure
+  define f
+  s1 FUNCTION scopeCount=0 declareCount=0
+    s2 BLOCK declareCount=0
+      s3 FUNCTION scopeCount=0 declareCount=0 arrow-default
+        s4 BLOCK declareCount=0
+--- accesses ---
+f -> global
+",
+    );
+}
+
+// ---- for-let: loop binding scope, postfix bumps the frame ----
+
+#[test]
+fn for_let_scope() {
+    assert_dump(
+        "for (let i = 0; i < 3; i++) { i; }",
+        "\
+s0 PROGRAM scopeCount=2 declareCount=0
+  s1 BLOCK declareCount=1
+    d0 LET i
+    s2 BLOCK declareCount=0
+--- accesses ---
+i -> s1:d0
+i -> s1:d0
+i -> s1:d0
+i -> s1:d0
+",
+    );
+}
+
+// ---- named function expression: the CONST self-binding ----
+
+#[test]
+fn named_function_expression_self_binding() {
+    assert_dump(
+        "var g = function rec() { return rec; };",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 VAR g closure useClosure
+  s1 FUNCTION scopeCount=1 declareCount=1
+    d0 DEFINE rec
+    define rec
+    s2 BLOCK declareCount=0
+--- accesses ---
+g -> global
+rec -> s1:d0
+",
+    );
+}
+
+// =============================== early errors ===============================
+
+fn scope_err(src: &str) -> String {
+    match scope_program(src, false) {
+        Err(e) => {
+            assert_eq!(e.kind, ParseErrorKind::Syntax, "expected a scoper SyntaxError for {src}");
+            e.message
+        }
+        Ok(_) => panic!("expected an early error for {src}"),
+    }
+}
+
+#[test]
+fn duplicate_lexical_is_error() {
+    assert_eq!(scope_err("let a; let a;"), "duplicate variable");
+    assert_eq!(scope_err("let a; var a;"), "duplicate variable");
+    assert_eq!(scope_err("const b = 1; let b = 2;"), "duplicate variable");
+}
+
+#[test]
+fn duplicate_strict_argument_is_error() {
+    // Dup params are legal sloppy but an early error once strict. Sloppy,
+    // the second `a` reuses the first arg slot (one ARG, both accesses
+    // resolve to it); strict, it is a duplicate-argument early error.
+    assert_eq!(scope_err("function f(a, a) { 'use strict'; }"), "duplicate argument");
+    assert_dump(
+        "function f(a, a) { return a; }",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 DEFINE f closure useClosure
+  define f
+  s1 FUNCTION scopeCount=1 declareCount=1
+    d0 ARG a
+    s2 BLOCK declareCount=0
+--- accesses ---
+f -> global
+a -> s1:d0
+a -> s1:d0
+a -> s1:d0
+",
+    );
+}
+
+#[test]
+fn var_redeclaration_is_fine() {
+    // Two `var`s of the same name collapse to one slot; a function
+    // redeclaration likewise.
+    assert_dump(
+        "var a; var a; a;",
+        "\
+s0 PROGRAM scopeCount=0 declareCount=0
+  d0 VAR a closure useClosure
+--- accesses ---
+a -> global
+a -> global
+a -> global
+",
+    );
+}
