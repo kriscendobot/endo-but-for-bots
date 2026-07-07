@@ -1496,7 +1496,12 @@ These are the remaining child-6/7 surface.
 > branch of `fxTemplateNodeCode` (the `TEMPLATE_CACHE.#<tag>`-guarded frozen
 > template object, cooked/raw arrays, and the tag call) is ported into
 > `coder.rs`, with the illegal-escape cooked slot carried as the parser's
-> `mxStringErrorFlag` (bit 1) and emitted as `undefined`. The fix2/fix3/fix4/fix5
+> `mxStringErrorFlag` (bit 1) and emitted as `undefined`. The same slice cleaned
+> **`expressions/template-literal`** (13 `accept-disagree` → **0**): an untagged
+> template whose cooked value carries `mxStringErrorFlag` (a truncated/illegal
+> `\x`/`\u` escape, a bad `\u{…}` code point/separator, or a legacy octal in
+> template position) is now a SyntaxError, matching `fxStringNodeCode` — while a
+> tagged template still accepts the same source. The fix2/fix3/fix4/fix5
 > blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix

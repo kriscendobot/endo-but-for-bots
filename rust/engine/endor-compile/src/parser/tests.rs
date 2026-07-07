@@ -675,6 +675,32 @@ fn arguments_in_class_field_initializer_is_error() {
 }
 
 #[test]
+fn untagged_template_illegal_escape_is_error() {
+    // `fxStringNodeCode`: an untagged template literal whose cooked value
+    // carries `mxStringErrorFlag` (a truncated/illegal `\x` / `\u` escape, an
+    // invalid `\u{…}` code point or separator, or a legacy octal in template
+    // position) is a SyntaxError. A *tagged* template accepts the same source
+    // (its cooked slot becomes `undefined`), so the tag makes it legal.
+    for src in [
+        "`\\x0`;",          // truncated hex
+        "`\\u0`;",          // truncated unicode
+        "`\\unicode`;",     // non-hex after \u
+        "`\\u{g`;",         // bad code point
+        "`\\u{1F_639}`;",   // numeric separator not allowed in \u{}
+        "`\\00`;",          // legacy octal in template
+        "`a${1}\\xZZ`;",    // error in a later template part
+    ] {
+        let err = prog_err(src);
+        assert_eq!(err.kind, ParseErrorKind::Syntax, "src {src:?}");
+    }
+    // The same illegal escapes are legal under a tag (cooked → undefined),
+    // and legal escapes cook cleanly in an untagged template.
+    prog_ok("var t = s => s; t`\\x0`;");
+    prog_ok("var t = s => s; t`\\u{1F_639}`;");
+    prog_ok("`a\\tb\\u0041c`;");
+}
+
+#[test]
 fn arguments_and_await_in_static_block_are_errors() {
     // A static initialization block is a field context: `arguments` and a
     // top-level `await` are Syntax Errors.

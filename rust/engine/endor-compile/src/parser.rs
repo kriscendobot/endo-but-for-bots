@@ -257,6 +257,29 @@ impl Parser {
         })));
     }
 
+    /// An untagged template's cooked value is coded through `fxStringNodeCode`,
+    /// which raises `invalid escape sequence` when the string carries
+    /// `mxStringErrorFlag` (a truncated/illegal `\x`/`\u` escape, or a legacy
+    /// octal in template position). A *tagged* template never codes the cooked
+    /// slot (it emits `undefined` instead), so this fires only for the untagged
+    /// primary-position template just built on the stack top.
+    fn reject_untagged_template_cooked_error(&self) -> PResult<()> {
+        let Some(Item::Node(node)) = self.stack.last() else { return Ok(()) };
+        let Some(Item::List(items)) = node.children.get(1) else { return Ok(()) };
+        for item in items {
+            if let Item::Node(mid) = item {
+                if mid.token == Token::TemplateMiddle {
+                    if let Some(Item::Node(cooked)) = mid.children.first() {
+                        if cooked.flags & flags::STRING_ERROR != 0 {
+                            return Err(self.error("invalid escape sequence"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn push_raw(&mut self, value: Vec<u16>, line: u32) {
         self.push(Item::Node(Box::new(Node { token: Token::String, line, flags: 0, children: Vec::new(), value: Value::Str(value) })));
     }
@@ -979,11 +1002,13 @@ impl Parser {
                 self.get_next_token()?;
                 self.push_node_list(1)?;
                 self.push_node_struct(2, Token::Template, line)?;
+                self.reject_untagged_template_cooked_error()?;
             }
             Token::TemplateHead => {
                 self.push_null();
                 self.template_expression()?;
                 self.push_node_struct(2, Token::Template, line)?;
+                self.reject_untagged_template_cooked_error()?;
             }
             _ => {
                 self.push_node_struct(0, Token::Undefined, line)?;
