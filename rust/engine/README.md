@@ -1337,13 +1337,19 @@ byte-identical vs the oracle:
   patterns (which already recurse), **all destructuring is now covered**:
   array + object, assignment + binding + parameters, holes/rest/defaults/
   computed/nested.
+- Slice 35 — **generator functions + `yield`**: `fxFunctionNodeCode`'s
+  generator path (the `GENERATOR_FUNCTION` create op + `START_GENERATOR`
+  opening the body) and `fxYieldNodeCode` (sync) — build the
+  `{ value, done: false }` result, `YIELD`, and thread the
+  `.return()`/`.throw()` completion (`BRANCH_STATUS`) out to the return
+  target on non-`next` resume.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
-inference and **direct-`eval` spread**; generator/async
-functions and `yield`/`await`; classes (constructor/derived, methods/
-accessors, static members, private fields/methods/brands, static blocks);
-`for await` / `using` heads; and
+inference and **direct-`eval` spread**; **async** functions and `await`,
+**async generators**, and `yield*` (`Delegate`); classes (constructor/
+derived, methods/accessors, static members, private fields/methods/brands,
+static blocks); `for await` / `using` heads; and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
