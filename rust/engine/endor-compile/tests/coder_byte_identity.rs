@@ -891,3 +891,13 @@ fn async_generators() {
         "async function*g(){yield 1;}", "(async function*(a){yield a;});",
     ]);
 }
+
+#[test]
+fn yield_star_delegate() {
+    assert_identical(&[
+        "(function*(){yield* a;});", "(function*(){yield* [1,2];});",
+        "(function*(){yield 1;yield* a;yield 2;});",
+        "(async function*(){yield* a;});",
+        "function*g(){yield* h();}",
+    ]);
+}

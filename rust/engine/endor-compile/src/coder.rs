@@ -861,6 +861,7 @@ impl Coder<'_> {
             ParamsBinding => self.code_params_binding(node),
             Yield => self.code_yield(node),
             Await => self.code_await(node),
+            Delegate => self.code_delegate(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1552,6 +1553,137 @@ impl Coder<'_> {
         self.adjust_scope(rt);
         self.add_branch(0, XS_CODE_BRANCH_1, rt);
         self.place_target(0, target);
+    }
+
+    /// `fxDelegateNodeCode` — `yield* expr`. Drives the delegate iterator's
+    /// `next`/`return`/`throw` protocol, forwarding results out via
+    /// `YIELD_STAR` and re-entering on resume, with the `async` variant
+    /// awaiting each step. A faithful transliteration of XS's four-section
+    /// (loop / return / throw / normal) state machine.
+    fn code_delegate(&mut self, node: &Node) {
+        let is_async = node.flags & crate::ast::flags::ASYNC != 0;
+        let next_target = self.create_target();
+        let catch_target = self.create_target();
+        let rethrow_target = self.create_target();
+        let return_target = self.create_target();
+        let normal_target = self.create_target();
+        let done_target = self.create_target();
+        let iterator = self.use_temporary();
+        let method = self.use_temporary();
+        let next = self.use_temporary();
+        let result = self.use_temporary();
+
+        self.code(&node.children[0]);
+        self.add_byte(0, if is_async { XS_CODE_FOR_AWAIT_OF } else { XS_CODE_FOR_OF });
+        self.add_index(0, XS_CODE_SET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "next");
+        self.add_index(0, XS_CODE_SET_LOCAL_1, next);
+        self.add_byte(-1, XS_CODE_POP);
+
+        self.add_byte(1, XS_CODE_UNDEFINED);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+        self.add_branch(0, XS_CODE_BRANCH_1, normal_target);
+
+        // LOOP
+        self.place_target(0, next_target);
+        if is_async {
+            self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+        }
+        self.add_byte(0, XS_CODE_YIELD_STAR);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+        self.add_branch(1, XS_CODE_BRANCH_STATUS_1, normal_target);
+
+        // RETURN
+        self.add_byte(0, XS_CODE_UNCATCH);
+        if is_async {
+            self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+            self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "return");
+        self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, return_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_byte(0, XS_CODE_SWAP);
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+        self.add_integer(-3, XS_CODE_RUN_1, 1);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+        self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, next_target);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+        self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+        self.place_target(0, return_target);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
+        self.add_byte(-1, XS_CODE_SET_RESULT);
+        let rt = self.return_target.expect("yield* outside a function");
+        self.adjust_environment(rt);
+        self.adjust_scope(rt);
+        self.add_branch(0, XS_CODE_BRANCH_1, rt);
+
+        // THROW
+        self.place_target(0, catch_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "throw");
+        self.add_index(0, XS_CODE_SET_LOCAL_1, method);
+        self.add_branch(-1, XS_CODE_BRANCH_COALESCE_1, done_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "return");
+        self.add_branch(-1, XS_CODE_BRANCH_CHAIN_1, rethrow_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_byte(0, XS_CODE_SWAP);
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_integer(-2, XS_CODE_RUN_1, 0);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.place_target(0, rethrow_target);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_byte(1, XS_CODE_UNDEFINED);
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.add_byte(-1, XS_CODE_POP);
+
+        // NORMAL
+        self.place_target(0, normal_target);
+        self.add_byte(0, XS_CODE_UNCATCH);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, next);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, method);
+        self.place_target(1, done_target);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, method);
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+        self.add_integer(-3, XS_CODE_RUN_1, 1);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+        self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, next_target);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+
+        self.unuse_temporaries(4);
     }
 
     /// `fxAwaitNodeCode`. Child `[expression]`. Evaluate the awaited value,
