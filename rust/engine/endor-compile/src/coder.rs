@@ -307,6 +307,12 @@ pub struct Coder<'a> {
     /// producing one. Captured (and cleared) at the top of `code_node` so
     /// it applies only to the immediate expression, not nested ones.
     no_value: bool,
+    /// The enclosing class's `instanceInit` closure declare `(scope, id)`,
+    /// set while coding a class's constructor so its base-flag body can find
+    /// the capturing alias and call the field initializer on entry (XS's
+    /// `coder->classNode->instanceInitAccess`). `None` outside a
+    /// field-bearing class constructor.
+    class_instance_init: Option<(usize, u32)>,
 }
 
 impl<'a> Coder<'a> {
@@ -320,6 +326,7 @@ impl<'a> Coder<'a> {
             target_index: 0,
             program_flag: false,
             eval_flag: false,
+            class_instance_init: None,
             first_break_target: None,
             first_continue_target: None,
             return_target: None,
@@ -559,18 +566,23 @@ impl<'a> Coder<'a> {
     /// per declare, in XS's `firstDeclareNode`… order — taken so the
     /// coder can assign slots (a `&mut self` walk) without borrowing the
     /// immutable tree across the loop.
-    fn declares_of(&self, scope: usize) -> Vec<(u32, Token, Option<String>, u32)> {
+    fn declares_of(&self, scope: usize) -> Vec<(u32, Token, Option<crate::scoper::Sym>, u32)> {
         self.tree.scopes[scope]
             .declares
             .iter()
-            .map(|d| {
-                let sym = match &d.symbol {
-                    Some(crate::scoper::Sym::Named(s)) => Some(s.clone()),
-                    _ => None,
-                };
-                (d.id, d.token, sym, d.flags)
-            })
+            .map(|d| (d.id, d.token, d.symbol.clone(), d.flags))
             .collect()
+    }
+
+    /// A declare symbol's name, or `None` for an anonymous (`Sym::Anon`) or
+    /// absent symbol. An anonymous closure (XS's `symbol->ID == -1`, e.g. an
+    /// `instanceInit` slot) still owns a frame slot — it serializes as the
+    /// null symbol (`NEW_CLOSURE` with id 0) — but has no name.
+    fn sym_name(s: &Option<crate::scoper::Sym>) -> Option<&str> {
+        match s {
+            Some(crate::scoper::Sym::Named(n)) => Some(n),
+            _ => None,
+        }
     }
 
     /// Assign one declaration its frame slot and remember it so a resolved
@@ -598,7 +610,12 @@ impl<'a> Coder<'a> {
             if is_closure {
                 if flags & crate::scoper::dflags::USE_CLOSURE == 0 {
                     let index = self.set_declare_index(scope, id);
-                    self.add_variable(0, XS_CODE_NEW_CLOSURE, sym.as_deref(), index);
+                    // An anonymous closure (`instanceInit`) has a slot but no
+                    // name — `NEW_CLOSURE` with the null symbol (id 0).
+                    match Self::sym_name(&sym) {
+                        Some(name) => self.add_variable(0, XS_CODE_NEW_CLOSURE, Some(name), index),
+                        None => self.add_symbol_null(0, XS_CODE_NEW_CLOSURE),
+                    }
                     if token == Token::Var {
                         self.add_byte(1, XS_CODE_UNDEFINED);
                         self.add_index(0, XS_CODE_VAR_CLOSURE_1, index);
@@ -607,7 +624,7 @@ impl<'a> Coder<'a> {
                 }
             } else {
                 let index = self.set_declare_index(scope, id);
-                if let Some(name) = sym.as_deref() {
+                if let Some(name) = Self::sym_name(&sym) {
                     self.add_variable(0, XS_CODE_NEW_LOCAL, Some(name), index);
                 } else {
                     self.add_index(0, XS_CODE_NEW_TEMPORARY, index);
@@ -930,14 +947,14 @@ impl Coder<'_> {
                     match token {
                         Token::Define => {
                             let index = self.set_declare_index(scope, *id);
-                            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                            self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(sym), index);
                             self.add_byte(1, XS_CODE_NULL);
                             self.add_index(0, XS_CODE_VAR_LOCAL_1, index);
                             self.add_byte(-1, XS_CODE_POP);
                         }
                         Token::Var => {
                             let index = self.set_declare_index(scope, *id);
-                            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                            self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(sym), index);
                             self.add_byte(1, XS_CODE_UNDEFINED);
                             self.add_index(0, XS_CODE_VAR_LOCAL_1, index);
                             self.add_byte(-1, XS_CODE_POP);
@@ -958,9 +975,9 @@ impl Coder<'_> {
                         self.assert_declared_kind(*token);
                         let index = self.set_declare_index(scope, *id);
                         if flags & crate::scoper::dflags::CLOSURE != 0 {
-                            self.add_variable(0, XS_CODE_NEW_CLOSURE, sym.as_deref(), index);
+                            self.add_variable(0, XS_CODE_NEW_CLOSURE, Self::sym_name(sym), index);
                         } else {
-                            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                            self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(sym), index);
                         }
                     }
                     if is_eval {
@@ -1967,6 +1984,13 @@ impl Coder<'_> {
         let name = Self::symbol_opt(&node.children[0]);
         let class_scope = self.scope_of(node);
         let symbol_scope = self.tree.node_scopes.get(&node_key(node)).and_then(|s| s.1);
+        // The synthesized `instanceInit` closure declare, present when the
+        // class has instance data fields (see `class_has_instance_field`).
+        let instance_init = self.tree.class_instance_init.get(&node_key(node)).copied();
+        let ctor_is_base = match &node.children[5] {
+            Item::Node(c) => c.flags & f::BASE != 0,
+            _ => false,
+        };
 
         let prototype = self.use_temporary();
         let constructor = self.use_temporary();
@@ -1995,7 +2019,13 @@ impl Coder<'_> {
         self.scope_coding_block(class_scope);
 
         // The constructor function, then bind the prototype/constructor pair.
+        // A base constructor of a field-bearing class captures the
+        // `instanceInit` closure and calls it on entry; expose the target so
+        // `code_function` can find the constructor's capturing alias.
+        let saved_instance_init = self.class_instance_init;
+        self.class_instance_init = instance_init;
         self.code(&node.children[5]);
+        self.class_instance_init = saved_instance_init;
         self.add_byte(0, XS_CODE_TO_INSTANCE);
         self.add_index(0, XS_CODE_SET_LOCAL_1, constructor);
         self.add_byte(-3, XS_CODE_CLASS);
@@ -2053,14 +2083,25 @@ impl Coder<'_> {
             }
         }
 
-        // Instance fields need the `instanceInit` closure + the constructor
-        // call after `super(...)`; deferred. Private / computed-key fields
-        // need class-scope declares; deferred.
-        assert!(instance_fields.is_empty(), "instance field init deferred (instanceInit)");
-        for p in &static_fields {
+        // Instance data fields run through the synthesized `instanceInit`
+        // field function stored in the class-body closure and called by the
+        // base constructor on entry. A *derived* class calls it after
+        // `super(...)` instead — deferred. Private / computed-key fields need
+        // class-scope declares — deferred.
+        if !instance_fields.is_empty() {
+            assert!(
+                ctor_is_base,
+                "derived-class instance-field init deferred (super-call instanceInit)"
+            );
+            assert!(
+                instance_init.is_some(),
+                "instance fields present but no instanceInit declare (scoper)"
+            );
+        }
+        for p in instance_fields.iter().chain(static_fields.iter()) {
             assert!(
                 p.token == Token::Property,
-                "computed / private static field deferred (needs class-scope declare)"
+                "computed / private field deferred (needs class-scope declare)"
             );
         }
 
@@ -2070,6 +2111,19 @@ impl Coder<'_> {
             let id = self.tree.scopes[ss].declares[0].id;
             let idx = self.declare_index(ss, id);
             self.add_index(0, XS_CODE_CONST_CLOSURE_1, idx);
+        }
+
+        // Instance fields: the `instanceInit` field function, homed on the
+        // prototype and stored in the class-body closure the constructor
+        // captures (`fxClassNodeCode`'s `instanceInit` block).
+        if !instance_fields.is_empty() {
+            let (iscope, iid) = instance_init.expect("instance-init declare");
+            self.code_field_init_function(&instance_fields);
+            self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
+            self.add_byte(-1, XS_CODE_SET_HOME);
+            let idx = self.declare_index(iscope, iid);
+            self.add_index(0, XS_CODE_CONST_CLOSURE_1, idx);
+            self.add_byte(-1, XS_CODE_POP);
         }
 
         // Static fields run through a synthesized `constructorInit` field
@@ -2261,6 +2315,28 @@ impl Coder<'_> {
         if flags & f::ASYNC != 0 && flags & f::GENERATOR == 0 {
             self.add_byte(0, XS_CODE_START_ASYNC);
         }
+        // A base class constructor calls the class's `instanceInit` field
+        // initializer on entry (`fxFunctionNodeCode`'s `mxBaseFlag` branch):
+        // `this`, the captured closure, then a zero-argument run.
+        if flags & f::BASE != 0 {
+            if let Some(target) = self.class_instance_init {
+                let aid = self.tree.scopes[scope]
+                    .declares
+                    .iter()
+                    .find(|d| {
+                        d.flags & crate::scoper::dflags::USE_CLOSURE != 0
+                            && d.alias == Some(target)
+                    })
+                    .map(|d| d.id)
+                    .expect("base constructor instanceInit capture alias");
+                let idx = self.declare_index(scope, aid);
+                self.add_byte(1, XS_CODE_THIS);
+                self.add_index(1, XS_CODE_GET_CLOSURE_1, idx);
+                self.add_byte(1, XS_CODE_CALL);
+                self.add_integer(-2, XS_CODE_RUN_1, 0);
+                self.add_byte(-1, XS_CODE_POP);
+            }
+        }
         self.code_arguments_object(scope, node, is_strict);
         self.code(&node.children[1]); // ParamsBinding
         self.code_function_name(scope);
@@ -2394,7 +2470,7 @@ impl Coder<'_> {
             if token == Token::Define {
                 let index = self.set_declare_index(scope, id);
                 assert!(flags & dflags::CLOSURE == 0, "captured function name deferred");
-                self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(&sym), index);
                 continue;
             }
             // `fxScopeCodingParams` slots `Arg`/`Var`/`Const` declares —
@@ -2410,9 +2486,9 @@ impl Coder<'_> {
                     flags & dflags::USE_CLOSURE == 0,
                     "argument that use-closures itself deferred"
                 );
-                self.add_variable(0, XS_CODE_NEW_CLOSURE, sym.as_deref(), index);
+                self.add_variable(0, XS_CODE_NEW_CLOSURE, Self::sym_name(&sym), index);
             } else {
-                self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(&sym), index);
             }
         }
     }

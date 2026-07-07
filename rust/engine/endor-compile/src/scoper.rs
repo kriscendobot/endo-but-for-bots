@@ -218,6 +218,10 @@ pub struct ScopeTree {
     /// declare id)` its symbol binds to, or `None` for the symbol path.
     /// Keyed with [`node_key`].
     pub resolutions: HashMap<usize, Option<(usize, u32)>>,
+    /// A class node address → its synthesized `instanceInit` closure
+    /// declare `(scope, id)` when the class has instance data fields.
+    /// Keyed with [`node_key`].
+    pub class_instance_init: HashMap<usize, (usize, u32)>,
 }
 
 /// The stable identity the scoper/coder use to associate a scope (and,
@@ -265,6 +269,7 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
         scope_counts: s.scope_counts,
         node_scopes: s.node_scope,
         resolutions: s.resolutions,
+        class_instance_init: s.class_instance_init,
     })
 }
 
@@ -307,8 +312,13 @@ struct Scoper {
     /// duplicate-export detection.
     export_links: Vec<Sym>,
     /// Next anonymous-symbol id. (Reserved for class computed-key slots.)
-    #[allow(dead_code)]
     anon: u32,
+    /// A class node address → its synthesized `instanceInit` closure
+    /// declare `(scope, id)`, when the class has instance data fields
+    /// (`self->instanceInitAccess->declaration`). The coder reads it to
+    /// store the field function (`CONST_CLOSURE`) and the base constructor
+    /// reads its capturing alias to call it after entry.
+    class_instance_init: HashMap<usize, (usize, u32)>,
 }
 
 fn node_ptr(n: &Node) -> usize {
@@ -335,6 +345,20 @@ fn child_sym(n: &Node, i: usize) -> Option<String> {
         Some(Item::Symbol(s)) => Some(s.clone()),
         _ => None,
     }
+}
+/// Whether a class node (`children[2]` = member list) declares at least one
+/// **instance** data field — a member with neither `static` nor a
+/// method/getter/setter flag. Drives the `instanceInit` synthesis.
+fn class_has_instance_field(class: &Node) -> bool {
+    use crate::ast::flags as f;
+    let members = match class.children.get(2) {
+        Some(Item::List(v)) => v,
+        _ => return false,
+    };
+    members.iter().any(|item| match item {
+        Item::Node(m) => m.flags & (f::STATIC | f::METHOD | f::GETTER | f::SETTER) == 0,
+        _ => false,
+    })
 }
 #[allow(dead_code)]
 fn child_list<'a>(n: &'a Node, i: usize) -> Option<&'a [Item]> {
@@ -628,6 +652,18 @@ impl Scoper {
             self.hoist_item(heritage)?;
         }
         let si = self.scope_new(node, Token::Block);
+        // A class with instance data fields synthesizes an `instanceInit`
+        // closure (XS's `self->instanceInit` + `instanceInitAccess`): an
+        // anonymous `const` closure declare in the class body scope, holding
+        // the field-initializer function the constructor calls on entry.
+        if class_has_instance_field(node) {
+            let sym = Sym::Anon(self.anon);
+            self.anon += 1;
+            let mut d = self.new_declare(si, Token::Const, Some(sym), node.line);
+            d.flags |= dflags::CLOSURE;
+            let id = self.scope_add_declare(si, d);
+            self.class_instance_init.insert(node_ptr(node), (si, id));
+        }
         self.class_node = Some(node_ptr(node));
         if let Some(constructor) = child(node, 5) {
             self.hoist_item(constructor)?;
@@ -1347,6 +1383,23 @@ impl Scoper {
         self.fx_scope_binding(si);
         if let Some(params) = child(node, 1) {
             self.bind_item(params)?;
+        }
+        // A base class constructor captures the class's `instanceInit`
+        // closure (`fxFunctionNodeBind`'s `mxBaseFlag` branch) so it can
+        // call the field initializer on entry — a use-closure alias in the
+        // constructor scope targeting the class body scope's declare.
+        if self.node_flags(node) & crate::ast::flags::BASE != 0 {
+            if let Some(cnode) = self.class_node {
+                if let Some(&(rscope, rid)) = self.class_instance_init.get(&cnode) {
+                    let d = self.declare_ref(rscope, rid);
+                    let (rline, rsym) = (d.line, d.symbol.clone());
+                    let mut alias = self.new_declare(si, Token::NoToken, rsym, rline);
+                    alias.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                    alias.alias = Some((rscope, rid));
+                    self.scope_add_declare(si, alias);
+                    self.scopes[si].closure_count += 1;
+                }
+            }
         }
         if let Some(body) = child(node, 2) {
             self.bind_item(body)?;

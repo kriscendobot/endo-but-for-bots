@@ -1418,10 +1418,24 @@ byte-identical vs the oracle:
   a scoper scope. Byte-identical for single/multiple, bare, mixed-with-methods,
   and expression/anon-fn static values on named and anonymous classes.
 
+- Slice 48 — **instance class fields (base classes)**: the parser defers
+  the `instanceInit` synthesis, so the **scoper** now detects instance data
+  fields (`class_has_instance_field`) and adds an anonymous `const` closure
+  declare to the class body scope — XS's `instanceInit` + `instanceInitAccess`.
+  A **base** constructor's bind captures it (a use-closure alias, XS's
+  `mxBaseFlag` lookup). The **coder** stores the synthesized field function
+  into that closure (homed on the prototype: `SET_HOME` + `CONST_CLOSURE`) and
+  the base constructor calls it on entry (`THIS` + `GET_CLOSURE` + `CALL` +
+  `RUN_1 0` + `POP`). Threading the anonymous (`Sym::Anon`, id-`-1`) closure
+  through `NEW_CLOSURE`/`RETRIEVE`/`STORE` needed the null-symbol path
+  (`NEW_CLOSURE` id 0). Byte-identical for single/multiple/bare fields, fields
+  interleaved with methods and static fields, and name-inferring/expression/
+  `this` values, on named and anonymous base classes.
+
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-**instance** fields and **private** members, static blocks, and the
-instance-field-init call after `super(...)` — these need more class-hoisting
-scoper work (the class scope's `instanceInit`/`CONST_CLOSURE` declares);
-`using` heads (a parser gap); and
+**derived-class** instance fields (the `instanceInit` call after `super(...)`,
+`fxSuperNodeCode`), **private** members, and static blocks — the first needs
+the super-node capture, the rest more class-scope declares; `using` heads (a
+parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.

@@ -1043,3 +1043,16 @@ fn class_static_fields() {
         "(class{static f=function(){};});",
     ]);
 }
+
+#[test]
+fn class_instance_fields() {
+    assert_identical(&[
+        "(class{x=1;});", "(class{x;});", "(class{x=1;y=2;});",
+        "(class C{x=1;});", "(class{x=1+2;});", "(class{x=this;});",
+        "(class{f=function(){};});", "(class{m(){}x=1;});",
+        "(class{x=1;m(){}y=2;});", "class C{x=1;}",
+        // instance and static fields interleaved
+        "(class{static a=1;b=2;static c=3;d=4;});",
+        "(class{x=1;static y=2;});",
+    ]);
+}
