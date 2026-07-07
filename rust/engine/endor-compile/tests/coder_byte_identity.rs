@@ -671,3 +671,11 @@ fn object_shorthand() {
         "({x,y:2});", "({a:1,b});",
     ]);
 }
+
+#[test]
+fn object_spread() {
+    assert_identical(&[
+        "({...a});", "({...a,...b});", "({x:1,...a});", "({...a,x:1});",
+        "({a:1,...b,c:3});", "let o={x:1};({...o});",
+    ]);
+}

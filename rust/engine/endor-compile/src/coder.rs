@@ -2069,14 +2069,26 @@ impl Coder<'_> {
         if let Some(Item::List(items)) = node.children.first() {
             for item in items {
                 let p = node_of(item);
+                // `...spread`: `Object.assign`-style copy of `expr`'s own
+                // enumerable properties onto the object (the `COPY_OBJECT`
+                // intrinsic invoked with the object as `this`).
+                if p.token == Token::Spread {
+                    self.add_byte(1, XS_CODE_UNDEFINED);
+                    self.add_byte(1, XS_CODE_COPY_OBJECT);
+                    self.add_byte(1, XS_CODE_CALL);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                    self.code(&p.children[0]);
+                    self.add_integer(-4, XS_CODE_RUN_1, 2);
+                    self.add_byte(-1, XS_CODE_POP);
+                    continue;
+                }
                 assert!(
                     p.flags
                         & (crate::ast::flags::METHOD
                             | crate::ast::flags::GETTER
-                            | crate::ast::flags::SETTER
-                            | crate::ast::flags::SPREAD)
+                            | crate::ast::flags::SETTER)
                         == 0,
-                    "object method/accessor/spread reached (later child)"
+                    "object method/accessor reached (later child)"
                 );
                 match p.token {
                     Token::Property => {
