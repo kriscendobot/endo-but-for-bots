@@ -47,6 +47,7 @@ use crate::ast::{Item, Node, Value};
 use crate::opcodes::*;
 use crate::scoper::{node_key, ScopeTree};
 use crate::token::Token;
+use std::collections::HashMap;
 
 /// The payload a code record carries beside its mutable `id`. Mirrors the
 /// `txByteCode` subtype union XS switches on: a plain byte, a branch to a
@@ -74,14 +75,132 @@ enum Payload {
     /// and `len` (== `bytes.len()`) is both the emitted length and the
     /// width selector.
     Str { bytes: Vec<u8>, len: i32 },
-    /// A symbol operand (`GET_VARIABLE`…). Deferred; carries the atom's
-    /// assigned id (child 6 wires atom-table assignment).
-    Symbol { id: i32 },
+    /// A symbol operand (`GET_VARIABLE` / `GET_PROPERTY` / …). Carries the
+    /// index of the interned symbol in the coder's atom table; the emitted
+    /// 2-byte `txID` is resolved from that table's bucket-walk assignment
+    /// once every emitted symbol's `usage` is known.
+    Symbol { sym: usize },
     /// A BigInt operand (`BIGINT_1`): the value as XS stores it — a
     /// little-endian array of `txU4` limbs (`bigint->data`) — with
     /// `measure` (== `bytes.len()`, `bigint->size * 4`) the emitted
     /// length and width selector.
     BigInt { bytes: Vec<u8>, measure: i32 },
+}
+
+// ============================= atom table ==============================
+
+/// XS's `parserTableModulo` at the oracle pin (the shim's creation record,
+/// `endor_shim.c`). The symbol hash bucket count.
+const SYMBOL_MODULO: u32 = 1993;
+
+/// The built-in symbols `fxInitializeParser` interns *before* lexing, in
+/// exact source order (`xsScript.c`). They occupy their hash buckets ahead
+/// of every program symbol, so their position is part of the ID contract
+/// whenever the program (or the coder) emits one of them.
+const SEED_SYMBOLS: &[&str] = &[
+    "Object", "__dirname", "__filename", "__jsx__", "__proto__", "*", "args",
+    "arguments", "=>", "as", "async", "await", "call", "caller", "constructor",
+    "default", "done", "eval", "exports", "fill", "freeze", "from", "get", "id",
+    "include", "Infinity", "json", "length", "let", "meta", "module", "name",
+    "NaN", "Native", "native", "next", "new.target", "of", "#constructor",
+    "prototype", "RangeError", "raw", "return", "set", "slice", "SyntaxError",
+    "static", "String", "target", "this", "throw", "toString", "undefined",
+    "uri", "using", "value", "with", "yield",
+];
+
+/// One interned symbol — XS's `txSymbol` (the fields the coder reads).
+#[derive(Clone, Debug)]
+struct SymEntry {
+    /// The interned spelling (kept for the atom-table dump / debugging).
+    #[allow(dead_code)]
+    string: String,
+    /// `sum % symbolModulo`.
+    bucket: u32,
+    /// `usage & 1` — set when the symbol is actually emitted in code; only
+    /// used symbols are assigned an ID.
+    usage: bool,
+    /// The assigned `txID` (1-based), or 0 until [`SymbolTable::assign_ids`].
+    id: i32,
+}
+
+/// The parser/coder symbol table — a transliteration of `parser->symbolTable`
+/// and the `fxNewParserSymbol` interning discipline: hash by
+/// `sum = Σ (sum<<1 + ch)` masked to 31 bits, bucket `sum % modulo`, new
+/// symbols **prepended** to their bucket. IDs are assigned by walking the
+/// buckets in index order and, within a bucket, most-recent-first (prepend
+/// order), numbering only the `usage` symbols — exactly `fxParserCode`'s
+/// symbol-table walk. That order leaks into every symbol operand's bytes.
+struct SymbolTable {
+    /// Interned symbols in insertion (chronological) order.
+    entries: Vec<SymEntry>,
+    index: HashMap<String, usize>,
+}
+
+impl SymbolTable {
+    /// A table pre-seeded with the built-in symbols, matching XS's
+    /// `fxInitializeParser`.
+    fn seeded() -> SymbolTable {
+        let mut t = SymbolTable { entries: Vec::new(), index: HashMap::new() };
+        for s in SEED_SYMBOLS {
+            t.intern(s);
+        }
+        t
+    }
+
+    /// `fxNewParserSymbol`'s hash: `sum = (sum << 1) + ch` over the bytes
+    /// (C promotes `char`, signed on the pin's platform, to `int`), masked
+    /// to 31 bits.
+    fn hash(s: &str) -> u32 {
+        let mut sum: u32 = 0;
+        for &b in s.as_bytes() {
+            sum = sum.wrapping_shl(1).wrapping_add((b as i8 as i32) as u32);
+        }
+        sum & 0x7FFF_FFFF
+    }
+
+    /// Intern `s`, returning its stable index. New symbols get a bucket but
+    /// no usage; re-interning returns the existing index.
+    fn intern(&mut self, s: &str) -> usize {
+        if let Some(&i) = self.index.get(s) {
+            return i;
+        }
+        let bucket = SymbolTable::hash(s) % SYMBOL_MODULO;
+        let i = self.entries.len();
+        self.entries.push(SymEntry { string: s.to_string(), bucket, usage: false, id: 0 });
+        self.index.insert(s.to_string(), i);
+        i
+    }
+
+    /// Intern `s` and mark it emitted (`usage |= 1`), returning its index.
+    fn use_symbol(&mut self, s: &str) -> usize {
+        let i = self.intern(s);
+        self.entries[i].usage = true;
+        i
+    }
+
+    /// `fxParserCode`'s ID walk: buckets in index order, most-recent-first
+    /// within each bucket, numbering only `usage` symbols from 1.
+    fn assign_ids(&mut self) {
+        // Per-bucket index lists in prepend (reverse-insertion) order.
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); SYMBOL_MODULO as usize];
+        for i in 0..self.entries.len() {
+            buckets[self.entries[i].bucket as usize].push(i);
+        }
+        let mut id: i32 = 1;
+        for bucket in &buckets {
+            for &i in bucket.iter().rev() {
+                if self.entries[i].usage {
+                    self.entries[i].id = id;
+                    id += 1;
+                }
+            }
+        }
+    }
+
+    /// The id-by-index table for emission.
+    fn id_table(&self) -> Vec<i32> {
+        self.entries.iter().map(|e| e.id).collect()
+    }
 }
 
 /// One code record — XS's `txByteCode` with its subtype fields. `id` is
@@ -141,6 +260,8 @@ pub struct Coder<'a> {
     first_break_target: Option<usize>,
     first_continue_target: Option<usize>,
     return_target: Option<usize>,
+    /// The atom table (`parser->symbolTable`), seeded with the built-ins.
+    symbols: SymbolTable,
     tree: &'a ScopeTree,
 }
 
@@ -158,8 +279,45 @@ impl<'a> Coder<'a> {
             first_break_target: None,
             first_continue_target: None,
             return_target: None,
+            symbols: SymbolTable::seeded(),
             tree,
         }
+    }
+
+    /// Pre-intern every source symbol in AST pre-order, mirroring XS's
+    /// lex-time interning so the atom table's insertion order (and thus the
+    /// bucket-list order that decides within-bucket IDs) matches. Runs once
+    /// before coding; usage is set later, as each symbol is emitted.
+    ///
+    /// Fold: AST pre-order equals XS's lex order for the ported surface
+    /// (identifier refs, member property names). Constructs where the
+    /// parser interns in an order that diverges from AST pre-order (e.g.
+    /// numeric/computed property keys, some declaration positions) are a
+    /// named edge for the declaration/object slices.
+    fn intern_tree(&mut self, item: &Item) {
+        match item {
+            Item::Symbol(s) => {
+                self.symbols.intern(s);
+            }
+            Item::Node(n) => {
+                for c in &n.children {
+                    self.intern_tree(c);
+                }
+            }
+            Item::List(items) => {
+                for c in items {
+                    self.intern_tree(c);
+                }
+            }
+            Item::Null => {}
+        }
+    }
+
+    /// `fxCoderAddSymbol` — emit a symbol-operand op, marking the symbol
+    /// used so it earns an ID.
+    fn add_symbol(&mut self, delta: i32, id: i32, name: &str) {
+        let sym = self.symbols.use_symbol(name);
+        self.add(delta, Payload::Symbol { sym }, id);
     }
 
     // ---- fxCoderAdd* constructors -----------------------------------
@@ -336,6 +494,9 @@ pub fn compile_with(source: &str, strict: bool) -> Result<Vec<u8>, crate::parser
     let root = parser.parse_program(strict)?;
     let tree = crate::scoper::run(&root)?;
     let mut coder = Coder::new(&tree);
+    // Intern the program's symbols in lex order before coding so the atom
+    // table's bucket lists match XS's.
+    coder.intern_tree(&root);
     // The oracle shim compiles the *script* goal as an eval program
     // (`fxParseScript(..., mxProgramFlag | mxEvalFlag)`), so the program
     // header is coded through `fxScopeCodingEval`.
@@ -450,6 +611,8 @@ impl Coder<'_> {
             }
             Regexp => self.code_regexp(node),
             Template => self.code_template(node),
+            Access => self.code_access(node),
+            Member => self.code_member(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -802,6 +965,47 @@ impl Coder<'_> {
         self.add_byte(-1, XS_CODE_THROW);
     }
 
+    /// The symbol name in an `Item::Symbol` child slot.
+    fn symbol_of(item: &Item) -> &str {
+        match item {
+            Item::Symbol(s) => s.as_str(),
+            _ => panic!("expected symbol slot"),
+        }
+    }
+
+    /// `fxAccessNodeCode`. Child `[symbol]`. At program scope every
+    /// identifier is a free (global) reference, so the coder takes the
+    /// unresolved path: an `EVAL_REFERENCE` (the program is coded with the
+    /// eval flag) then `GET_VARIABLE`. Resolved (local/closure) access
+    /// needs the scoper's per-node declaration and arrives with the
+    /// declaration slices.
+    fn code_access(&mut self, node: &Node) {
+        let name = Self::symbol_of(&node.children[0]).to_string();
+        // fxAccessNodeCodeReference (unresolved, evalFlag branch)
+        if self.eval_flag {
+            self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
+        } else {
+            self.add_symbol(1, XS_CODE_PROGRAM_REFERENCE, &name);
+        }
+        self.add_symbol(0, XS_CODE_GET_VARIABLE, &name);
+    }
+
+    /// `fxMemberNodeCode`. Children `[reference, symbol]` → the reference
+    /// then a `GET_PROPERTY` (or `GET_SUPER` for a `super.x` reference;
+    /// `super` is deferred with classes).
+    fn code_member(&mut self, node: &Node) {
+        self.code(&node.children[0]);
+        let is_super = self.node_is_super(&node.children[0]);
+        let name = Self::symbol_of(&node.children[1]).to_string();
+        let op = if is_super { XS_CODE_GET_SUPER } else { XS_CODE_GET_PROPERTY };
+        self.add_symbol(0, op, &name);
+    }
+
+    /// Whether a reference child carries `mxSuperFlag` (a `super.x` base).
+    fn node_is_super(&self, item: &Item) -> bool {
+        matches!(item, Item::Node(n) if n.flags & crate::ast::flags::SUPER != 0)
+    }
+
     /// `fxTemplateNodeCode`, untagged branch. Children `[reference,
     /// List(items)]`; the items alternate `TemplateMiddle` (a cooked +
     /// raw string pair) with substitution expressions. The tagged branch
@@ -1124,10 +1328,15 @@ impl Coder<'_> {
             size2_step(c, &mut size, &mut delta, &mut self.targets);
         }
 
+        // Assign symbol IDs from the now-complete usage marks (XS does the
+        // bucket walk here, between sizing and emission).
+        self.symbols.assign_ids();
+        let sym_ids = self.symbols.id_table();
+
         // ---- pass 3: emit ---------------------------------------------
         let mut out: Vec<u8> = Vec::with_capacity(size.max(0) as usize);
         for c in &self.codes {
-            emit_step(c, &mut out, &self.targets);
+            emit_step(c, &mut out, &self.targets, &sym_ids);
         }
         out
     }
@@ -1336,7 +1545,7 @@ fn size2_step(c: &mut Code, size: &mut i32, delta: &mut i32, targets: &mut [Targ
 }
 
 /// Pass 3: emit the opcode byte and its operand with the chosen width.
-fn emit_step(c: &Code, out: &mut Vec<u8>, targets: &[Target]) {
+fn emit_step(c: &Code, out: &mut Vec<u8>, targets: &[Target], sym_ids: &[i32]) {
     if c.id != XS_NO_CODE {
         out.push(c.id as u8);
     }
@@ -1424,7 +1633,7 @@ fn emit_step(c: &Code, out: &mut Vec<u8>, targets: &[Target]) {
         }
         _ => {
             if is_symbol_op(c.id) {
-                out.extend_from_slice(&(symbol_id(c) as u16).to_le_bytes());
+                out.extend_from_slice(&(symbol_id(c, sym_ids) as u16).to_le_bytes());
             } else if is_index_1_fixed(c.id) {
                 out.push((index_value(c) + 1) as u8);
             } else if is_index_2_fixed(c.id) {
@@ -1455,9 +1664,9 @@ fn integer_value(c: &Code) -> i32 {
         _ => 0,
     }
 }
-fn symbol_id(c: &Code) -> i32 {
+fn symbol_id(c: &Code, sym_ids: &[i32]) -> i32 {
     match &c.payload {
-        Payload::Symbol { id } => *id,
+        Payload::Symbol { sym } => sym_ids[*sym],
         _ => 0,
     }
 }

@@ -254,6 +254,23 @@ fn this_and_regexp() {
 }
 
 #[test]
+fn global_access_and_member() {
+    assert_identical(&[
+        // free (global) identifier references → EVAL_REFERENCE + GET_VARIABLE
+        "x;", "foo;", "x,y;", "x+y;", "x*y+z;", "typeof x;", "-x;",
+        // member access → GET_PROPERTY (symbol IDs from the atom table)
+        "a.b;", "a.b.c;", "foo.bar;", "x.length;", "o.a+o.b;",
+        "a.b,c.d;", "obj.prototype;", "x.y.z.w;",
+        // mix with built-in-symbol collisions (length/name/prototype seeded)
+        "a.name;", "a.length;", "a.constructor;", "x.value.done;",
+        // identifiers that are also seeded symbols used as globals
+        "undefined;", "NaN;", "Infinity;",
+        // longer symbol sets to exercise multi-symbol ID ordering
+        "alpha.beta+gamma.delta;", "one.two.three;",
+    ]);
+}
+
+#[test]
 fn untagged_templates() {
     assert_identical(&[
         "``;", "`abc`;", "`a\nb`;",
