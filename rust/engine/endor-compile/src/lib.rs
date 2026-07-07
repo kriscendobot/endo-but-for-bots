@@ -28,7 +28,7 @@ pub mod token_flags;
 pub mod unicode;
 
 pub use ast::{Item, Node};
-pub use coder::{compile, compile_with};
+pub use coder::{compile, compile_module, compile_with};
 pub use error::{LexError, LexErrorKind};
 pub use lexer::{BigIntLiteral, Lexeme, Lexer};
 pub use meter::ParseMeter;

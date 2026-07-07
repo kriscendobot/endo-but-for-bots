@@ -238,6 +238,104 @@ void endor_oracle_free(EndorOracleResult *out)
 }
 
 /*
+ * Compile `source` as a MODULE goal and return the emitted bytecode
+ * WITHOUT running it (stage-5 modules child, PR #600).
+ *
+ * The differential harness reaches the C-XS compiler through
+ * endor_oracle_run, but that entry compiles only the SCRIPT goal
+ * (fxParseScript with mxProgramFlag | mxEvalFlag), where a top-level
+ * import/export is a SyntaxError — so module output was untestable. A
+ * module also cannot fxRunScript without a linker (the MODULE opcode
+ * needs a module record + realm the bare-boot machine has not built),
+ * so this entry parses-and-codes ONLY and hands back script->codeBuffer.
+ *
+ * The goal split is the whole point: we pass fxParseScript neither
+ * mxProgramFlag nor mxJSONModuleFlag, so fxParserTree takes its module
+ * branch (fxModule, adding mxStrictFlag | mxAsyncFlag), exactly the goal
+ * the endor Rust `compile_module` targets. This does NOT touch the
+ * script path: endor_oracle_run is unchanged, so the existing
+ * byte-identity script corpus is a locked regression (a dedicated test
+ * asserts the script entry's output is unperturbed by this addition).
+ *
+ * Contract mirrors endor_oracle_run's capture half: out->ok == 1 with
+ * code/symbols populated on a clean parse+code; out->ok == 0 with a
+ * best-effort message on a SyntaxError (or an empty codeBuffer, which
+ * the harness reads as a rejection). No metering, no completion value —
+ * nothing runs.
+ */
+int endor_oracle_compile_module(const char *source, txU4 sourceLen, EndorOracleResult *out)
+{
+	txMachine *the;
+	memset(out, 0, sizeof(*out));
+
+	if (!gEndorClusterReady) {
+		fxInitializeSharedCluster(C_NULL);
+		gEndorClusterReady = 1;
+	}
+
+	the = fxCreateMachine(&gEndorCreation, "endor-oracle-module", C_NULL, 0);
+	if (!the)
+		return -1;
+
+	the = fxBeginHost(the);
+	{
+		mxTry(the) {
+			txStringCStream stream;
+			txScript *script;
+
+			stream.buffer = (txString)source;
+			stream.offset = 0;
+			stream.size = (txSize)sourceLen;
+
+			/* Module goal: no mxProgramFlag and no mxJSONModuleFlag, so
+			 * fxParserTree parses as a Module (fxModule) rather than a
+			 * Script. Compile only; never run. */
+			script = fxParseScript(the, &stream, fxStringCGetter, 0);
+
+			if (script && script->codeSize > 0) {
+				out->code_size = (txU4)script->codeSize;
+				out->code = (txS1 *)malloc(script->codeSize);
+				if (out->code)
+					memcpy(out->code, script->codeBuffer, script->codeSize);
+				if (script->symbolsBuffer && script->symbolsSize > 0) {
+					out->symbols_size = (txU4)script->symbolsSize;
+					out->symbols = (txS1 *)malloc(script->symbolsSize);
+					if (out->symbols)
+						memcpy(out->symbols, script->symbolsBuffer,
+							script->symbolsSize);
+				}
+				out->ok = 1;
+			}
+			else {
+				/* A parse error yields a NULL/empty script (fxParserCode
+				 * returns C_NULL when errorCount is nonzero and there is no
+				 * console). Report a rejection, not a machine failure. */
+				out->ok = 0;
+				strncpy(out->error, "SyntaxError: module parse failed",
+					ENDOR_ERROR_MAX - 1);
+				out->error[ENDOR_ERROR_MAX - 1] = 0;
+			}
+		}
+		mxCatch(the) {
+			out->ok = 0;
+			if (mxException.kind != XS_UNDEFINED_KIND) {
+				mxPush(mxException);
+				fxToString(the, the->stack);
+				if (the->stack->value.string) {
+					strncpy(out->error, the->stack->value.string,
+						ENDOR_ERROR_MAX - 1);
+					out->error[ENDOR_ERROR_MAX - 1] = 0;
+				}
+				mxPop();
+			}
+		}
+	}
+	fxEndHost(the);
+	fxDeleteMachine(the);
+	return 0;
+}
+
+/*
  * XSRE matcher oracle (stage-3b child 8, PR #600).
  *
  * The XSRE regexp engine (xsre.c) is engine-internal: it has no

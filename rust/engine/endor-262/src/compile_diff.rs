@@ -122,6 +122,25 @@ fn oracle_compile(source: &str) -> Option<(bool, Vec<u8>)> {
     Some((parsed, o.bytecode))
 }
 
+/// Whether the oracle *compiled* `source` as a **Module** (accepted it),
+/// returning the exact XS module bytecode on accept. `None` = machine
+/// startup failure (unavailable); `Some((false, _))` = a `SyntaxError`.
+fn oracle_compile_module(source: &str) -> Option<(bool, Vec<u8>)> {
+    let o = endor_oracle::compile_module(source)?;
+    Some((o.compiled, o.bytecode))
+}
+
+/// endor's **Module** compile verdict for `source`, total over panics —
+/// the module counterpart of [`endor_compile`].
+fn endor_compile_module(source: &str) -> Result<Result<Vec<u8>, String>, String> {
+    let caught = panic::catch_unwind(AssertUnwindSafe(|| endor_compile::compile_module(source)));
+    match caught {
+        Ok(Ok(bytes)) => Ok(Ok(bytes)),
+        Ok(Err(e)) => Ok(Err(format!("{:?}", e))),
+        Err(payload) => Err(panic_message(payload)),
+    }
+}
+
 /// endor's compile verdict for `source`, total over panics. `Ok(Ok(bytes))`
 /// = accepted; `Ok(Err(reason))` = structured rejection; `Err(reason)` =
 /// coder panic (the ported-surface fold). The caller silences the panic
@@ -225,6 +244,107 @@ pub fn compile_one(source: &str) -> CompileVerdict {
         (false, true) => CompileVerdict::OracleRejectedEndorAccepted,
         (false, false) => CompileVerdict::OracleRejected,
     }
+}
+
+/// Classify one `(id, source)` under the **Module** compile differential —
+/// the module-goal counterpart of [`compile_one`], comparing
+/// `endor_compile::compile_module` against `endor_oracle::compile_module`
+/// (parse + code, no run) byte for byte.
+pub fn compile_one_module(source: &str) -> CompileVerdict {
+    let (oracle_accepts, oracle_bytes) = match oracle_compile_module(source) {
+        Some(v) => v,
+        None => return CompileVerdict::OracleUnavailable,
+    };
+    let endor = endor_compile_module(source);
+    let endor_accepts = matches!(endor, Ok(Ok(_)));
+
+    match (oracle_accepts, endor_accepts) {
+        (true, true) => {
+            let endor_bytes = match endor {
+                Ok(Ok(b)) => b,
+                _ => unreachable!(),
+            };
+            if endor_bytes == oracle_bytes {
+                CompileVerdict::Identical
+            } else {
+                let (class, detail) = classify_divergence(&oracle_bytes, &endor_bytes);
+                CompileVerdict::Divergent { class, detail }
+            }
+        }
+        (true, false) => {
+            let detail = match endor {
+                Ok(Err(e)) => format!("module parse/scope reject: {}", e),
+                Err(p) => format!("module coder panic: {}", p),
+                _ => unreachable!(),
+            };
+            CompileVerdict::EndorRejected { detail }
+        }
+        (false, true) => CompileVerdict::OracleRejectedEndorAccepted,
+        (false, false) => CompileVerdict::OracleRejected,
+    }
+}
+
+/// Run the **Module** compile differential over an explicit list of `(id,
+/// source)` module programs, silencing the panic hook for the batch.
+pub fn module_compile_diff_programs(programs: &[(String, String)]) -> CompileReport {
+    let prev_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let mut report = CompileReport::default();
+    for (id, source) in programs {
+        report.record(id, compile_one_module(source));
+    }
+    panic::set_hook(prev_hook);
+    report
+}
+
+/// The curated **module** corpus (`endor-262/corpora-modules/*.js`) as
+/// `(id, source)` pairs. Unlike the script corpora (one program per line),
+/// each file holds one or more whole *module* programs separated by a line
+/// that is exactly `// ---` (a module spans multiple lines and its
+/// `import`/`export` declarations are goal-sensitive), so the file is read
+/// as a delimiter-split sequence, not line by line.
+pub fn module_corpora_programs() -> Vec<(String, String)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpora-modules");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().map(|x| x == "js").unwrap_or(false))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let mut out = Vec::new();
+    for file in &files {
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let contents = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Split the file into module chunks on `// ---` delimiter lines.
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in contents.lines() {
+            if line.trim() == "// ---" {
+                chunks.push(std::mem::take(&mut current));
+            } else {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+        chunks.push(current);
+        let mut n = 0usize;
+        for chunk in chunks {
+            if chunk.trim().is_empty() {
+                continue;
+            }
+            n += 1;
+            out.push((format!("{}#{}", name, n), chunk));
+        }
+    }
+    out
 }
 
 /// Run the compile differential over an explicit list of `(id, source)`
@@ -406,6 +526,48 @@ mod tests {
             report.identical,
             report.total
         );
+    }
+
+    #[test]
+    fn module_corpora_byte_identity_no_divergence() {
+        // The stage-5 **module** byte-identity gate: every curated module
+        // program (`corpora-modules/*.js`, delimiter-split) must compile to
+        // module bytecode byte-identical to the C-XS oracle's module-compile
+        // entry — default/named/namespace imports, named/default/re-export
+        // forms, and live-binding access. Zero divergence AND zero
+        // endor-rejection where the oracle accepts (a coder fold in the
+        // module path fails the build), exactly as the script gate does.
+        let programs = module_corpora_programs();
+        assert!(
+            !programs.is_empty(),
+            "curated module corpora must contain programs"
+        );
+        let report = module_compile_diff_programs(&programs);
+        let mut buf = Vec::new();
+        print_report(&mut buf, &report, "corpora-modules").unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&buf));
+
+        assert_eq!(
+            report.divergent, 0,
+            "module byte divergence(s): {:#?}",
+            report.divergences
+        );
+        assert_eq!(
+            report.endor_rejected, 0,
+            "module endor-rejection(s) where the oracle accepts (a module coder fold): {:#?}",
+            report.endor_rejections
+        );
+        assert_eq!(
+            report.accept_disagreements, 0,
+            "endor accepted module program(s) the oracle rejected — a real bar violation"
+        );
+        // Every curated module program is both-accept and byte-identical.
+        assert_eq!(
+            report.identical, report.total,
+            "every curated module program must be byte-identical (identical={} total={})",
+            report.identical, report.total
+        );
+        assert!(report.identical > 0, "expected accepted module programs");
     }
 }
 

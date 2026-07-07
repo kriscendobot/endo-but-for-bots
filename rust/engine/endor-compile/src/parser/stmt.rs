@@ -1705,7 +1705,7 @@ impl Parser {
         let mut symbol: Option<String> = None;
         if self.cur.token == Token::Class {
             self.class_expression(line, Some(&mut symbol))?;
-            let name = symbol.clone().unwrap_or_else(|| "*default*".to_string());
+            let name = symbol.clone().unwrap_or_else(|| "default".to_string());
             self.push_symbol(name);
             self.push_node_struct(1, Token::Let, line)?;
             self.swap_nodes();
@@ -1724,12 +1724,12 @@ impl Parser {
             } else {
                 self.function_expression(line, Some(&mut symbol), flag)?;
             }
-            let name = symbol.clone().unwrap_or_else(|| "*default*".to_string());
+            let name = symbol.clone().unwrap_or_else(|| "default".to_string());
             self.push_define(name, line);
         } else {
             self.assignment_expression()?;
             self.semicolon()?;
-            self.push_symbol("*default*".to_string());
+            self.push_symbol("default".to_string());
             self.push_null();
             self.push_node_struct(2, Token::Const, line)?;
             self.swap_nodes();
@@ -1739,9 +1739,9 @@ impl Parser {
         // specifier for the default export
         if let Some(sym) = &symbol {
             self.push_symbol(sym.clone());
-            self.push_symbol("*default*".to_string());
+            self.push_symbol("default".to_string());
         } else {
-            self.push_symbol("*default*".to_string());
+            self.push_symbol("default".to_string());
             self.push_null();
         }
         self.push_node_struct(2, Token::Specifier, line)?;
@@ -1826,7 +1826,7 @@ impl Parser {
         let before = self.stack.len();
         self.match_token(Token::Import)?;
         if self.cur.token == Token::Identifier {
-            self.push_symbol("*default*".to_string());
+            self.push_symbol("default".to_string());
             let s = self.cur.symbol.clone().unwrap_or_default();
             let l = self.cur.line;
             self.push_symbol(s);

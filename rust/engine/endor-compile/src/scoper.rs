@@ -87,6 +87,34 @@ pub enum Sym {
 
 // ============================ declare node =============================
 
+/// The module linkage a declaration carries when it is an import binding
+/// or a re-export slot — a transliteration of the `txSpecifierNode` the
+/// hoist pass hangs off `txDeclareNode.importSpecifier`. The coder reads
+/// it in `fxScopeCodeSpecifierNodes` to emit the `TRANSFER` operands.
+#[derive(Clone, Debug)]
+pub struct ImportSpec {
+    /// `specifier->from` — the module-specifier string (`from "m"`), as
+    /// UTF-16 code units so the coder emits XS's CESU-8 `STRING_1`.
+    pub from: Vec<u16>,
+    /// `specifier->symbol` — the *imported* name (a named import's source
+    /// name, or `*default*`), or `None` for a namespace / bare import.
+    pub symbol: Option<String>,
+    /// `specifier->with` — an import-attributes (`with { … }`) form, which
+    /// selects `TRANSFER_JSON` over `TRANSFER`.
+    pub with: bool,
+}
+
+/// One exported name a module-scope declaration answers to — a
+/// transliteration of an entry on `txDeclareNode.firstExportSpecifier`.
+/// The coder emits the export name (`asSymbol ? asSymbol : symbol`, or
+/// `NULL`) per entry.
+#[derive(Clone, Debug)]
+pub struct ExportSpec {
+    /// The exported name: `asSymbol ? asSymbol : symbol`, or `None` for an
+    /// anonymous (`export *`) slot.
+    pub name: Option<String>,
+}
+
 /// One declaration in a scope's declare list — a transliteration of the
 /// `txDeclareNode` fields the scoper reads and writes. Carries a stable
 /// `id` so define-list entries, closure aliases, and access resolutions
@@ -110,6 +138,13 @@ pub struct Declare {
     /// For a closure alias (`NoToken` in a function scope) the ancestor
     /// declaration it forwards to: `(scope, declare id)`.
     pub alias: Option<(usize, u32)>,
+    /// `node->importSpecifier` — the import/re-export linkage when this is a
+    /// module-scope import binding (`None` for a plain local).
+    pub import_spec: Option<ImportSpec>,
+    /// `node->firstExportSpecifier` — the exported names this declaration is
+    /// bound to, in coder-emit order (XS prepends, so this is the reverse of
+    /// source order across repeated exports of the same local).
+    pub export_specs: Vec<ExportSpec>,
 }
 
 /// A define-list entry (`firstDefineNode`…). In XS the define node is the
@@ -381,6 +416,17 @@ fn child_sym(n: &Node, i: usize) -> Option<String> {
         _ => None,
     }
 }
+/// The UTF-16 units of a `String`-node child (a module specifier `from`
+/// string), or `None` if the slot is not a string node.
+fn child_str_units(n: &Node, i: usize) -> Option<Vec<u16>> {
+    match n.children.get(i) {
+        Some(Item::Node(b)) if b.token == Token::String => match &b.value {
+            crate::ast::Value::Str(u) => Some(u.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 /// Whether a class node (`children[2]` = member list) declares at least one
 /// **instance** data field — a member with neither `static` nor a
 /// method/getter/setter flag. Drives the `instanceInit` synthesis.
@@ -445,7 +491,16 @@ impl Scoper {
     fn new_declare(&mut self, si: usize, token: Token, symbol: Option<Sym>, line: u32) -> Declare {
         let id = self.scopes[si].next_id;
         self.scopes[si].next_id += 1;
-        Declare { id, token, symbol, flags: 0, line, alias: None }
+        Declare {
+            id,
+            token,
+            symbol,
+            flags: 0,
+            line,
+            alias: None,
+            import_spec: None,
+            export_specs: Vec::new(),
+        }
     }
 
     /// `fxScopeAddDeclareNode` — append (or, for an eval scope, prepend)
@@ -1217,19 +1272,29 @@ impl Scoper {
     fn hoist_import(&mut self, node: &Node) -> Result<(), ParseError> {
         let scope = self.scope.unwrap();
         let strict = self.node_flags(node) & SCOPE_STRICT != 0;
+        // `from` string (children[1]) and `with` attributes (children[2])
+        // are the import node's, shared by every specifier (`specifier->from
+        // = self->from`, `fxImportNodeHoist`).
+        let from = child_str_units(node, 1).unwrap_or_default();
+        let with = matches!(child(node, 2), Some(Item::Node(_)));
         let specs = match child(node, 0) {
             Some(Item::List(v)) if !v.is_empty() => v.clone(),
             _ => {
-                // bare `import "m"` — one anonymous indirect binding.
+                // bare `import "m"` — one anonymous indirect binding whose
+                // TRANSFER still carries the module specifier.
                 let mut d = self.new_declare(scope, Token::Let, None, node.line);
                 d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                d.import_spec = Some(ImportSpec { from, symbol: None, with });
                 self.scope_add_declare(scope, d);
                 return Ok(());
             }
         };
         for spec in &specs {
             let Item::Node(spec) = spec else { continue };
-            let local = child_sym(spec, 1).or_else(|| child_sym(spec, 0));
+            // spec children: [symbol (imported name), asSymbol (local alias)].
+            // local = asSymbol ? asSymbol : symbol; imported = symbol.
+            let imported = child_sym(spec, 0);
+            let local = child_sym(spec, 1).or_else(|| imported.clone());
             let Some(local) = local else { continue };
             let sym = Sym::Named(local.clone());
             if strict && (local == "arguments" || local == "eval") {
@@ -1240,6 +1305,7 @@ impl Scoper {
             }
             let mut d = self.new_declare(scope, Token::Let, Some(sym), spec.line);
             d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+            d.import_spec = Some(ImportSpec { from: from.clone(), symbol: imported, with });
             self.scope_add_declare(scope, d);
         }
         Ok(())
@@ -1250,8 +1316,51 @@ impl Scoper {
     /// error. The `export … from` re-export indirection (which synthesizes
     /// indirect `let` bindings) is folded (see report).
     fn hoist_export(&mut self, node: &Node) -> Result<(), ParseError> {
-        if matches!(child(node, 1), Some(Item::Node(_))) {
-            // `export … from "m"` — folded.
+        // `export … from "m"` — a re-export. XS synthesizes one anonymous
+        // module-scope `let` per specifier (its `importSpecifier` *and*
+        // `firstExportSpecifier` both point at the specifier), so the module
+        // record links a fresh indirect binding to the source module.
+        if let Some(from) = child_str_units(node, 1) {
+            let scope = self.scope.unwrap();
+            let with = matches!(child(node, 2), Some(Item::Node(_)));
+            match child(node, 0) {
+                Some(Item::List(specs)) if !specs.is_empty() => {
+                    for spec in specs.clone() {
+                        let Item::Node(spec) = spec else { continue };
+                        // import symbol = spec->symbol (children[0]); export
+                        // name = asSymbol ? asSymbol : symbol.
+                        let imported = child_sym(&spec, 0);
+                        let export_name = child_sym(&spec, 1).or_else(|| imported.clone());
+                        let mut d = self.new_declare(scope, Token::Let, None, node.line);
+                        d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                        d.import_spec =
+                            Some(ImportSpec { from: from.clone(), symbol: imported, with });
+                        d.export_specs.push(ExportSpec { name: export_name });
+                        self.scope_add_declare(scope, d);
+                    }
+                }
+                _ => {
+                    // `export * from "m"` with no specifiers list.
+                    let mut d = self.new_declare(scope, Token::Let, None, node.line);
+                    d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                    d.import_spec = Some(ImportSpec { from, symbol: None, with });
+                    self.scope_add_declare(scope, d);
+                }
+            }
+            // Re-export names still join the export-link duplicate set.
+            if let Some(Item::List(specs)) = child(node, 0) {
+                for spec in specs {
+                    let Item::Node(spec) = spec else { continue };
+                    let name = child_sym(spec, 1).or_else(|| child_sym(spec, 0));
+                    if let Some(name) = name {
+                        let sym = Sym::Named(name);
+                        if self.export_links.contains(&sym) {
+                            return Err(err(spec.line, "duplicate export"));
+                        }
+                        self.export_links.push(sym);
+                    }
+                }
+            }
             return Ok(());
         }
         if let Some(Item::List(specs)) = child(node, 0) {
@@ -1832,23 +1941,33 @@ impl Scoper {
             return Ok(());
         }
         let scope = self.scope.unwrap();
-        let specs: Vec<(String, u32)> = match child(node, 0) {
+        // spec children: [symbol (local name), asSymbol (exported name)].
+        // Resolve the local; the exported name (`asSymbol ? asSymbol :
+        // symbol`) is linked onto the declaration's export chain.
+        let specs: Vec<(String, Option<String>, u32)> = match child(node, 0) {
             Some(Item::List(v)) => v
                 .iter()
                 .filter_map(|it| match it {
-                    Item::Node(spec) => child_sym(spec, 0).map(|s| (s, spec.line)),
+                    Item::Node(spec) => {
+                        child_sym(spec, 0).map(|s| (s, child_sym(spec, 1), spec.line))
+                    }
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
         };
-        for (name, line) in specs {
+        for (name, as_name, line) in specs {
             let sym = Sym::Named(name.clone());
             let resolved = self.scope_lookup(scope, &sym, line, false, false);
             match resolved {
                 Some((si, id)) => {
+                    let export_name = as_name.or_else(|| Some(name.clone()));
                     let d = self.declare_mut(si, id);
                     d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                    // XS prepends the specifier onto `firstExportSpecifier`
+                    // (`fxExportNodeBind`), so the emit order is the reverse
+                    // of source order across repeated exports of one local.
+                    d.export_specs.insert(0, ExportSpec { name: export_name });
                     self.record_access(&name, line, Some((si, id)));
                 }
                 None => return Err(err(line, "unknown variable")),

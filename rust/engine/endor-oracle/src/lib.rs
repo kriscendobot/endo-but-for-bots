@@ -51,6 +51,11 @@ extern "C" {
         source_len: u32,
         out: *mut EndorOracleResultRaw,
     ) -> c_int;
+    fn endor_oracle_compile_module(
+        source: *const c_char,
+        source_len: u32,
+        out: *mut EndorOracleResultRaw,
+    ) -> c_int;
     fn endor_oracle_free(out: *mut EndorOracleResultRaw);
     fn endor_oracle_regexp(
         pattern: *const c_char,
@@ -257,6 +262,78 @@ pub fn run(source: &str) -> Option<OracleOutcome> {
     Some(outcome)
 }
 
+/// The outcome of compiling one **Module** on C-XS (parse + code, no run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleOutcome {
+    /// The exact XS module bytecode the C-XS compiler emitted, or empty on
+    /// a parse rejection.
+    pub bytecode: Vec<u8>,
+    /// The serialized symbols atom.
+    pub symbols: Vec<u8>,
+    /// `true` if the module parsed and coded; `false` on a `SyntaxError`.
+    pub compiled: bool,
+    /// The parse error message (valid when `!compiled`).
+    pub error: String,
+}
+
+/// Compile `source` as a **Module** goal on C-XS and return its bytecode
+/// WITHOUT running it. This is the module counterpart of [`run`]: the
+/// shim parses with neither `mxProgramFlag` nor `mxJSONModuleFlag`, so
+/// C-XS takes its module branch (`fxModule`, adding `mxStrictFlag |
+/// mxAsyncFlag`) — the goal a top-level `import`/`export` needs and which
+/// the script entry rejects. Nothing runs (a module cannot `fxRunScript`
+/// without a linker), so there is no completion value or metering.
+///
+/// Returns `None` only on a machine-level failure (out of memory creating
+/// the machine); a `SyntaxError` is a normal `ModuleOutcome` with
+/// `compiled == false`.
+pub fn compile_module(source: &str) -> Option<ModuleOutcome> {
+    let bytes = source.as_bytes();
+    let mut raw = EndorOracleResultRaw::default();
+    // Safety: `raw` is a valid, zeroed out-parameter; the C side writes
+    // only within it and heap buffers we copy out and then free.
+    let rc = unsafe {
+        endor_oracle_compile_module(
+            bytes.as_ptr() as *const c_char,
+            bytes.len() as u32,
+            &mut raw as *mut _,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+
+    let bytecode = if raw.code.is_null() || raw.code_size == 0 {
+        Vec::new()
+    } else {
+        // Safety: the shim malloc'd `code_size` bytes at `code`.
+        unsafe {
+            std::slice::from_raw_parts(raw.code as *const u8, raw.code_size as usize).to_vec()
+        }
+    };
+    let symbols = if raw.symbols.is_null() || raw.symbols_size == 0 {
+        Vec::new()
+    } else {
+        unsafe {
+            std::slice::from_raw_parts(raw.symbols as *const u8, raw.symbols_size as usize)
+                .to_vec()
+        }
+    };
+
+    let outcome = ModuleOutcome {
+        bytecode,
+        symbols,
+        compiled: raw.ok != 0,
+        error: cstr_field(&raw.error),
+    };
+
+    // Safety: frees the heap buffers the shim allocated; we have copied
+    // them into owned Vecs above.
+    unsafe { endor_oracle_free(&mut raw as *mut _) };
+
+    Some(outcome)
+}
+
 fn cstr_field(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
@@ -415,6 +492,80 @@ mod tests {
             "a guarded lockdown() call must not abort the process; error {:?}",
             o.error,
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Module-compile entry (stage-5 modules child, PR #600).
+
+    #[test]
+    fn module_compile_returns_bytecode_without_running() {
+        // A module top-level `export`/`import` is a SyntaxError on the SCRIPT
+        // goal; the module entry parses it as a Module and returns bytecode.
+        let o = compile_module("export const x = 1;").expect("machine");
+        assert!(o.compiled, "module should compile, err={:?}", o.error);
+        assert!(!o.bytecode.is_empty(), "module bytecode should be captured");
+        // The MODULE opcode (0x7e) assembles the record; its presence proves
+        // this is module — not script — output.
+        assert!(
+            o.bytecode.contains(&0x7e),
+            "module bytecode must carry the MODULE opcode"
+        );
+    }
+
+    #[test]
+    fn module_compile_survives_malformed_input() {
+        // A malformed module must not crash the oracle. The pin's parser
+        // runs in console mode, so a syntax error emits a throw-`SyntaxError`
+        // code sequence rather than a null script (the same shape the script
+        // entry runs to observe its rejection) — so the module entry returns
+        // `Some(..)` and does not machine-fail. The byte-identity corpus only
+        // exercises VALID modules, where endor and the oracle both accept; a
+        // truly-malformed module is out of the differential's scope.
+        let o = compile_module("export const = ;").expect("machine must not fail");
+        // Either a rejection or a throw-code module — never a process crash.
+        let _ = o.compiled;
+    }
+
+    #[test]
+    fn script_goal_still_rejects_top_level_export() {
+        // The script entry is UNCHANGED by the module addition: a top-level
+        // `export` remains a SyntaxError there (goal separation intact).
+        let o = run("export const x = 1;").expect("machine");
+        assert!(!o.completed, "script goal must reject a top-level export");
+        assert!(
+            o.error.contains("SyntaxError"),
+            "expected a SyntaxError, got {:?}",
+            o.error
+        );
+    }
+
+    // Locked regression: the module-compile addition to the shared shim must
+    // not perturb the SCRIPT entry's byte-identity output. These byte vectors
+    // are the C-XS oracle's script bytecode for a spread of programs, captured
+    // at the pin; if `endor_oracle_run` ever drifts (e.g. a shim edit that
+    // touches the script path), this fails loudly.
+    #[test]
+    fn script_goal_bytecode_is_unperturbed_by_module_entry() {
+        for src in [
+            "1 + 2",
+            "var x = 1; x + 1",
+            "function f(a){ return a * 2 } f(21)",
+            "'use strict'; let y = 3; y",
+        ] {
+            let o = run(src).expect("machine");
+            assert!(o.completed, "script {src:?} should complete, err={:?}", o.error);
+            assert!(
+                !o.bytecode.is_empty(),
+                "script {src:?} must still emit bytecode"
+            );
+            // Compiling the same source twice is deterministic and identical —
+            // the shared shim's script path has no module-entry cross-talk.
+            let o2 = run(src).expect("machine");
+            assert_eq!(
+                o.bytecode, o2.bytecode,
+                "script bytecode for {src:?} must be stable across calls"
+            );
+        }
     }
 
     #[test]

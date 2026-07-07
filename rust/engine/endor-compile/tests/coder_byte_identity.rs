@@ -8,7 +8,7 @@
 //! **opcode-level diff** from a small disassembler — a triage tool that
 //! pays for itself the first time a width or a branch displacement is off.
 
-use endor_compile::compile;
+use endor_compile::{compile, compile_module};
 
 // --------------------------- disassembler ----------------------------
 //
@@ -1291,5 +1291,119 @@ fn anonymous_function_member_target_no_name() {
         "function F(){} F.valueOf = function(){ return 1; }; 1 + F;",
         // a bare-identifier assignment still infers the name
         "var g; g = function(){}; g.name;",
+    ]);
+}
+
+// ============================ module goal ============================
+//
+// The Module goal (stage-5 modules child): `endor_compile::compile_module`
+// must equal `endor_oracle::compile_module(src).bytecode` byte for byte.
+// The oracle module entry parses as a Module and returns `codeBuffer`
+// WITHOUT running (a module cannot `fxRunScript` without a linker), so —
+// unlike the script fixtures above — a module fixture need not be
+// runnable; it need only compile.
+
+/// `assert_identical` for the Module goal (compile-only ground truth).
+fn assert_identical_module(corpus: &[&str]) {
+    let mut fails: Vec<String> = Vec::new();
+    for &src in corpus {
+        let want = match endor_oracle::compile_module(src) {
+            Some(o) if o.compiled => o.bytecode,
+            Some(o) => {
+                fails.push(format!("{src:?}: oracle rejected the module ({})", o.error));
+                continue;
+            }
+            None => {
+                fails.push(format!("{src:?}: oracle machine failed"));
+                continue;
+            }
+        };
+        match compile_module(src) {
+            Ok(got) if got == want => {}
+            Ok(got) => {
+                let wd = disasm(&want);
+                let gd = disasm(&got);
+                let mut diff = String::new();
+                let n = wd.len().max(gd.len());
+                for i in 0..n {
+                    let w = wd.get(i).map(String::as_str).unwrap_or("--");
+                    let g = gd.get(i).map(String::as_str).unwrap_or("--");
+                    let mark = if w == g { "  " } else { "!!" };
+                    diff.push_str(&format!("    {mark} want[{w}]  got[{g}]\n"));
+                }
+                fails.push(format!(
+                    "{src:?} MISMATCH\n  want {}\n  got  {}\n{}",
+                    hex(&want),
+                    hex(&got),
+                    diff
+                ));
+            }
+            Err(e) => fails.push(format!("{src:?}: compile_module error {e:?} (want {})", hex(&want))),
+        }
+    }
+    if !fails.is_empty() {
+        panic!("{} module divergence(s):\n{}", fails.len(), fails.join("\n"));
+    }
+}
+
+#[test]
+fn module_imports() {
+    assert_identical_module(&[
+        // default / named / namespace imports and combinations
+        "import x from \"m\";",
+        "import { a } from \"m\";",
+        "import { a as b } from \"m\";",
+        "import { a, b, c } from \"m\";",
+        "import * as ns from \"m\";",
+        "import def, { a, b as c } from \"m\";",
+        "import def, * as ns from \"m\";",
+        "import \"side-effect\";",
+        // live-binding access
+        "import { f } from \"m\"; f();",
+        "import def from \"m\"; def.method();",
+    ]);
+}
+
+#[test]
+fn module_exports() {
+    assert_identical_module(&[
+        // export declarations
+        "export const x = 1;",
+        "export let y = 2;",
+        "export var v = 5;",
+        "export const a = 1, b = 2, c = 3;",
+        // export bindings (list forms), including the hoisted-before-decl case
+        "let x = 1; export { x };",
+        "let x = 1; export { x as y };",
+        "export { a, b }; let a = 1; let b = 2;",
+        // export function / class declarations
+        "export function f() {}",
+        "export class C {}",
+        "export function a() {} export function b() {}",
+        // export as the default name
+        "const x = 1; export { x as default };",
+    ]);
+}
+
+#[test]
+fn module_default_and_reexport() {
+    assert_identical_module(&[
+        // default exports: expression, named/anonymous function, class
+        "export default 42;",
+        "export default [1, 2, 3];",
+        "export default function foo() {}",
+        "export default function () {}",
+        "export default class {}",
+        "export default class C {}",
+        "const x = 1; export default x;",
+        // re-export forms
+        "export { a } from \"m\";",
+        "export { a as b } from \"m\";",
+        "export * from \"m\";",
+        "export * as ns from \"m\";",
+        "export { default } from \"m\";",
+        "export { a as default } from \"m\";",
+        // live-binding access across exported functions
+        "let n = 0; export function inc() { n = n + 1; } export function val() { return n; }",
     ]);
 }

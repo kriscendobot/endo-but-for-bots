@@ -526,7 +526,7 @@ fn module_imports() {
     check_prog_module(&[
         (
             "import x from 'm';",
-            "(Module :strict (Import :strict :async [(Specifier :strict :async #*default* #x)] (String \"m\") ()))",
+            "(Module :strict (Import :strict :async [(Specifier :strict :async #default #x)] (String \"m\") ()))",
         ),
         (
             "import {a, b as c} from 'm';",
@@ -556,7 +556,7 @@ fn module_exports() {
         ),
         (
             "export default 42;",
-            "(Module :strict (Statements :strict :async [(Statement :strict :async (Assign :strict :async (Const :strict :async #*default* ()) (Integer 42))) (Export :strict :async [(Specifier :strict :async #*default* ())] () ())]))",
+            "(Module :strict (Statements :strict :async [(Statement :strict :async (Assign :strict :async (Const :strict :async #default ()) (Integer 42))) (Export :strict :async [(Specifier :strict :async #default ())] () ())]))",
         ),
     ]);
 }

@@ -131,6 +131,13 @@ const XS_DONT_ENUM_FLAG: i32 = 4;
 /// `.name` from the property key.
 const XS_NAME_FLAG: i32 = 1;
 
+/// The `MODULE` opcode's flag byte bits (`xsCommon.h`): a non-strict
+/// (JSON) module, a module that uses dynamic `import(...)`, and one that
+/// uses `import.meta`, respectively.
+const XS_JSON_MODULE_FLAG: i32 = 16;
+const XS_IMPORT_FLAG: i32 = 32;
+const XS_IMPORT_META_FLAG: i32 = 64;
+
 /// `XS_METHOD_FLAG` / `XS_GETTER_FLAG` / `XS_SETTER_FLAG` (`xsCommon.h`) —
 /// the `NEW_PROPERTY` attribute bits marking a concise method or an
 /// accessor (the runtime binds the value's home object and, for accessors,
@@ -354,6 +361,12 @@ pub struct Coder<'a> {
     /// producing one. Captured (and cleared) at the top of `code_node` so
     /// it applies only to the immediate expression, not nested ones.
     no_value: bool,
+    /// XS's `coder->importFlag` / `coder->importMetaFlag` — set when the
+    /// module body codes a dynamic `import(...)` / `import.meta`, folded into
+    /// the `MODULE` opcode's flag byte. Only meaningful while coding a
+    /// module; `false` for the static import/export surface.
+    import_flag: bool,
+    import_meta_flag: bool,
     /// The enclosing class's `instanceInit` closure declare `(scope, id)`,
     /// set while coding a class's constructor so its base-flag body can find
     /// the capturing alias and call the field initializer on entry (XS's
@@ -373,6 +386,8 @@ impl<'a> Coder<'a> {
             target_index: 0,
             program_flag: false,
             eval_flag: false,
+            import_flag: false,
+            import_meta_flag: false,
             class_instance_init: None,
             first_break_target: None,
             first_continue_target: None,
@@ -816,6 +831,24 @@ fn node_of(item: &Item) -> &Node {
     }
 }
 
+/// Compile `source` as a **Module** goal to XS module bytecode, or return
+/// the first parser/scoper early error. The returned bytes are the
+/// `codeBuffer` half of XS's `txScript` for the Module goal — exactly what
+/// `endor_oracle::compile_module(source).bytecode` returns (the module
+/// counterpart of [`compile`]).
+pub fn compile_module(source: &str) -> Result<Vec<u8>, crate::parser::ParseError> {
+    // The module goal is strict and allows top-level await (the parser's
+    // `module` flag), mirroring the oracle shim's fxParserTree module branch
+    // (`mxStrictFlag | mxAsyncFlag`).
+    let mut parser = crate::parser::Parser::new(source, true, true)?;
+    let root = parser.parse_module()?;
+    let tree = crate::scoper::run(&root)?;
+    let mut coder = Coder::new(&tree);
+    coder.intern_tree(&root);
+    coder.code_module(node_of(&root));
+    Ok(coder.serialize())
+}
+
 // ============================ node dispatch ============================
 
 impl Coder<'_> {
@@ -838,6 +871,7 @@ impl Coder<'_> {
         let no_value = std::mem::take(&mut self.no_value);
         match node.token {
             Program => self.code_program(node),
+            Module => self.code_module(node),
             Statements => self.code_statements(node),
             Statement => self.code_statement(node),
             Block => self.code_block(node),
@@ -954,6 +988,11 @@ impl Coder<'_> {
             Delegate => self.code_delegate(node),
             Class => self.code_class(node),
             Super => self.code_super(node),
+            // `fxImportNodeCode` / `fxExportNodeCode` are both empty in XS:
+            // the module's import/export *linkage* is emitted from the
+            // module scope's declares (`fxScopeCodeSpecifierNodes`), so the
+            // declaration statements themselves code to nothing.
+            Import | Export => {}
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1069,6 +1108,163 @@ impl Coder<'_> {
                 }
             }
         }
+    }
+
+    /// `fxModuleNodeCode` — the Module goal's top-level coder. Emits the
+    /// module-body function (a second `var`/function-hoist wrapper first
+    /// when the module declares any `var`/function), then the per-binding
+    /// `TRANSFER` linkage from `fxScopeCodeSpecifierNodes`, and closes with
+    /// the `MODULE` opcode that assembles the module record. No debug
+    /// metering (`LINE`/`PROFILE`) — the oracle module entry compiles with
+    /// no `mxDebugFlag`, exactly like the script entry.
+    fn code_module(&mut self, node: &Node) {
+        use crate::ast::flags as f;
+        let scope = self.scope_of(node);
+        let awaiting = node.flags & f::AWAITING != 0;
+        let strict = node.flags & f::STRICT != 0;
+        let scope_count = *self.tree.scope_counts.get(&scope).unwrap_or(&0);
+
+        let mut target = self.create_target();
+        self.program_flag = false;
+        self.scope_level = 0;
+        self.first_break_target = None;
+        self.first_continue_target = None;
+
+        // `var`/function-declaration hoist prelude: emitted as a first
+        // wrapper function when the module scope declares any `Var`/`Define`.
+        let var_define_count = self.tree.scopes[scope]
+            .declares
+            .iter()
+            .filter(|d| matches!(d.token, Token::Var | Token::Define))
+            .count();
+        if var_define_count != 0 {
+            self.add_symbol_null(1, XS_CODE_FUNCTION);
+            self.add_branch(0, XS_CODE_CODE_1, target);
+            self.add_index(0, XS_CODE_BEGIN_STRICT, 0);
+            if scope_count != 0 {
+                self.add_index(0, XS_CODE_RESERVE_1, scope_count);
+            }
+            self.scope_code_retrieve(scope);
+            // Each module-scope `var` gets an `undefined` closure slot.
+            let vars: Vec<u32> = self.tree.scopes[scope]
+                .declares
+                .iter()
+                .filter(|d| d.token == Token::Var)
+                .map(|d| d.id)
+                .collect();
+            for id in vars {
+                let index = self.declare_index(scope, id);
+                self.add_byte(1, XS_CODE_UNDEFINED);
+                self.add_index(0, XS_CODE_VAR_CLOSURE_1, index);
+                self.add_byte(-1, XS_CODE_POP);
+            }
+            self.code_define_nodes(&node.children[0]);
+            self.add_byte(0, XS_CODE_END);
+            self.place_target(0, target);
+            self.add_byte(1, XS_CODE_ENVIRONMENT);
+            self.add_byte(-1, XS_CODE_POP);
+
+            target = self.create_target();
+            self.program_flag = false;
+            self.scope_level = 0;
+            self.first_break_target = None;
+            self.first_continue_target = None;
+        } else {
+            self.add_byte(1, XS_CODE_NULL);
+        }
+
+        // The module-body function (async when the module top-level awaits).
+        let create_op = if awaiting { XS_CODE_ASYNC_FUNCTION } else { XS_CODE_FUNCTION };
+        self.add_symbol_null(1, create_op);
+        self.add_branch(0, XS_CODE_CODE_1, target);
+        self.add_index(0, XS_CODE_BEGIN_STRICT, 0);
+        if scope_count != 0 {
+            self.add_index(0, XS_CODE_RESERVE_1, scope_count);
+        }
+        self.scope_code_retrieve(scope);
+        if awaiting {
+            self.add_byte(0, XS_CODE_START_ASYNC);
+        }
+        self.return_target = Some(self.create_target());
+        self.code(&node.children[0]);
+        let rt = self.return_target.take().expect("module return target");
+        self.place_target(0, rt);
+        self.add_byte(0, XS_CODE_END);
+        self.place_target(0, target);
+        self.add_byte(1, XS_CODE_ENVIRONMENT);
+        self.add_byte(-1, XS_CODE_POP);
+
+        // The import/export linkage, one `TRANSFER` per module binding.
+        let count = 2 + self.scope_code_specifier_nodes(scope);
+        self.add_integer(1, XS_CODE_INTEGER_1, count);
+        let mut flag = 0;
+        if !strict {
+            flag |= XS_JSON_MODULE_FLAG;
+        }
+        if self.import_flag {
+            flag |= XS_IMPORT_FLAG;
+        }
+        if self.import_meta_flag {
+            flag |= XS_IMPORT_META_FLAG;
+        }
+        self.add_index(-count, XS_CODE_MODULE, flag);
+        self.add_byte(-1, XS_CODE_SET_RESULT);
+        self.add_byte(0, XS_CODE_END);
+    }
+
+    /// `fxScopeCodeSpecifierNodes` — for each module-scope declaration that
+    /// is a closure (`useClosure`) binding, push the `TRANSFER` operands the
+    /// `MODULE` opcode consumes: the local name, the import specifier
+    /// (`from` module + imported name, or two `NULL`s for a plain local),
+    /// then each exported name. Returns the transfer count.
+    fn scope_code_specifier_nodes(&mut self, scope: usize) -> i32 {
+        use crate::scoper::dflags;
+        let declares = self.tree.scopes[scope].declares.clone();
+        let mut count = 0;
+        for d in &declares {
+            if d.flags & dflags::USE_CLOSURE == 0 {
+                continue;
+            }
+            let mut index = 3;
+            // The local name (`node->symbol`), or NULL for a re-export slot.
+            match &d.symbol {
+                Some(crate::scoper::Sym::Named(s)) => self.add_symbol(1, XS_CODE_SYMBOL, s),
+                _ => self.add_byte(1, XS_CODE_NULL),
+            }
+            // The import specifier: `from` module string + imported name.
+            match &d.import_spec {
+                Some(imp) => {
+                    let mut bytes = units_to_cesu8(&imp.from);
+                    bytes.push(0);
+                    self.add_string(1, XS_CODE_STRING_1, bytes);
+                    match &imp.symbol {
+                        Some(s) => self.add_symbol(1, XS_CODE_SYMBOL, s),
+                        None => self.add_byte(1, XS_CODE_NULL),
+                    }
+                }
+                None => {
+                    self.add_byte(1, XS_CODE_NULL);
+                    self.add_byte(1, XS_CODE_NULL);
+                }
+            }
+            // Each exported name this binding answers to.
+            for e in &d.export_specs {
+                match &e.name {
+                    Some(s) => self.add_symbol(1, XS_CODE_SYMBOL, s),
+                    None => self.add_byte(1, XS_CODE_NULL),
+                }
+                index += 1;
+            }
+            self.add_integer(1, XS_CODE_INTEGER_1, index);
+            let with = d.import_spec.as_ref().map(|i| i.with).unwrap_or(false);
+            if with {
+                self.add_byte(-index, XS_CODE_TRANSFER_JSON);
+            } else {
+                self.add_byte(-index, XS_CODE_TRANSFER);
+            }
+            count += 1;
+        }
+        count
     }
 
     /// `fxStatementsNodeCode`.
@@ -1977,6 +2173,15 @@ impl Coder<'_> {
             return;
         }
         self.code_declare_reference(node);
+        // Name inference for an anonymous initializer: `export default
+        // function(){}` builds a `Define(default)` whose initializer is an
+        // anonymous function, which takes the define's `default` name (XS
+        // stamps `parser->defaultSymbol` on the node; the value's creation
+        // operand carries it). A named function declaration supplies its own
+        // name, so `infers_name` is false and this is a no-op.
+        if Self::infers_name(&node.children[1]) {
+            self.pending_name = Self::symbol_opt(&node.children[0]);
+        }
         self.code(&node.children[1]);
         self.code_declare_assign(node);
         self.add_byte(-1, XS_CODE_POP);
