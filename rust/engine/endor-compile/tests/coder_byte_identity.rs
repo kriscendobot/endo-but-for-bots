@@ -410,6 +410,21 @@ fn declarations_strict_and_blocks() {
     ]);
 }
 
+// `with` statements (child 6). The object becomes a `with` environment
+// (`TO_INSTANCE` + `WITH`), the body runs with the eval flag forced on so
+// its free identifiers take the symbol path, and the environment is
+// popped (`WITHOUT`). `with` is a strict-mode syntax error, so only the
+// sloppy shape is reachable.
+#[test]
+fn with_statement() {
+    assert_identical(&[
+        "with({})1;", "with(o)1;", "with(o)x;", "with(o){x;}",
+        "with(o){x=1;}", "with(o)o.a;", "with({a:1})a;", "with(o)x+y;",
+        "with(o){ while(0)break; }", "with(a)with(b)1;",
+        "var o={}; with(o)a;",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

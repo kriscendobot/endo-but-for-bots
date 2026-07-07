@@ -736,6 +736,7 @@ impl Coder<'_> {
             Break | Continue => self.code_break_continue(node),
             Throw => self.code_throw(node),
             Debugger => self.add_byte(0, XS_CODE_DEBUGGER),
+            With => self.code_with(node),
             Switch => self.code_switch(node),
             Try => self.code_try(node),
             Catch => self.code_catch(node),
@@ -918,6 +919,29 @@ impl Coder<'_> {
         self.scope_code_define_nodes(scope);
         self.code(&node.children[0]);
         self.scope_coded(scope);
+    }
+
+    /// `fxWithNodeCode` — `with (expression) statement`. Push the object
+    /// as a `with` environment, run the body with the eval flag forced on
+    /// (so its free accesses take the symbol path), then pop the
+    /// environment. `with` is a syntax error in strict mode, so only the
+    /// sloppy path is reached. Children `[expression, statement]`.
+    fn code_with(&mut self, node: &Node) {
+        self.code(&node.children[0]);
+        self.add_byte(0, XS_CODE_TO_INSTANCE);
+        self.add_byte(0, XS_CODE_WITH);
+        self.add_byte(-1, XS_CODE_POP);
+        let eval_flag = self.eval_flag;
+        self.environment_level += 1;
+        self.eval_flag = true;
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        self.code(&node.children[1]);
+        self.eval_flag = eval_flag;
+        self.environment_level -= 1;
+        self.add_byte(0, XS_CODE_WITHOUT);
     }
 
     /// `fxIfNodeCode` (program-flag branch: each arm sets the result to
