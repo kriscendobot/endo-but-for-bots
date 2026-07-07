@@ -1212,6 +1212,20 @@ impl Lexer {
                 break;
             }
         }
+        // XS's lexer runs `fxCompileRegExp` on the delimited literal
+        // (`fxGetNextRegExp`), so a syntactically invalid pattern or flag
+        // set is a parse-time error, not a runtime one. Mirror that through
+        // the ported parser: a genuine `Syntax` rejection rejects the
+        // literal here; an `Unsupported` surface (a feature whose SYNTAX XS
+        // accepts but whose matcher code endor has not ported yet) is not a
+        // syntax error, so the literal stands and accept/reject still agrees
+        // with the oracle.
+        match endor_regexp::compile::compile(&body, &flags) {
+            Ok(_) | Err(endor_regexp::compile::CompileError::Unsupported(_)) => {}
+            Err(endor_regexp::compile::CompileError::Syntax(_)) => {
+                return Err(self.err(LexErrorKind::InvalidRegExp));
+            }
+        }
         st.modifier = Some(flags);
         st.token = Token::Regexp;
         st.end = self.ch_offset;
