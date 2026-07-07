@@ -1379,11 +1379,18 @@ byte-identical vs the oracle:
   `DONT_ENUM` + method/getter/setter bits; static on the constructor,
   instance on the prototype). The scoper's `fxClassNodeBind` reserves the
   two class temporaries. Covers generator/async/`super`-using methods.
+- Slice 43 — **named classes**: ported `fxClassNodeHoist`/`Bind`'s
+  named-class path — the scoper now builds the class's block scopes (a
+  `symbolScope` binding the class name as a `const` closure visible in the
+  body, plus the class body scope) and enters them in the bind pass (so the
+  name slot lands in `RESERVE`); the coder codes the `symbolScope`
+  (`NEW_CLOSURE`), the `NAME` op, and the class→name `CONST_CLOSURE`.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-named classes (the symbol scope), `extends` / derived constructors +
+`extends` / derived constructors +
 `super(...)`, class **fields** and **private** members, static blocks,
-computed method keys, and anonymous-class name inference (these need the
-deferred class-hoisting scoper work); `using` heads (a parser gap); and
+computed method keys, anonymous-class name inference, and a class body that
+references its own name (the `USE_CLOSURE` retrieve path) — these need more
+class-hoisting scoper work; `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
