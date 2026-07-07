@@ -1203,16 +1203,27 @@ byte-identical vs the oracle:
   `fxParamsBindingNodeCode`, and a null-symbol operand for anonymous
   functions. Scoped to **simple bodies** (expression statements +
   `return expr`) in non-naming contexts.
+- Slice 12 — **positional parameters**: `fxScopeCodingParams` (each `Arg`
+  gets a `NEW_LOCAL` frame slot) and `fxParamsBindingNodeCode`
+  (`ARGUMENT i` / `VAR_LOCAL` / `POP` binds each parameter from its
+  argument); `BEGIN` carries the parameter count. Defaults, destructuring,
+  rest, the `arguments` object, and captured parameters stay deferred.
+- Slice 13 — **name inference**: an anonymous function assigned to a simple
+  identifier (a `var`/`let`/`const` binding initializer or a plain
+  assignment) takes that identifier as its name, landing in the
+  function-creation operand (a pending-name the naming site stages and
+  `code_function` consumes). Object-method/property naming (the `NAME`-op
+  path), member-target assignment, and anonymous classes stay deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-parameters (defaults/destructuring/rest) and the `arguments` object;
-captured closures (`fxScopeCodeRetrieve`/`Store`) and home-object/`super`;
-**named function expressions** (the `CURRENT` name binding) and anonymous
-**name inference**; **control-flow / declaring function bodies** (they need
-the non-program loop/return paths and XS's branch-threading optimizer, of
-which only branch-to-next elision is ported); generator/async functions
-and `yield`/`await`; classes (constructor/derived, methods/accessors,
-static members, private fields/methods/brands, static blocks);
+parameter defaults/destructuring/rest and the `arguments` object; captured
+closures (`fxScopeCodeRetrieve`/`Store`) and home-object/`super`; **named
+function expressions** (the `CURRENT` name binding) and object-method/
+property **name inference**; **control-flow / declaring function bodies**
+(they need the non-program loop/return paths and XS's branch-threading
+optimizer, of which only branch-to-next elision is ported); generator/async
+functions and `yield`/`await`; classes (constructor/derived, methods/
+accessors, static members, private fields/methods/brands, static blocks);
 `for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
 import/export linkage + the module-body wrapper. These are the remaining
 child-6/7 surface.
