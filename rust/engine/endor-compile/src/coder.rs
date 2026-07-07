@@ -613,6 +613,9 @@ impl Coder<'_> {
             Template => self.code_template(node),
             Access => self.code_access(node),
             Member => self.code_member(node),
+            MemberAt => self.code_member_at(node),
+            Call => self.code_call(node),
+            Params => self.code_params(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1004,6 +1007,136 @@ impl Coder<'_> {
     /// Whether a reference child carries `mxSuperFlag` (a `super.x` base).
     fn node_is_super(&self, item: &Item) -> bool {
         matches!(item, Item::Node(n) if n.flags & crate::ast::flags::SUPER != 0)
+    }
+
+    /// `fxMemberAtNodeCode` — computed access `ref[at]`. Children
+    /// `[reference, at]`. Symbol-free (`AT` + `GET_PROPERTY_AT`); the
+    /// subexpressions carry any symbols.
+    fn code_member_at(&mut self, node: &Node) {
+        let is_super = self.node_is_super(&node.children[0]);
+        self.code(&node.children[0]);
+        self.code(&node.children[1]);
+        self.add_byte(0, if is_super { XS_CODE_SUPER_AT } else { XS_CODE_AT });
+        self.add_byte(-1, if is_super { XS_CODE_GET_SUPER_AT } else { XS_CODE_GET_PROPERTY_AT });
+    }
+
+    /// `fxCallNodeCode`. Children `[reference, params]`: set up the callee
+    /// and its `this`, `CALL`, then the argument list + `RUN`.
+    fn code_call(&mut self, node: &Node) {
+        self.code_this(&node.children[0], 0);
+        self.add_byte(1, XS_CODE_CALL);
+        self.code(&node.children[1]);
+    }
+
+    /// `fxParamsNodeCode`, the non-spread / non-eval branch. Children
+    /// `[List(items)]`; each arg is pushed then a single `RUN_1 count`
+    /// pops callee+this+args and leaves the result. Spread arguments and
+    /// direct-`eval` parameter passing (the `EVAL` opcode) are deferred.
+    fn code_params(&mut self, node: &Node) {
+        assert!(
+            node.flags & crate::ast::flags::SPREAD == 0,
+            "spread arguments reached (later child)"
+        );
+        let items: &[Item] = match node.children.first() {
+            Some(Item::List(v)) => v,
+            _ => &[],
+        };
+        let mut c: i32 = 0;
+        for item in items {
+            self.code(item);
+            c += 1;
+        }
+        self.add_integer(-2 - c, XS_CODE_RUN_1, c);
+    }
+
+    // ---- the `codeThis` family (callee + receiver setup) ------------
+
+    /// `fxNodeDispatchCodeThis` — dispatch a callee reference in
+    /// receiver-setup mode, returning the residual `flag`.
+    fn code_this(&mut self, item: &Item, flag: i32) -> i32 {
+        match item {
+            Item::Node(n) => match n.token {
+                Token::Access => self.code_access_this(n, flag),
+                Token::Member => self.code_member_this(n, flag),
+                Token::MemberAt => self.code_member_at_this(n, flag),
+                Token::Expressions => self.code_expressions_this(n, flag),
+                _ => self.code_node_this(item, flag),
+            },
+            _ => self.code_node_this(item, flag),
+        }
+    }
+
+    /// `fxNodeCodeThis` — the fallback: push `undefined` as the receiver,
+    /// then the value.
+    fn code_node_this(&mut self, item: &Item, _flag: i32) -> i32 {
+        self.add_byte(1, XS_CODE_UNDEFINED);
+        self.code(item);
+        1
+    }
+
+    /// `fxAccessNodeCodeThis` (unresolved/global path).
+    fn code_access_this(&mut self, node: &Node, flag: i32) -> i32 {
+        let name = Self::symbol_of(&node.children[0]).to_string();
+        if flag == 0 {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+        }
+        // unresolved: reference then GET_THIS_VARIABLE
+        if self.eval_flag {
+            self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
+        } else {
+            self.add_symbol(1, XS_CODE_PROGRAM_REFERENCE, &name);
+        }
+        if flag != 0 {
+            self.add_byte(1, XS_CODE_DUB);
+        }
+        self.add_symbol(0, XS_CODE_GET_THIS_VARIABLE, &name);
+        flag
+    }
+
+    /// `fxMemberNodeCodeThis` — the object is the receiver (`DUB`'d).
+    fn code_member_this(&mut self, node: &Node, _flag: i32) -> i32 {
+        self.code(&node.children[0]);
+        let is_super = self.node_is_super(&node.children[0]);
+        let name = Self::symbol_of(&node.children[1]).to_string();
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_symbol(0, if is_super { XS_CODE_GET_SUPER } else { XS_CODE_GET_PROPERTY }, &name);
+        1
+    }
+
+    /// `fxMemberAtNodeCodeThis`.
+    fn code_member_at_this(&mut self, node: &Node, flag: i32) -> i32 {
+        let is_super = self.node_is_super(&node.children[0]);
+        let mut flag = flag;
+        if flag != 0 {
+            // fxMemberAtNodeCodeReference: reference then at
+            self.code(&node.children[0]);
+            self.code(&node.children[1]);
+            self.add_byte(2, XS_CODE_DUB_AT);
+            flag = 2;
+        } else {
+            self.code(&node.children[0]);
+            self.add_byte(1, XS_CODE_DUB);
+            self.code(&node.children[1]);
+            self.add_byte(0, if is_super { XS_CODE_SUPER_AT } else { XS_CODE_AT });
+        }
+        self.add_byte(-1, if is_super { XS_CODE_GET_SUPER_AT } else { XS_CODE_GET_PROPERTY_AT });
+        flag
+    }
+
+    /// `fxExpressionsNodeCodeThis` — a single-item sequence forwards to its
+    /// item's `codeThis`; otherwise the fallback (`undefined` receiver +
+    /// the sequence's value), dispatched on the original node so scope
+    /// keying stays intact.
+    fn code_expressions_this(&mut self, node: &Node, flag: i32) -> i32 {
+        if let Some(Item::List(items)) = node.children.first() {
+            if items.len() == 1 {
+                return self.code_this(&items[0], flag);
+            }
+        }
+        let _ = flag;
+        self.add_byte(1, XS_CODE_UNDEFINED);
+        self.code_node(node);
+        1
     }
 
     /// `fxTemplateNodeCode`, untagged branch. Children `[reference,

@@ -271,6 +271,21 @@ fn global_access_and_member() {
 }
 
 #[test]
+fn calls_and_computed_member() {
+    assert_identical(&[
+        // computed member access (symbol-free AT / GET_PROPERTY_AT)
+        "a[b];", "a[0];", "a[\"k\"];", "a[b][c];", "o[i+1];", "a.b[c];",
+        // global calls → CALL + RUN_1
+        "f();", "f(1);", "f(1,2);", "f(1,2,3);", "g(x);", "h(x,y);",
+        // method calls (receiver via DUB + GET_PROPERTY)
+        "a.b();", "a.b(1);", "o.m(x,y);", "a.b.c();",
+        // computed-member calls, nested calls, call results
+        "a[b]();", "f()();", "f(g(1));", "a.b(c.d);",
+        "console.log(1);", "Math.max(1,2,3);",
+    ]);
+}
+
+#[test]
 fn untagged_templates() {
     assert_identical(&[
         "``;", "`abc`;", "`a\nb`;",
