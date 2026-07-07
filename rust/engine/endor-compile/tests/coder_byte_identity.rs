@@ -563,3 +563,12 @@ fn wide_operands_and_branch_widths() {
         long_then.as_str(),
     ]);
 }
+
+#[test]
+fn function_default_parameters() {
+    assert_identical(&[
+        "((a=1)=>a);", "((a,b=2)=>a+b);", "(function(a=1){return a;});",
+        "(function(a,b=2){return a+b;});", "(function(a=1,b=2){return a+b;});",
+        "((a=1,b=a)=>a+b);", "(function(x,y=x+1){return y;});",
+    ]);
+}

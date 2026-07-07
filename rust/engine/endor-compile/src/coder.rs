@@ -1702,12 +1702,14 @@ impl Coder<'_> {
             let Item::Node(arg) = item else {
                 panic!("coder: unexpected parameter slot {item:?}");
             };
-            assert_eq!(arg.token, Token::Arg, "parameter pattern/default/rest deferred (params slice)");
-            // A bare `Arg` is `[symbol]` or `[symbol, ()]` (a null default);
-            // a real default makes the second slot a node.
+            // A plain `Arg` (`[symbol]`) or an `= default` param (a
+            // `Binding` wrapping an `Arg` target). Destructuring
+            // (`ArrayBinding`/`ObjectBinding`) and rest (`RestBinding`) are
+            // deferred.
             assert!(
-                arg.children.get(1).map(|c| matches!(c, Item::Null)).unwrap_or(true),
-                "default parameter deferred (params slice)"
+                matches!(arg.token, Token::Arg | Token::Binding),
+                "parameter pattern/rest {:?} deferred (params slice)",
+                arg.token
             );
             self.code_reference(item, 0);
             self.add_index(1, XS_CODE_ARGUMENT, index as i32);
@@ -2166,6 +2168,11 @@ impl Coder<'_> {
                 Token::Var | Token::Let | Token::Const | Token::Using | Token::Arg => {
                     self.code_declare_reference(n);
                 }
+                // fxBindingNodeCodeReference: an `= default` target
+                // references its inner target.
+                Token::Binding => {
+                    self.code_reference(&n.children[0], flag);
+                }
                 Token::Access => {
                     // fxAccessNodeCodeReference: resolved locals need no
                     // reference; a free reference takes the symbol path.
@@ -2230,6 +2237,20 @@ impl Coder<'_> {
                         self.add_byte(0, if is_super { XS_CODE_SUPER_AT_2 } else { XS_CODE_AT_2 });
                     }
                     self.add_byte(-2, if is_super { XS_CODE_SET_SUPER_AT } else { XS_CODE_SET_PROPERTY_AT });
+                }
+                // fxBindingNodeCodeAssign: an `= default` target. Use the
+                // supplied value unless it is `undefined`, in which case
+                // evaluate the initializer, then store into the inner target.
+                Token::Binding => {
+                    let target = self.create_target();
+                    self.add_byte(1, XS_CODE_DUB);
+                    self.add_byte(1, XS_CODE_UNDEFINED);
+                    self.add_byte(-1, XS_CODE_STRICT_NOT_EQUAL);
+                    self.add_branch(-1, XS_CODE_BRANCH_IF_1, target);
+                    self.add_byte(-1, XS_CODE_POP);
+                    self.code(&n.children[1]);
+                    self.place_target(0, target);
+                    self.code_assign(&n.children[0], flag);
                 }
                 other => panic!("coder: no reference for assignment target {:?}", other),
             },
