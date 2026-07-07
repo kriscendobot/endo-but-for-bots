@@ -2062,13 +2062,41 @@ impl Coder<'_> {
     /// Folds: `...spread`, `__proto__:` (the `INSTANTIATE` prelude),
     /// shorthand, and method / getter / setter shorthand all reach the
     /// function/spread surface and are deferred; they assert here.
+    /// Whether a member is a written `__proto__:` property (the prototype
+    /// setter): a non-shorthand `Property` whose key is `__proto__`.
+    fn is_proto_property(p: &Node) -> bool {
+        p.token == Token::Property
+            && p.flags & crate::ast::flags::SHORTHAND == 0
+            && matches!(&p.children[0], Item::Symbol(s) if s == "__proto__")
+    }
+
     fn code_object(&mut self, node: &Node) {
         let object = self.use_temporary();
-        self.add_byte(1, XS_CODE_OBJECT);
+        let items: &[Item] = match node.children.first() {
+            Some(Item::List(v)) => v,
+            _ => &[],
+        };
+        // A written `__proto__: v` (not shorthand) makes `v` the object's
+        // prototype via `INSTANTIATE` in place of the plain `OBJECT`; it is
+        // then skipped in the property loop.
+        let mut proto = false;
+        for item in items {
+            if Self::is_proto_property(node_of(item)) {
+                self.code(&node_of(item).children[1]);
+                self.add_byte(0, XS_CODE_INSTANTIATE);
+                proto = true;
+            }
+        }
+        if !proto {
+            self.add_byte(1, XS_CODE_OBJECT);
+        }
         self.add_index(0, XS_CODE_SET_LOCAL_1, object);
-        if let Some(Item::List(items)) = node.children.first() {
+        {
             for item in items {
                 let p = node_of(item);
+                if Self::is_proto_property(p) {
+                    continue;
+                }
                 // `...spread`: `Object.assign`-style copy of `expr`'s own
                 // enumerable properties onto the object (the `COPY_OBJECT`
                 // intrinsic invoked with the object as `this`).
@@ -2093,11 +2121,6 @@ impl Coder<'_> {
                 match p.token {
                     Token::Property => {
                         let key = Self::symbol_of(&p.children[0]).to_string();
-                        // A shorthand `{x}` is a normal `x: x` property; only
-                        // a written `__proto__:` sets the prototype (deferred).
-                        if p.flags & crate::ast::flags::SHORTHAND == 0 {
-                            assert!(key != "__proto__", "__proto__ property reached (later child)");
-                        }
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
                         self.code(&p.children[1]);
                         self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);

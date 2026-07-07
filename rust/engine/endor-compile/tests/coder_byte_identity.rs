@@ -696,3 +696,13 @@ fn call_new_spread() {
         "a.m(...b);", "let a=[1];f(...a);",
     ]);
 }
+
+#[test]
+fn object_proto() {
+    assert_identical(&[
+        "({__proto__:null});", "({__proto__:x});", "({__proto__:x,a:1});",
+        "({a:1,__proto__:x});", "let x={};({__proto__:x});",
+        // a shorthand or computed __proto__ is a NORMAL property (not the setter)
+        "({['__proto__']:1});",
+    ]);
+}
