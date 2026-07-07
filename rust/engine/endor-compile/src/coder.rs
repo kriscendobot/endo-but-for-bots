@@ -2183,31 +2183,84 @@ impl Coder<'_> {
     /// handled by the target's own coder, but the spread / at branches
     /// assert.
     fn code_object_binding_assign(&mut self, node: &Node, _flag: i32) {
-        assert!(
-            node.flags & crate::ast::flags::SPREAD == 0,
-            "object rest destructuring deferred"
-        );
         let items: &[Item] = match node.children.first() {
             Some(Item::List(v)) => v,
             _ => &[],
         };
+        let spread = node.flags & crate::ast::flags::SPREAD != 0;
         let object = self.use_temporary();
-        let _at = self.use_temporary();
+        let at = self.use_temporary();
+        let mut c = 0;
         self.add_byte(1, XS_CODE_DUB);
         self.add_byte(0, XS_CODE_TO_INSTANCE);
         self.add_index(-1, XS_CODE_PULL_LOCAL_1, object);
-        for item in items {
+        if spread {
+            // Build the rest object: `Object.assign`-style copy of the
+            // source minus the explicitly-bound keys, which are pushed as
+            // exclusion arguments.
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(1, XS_CODE_COPY_OBJECT);
+            self.add_byte(1, XS_CODE_CALL);
+            self.add_byte(1, XS_CODE_OBJECT);
+            self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+            c = 2;
+        }
+        // The property-binding items, up to a trailing rest binding.
+        let regular_end = items
+            .iter()
+            .position(|it| matches!(it, Item::Node(x) if x.token == Token::RestBinding))
+            .unwrap_or(items.len());
+        for item in &items[..regular_end] {
             let p = node_of(item);
-            assert_eq!(
-                p.token,
-                Token::PropertyBinding,
-                "computed-key / rest object destructuring deferred"
-            );
-            let key = Self::symbol_of(&p.children[0]).to_string();
-            let binding = &p.children[1];
+            match p.token {
+                Token::PropertyBinding => {
+                    if spread {
+                        self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                        let key = Self::symbol_of(&p.children[0]).to_string();
+                        self.add_symbol(1, XS_CODE_SYMBOL, &key);
+                        self.add_byte(0, XS_CODE_AT);
+                        self.add_byte(0, XS_CODE_SWAP);
+                        self.add_byte(-1, XS_CODE_POP);
+                        c += 1;
+                    }
+                    let key = Self::symbol_of(&p.children[0]).to_string();
+                    let binding = &p.children[1];
+                    self.code_reference(binding, 1);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, &key);
+                    self.code_assign(binding, 1);
+                }
+                Token::PropertyBindingAt => {
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                    self.code(&p.children[0]);
+                    self.add_byte(0, XS_CODE_AT);
+                    if spread {
+                        self.add_index(0, XS_CODE_SET_LOCAL_1, at);
+                        self.add_byte(0, XS_CODE_SWAP);
+                        self.add_byte(-1, XS_CODE_POP);
+                        c += 1;
+                    } else {
+                        self.add_index(-1, XS_CODE_PULL_LOCAL_1, at);
+                        self.add_byte(-1, XS_CODE_POP);
+                    }
+                    let binding = &p.children[1];
+                    self.code_reference(binding, 1);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, at);
+                    self.add_byte(-1, XS_CODE_GET_PROPERTY_AT);
+                    self.code_assign(binding, 1);
+                }
+                other => panic!("coder: unsupported object-binding item {other:?}"),
+            }
+            self.add_byte(-1, XS_CODE_POP);
+        }
+        if spread {
+            let rest_node = node_of(&items[regular_end]);
+            let binding = &rest_node.children[0];
+            self.add_integer(-2 - c, XS_CODE_RUN_1, c);
+            self.add_index(-1, XS_CODE_PULL_LOCAL_1, object);
             self.code_reference(binding, 1);
             self.add_index(1, XS_CODE_GET_LOCAL_1, object);
-            self.add_symbol(0, XS_CODE_GET_PROPERTY, &key);
             self.code_assign(binding, 1);
             self.add_byte(-1, XS_CODE_POP);
         }

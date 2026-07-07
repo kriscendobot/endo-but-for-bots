@@ -758,6 +758,24 @@ fn destructuring_parameters() {
     ]);
 }
 
+// Object destructuring tail (child 6): rest (`{...r}`), computed keys
+// (`{[k]: v}`), and their combinations. A rest target collects the source's
+// own enumerable properties minus the explicitly-bound keys via
+// `COPY_OBJECT` (each bound key pushed as an exclusion argument); a computed
+// key reads through `GET_PROPERTY_AT`. Nested patterns already recurse
+// through the target's own assign coder.
+#[test]
+fn object_destructuring_rest_and_computed() {
+    assert_identical(&[
+        // rest
+        "({...r}=x);", "let{a,...r}=x;", "({a,...rest}=o);",
+        "let{p,q,...r}=x;", "let{a,b,...rest}=obj;",
+        // computed keys
+        "({[k]:v}=x);", "let{[k]:v}=x;", "let{[key]:val}=obj;",
+        "({[a]:x,[b]:y}=o);", "({[k1]:a,[k2]:b}=o);",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
