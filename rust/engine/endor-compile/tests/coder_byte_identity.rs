@@ -1417,6 +1417,33 @@ fn class_private_member_reads() {
     ]);
 }
 
+// A private accessor **pair** (`get #x` / `set #x`) shares ONE brand
+// closure across both members (XS's `fxScopeLookup` resolves both
+// `symbolAccess` nodes — same symbol pointer — to the first class-scope
+// declare, so the field-init function captures the brand once, not twice).
+// Class β / accessor-pair brand double-capture (stage-5 fix3). The
+// synthesized field-init function must `RESERVE`/`RETRIEVE`/`STORE` one
+// shared brand slot; a naive per-member capture emits an extra `STORE_1`.
+#[test]
+fn class_private_accessor_pair_shares_brand() {
+    assert_identical(&[
+        // the minimal get/set pair — one shared brand, two value closures
+        "(class{get #x(){return 1;}set #x(v){}});",
+        // pair plus a body that reads/writes it (exercises get_private/set_private)
+        "(class{get #x(){return this._x;}set #x(v){this._x=v;}read(){return this.#x;}write(v){this.#x=v;}});",
+        // getter-only and setter-only stay single-brand (no pair to dedup)
+        "(class{get #g(){return 7;}});",
+        "(class{set #s(v){}});",
+        // two independent private names, each a full get/set pair
+        "(class{get #a(){return 1;}set #a(v){}get #b(){return 2;}set #b(v){}});",
+        // an accessor pair interleaved with a private data field and a private method
+        "(class{#d=1;get #x(){return 1;}set #x(v){}#m(){return 2;}});",
+        // named / static-mixed shapes carrying an instance accessor pair
+        "(class C{get #x(){return 1;}set #x(v){}});",
+        "(class{static #s=1;get #x(){return 1;}set #x(v){}});",
+    ]);
+}
+
 // A class field initializer whose VALUE is a function/arrow carries
 // `mxFieldFlag` (copied from the field-parse `parser->flags`), so its
 // function value opens with `BEGIN_STRICT_FIELD` rather than a plain

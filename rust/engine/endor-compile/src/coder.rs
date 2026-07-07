@@ -2556,6 +2556,14 @@ impl Coder<'_> {
         // `symbolAccess`), plus each field's 1-based alias slots.
         let mut caps: Vec<u32> = Vec::new();
         let mut plans: Vec<FieldPlan> = Vec::with_capacity(fields.len());
+        // XS's `fxScopeLookup` resolves every `symbolAccess` for one private
+        // name to the *first* class-scope declare of that name (a symbol-
+        // pointer match), so a `get #x`/`set #x` accessor pair captures ONE
+        // shared brand slot — not two — in the field-init function's frame
+        // (`fxScopeGetDeclareNode(functionScope, symbol)` dedups the
+        // use-closure). Dedup the brand cap by private name here; each
+        // member's `valueAccess` stays a distinct per-member cap.
+        let mut brand_slot: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
         for field in fields {
             let access = self.tree.class_member_access.get(&node_key(field)).copied();
             let is_method = field.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
@@ -2574,8 +2582,29 @@ impl Coder<'_> {
                         plan.value = Some(caps.len() as i32);
                         caps.push(a.value.expect("valueAccess"));
                     }
-                    plan.symbol = Some(caps.len() as i32);
-                    caps.push(a.symbol.expect("symbolAccess"));
+                    let sym_id = a.symbol.expect("symbolAccess");
+                    // The private name of this brand declare (a `Named` sym).
+                    let name = self.tree.scopes[class_scope]
+                        .declares
+                        .iter()
+                        .find(|d| d.id == sym_id)
+                        .and_then(|d| match &d.symbol {
+                            Some(crate::scoper::Sym::Named(n)) => Some(n.clone()),
+                            _ => None,
+                        });
+                    let slot = match name {
+                        Some(n) => *brand_slot.entry(n).or_insert_with(|| {
+                            let s = caps.len() as i32;
+                            caps.push(sym_id);
+                            s
+                        }),
+                        None => {
+                            let s = caps.len() as i32;
+                            caps.push(sym_id);
+                            s
+                        }
+                    };
+                    plan.symbol = Some(slot);
                 }
                 Token::Body => {
                     // A `static { … }` block with its own lexical
