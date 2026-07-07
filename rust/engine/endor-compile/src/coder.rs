@@ -622,6 +622,8 @@ impl Coder<'_> {
             | ExponentiationAssign | BitAndAssign | BitOrAssign | BitXorAssign
             | LeftShiftAssign | SignedRightShiftAssign | UnsignedRightShiftAssign
             | AndAssign | OrAssign | CoalesceAssign => self.code_compound(node),
+            Increment | Decrement => self.code_postfix(node),
+            Delete => self.code_delete(&node.children[0]),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1032,6 +1034,85 @@ impl Coder<'_> {
         self.code_this(&node.children[0], 0);
         self.add_byte(1, XS_CODE_CALL);
         self.code(&node.children[1]);
+    }
+
+    /// `fxPostfixExpressionNodeCode` — codes both `x++`/`x--` and the
+    /// prefix `++x`/`--x` (which the parser flags `EXPRESSION_NO_VALUE` to
+    /// skip the old-value save/restore, yielding the new value). Child
+    /// `[reference]`.
+    fn code_postfix(&mut self, node: &Node) {
+        let no_value = node.flags & crate::ast::flags::EXPRESSION_NO_VALUE != 0;
+        self.code_this(&node.children[0], 1);
+        let mut value = 0;
+        if !no_value {
+            value = self.use_temporary();
+            self.add_byte(0, XS_CODE_TO_NUMERIC);
+            self.add_index(0, XS_CODE_SET_LOCAL_1, value);
+        }
+        self.add_byte(0, if node.token == Token::Increment { XS_CODE_INCREMENT } else { XS_CODE_DECREMENT });
+        self.code_assign(&node.children[0], 0);
+        if !no_value {
+            self.add_byte(-1, XS_CODE_POP);
+            self.add_index(1, XS_CODE_GET_LOCAL_1, value);
+            self.unuse_temporaries(1);
+        }
+    }
+
+    /// `fxDeleteNodeCode` → the `codeDelete` family.
+    fn code_delete(&mut self, item: &Item) {
+        match item {
+            Item::Node(n) => match n.token {
+                Token::Access => {
+                    // fxAccessNodeCodeDelete (unresolved): reference then
+                    // DELETE_PROPERTY. (strict `delete ident` is a parser
+                    // early error, not reached here.)
+                    let name = Self::symbol_of(&n.children[0]).to_string();
+                    if self.eval_flag {
+                        self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
+                    } else {
+                        self.add_symbol(1, XS_CODE_PROGRAM_REFERENCE, &name);
+                    }
+                    self.add_symbol(0, XS_CODE_DELETE_PROPERTY, &name);
+                }
+                Token::Member => {
+                    let is_super = self.node_is_super(&n.children[0]);
+                    self.code(&n.children[0]);
+                    let name = Self::symbol_of(&n.children[1]).to_string();
+                    self.add_symbol(0, if is_super { XS_CODE_DELETE_SUPER } else { XS_CODE_DELETE_PROPERTY }, &name);
+                }
+                Token::MemberAt => {
+                    let is_super = self.node_is_super(&n.children[0]);
+                    // fxMemberAtNodeCodeReference(super?1:0)
+                    self.code(&n.children[0]);
+                    self.code(&n.children[1]);
+                    if !is_super {
+                        self.add_byte(0, XS_CODE_AT);
+                    }
+                    self.add_byte(-1, if is_super { XS_CODE_DELETE_SUPER_AT } else { XS_CODE_DELETE_PROPERTY_AT });
+                }
+                Token::Expressions => {
+                    // Single-item sequence delegates; else the value form.
+                    if let Some(Item::List(items)) = n.children.first() {
+                        if items.len() == 1 {
+                            self.code_delete(&items[0]);
+                            return;
+                        }
+                    }
+                    self.code_delete_value(item);
+                }
+                // fxNodeCodeDelete: evaluate, discard, push `true`.
+                _ => self.code_delete_value(item),
+            },
+            _ => self.code_delete_value(item),
+        }
+    }
+
+    /// `fxNodeCodeDelete` — the non-reference `delete expr`: run it for
+    /// effect then yield `true`.
+    fn code_delete_value(&mut self, item: &Item) {
+        self.code(item);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_byte(1, XS_CODE_TRUE);
     }
 
     /// `fxNewNodeCode`. Children `[reference, params]`: the constructor,

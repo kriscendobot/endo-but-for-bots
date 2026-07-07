@@ -304,6 +304,21 @@ fn assignment_and_new() {
 }
 
 #[test]
+fn increment_decrement_delete() {
+    assert_identical(&[
+        // postfix / prefix on variable, member, computed member
+        "x++;", "x--;", "++x;", "--x;",
+        "a.b++;", "a.b--;", "++a.b;", "--a.b;",
+        "a[b]++;", "++a[b];", "o.count++;",
+        // as sub-expressions (value used)
+        "y=x++;", "y=++x;", "f(x++);", "x++ + 1;",
+        // delete
+        "delete a.b;", "delete a[b];", "delete a.b.c;",
+        "delete x;", "delete o[i];",
+    ]);
+}
+
+#[test]
 fn untagged_templates() {
     assert_identical(&[
         "``;", "`abc`;", "`a\nb`;",
