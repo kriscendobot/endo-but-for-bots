@@ -1277,13 +1277,17 @@ byte-identical vs the oracle:
   running `counter` slot indexes appends and each `...expr` is iterated
   with the `for-of` protocol (`FOR_OF` + a `next()`/`done` loop that
   `SET_PROPERTY_AT`s each value); elisions bump `counter`/`length`.
+- Slice 25 — **call/`new` spread arguments**: `fxParamsNodeCode`'s spread
+  branch + `fxSpreadNodeCode` — a `...spread` argument makes the count
+  dynamic (a `counter` slot bumped per fixed arg and per `for-of`'d spread
+  element), closing with a plain `RUN` (no static count). Calls and `new`.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
 `this`/`super`/`target`); object **methods/accessors**, written
-`__proto__:`, anonymous-class name inference, and **call/`new` spread
-arguments**; generator/async
+`__proto__:`, anonymous-class name inference, and **direct-`eval` spread**;
+generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
