@@ -147,6 +147,79 @@ fn assert_identical(corpus: &[&str]) {
     }
 }
 
+/// Reject-agreement lock: every source must be a SyntaxError in BOTH
+/// engines — endor's `compile` returns an error and the C-XS oracle
+/// returns no bytecode (it never reaches execution). Pins a rejection
+/// shape so a later change cannot silently start accepting it on one
+/// side while the other still rejects.
+fn assert_both_reject(corpus: &[&str]) {
+    let mut fails: Vec<String> = Vec::new();
+    for &src in corpus {
+        let endor_accepts = compile(src).is_ok();
+        // `endor_oracle::run` returns `Some` even on a compile failure (an
+        // uncompleted run carrying the error text), so mirror
+        // `compile-diff`'s `oracle_compile`: the oracle *rejected* only when
+        // the run did not complete AND the error is a `SyntaxError` (any
+        // other uncompleted run is a parsed program that threw at runtime).
+        let oracle_accepts = match endor_oracle::run(src) {
+            None => true, // machine unavailable — do not claim a rejection
+            Some(o) => o.completed || !o.error.contains("SyntaxError"),
+        };
+        if endor_accepts || oracle_accepts {
+            fails.push(format!(
+                "{src:?}: endor_accepts={endor_accepts} oracle_accepts={oracle_accepts} (want both reject)"
+            ));
+        }
+    }
+    if !fails.is_empty() {
+        panic!("{} reject-disagreement(s):\n{}", fails.len(), fails.join("\n"));
+    }
+}
+
+// A malformed `\x`/`\u` escape in a *plain* string literal is a
+// context-independent SyntaxError (`fxStringNodeCode`'s
+// `mxStringErrorFlag` check), and a legacy octal / `\8`/`\9` escape is a
+// SyntaxError only in a strict scope (`fxStringNodeHoist` upgrades
+// `mxStringLegacyFlag` to `mxStringErrorFlag` once a later `"use strict"`
+// prologue has flipped the enclosing scope strict). Both must reject on
+// both engines; the sloppy legacy-octal forms below must still be
+// ACCEPTED (they appear in `hashbang_comment`/`literals_and_operators`
+// company only implicitly, so pin acceptance here too).
+#[test]
+fn string_escape_validation_rejects() {
+    assert_both_reject(&[
+        // truncated / illegal UnicodeEscapeSequence (S7.8.4_A7.*)
+        r#""\u000G""#,
+        r#""\u1""#,
+        r#""\uA""#,
+        r#""\u11""#,
+        r#""\uAA""#,
+        r#""\u111""#,
+        r#""\uAAA""#,
+        // NumericLiteralSeparator inside a `\u{…}` code point
+        r#""\u{1F_639}""#,
+        r#"'\u{1F_639}'"#,
+        // legacy octal in a directive prologue that a later "use strict"
+        // makes strict (legacy-octal-escape-sequence-prologue-strict)
+        "(function() {\n  \"asterisk: \\052\";\n  \"use strict\";\n})",
+        // legacy octal / \8 in strict code generally
+        "\"use strict\"; var x = \"\\052\";",
+        "\"use strict\"; var y = \"\\8\";",
+    ]);
+}
+
+// The same legacy-octal escapes are a sloppy-mode allowance and must
+// compile byte-identically to the oracle when strict mode is off.
+#[test]
+fn legacy_octal_sloppy_accepts() {
+    assert_identical(&[
+        r#""\052""#,
+        r#""\7""#,
+        r#""\8""#,
+        r#""abc\052def""#,
+    ]);
+}
+
 // In-function **direct `eval`** — the eval-scope slice (stage-5 fix2 4/6).
 // A function that contains a direct `eval` publishes its parameters into a
 // `with` environment (`fxScopeCodingParams`' eval branch), materializes an

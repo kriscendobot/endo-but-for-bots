@@ -241,6 +241,24 @@ impl Parser {
         self.push_string_flagged(value, line, escaped, false);
     }
 
+    /// A plain string literal node that additionally carries
+    /// `mxStringLegacyFlag` (bit 2) when its escape scan saw a legacy
+    /// octal or `\8`/`\9`. `fxStringNodeHoist` turns that into a
+    /// SyntaxError in a strict scope; sloppy code keeps the value.
+    fn push_string_legacy(&mut self, value: Vec<u16>, line: u32, escaped: bool, legacy: bool) {
+        let mut flags = if escaped { 1 } else { 0 };
+        if legacy {
+            flags |= flags::STRING_LEGACY;
+        }
+        self.push(Item::Node(Box::new(Node {
+            token: Token::String,
+            line,
+            flags,
+            children: Vec::new(),
+            value: Value::Str(value),
+        })));
+    }
+
     /// `fxPushStringNode` sets `flags = states[0].escaped`
     /// (`mxStringEscapeFlag`, bit 0). A template cooked value additionally
     /// carries `mxStringErrorFlag` (bit 1) when its escape scan failed, so
@@ -962,7 +980,20 @@ impl Parser {
             Token::String => {
                 let s = self.cur.string.clone().unwrap_or_default();
                 let escaped = self.cur.escaped;
-                self.push_string(s, line, escaped);
+                // A plain string literal (unlike a *tagged* template's cooked
+                // slot) is coded through `fxStringNodeCode`, which rejects a
+                // string carrying `mxStringErrorFlag` — a truncated/illegal
+                // `\x`/`\u` escape. That is context-independent (illegal in
+                // sloppy mode too), so reject it here. A legacy octal /
+                // `\8`/`\9` (`mxStringLegacyFlag`) is a sloppy-mode allowance
+                // whose strict-mode illegality is decided later, once the
+                // enclosing scope's strictness is known; carry the flag to
+                // the node so `hoist_string` can rule on it.
+                if self.cur.string_error {
+                    return Err(self.error("invalid escape sequence"));
+                }
+                let legacy = self.cur.legacy_octal;
+                self.push_string_legacy(s, line, escaped, legacy);
                 self.get_next_token()?;
             }
             Token::Identifier => self.identifier_literal(line)?,

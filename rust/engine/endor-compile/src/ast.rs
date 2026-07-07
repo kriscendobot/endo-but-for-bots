@@ -35,6 +35,13 @@ pub mod flags {
     pub const STRING_ERROR: u32 = 1 << 1;
     /// `mxEvalFlag`. (bit 2)
     pub const EVAL: u32 = 1 << 2;
+    /// `mxStringLegacyFlag` — bit 2 in its **String-node** meaning: the
+    /// string carried a legacy (non-simple) octal escape or `\8`/`\9`, a
+    /// sloppy-mode-only allowance. `fxStringNodeHoist` upgrades it to
+    /// `STRING_ERROR` (a SyntaxError) when the enclosing scope is strict.
+    /// Reuses bit 2 exactly as XS does — a String node never carries
+    /// `EVAL`, so the two never collide on one node.
+    pub const STRING_LEGACY: u32 = 1 << 2;
     /// `mxProgramFlag` — set while parsing a Script goal (not a Module).
     /// (bit 3)
     pub const PROGRAM: u32 = 1 << 3;

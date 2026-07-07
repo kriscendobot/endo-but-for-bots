@@ -1551,9 +1551,23 @@ impl Scoper {
         Ok(())
     }
 
-    fn hoist_string(&mut self, _node: &Node) -> Result<(), ParseError> {
-        // fxStringNodeHoist marks legacy-octal strings in strict scopes as
-        // errors at code time; not part of the scope-shape contract.
+    fn hoist_string(&mut self, node: &Node) -> Result<(), ParseError> {
+        // `fxStringNodeHoist`: a string carrying `mxStringLegacyFlag` (a
+        // legacy octal or `\8`/`\9`) inside a strict scope becomes
+        // `mxStringErrorFlag`, which `fxStringNodeCode` then reports as an
+        // "invalid escape sequence". XS defers the strict test to hoist
+        // because a later `"use strict"` prologue can flip the enclosing
+        // scope strict after the string was already scanned. Only plain
+        // string literals reach here with the legacy flag — a template that
+        // contains an octal escape is upgraded to `mxStringErrorFlag` at lex
+        // time (and its untagged form already rejected in the parser), so
+        // this never mis-fires on a tagged template's cooked slot.
+        if node.flags & flags::STRING_LEGACY != 0 {
+            let strict = self.scope.map_or(false, |si| self.scopes[si].flags & SCOPE_STRICT != 0);
+            if strict {
+                return Err(err(node.line, "invalid escape sequence"));
+            }
+        }
         Ok(())
     }
 
