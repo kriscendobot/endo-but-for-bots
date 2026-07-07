@@ -1820,6 +1820,63 @@ derived-with-`super`, static, and private-adjacent shapes. The remaining 5
 literal-numeric accessor-key + `arguments-callee` scope classification), a
 separate narrow scoper fold; no unexplained byte divergence.
 
+**fix4 3/4 (numeric keys, captured `arguments`, captured self-name) —
+Class α + the `tco-call-args` fold CLOSED.** The four independent
+remainders are closed:
+
+- **Numeric accessor/property-key canonicalization** (the 4
+  `accessor-name-{inst,static}/literal-numeric-{leading-decimal,non-canonical}`
+  files + their `expressions/class` mirrors). `fxPropertyName` runs a
+  numeric key through `fxNumberToIndex`: a canonical array index codes
+  as an index node (`PROPERTY_AT`); a **non-index** number (`.1`,
+  `0.0000001`, any value at/above the 2^32-1 sentinel) canonicalizes to
+  its `fxNumberToString` symbol and codes **by name** (`NEW_PROPERTY`).
+  Endor always took the index path, coding a non-index key 16 bytes
+  longer. `property_name`/`object_binding` now route the integer/number
+  branches through the index-or-canonical-symbol classification
+  (`push_property_index_{integer,number}` return `Option<symbol>`;
+  local `number_to_index` + `number_to_ecma_string`, endor-compile has no
+  endor-vm dep).
+- **Latent index-boundary wrap** (slice 4, flagged by fix3 δ). An
+  unquoted numeric key that IS an index but overflows a signed int
+  (`4294967294`, `2147483648`) now codes as a `NUMBER` node through the
+  faithful `fxPushIndexNode` (`push_property_index`) instead of wrapping
+  negative through `value as i32`.
+- **`arguments-callee` (Class α residue)** was NOT an `arguments`
+  classification at all — the trigger is **NamedEvaluation of an
+  anonymous class WITH a heritage** (`var D = class extends
+  function(){} {}`). `code_class` codes the heritage first, and a
+  heritage `function(){}` is itself a `CONSTRUCTOR_FUNCTION` whose
+  creation operand consumed the staged `pending_name` — so endor named
+  the heritage "D" and left the class constructor anonymous, exactly
+  inverting the oracle. The inferred name is now held across the heritage
+  evaluation and restored for the constructor.
+- **The `tco-call-args` named-reject fold** (`expressions/call`, the
+  lone `endor-rejected` in the fix3-verify sweep, `coder panic: captured
+  function name deferred`). When a nested function captures the enclosing
+  named function expression's own name, XS's `fxScopeCodingBlock`
+  promotes the name `Define` to a closure slot (`NEW_CLOSURE`) and binds
+  `CURRENT` through `CONST_CLOSURE_1`. `scope_coding_params` +
+  `code_function_name` now select the closure ops by the `Define`'s
+  closure flag. This also closed `expressions/function`'s three
+  `scope-name-var-{close,open-strict,open-non-strict}` rejects (the same
+  captured-self-name shape).
+
+Result (re-measured on the pin): **`statements/class` divergent 5 → 0**
+and **`expressions/class` 4 → 0** (both BAR MET), **`expressions/call`
+0 divergent / 0 `endor-rejected`** (the fold closed),
+**`expressions/function` 3 `endor-rejected` → 0**. The curated corpora
+stay **1711/1711 divergent=0**, `cargo test --workspace`
+(`--test-threads=1`) EXIT=0, `#![forbid(unsafe_code)]` intact. New
+byte-identity fixtures pin every closed shape
+(`class_accessor_numeric_key_canonicalization`,
+`numeric_property_key_index_boundary`,
+`named_class_with_heritage_names_constructor`,
+`captured_function_self_name`). The remaining broadened-sweep residual is
+`expressions/arrow-function` (**6** divergent, a separate pre-existing
+`scope-param-*-var-*` / `scope-body-lex-distinct` scoper fold, out of
+this slice's scope) — fully attributed, no unexplained byte divergence.
+
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
 `SyntaxError: missing ;`); endor rejects it identically (`missing ;`) at
