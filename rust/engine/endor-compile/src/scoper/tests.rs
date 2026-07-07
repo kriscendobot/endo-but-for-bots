@@ -8,11 +8,20 @@
 //! oracle pin; they are the explicit, readable contract the job asks for,
 //! and a divergence here is a byte-identity failure downstream.
 
-use super::scope_program;
+use super::{scope_module, scope_program};
 use crate::parser::ParseErrorKind;
 
 fn dump(src: &str) -> String {
     scope_program(src, false).expect("scopes").dump()
+}
+
+fn dump_module(src: &str) -> String {
+    scope_module(src).expect("module scopes").dump()
+}
+
+fn assert_module(src: &str, want: &str) {
+    let got = dump_module(src);
+    assert_eq!(got, want.trim_start_matches('\n'), "\n--- module ---\n{src}\n--- got ---\n{got}");
 }
 
 /// Assert the dump equals `want` (leading newline in `want` trimmed for
@@ -324,6 +333,98 @@ a -> s1:d0
 a -> s1:d0
 a -> s1:d0
 ",
+    );
+}
+
+// =============================== modules ===============================
+
+#[test]
+fn module_imports_are_indirect_bindings() {
+    // Each import declares a module-scope `let` that is an immutable
+    // indirect binding (closure|useClosure); `b as c` binds the local `c`.
+    assert_module(
+        "import { a, b as c } from 'm'; a; c;",
+        "\
+s0 MODULE strict scopeCount=2 declareCount=2
+  d0 LET a closure useClosure
+  d1 LET c closure useClosure
+--- accesses ---
+a -> s0:d0
+c -> s0:d1
+",
+    );
+}
+
+#[test]
+fn module_default_import() {
+    assert_module(
+        "import d from 'm'; d;",
+        "\
+s0 MODULE strict scopeCount=1 declareCount=1
+  d0 LET d closure useClosure
+--- accesses ---
+d -> s0:d0
+",
+    );
+}
+
+#[test]
+fn module_export_marks_local_closure() {
+    // A local `const` that is exported becomes a closure|useClosure module
+    // binding; the export resolves it (unknown export → early error).
+    assert_module(
+        "const x = 1; export { x };",
+        "\
+s0 MODULE strict scopeCount=1 declareCount=1
+  d0 CONST x closure useClosure
+--- accesses ---
+x -> s0:d0
+x -> s0:d0
+",
+    );
+}
+
+#[test]
+fn module_function_captured_across_import() {
+    // Unlike a script, a module top-level function is a lexical binding
+    // (it resolves to the declaration, not the global object); an imported
+    // name captured by a nested function forms a closure alias.
+    assert_module(
+        "import { f } from 'm'; function g() { return f; }",
+        "\
+s0 MODULE strict scopeCount=2 declareCount=2
+  d0 LET f closure useClosure
+  d1 DEFINE g closure useClosure
+  define g
+  s1 FUNCTION strict scopeCount=1 declareCount=1 closureCount=1
+    d0 alias f closure useClosure -> s0:d0
+    s2 BLOCK strict declareCount=0
+--- accesses ---
+g -> s0:d1
+f -> s1:d0
+",
+    );
+}
+
+#[test]
+fn module_duplicate_export_is_error() {
+    assert_eq!(
+        match scope_module("const a = 1; export { a }; export { a };") {
+            Err(e) => e.message,
+            Ok(_) => panic!("expected duplicate export error"),
+        },
+        "duplicate export"
+    );
+}
+
+#[test]
+fn module_export_unknown_is_error() {
+    assert_eq!(
+        match scope_module("export { nope };") {
+            Err(e) => e.message,
+            Ok(_) => panic!("expected unknown variable error"),
+        },
+        "unknown variable"
     );
 }
 

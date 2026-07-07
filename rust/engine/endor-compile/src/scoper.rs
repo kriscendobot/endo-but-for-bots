@@ -270,6 +270,9 @@ struct Scoper {
     scope_maximum: i32,
     scope_counts: HashMap<usize, i32>,
     accesses: Vec<AccessRecord>,
+    /// `hoister->firstExportLink` — the exported names seen so far, for
+    /// duplicate-export detection.
+    export_links: Vec<Sym>,
     /// Next anonymous-symbol id. (Reserved for class computed-key slots.)
     #[allow(dead_code)]
     anon: u32,
@@ -563,7 +566,9 @@ impl Scoper {
             Token::Switch => self.hoist_switch(node),
             Token::With => self.hoist_with(node),
             Token::String => self.hoist_string(node),
-            // fold: Import / Export / Class / Host — deferred (see report).
+            Token::Import => self.hoist_import(node),
+            Token::Export => self.hoist_export(node),
+            // fold: Class / Host — deferred (see report).
             _ => self.hoist_children(node),
         }
     }
@@ -1000,6 +1005,68 @@ impl Scoper {
         // errors at code time; not part of the scope-shape contract.
         Ok(())
     }
+
+    /// `fxImportNodeHoist` — each import specifier declares a module-scope
+    /// `let` that is an immutable indirect binding (closure|useClosure);
+    /// a bare `import "m"` declares one anonymous slot. The `from`/`with`
+    /// re-export attributes are coder-side. Modules are strict, so
+    /// importing `arguments`/`eval` is an early error.
+    fn hoist_import(&mut self, node: &Node) -> Result<(), ParseError> {
+        let scope = self.scope.unwrap();
+        let strict = self.node_flags(node) & SCOPE_STRICT != 0;
+        let specs = match child(node, 0) {
+            Some(Item::List(v)) if !v.is_empty() => v.clone(),
+            _ => {
+                // bare `import "m"` — one anonymous indirect binding.
+                let mut d = self.new_declare(scope, Token::Let, None, node.line);
+                d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                self.scope_add_declare(scope, d);
+                return Ok(());
+            }
+        };
+        for spec in &specs {
+            let Item::Node(spec) = spec else { continue };
+            let local = child_sym(spec, 1).or_else(|| child_sym(spec, 0));
+            let Some(local) = local else { continue };
+            let sym = Sym::Named(local.clone());
+            if strict && (local == "arguments" || local == "eval") {
+                return Err(err(spec.line, "invalid import"));
+            }
+            if self.scope_get_declare(scope, &sym).is_some() {
+                return Err(err(spec.line, "duplicate variable"));
+            }
+            let mut d = self.new_declare(scope, Token::Let, Some(sym), spec.line);
+            d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+            self.scope_add_declare(scope, d);
+        }
+        Ok(())
+    }
+
+    /// `fxExportNodeHoist` (the local-export half) — record each exported
+    /// name in the export-link set, raising a duplicate-export early
+    /// error. The `export … from` re-export indirection (which synthesizes
+    /// indirect `let` bindings) is folded (see report).
+    fn hoist_export(&mut self, node: &Node) -> Result<(), ParseError> {
+        if matches!(child(node, 1), Some(Item::Node(_))) {
+            // `export … from "m"` — folded.
+            return Ok(());
+        }
+        if let Some(Item::List(specs)) = child(node, 0) {
+            for spec in specs {
+                let Item::Node(spec) = spec else { continue };
+                // export name = asSymbol ? asSymbol : symbol
+                let name = child_sym(spec, 1).or_else(|| child_sym(spec, 0));
+                if let Some(name) = name {
+                    let sym = Sym::Named(name);
+                    if self.export_links.contains(&sym) {
+                        return Err(err(spec.line, "duplicate export"));
+                    }
+                    self.export_links.push(sym);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ============================== bind pass ==============================
@@ -1086,7 +1153,8 @@ impl Scoper {
             Token::This | Token::Target => self.bind_this_target(node),
             Token::Super => self.bind_super(node),
             Token::Increment | Token::Decrement => self.bind_postfix(node),
-            // fold: Field / PrivateMember / Class / Export — deferred.
+            Token::Export => self.bind_export(node),
+            // fold: Field / PrivateMember / Class — deferred.
             _ => self.bind_children(node),
         }
     }
@@ -1450,6 +1518,40 @@ impl Scoper {
         }
         self.push_variables(1);
         self.pop_variables(1);
+        Ok(())
+    }
+
+    /// `fxExportNodeBind` (the local-export half) — resolve each exported
+    /// local name and mark its declaration a closure|useClosure indirect
+    /// binding, or raise `unknown variable` if it does not resolve. A
+    /// re-export (`export … from`) is bound at load time, not here.
+    fn bind_export(&mut self, node: &Node) -> Result<(), ParseError> {
+        if matches!(child(node, 1), Some(Item::Node(_))) {
+            return Ok(());
+        }
+        let scope = self.scope.unwrap();
+        let specs: Vec<(String, u32)> = match child(node, 0) {
+            Some(Item::List(v)) => v
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Node(spec) => child_sym(spec, 0).map(|s| (s, spec.line)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (name, line) in specs {
+            let sym = Sym::Named(name.clone());
+            let resolved = self.scope_lookup(scope, &sym, line, false, false);
+            match resolved {
+                Some((si, id)) => {
+                    let d = self.declare_mut(si, id);
+                    d.flags |= dflags::CLOSURE | dflags::USE_CLOSURE;
+                    self.record_access(&name, line, Some((si, id)));
+                }
+                None => return Err(err(line, "unknown variable")),
+            }
+        }
         Ok(())
     }
 }
