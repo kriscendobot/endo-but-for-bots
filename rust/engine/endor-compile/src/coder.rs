@@ -2531,6 +2531,11 @@ impl Coder<'_> {
     /// frame slot with a `NEW_LOCAL`. Captured parameters (`NEW_CLOSURE`),
     /// `arguments` (`Var`), and eval-scope params are deferred and were
     /// guarded in `code_function`; this reaches only the plain `Arg` case.
+    /// A function containing a direct `eval` (an `SCOPE_EVAL` parameter
+    /// scope) is a named gap: it needs the whole in-function eval-body slice
+    /// (the `EVAL` opcode's environment plumbing and in-function sloppy-eval
+    /// references), not just the parameter `with`/`STORE` dance, so it
+    /// asserts loudly here. Program/block-level `eval` is already ported.
     fn scope_coding_params(&mut self, scope: usize) {
         use crate::scoper::dflags;
         assert!(
