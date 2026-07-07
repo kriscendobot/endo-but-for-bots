@@ -981,3 +981,13 @@ fn direct_eval() {
         "let y=1;eval(y);", "{let z=1;eval(z);}", "var v=1;eval(v);",
     ]);
 }
+
+#[test]
+fn named_classes() {
+    assert_identical(&[
+        "(class C{});", "class C{}", "(class C{m(){}});",
+        "(class C{m(){}n(){}});", "(class C{static s(){}});",
+        "(class C{get x(){}set x(v){}});", "(class C{constructor(){}});",
+        "let K=class C{};", "(class C{*g(){}async a(){}});",
+    ]);
+}

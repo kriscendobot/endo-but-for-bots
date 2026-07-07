@@ -601,9 +601,53 @@ impl Scoper {
             Token::String => self.hoist_string(node),
             Token::Import => self.hoist_import(node),
             Token::Export => self.hoist_export(node),
-            // fold: Class / Host — deferred (see report).
+            Token::Class => self.hoist_class(node),
+            // fold: Host — deferred (see report).
             _ => self.hoist_children(node),
         }
+    }
+
+    /// `fxClassNodeHoist` — create the class's block scopes: a `symbolScope`
+    /// binding the class name (a `const` closure visible in the body) when
+    /// named, and the class body scope. The private / computed-key / field
+    /// declares that populate the body scope are deferred; the method-only
+    /// surface adds none. Children `[symbol, heritage, items, constructorInit,
+    /// instanceInit, constructor]`.
+    fn hoist_class(&mut self, node: &Node) -> Result<(), ParseError> {
+        let former = self.class_node;
+        let symbol = child_sym(node, 0);
+        let mut symbol_scope = None;
+        if let Some(sym) = &symbol {
+            let ss = self.scope_new(node, Token::Block);
+            let mut d = self.new_declare(ss, Token::Const, Some(Sym::Named(sym.clone())), node.line);
+            d.flags |= dflags::CLOSURE;
+            self.scope_add_declare(ss, d);
+            symbol_scope = Some(ss);
+        }
+        if let Some(heritage) = child(node, 1) {
+            self.hoist_item(heritage)?;
+        }
+        let si = self.scope_new(node, Token::Block);
+        self.class_node = Some(node_ptr(node));
+        if let Some(constructor) = child(node, 5) {
+            self.hoist_item(constructor)?;
+        }
+        if let Some(items) = child(node, 2) {
+            self.hoist_item(items)?;
+        }
+        if let Some(constructor_init) = child(node, 3) {
+            self.hoist_item(constructor_init)?;
+        }
+        if let Some(instance_init) = child(node, 4) {
+            self.hoist_item(instance_init)?;
+        }
+        self.class_node = former;
+        self.fx_scope_hoisted(si);
+        if let Some(ss) = symbol_scope {
+            self.fx_scope_hoisted(ss);
+        }
+        self.node_scope.insert(node_ptr(node), (si, symbol_scope));
+        Ok(())
     }
 
     /// `fxNodeHoist` / `fxNodeDistribute` default — hoist every child node.
@@ -1200,15 +1244,33 @@ impl Scoper {
     /// members, a named-class binding) are the deferred class-hoisting fold;
     /// a base class with methods needs only the two-slot reservation.
     fn bind_class(&mut self, node: &Node) -> Result<(), ParseError> {
+        let former = self.class_node;
         self.push_variables(2);
+        let (si, symbol_scope) = self.scope_of(node);
+        if let Some(ss) = symbol_scope {
+            self.fx_scope_binding(ss);
+        }
         if let Some(heritage) = child(node, 1) {
             self.bind_item(heritage)?;
         }
+        self.fx_scope_binding(si);
+        self.class_node = Some(node_ptr(node));
         if let Some(constructor) = child(node, 5) {
             self.bind_item(constructor)?;
         }
         if let Some(items) = child(node, 2) {
             self.bind_item(items)?;
+        }
+        if let Some(constructor_init) = child(node, 3) {
+            self.bind_item(constructor_init)?;
+        }
+        if let Some(instance_init) = child(node, 4) {
+            self.bind_item(instance_init)?;
+        }
+        self.class_node = former;
+        self.fx_scope_bound(si);
+        if let Some(ss) = symbol_scope {
+            self.fx_scope_bound(ss);
         }
         self.pop_variables(2);
         Ok(())

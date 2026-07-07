@@ -1972,18 +1972,31 @@ impl Coder<'_> {
     /// which the scoper's class-hoisting fold has not set up yet.
     fn code_class(&mut self, node: &Node) {
         use crate::ast::flags as f;
-        assert!(matches!(node.children[0], Item::Null), "named class deferred (symbol scope)");
         assert!(matches!(node.children[1], Item::Null), "class `extends` deferred");
         assert!(matches!(node.children[3], Item::Null), "class field/static-block init deferred");
         assert!(matches!(node.children[4], Item::Null), "class instance-field init deferred");
 
+        let name = Self::symbol_opt(&node.children[0]);
+        let class_scope = self.scope_of(node);
+        let symbol_scope = self.tree.node_scopes.get(&node_key(node)).and_then(|s| s.1);
+
         let prototype = self.use_temporary();
         let constructor = self.use_temporary();
+
+        // A named class binds its name to a `const` closure slot visible in
+        // the body (`NEW_CLOSURE`).
+        if let Some(ss) = symbol_scope {
+            self.scope_coding_block(ss);
+        }
 
         // No heritage: a fresh prototype object with a null parent.
         self.add_byte(1, XS_CODE_NULL);
         self.add_byte(1, XS_CODE_OBJECT);
         self.add_index(0, XS_CODE_SET_LOCAL_1, prototype);
+
+        // The class body scope (private/field declares are deferred; empty
+        // for the method-only surface).
+        self.scope_coding_block(class_scope);
 
         // The constructor function, then bind the prototype/constructor pair.
         self.code(&node.children[5]);
@@ -1991,6 +2004,9 @@ impl Coder<'_> {
         self.add_index(0, XS_CODE_SET_LOCAL_1, constructor);
         self.add_byte(-3, XS_CODE_CLASS);
         self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
+        if let Some(n) = name.as_deref() {
+            self.add_symbol(0, XS_CODE_NAME, n);
+        }
 
         // Members: concise methods / accessors on the prototype (or the
         // constructor, when static).
@@ -2017,6 +2033,17 @@ impl Coder<'_> {
             }
         }
 
+        // Store the class into its own name's closure slot (visible in the
+        // body) and tear the scopes down.
+        if let Some(ss) = symbol_scope {
+            let id = self.tree.scopes[ss].declares[0].id;
+            let idx = self.declare_index(ss, id);
+            self.add_index(0, XS_CODE_CONST_CLOSURE_1, idx);
+        }
+        self.scope_coded(class_scope);
+        if let Some(ss) = symbol_scope {
+            self.scope_coded(ss);
+        }
         self.unuse_temporaries(2);
     }
 
