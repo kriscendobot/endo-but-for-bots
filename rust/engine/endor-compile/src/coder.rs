@@ -862,6 +862,7 @@ impl Coder<'_> {
             Yield => self.code_yield(node),
             Await => self.code_await(node),
             Delegate => self.code_delegate(node),
+            Class => self.code_class(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1962,13 +1963,70 @@ impl Coder<'_> {
     /// generator, method, getter/setter, and class field/base/derived
     /// constructors assert (later slices), as do parameters and captured
     /// closures.
+    /// `fxClassNodeCode` — a class value. Children `[name, heritage, items,
+    /// constructorInit, instanceInit, constructor]`. This slice covers a
+    /// base class (no `extends`) with a synthesized/explicit constructor and
+    /// concise method / accessor members. Deferred (assert): a named class
+    /// (needs the symbol scope), `extends`, instance/static **fields** and
+    /// **private** members, static blocks, and computed method keys — all of
+    /// which the scoper's class-hoisting fold has not set up yet.
+    fn code_class(&mut self, node: &Node) {
+        use crate::ast::flags as f;
+        assert!(matches!(node.children[0], Item::Null), "named class deferred (symbol scope)");
+        assert!(matches!(node.children[1], Item::Null), "class `extends` deferred");
+        assert!(matches!(node.children[3], Item::Null), "class field/static-block init deferred");
+        assert!(matches!(node.children[4], Item::Null), "class instance-field init deferred");
+
+        let prototype = self.use_temporary();
+        let constructor = self.use_temporary();
+
+        // No heritage: a fresh prototype object with a null parent.
+        self.add_byte(1, XS_CODE_NULL);
+        self.add_byte(1, XS_CODE_OBJECT);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, prototype);
+
+        // The constructor function, then bind the prototype/constructor pair.
+        self.code(&node.children[5]);
+        self.add_byte(0, XS_CODE_TO_INSTANCE);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, constructor);
+        self.add_byte(-3, XS_CODE_CLASS);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
+
+        // Members: concise methods / accessors on the prototype (or the
+        // constructor, when static).
+        if let Some(Item::List(items)) = node.children.get(2) {
+            for item in items {
+                let p = node_of(item);
+                let is_method =
+                    p.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+                assert!(is_method, "class field / private member deferred");
+                assert_eq!(p.token, Token::Property, "computed-key class member deferred");
+                let is_static = p.flags & f::STATIC != 0;
+                if is_static {
+                    self.add_byte(1, XS_CODE_DUB);
+                } else {
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
+                }
+                let key = Self::symbol_of(&p.children[0]).to_string();
+                self.pending_accessor = p.flags & (f::GETTER | f::SETTER) != 0;
+                self.code(&p.children[1]);
+                self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
+                // Class members are non-enumerable (`XS_DONT_ENUM_FLAG`).
+                let flag = XS_DONT_ENUM_FLAG | Self::property_flag(p);
+                self.add_integer(0, XS_CODE_INTEGER_1, flag);
+            }
+        }
+
+        self.unuse_temporaries(2);
+    }
+
     fn code_function(&mut self, node: &Node) {
         use crate::ast::flags as f;
         let flags = node.flags;
         assert_eq!(
-            flags & (f::FIELD | f::BASE | f::DERIVED),
+            flags & (f::FIELD | f::DERIVED),
             0,
-            "function flavor {flags:#x} deferred (class)"
+            "function flavor {flags:#x} deferred (field / derived constructor)"
         );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
@@ -2045,9 +2103,16 @@ impl Coder<'_> {
         self.add_symbol_opt(1, create_op, name.as_deref());
         self.add_branch(0, XS_CODE_CODE_1, target);
 
-        // BEGIN_* with the leading parameter count.
+        // BEGIN_* with the leading parameter count. A base class
+        // constructor uses `BEGIN_STRICT_BASE`.
         let count_params = self.count_parameters(&node.children[1]);
-        let begin = if is_strict { XS_CODE_BEGIN_STRICT } else { XS_CODE_BEGIN_SLOPPY };
+        let begin = if flags & f::BASE != 0 {
+            XS_CODE_BEGIN_STRICT_BASE
+        } else if is_strict {
+            XS_CODE_BEGIN_STRICT
+        } else {
+            XS_CODE_BEGIN_SLOPPY
+        };
         self.add_index(0, begin, count_params);
 
         if scope_count != 0 {
@@ -2079,7 +2144,14 @@ impl Coder<'_> {
         self.code(&node.children[2]); // Body
         let rt = self.return_target.expect("function return target");
         self.place_target(0, rt);
-        self.add_byte(0, if is_arrow { XS_CODE_END_ARROW } else { XS_CODE_END });
+        let end = if is_arrow {
+            XS_CODE_END_ARROW
+        } else if flags & f::BASE != 0 {
+            XS_CODE_END_BASE
+        } else {
+            XS_CODE_END
+        };
+        self.add_byte(0, end);
         self.place_target(0, target);
 
         // Environment storing for captured closures / eval.

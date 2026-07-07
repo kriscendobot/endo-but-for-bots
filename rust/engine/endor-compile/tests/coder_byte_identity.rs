@@ -816,6 +816,32 @@ fn super_in_methods_and_arrows() {
     ]);
 }
 
+// Base classes (child 6). `fxClassNodeCode` for an anonymous `class` with
+// no heritage: a fresh prototype (`NULL`/`OBJECT`), the base constructor
+// (`BEGIN_STRICT_BASE`/`END_BASE`), `CLASS` binding the prototype/
+// constructor pair, and concise method / accessor / static members
+// (`NEW_PROPERTY` with `DONT_ENUM` + method bits). The scoper reserves the
+// two class temporaries (`fxClassNodeBind`). Deferred: named classes,
+// `extends`, fields, private members, computed keys, and anonymous-class
+// name inference.
+#[test]
+fn base_classes() {
+    assert_identical(&[
+        // empty class and a synthesized vs explicit constructor
+        "(class{});", "(class{constructor(){}});",
+        "(class{constructor(a){this.a=a;}});", "(class{m(a,b){return a+b;}});",
+        // methods, accessors, and multiple members (no commas)
+        "(class{m(){}});", "(class{m(){}n(){}});",
+        "(class{get x(){return 1;}set x(v){}});",
+        // static members
+        "(class{static m(){}});", "(class{static m(){}i(){}});",
+        "(class{static get s(){return 1;}});",
+        // generator / async / super-using methods
+        "(class{*g(){}});", "(class{async m(){}});",
+        "(class{m(){return super.x;}});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

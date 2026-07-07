@@ -1187,9 +1187,31 @@ impl Scoper {
             Token::Super => self.bind_super(node),
             Token::Increment | Token::Decrement => self.bind_postfix(node),
             Token::Export => self.bind_export(node),
-            // fold: Field / PrivateMember / Class — deferred.
+            Token::Class => self.bind_class(node),
+            // fold: Field / PrivateMember — deferred.
             _ => self.bind_children(node),
         }
+    }
+
+    /// `fxClassNodeBind` — reserve the two frame slots the class coder uses
+    /// for its prototype and constructor temporaries (so the enclosing
+    /// scope's frame count includes them), then bind the heritage,
+    /// constructor, and members. The class/symbol scopes (fields, private
+    /// members, a named-class binding) are the deferred class-hoisting fold;
+    /// a base class with methods needs only the two-slot reservation.
+    fn bind_class(&mut self, node: &Node) -> Result<(), ParseError> {
+        self.push_variables(2);
+        if let Some(heritage) = child(node, 1) {
+            self.bind_item(heritage)?;
+        }
+        if let Some(constructor) = child(node, 5) {
+            self.bind_item(constructor)?;
+        }
+        if let Some(items) = child(node, 2) {
+            self.bind_item(items)?;
+        }
+        self.pop_variables(2);
+        Ok(())
     }
 
     fn bind_children(&mut self, node: &Node) -> Result<(), ParseError> {
