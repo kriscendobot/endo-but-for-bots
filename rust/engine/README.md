@@ -1296,16 +1296,24 @@ byte-identical vs the oracle:
   header allocates the slot, a per-iteration `fxScopeCodeReset`
   (`RESET_LOCAL`/`RESET_CLOSURE`) refreshes it, the binding assigns via
   `LET_LOCAL`/`CONST_LOCAL`, and the scope unwinds it. `let`/`const`,
-  `for-in`, nesting, and use inside functions covered; `for (var …)`,
-  `for await`, and `using` heads stay deferred.
+  `for-in`, nesting, and use inside functions covered; `for await` and
+  `using` heads stay deferred (`for (var …)` heads code correctly — the var
+  hoists out, leaving the loop block non-declaring).
+- Slice 29 — **the `arguments` object**: a function that references
+  `arguments` carries a synthetic `arguments` `Var`; its scope header slots
+  it and a parameter prelude builds the object (`ARGUMENTS_SLOPPY` mapped /
+  else `ARGUMENTS_STRICT`, operand = the parameter count) and stores it. The
+  no-parameter (mapped) and strict cases are covered; a *mapped* `arguments`
+  with parameters — which promotes the parameters to closure slots — is
+  deferred pending the scoper marking (`fxParamsBindingNodeBind`).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-parameter destructuring and the `arguments` object (which forces
-mapped/closure parameters); home-object/`super` (and arrow capture of
-`this`/`super`/`target`); anonymous-class name inference and
+parameter destructuring; a **mapped `arguments` with parameters** (needs the
+scoper to closure-mark the parameters); home-object/`super` (and arrow
+capture of `this`/`super`/`target`); anonymous-class name inference and
 **direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
-`for (var … of/in …)` / `for await` / `using` heads; and
+`for await` / `using` heads; and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
