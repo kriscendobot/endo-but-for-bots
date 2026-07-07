@@ -863,6 +863,7 @@ impl Coder<'_> {
             Await => self.code_await(node),
             Delegate => self.code_delegate(node),
             Class => self.code_class(node),
+            Super => self.code_super(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1970,9 +1971,19 @@ impl Coder<'_> {
     /// (needs the symbol scope), `extends`, instance/static **fields** and
     /// **private** members, static blocks, and computed method keys — all of
     /// which the scoper's class-hoisting fold has not set up yet.
+    /// `fxSuperNodeCode` — a `super(...)` call in a derived constructor:
+    /// invoke the parent constructor (`SUPER` + the argument list) and
+    /// install its result as `this` (`SET_THIS`). Child `[params]`. The
+    /// instance-field-init call after `super(...)` is deferred with fields;
+    /// a `@host` heritage is a deferred (native) form.
+    fn code_super(&mut self, node: &Node) {
+        self.add_byte(3, XS_CODE_SUPER);
+        self.code(&node.children[0]);
+        self.add_byte(0, XS_CODE_SET_THIS);
+    }
+
     fn code_class(&mut self, node: &Node) {
         use crate::ast::flags as f;
-        assert!(matches!(node.children[1], Item::Null), "class `extends` deferred");
         assert!(matches!(node.children[3], Item::Null), "class field/static-block init deferred");
         assert!(matches!(node.children[4], Item::Null), "class instance-field init deferred");
 
@@ -1989,9 +2000,17 @@ impl Coder<'_> {
             self.scope_coding_block(ss);
         }
 
-        // No heritage: a fresh prototype object with a null parent.
-        self.add_byte(1, XS_CODE_NULL);
-        self.add_byte(1, XS_CODE_OBJECT);
+        // Heritage: `extends E` derives the prototype from `E` (`EXTEND`);
+        // no heritage builds a fresh prototype with a null parent. A `@host`
+        // heritage is a deferred (native) form.
+        if let Item::Node(h) = &node.children[1] {
+            assert_ne!(h.token, Token::Host, "class `extends @host` deferred");
+            self.code(&node.children[1]);
+            self.add_byte(1, XS_CODE_EXTEND);
+        } else {
+            self.add_byte(1, XS_CODE_NULL);
+            self.add_byte(1, XS_CODE_OBJECT);
+        }
         self.add_index(0, XS_CODE_SET_LOCAL_1, prototype);
 
         // The class body scope (private/field declares are deferred; empty
@@ -2064,9 +2083,9 @@ impl Coder<'_> {
         use crate::ast::flags as f;
         let flags = node.flags;
         assert_eq!(
-            flags & (f::FIELD | f::DERIVED),
+            flags & f::FIELD,
             0,
-            "function flavor {flags:#x} deferred (field / derived constructor)"
+            "function flavor {flags:#x} deferred (field initializer)"
         );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
@@ -2143,11 +2162,13 @@ impl Coder<'_> {
         self.add_symbol_opt(1, create_op, name.as_deref());
         self.add_branch(0, XS_CODE_CODE_1, target);
 
-        // BEGIN_* with the leading parameter count. A base class
-        // constructor uses `BEGIN_STRICT_BASE`.
+        // BEGIN_* with the leading parameter count. A class constructor uses
+        // `BEGIN_STRICT_BASE` / `BEGIN_STRICT_DERIVED`.
         let count_params = self.count_parameters(&node.children[1]);
         let begin = if flags & f::BASE != 0 {
             XS_CODE_BEGIN_STRICT_BASE
+        } else if flags & f::DERIVED != 0 {
+            XS_CODE_BEGIN_STRICT_DERIVED
         } else if is_strict {
             XS_CODE_BEGIN_STRICT
         } else {
@@ -2188,6 +2209,8 @@ impl Coder<'_> {
             XS_CODE_END_ARROW
         } else if flags & f::BASE != 0 {
             XS_CODE_END_BASE
+        } else if flags & f::DERIVED != 0 {
+            XS_CODE_END_DERIVED
         } else {
             XS_CODE_END
         };

@@ -842,6 +842,27 @@ fn base_classes() {
     ]);
 }
 
+// Derived classes (child 6). `class extends E` derives the prototype from
+// `E` (`EXTEND`); the derived constructor uses `BEGIN_STRICT_DERIVED` /
+// `END_DERIVED`, and `super(...)` (`fxSuperNodeCode`) invokes the parent
+// constructor (`SUPER` + arguments) and installs the result as `this`
+// (`SET_THIS`). Covers the synthesized default constructor
+// (`constructor(...args){super(...args)}`), explicit constructors, and
+// static/instance members. Deferred: fields (the instance-field-init after
+// `super`) and a `@host` heritage.
+#[test]
+fn derived_classes() {
+    assert_identical(&[
+        "(class extends A{});", "(class extends A{constructor(){super();}});",
+        "(class extends A{constructor(a){super(a);}});",
+        "(class extends A{constructor(a,b){super(a,b);}});",
+        "(class extends A{constructor(){super();this.x=1;}});",
+        "(class extends A{constructor(){super();return this;}});",
+        "(class extends A{m(){}});", "(class extends B{static m(){}});",
+        "(class extends(f()){});", "(class extends A{m(){return super.x;}});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
