@@ -1266,12 +1266,16 @@ byte-identical vs the oracle:
   property value is an anonymous function (`fxNodeCodeName`), so the
   interpreter infers the value's `.name` from the key (data + computed
   keys; named / non-function values unaffected).
+- Slice 22 — **object shorthand**: a `{x}` shorthand codes exactly like the
+  data property `x: x` (its value is an `Access` to `x`), differing only in
+  that a shorthand named `__proto__` is a normal property rather than the
+  prototype setter.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
-`this`/`super`/`target`); object **methods/accessors/shorthand/spread** and
-anonymous-class name inference; generator/async
+`this`/`super`/`target`); object **methods/accessors/spread**, written
+`__proto__:`, and anonymous-class name inference; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
