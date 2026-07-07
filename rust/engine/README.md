@@ -1281,12 +1281,16 @@ byte-identical vs the oracle:
   branch + `fxSpreadNodeCode` — a `...spread` argument makes the count
   dynamic (a `counter` slot bumped per fixed arg and per `for-of`'d spread
   element), closing with a plain `RUN` (no static count). Calls and `new`.
+- Slice 26 — **written `__proto__:`**: a non-shorthand `__proto__: v`
+  object property makes `v` the prototype via `INSTANTIATE` (in place of
+  the plain `OBJECT`) and is skipped in the property loop; a shorthand
+  `{__proto__}` or computed `['__proto__']` stays a normal property.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
-`this`/`super`/`target`); object **methods/accessors**, written
-`__proto__:`, anonymous-class name inference, and **direct-`eval` spread**;
+`this`/`super`/`target`); object **methods/accessors**,
+anonymous-class name inference, and **direct-`eval` spread**;
 generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
