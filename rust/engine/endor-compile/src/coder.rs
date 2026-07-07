@@ -2349,6 +2349,15 @@ impl Coder<'_> {
         let prototype = self.use_temporary();
         let constructor = self.use_temporary();
 
+        // NamedEvaluation: an anonymous class assigned to `D` (`var D =
+        // class extends E {}`) names its **constructor** "D" through the
+        // constructor's creation operand, not the heritage expression.
+        // Hold the inferred `pending_name` across the heritage evaluation
+        // so a heritage `function(){}` (itself a `CONSTRUCTOR_FUNCTION`
+        // that would consume the pending name) stays anonymous, then
+        // restore it for the constructor's `code_function`.
+        let inferred_name = self.pending_name.take();
+
         // A named class binds its name to a `const` closure slot visible in
         // the body (`NEW_CLOSURE`).
         if let Some(ss) = symbol_scope {
@@ -2378,6 +2387,7 @@ impl Coder<'_> {
         // `code_function` can find the constructor's capturing alias.
         let saved_instance_init = self.class_instance_init;
         self.class_instance_init = instance_init;
+        self.pending_name = inferred_name;
         self.code(&node.children[5]);
         self.class_instance_init = saved_instance_init;
         self.add_byte(0, XS_CODE_TO_INSTANCE);

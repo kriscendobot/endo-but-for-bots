@@ -1833,6 +1833,28 @@ fn numeric_property_key_index_boundary() {
     ]);
 }
 
+// NamedEvaluation of an anonymous class WITH a heritage — the inferred
+// name binds the class **constructor**, not the heritage expression
+// (stage-5 fix4 3/4, Class α). `code_class` codes the heritage first; a
+// heritage `function(){}` is itself a CONSTRUCTOR_FUNCTION that would
+// consume the staged pending name, so the name must be held across the
+// heritage evaluation and restored for the constructor. Covers the
+// `strict-mode/arguments-callee` residual.
+#[test]
+fn named_class_with_heritage_names_constructor() {
+    assert_identical(&[
+        "var D = class extends function() {} {};",
+        "var D = class extends function() { arguments.callee; } {};",
+        "let E = class extends function() {} {};",
+        "const F = class extends Object {};",
+        "var G = class extends function() {} { m() {} };",
+        // an assignment target infers the same way
+        "var H; H = class extends function() {} {};",
+        // a named class keeps its own name; heritage stays anonymous
+        "var I = class Named extends function() {} {};",
+    ]);
+}
+
 #[test]
 fn module_default_and_reexport() {
     assert_identical_module(&[
