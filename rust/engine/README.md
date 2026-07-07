@@ -1247,12 +1247,18 @@ byte-identical vs the oracle:
   on creation. Parameters and locals, nested/multi-capture, arrow closures,
   and mutation of captured bindings all covered; arrow capture of
   `this`/`super`/`target` and the `arguments` object stay deferred.
+- Slice 19 — **named function expressions**: a `function g(){…}` value
+  binds its own name `g` in a `const` slot of its scope, initialized to the
+  running function (`CURRENT`), so the body can recurse by name. The Rust
+  scoper folds XS's symbolScope into the function scope, so this is a
+  targeted `code_function_name` emission. A name captured by an inner
+  function (a closure-slot name) stays deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
-`this`/`super`/`target`); **named function expressions** (the `CURRENT`
-name binding) and object-method/property **name inference**; generator/async
+`this`/`super`/`target`); object-method/property **name inference**;
+generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 `for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
