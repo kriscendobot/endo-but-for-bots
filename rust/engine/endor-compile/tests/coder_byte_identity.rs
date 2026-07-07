@@ -1788,6 +1788,51 @@ fn class_field_init_direct_eval() {
     ]);
 }
 
+// Numeric accessor/property keys — `fxPropertyName`'s `fxNumberToIndex`
+// classification (stage-5 fix4 3/4). A numeric key that is a canonical
+// array index codes through the index path (`NUMBER`/`INTEGER` + `AT` +
+// `NEW_PROPERTY_AT`); a NON-index numeric key (`.1`, `0.0000001`, and any
+// value at/above 2^32-1) canonicalizes to its `fxNumberToString` symbol
+// and codes by name (`NEW_PROPERTY`). Endor previously always took the
+// index path, coding a non-index key 16 bytes longer.
+#[test]
+fn class_accessor_numeric_key_canonicalization() {
+    assert_identical(&[
+        // leading-decimal accessor key: `.1` → symbol "0.1"
+        "class C { get .1() { return 1; } set .1(v) {} }",
+        "class C { static get .1() { return 1; } static set .1(v) {} }",
+        // non-canonical numeric accessor key: `0.0000001` → symbol "1e-7"
+        "class C { get 0.0000001() { return 1; } }",
+        "class C { static get 0.0000001() { return 1; } }",
+        // class instance/static data members with a non-index numeric key
+        "class C { .1() {} }",
+        "class C { 0.0000001() {} }",
+        // object-literal numeric keys, both branches
+        "({ .1: 'a', 0.0000001: 'b', 0: 'i', 1: 'j' })",
+        "({ get .1() { return 1; }, set .1(v) {} })",
+    ]);
+}
+
+// Numeric property key at the array-index boundary — `fxNumberToIndex` +
+// `fxPushIndexNode` (stage-5 fix4 3/4, slice 4). A key at/above the
+// 2^32-1 sentinel is NOT an index (→ `fxNumberToString` symbol); an
+// in-range key whose `(txIndex)` value overflows a signed int
+// (`4294967294`, `2147483648`) is still an index but must code as a
+// `NUMBER` node (`fxPushIndexNode`'s `(txInteger)value < 0` arm), NOT
+// wrap negative through an `INTEGER` node.
+#[test]
+fn numeric_property_key_index_boundary() {
+    assert_identical(&[
+        "({ 4294967294: 1 })", // index, > i32::MAX → NUMBER node
+        "({ 4294967295: 1 })", // == sentinel → NOT an index → symbol
+        "({ 4294967296: 1 })", // > sentinel → symbol
+        "({ 2147483648: 1 })", // 2^31, index, wraps i32 → NUMBER node
+        "({ 2147483647: 1 })", // i32::MAX, index → INTEGER node
+        "({ 4294967294() {} })", // same boundary as a method key
+        "({ 2147483648() {} })",
+    ]);
+}
+
 #[test]
 fn module_default_and_reexport() {
     assert_identical_module(&[

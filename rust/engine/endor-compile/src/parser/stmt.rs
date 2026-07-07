@@ -805,11 +805,15 @@ impl Parser {
                 self.push_symbol(sym);
                 a_symbol = true;
             } else if self.cur.token == Token::Integer {
-                self.push_property_index_integer(self.cur.integer, prop_line);
-                a_token = Token::PropertyBindingAt;
+                match self.push_property_index_integer(self.cur.integer, prop_line) {
+                    None => a_token = Token::PropertyBindingAt,
+                    Some(_) => a_symbol = true,
+                }
             } else if self.cur.token == Token::Number {
-                self.push_property_index_number(self.cur.number, prop_line);
-                a_token = Token::PropertyBindingAt;
+                match self.push_property_index_number(self.cur.number, prop_line) {
+                    None => a_token = Token::PropertyBindingAt,
+                    Some(_) => a_symbol = true,
+                }
             } else if self.cur.token == Token::String {
                 let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
                 self.push_symbol(s);

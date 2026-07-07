@@ -1300,11 +1300,15 @@ impl Parser {
             self.push_symbol(symbol.clone().unwrap_or_default());
             token1 = Token::PrivateProperty;
         } else if self.cur.token == Token::Integer {
-            self.push_property_index_integer(self.cur.integer, line);
-            token1 = Token::PropertyAt;
+            match self.push_property_index_integer(self.cur.integer, line) {
+                None => token1 = Token::PropertyAt,
+                Some(s) => { symbol = Some(s); token1 = Token::Property; }
+            }
         } else if self.cur.token == Token::Number {
-            self.push_property_index_number(self.cur.number, line);
-            token1 = Token::PropertyAt;
+            match self.push_property_index_number(self.cur.number, line) {
+                None => token1 = Token::PropertyAt,
+                Some(s) => { symbol = Some(s); token1 = Token::Property; }
+            }
         } else if self.cur.token == Token::String {
             let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
             // `fxStringToIndex`: a string key that is a canonical array
@@ -1345,12 +1349,16 @@ impl Parser {
                 token1 = Token::PrivateProperty;
                 self.get_next_token()?;
             } else if self.cur.token == Token::Integer {
-                self.push_property_index_integer(self.cur.integer, line);
-                token1 = Token::PropertyAt;
+                match self.push_property_index_integer(self.cur.integer, line) {
+                    None => token1 = Token::PropertyAt,
+                    Some(s) => { symbol = Some(s); token1 = Token::Property; }
+                }
                 self.get_next_token()?;
             } else if self.cur.token == Token::Number {
-                self.push_property_index_number(self.cur.number, line);
-                token1 = Token::PropertyAt;
+                match self.push_property_index_number(self.cur.number, line) {
+                    None => token1 = Token::PropertyAt,
+                    Some(s) => { symbol = Some(s); token1 = Token::Property; }
+                }
                 self.get_next_token()?;
             } else if self.cur.token == Token::String {
                 let s = crate::ast::units_to_string(&self.cur.string.clone().unwrap_or_default());
@@ -1389,21 +1397,38 @@ impl Parser {
         Ok((symbol, token0, token1, token2))
     }
 
-    /// Push an integer property key as XS's `fxPushIndexNode` would: a
-    /// non-negative array index becomes an `Integer` (`PropertyAt`);
-    /// otherwise the caller falls back to a symbol. Integers are always
-    /// valid indices here.
-    fn push_property_index_integer(&mut self, value: i32, line: u32) {
-        self.push_integer(value, line);
+    /// XS's `fxPropertyName` integer-key handling: `fxIntegerToIndex`
+    /// keeps a non-negative integer as an array index (`fxPushIndexNode`
+    /// → `PropertyAt`); otherwise the key canonicalizes to its
+    /// `fxIntegerToString` symbol (`Property`). Returns `Some(symbol)`
+    /// when a symbol was pushed, `None` when an index node was pushed.
+    /// Integer tokens are always non-negative from the lexer, so the
+    /// symbol branch is the faithful-but-unreached fallback.
+    fn push_property_index_integer(&mut self, value: i32, line: u32) -> Option<String> {
+        if value >= 0 {
+            self.push_property_index(value as u32, line);
+            None
+        } else {
+            let s = value.to_string();
+            self.push_symbol(s.clone());
+            Some(s)
+        }
     }
 
-    /// Push a numeric property key. A number that is a canonical array
-    /// index becomes an `Integer`/`Number` index node.
-    fn push_property_index_number(&mut self, value: f64, line: u32) {
-        if value >= 0.0 && value == value.trunc() && value < 4_294_967_295.0 {
-            self.push_integer(value as i32, line);
+    /// XS's `fxPropertyName` numeric-key handling: `fxNumberToIndex`
+    /// keeps a canonical array index as an index node (`fxPushIndexNode`
+    /// → `PropertyAt`); a non-index number (`.1`, `0.0000001`, a value
+    /// at/above 2^32-1) canonicalizes to its `fxNumberToString` symbol
+    /// (`Property`). Returns `Some(symbol)` when a symbol was pushed,
+    /// `None` when an index node was pushed.
+    fn push_property_index_number(&mut self, value: f64, line: u32) -> Option<String> {
+        if let Some(index) = number_to_index(value) {
+            self.push_property_index(index, line);
+            None
         } else {
-            self.push_number(value, line);
+            let s = number_to_ecma_string(value);
+            self.push_symbol(s.clone());
+            Some(s)
         }
     }
 
@@ -1712,6 +1737,74 @@ fn string_key_to_index(s: &str) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// `fxNumberToIndex`: a number is a canonical array index when it equals
+/// its own `(txIndex)` (u32) truncation and is strictly below the
+/// 2^32-1 sentinel. So `.1` / `0.0000001` / a value at or above the
+/// sentinel are NOT indices; `0`, `1`, `4294967294` are.
+fn number_to_index(number: f64) -> Option<u32> {
+    // C's `(txIndex)number` truncates toward zero into a u32; `as u32`
+    // matches for the finite non-negative in-range values that reach an
+    // affirmative result, and saturates harmlessly otherwise (the
+    // equality re-check below rejects any saturated value).
+    let integer = number as u32;
+    if number == integer as f64 && integer < 4_294_967_295 {
+        Some(integer)
+    } else {
+        None
+    }
+}
+
+/// The ECMAScript `Number::toString(10)` rendering (spec 6.1.6.1.20) —
+/// XS's `fxNumberToString` / dtoa. Mirrors
+/// `endor_vm::value::number_to_ecma_string` (endor-compile does not
+/// depend on endor-vm), producing the canonical string a non-index
+/// numeric property key becomes (`fxNewParserSymbol(fxNumberToString…)`).
+fn number_to_ecma_string(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if n == 0.0 {
+        // Covers +0 and -0; JS String(-0) === "0".
+        return "0".to_string();
+    }
+    let sign = if n < 0.0 { "-" } else { "" };
+    let abs = n.abs();
+    // Rust's `{:e}` gives the shortest round-tripping mantissa (one digit
+    // before the point, trailing zeros stripped) and its base-10 exponent.
+    let exp = format!("{:e}", abs);
+    let (mantissa, exp10) = match exp.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+        None => return format!("{}{}", sign, abs),
+    };
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let s = digits.trim_end_matches('0');
+    let s = if s.is_empty() { "0" } else { s };
+    let k = s.len() as i32;
+    let point = exp10 + 1;
+    let body = if k <= point && point <= 21 {
+        let mut out = String::from(s);
+        out.push_str(&"0".repeat((point - k) as usize));
+        out
+    } else if 0 < point && point <= 21 {
+        format!("{}.{}", &s[..point as usize], &s[point as usize..])
+    } else if -6 < point && point <= 0 {
+        format!("0.{}{}", "0".repeat((-point) as usize), s)
+    } else {
+        let e = point - 1;
+        let esign = if e >= 0 { "+" } else { "-" };
+        let head = if k == 1 {
+            s.to_string()
+        } else {
+            format!("{}.{}", &s[..1], &s[1..])
+        };
+        format!("{}e{}{}", head, esign, e.abs())
+    };
+    format!("{}{}", sign, body)
 }
 
 mod stmt;
