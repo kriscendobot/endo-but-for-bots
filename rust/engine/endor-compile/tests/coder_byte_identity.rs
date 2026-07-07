@@ -552,6 +552,37 @@ fn catch_parameter_bindings() {
     ]);
 }
 
+// Captured closures (child 6). A variable an inner function references is
+// promoted to a closure slot in its defining scope (`NEW_CLOSURE` /
+// `VAR_CLOSURE`); the inner function `RETRIEVE`s the captured closures into
+// its frame, accesses them via `GET_CLOSURE`, and on creation `STORE`s the
+// defining scope's slot into the new function's environment. Deferred:
+// arrow functions capturing `this`/`super`/`target`, and the `arguments`
+// object.
+#[test]
+fn captured_closures() {
+    assert_identical(&[
+        // capture a parameter / a local
+        "(function(a){return function(){return a;};});",
+        "function f(){var x=1;return function(){return x;};}",
+        "(function(a){return function(){return a+1;};});",
+        "function g(){let y=2;return function(){return y*2;};}",
+        // multiple captures, nested captures
+        "(function(a,b){return function(){return a+b;};});",
+        "(function(a,b,c){return function(){return a+b+c;};});",
+        "(function(x){return function(){return function(){return x;};};});",
+        // capture a copied local; capture + inner parameter
+        "(function(a){var b=a;return function(){return b;};});",
+        "(function(a){return function(b){return a+b;};});",
+        // arrow closures (no this/super), mutation of a captured binding
+        "(function(a){return()=>a;});", "function h(){let c=0;return()=>c;}",
+        "function counter(){var n=0;return function(){n=n+1;return n;};}",
+        "(function(a){return function(){a=1;return a;};});",
+        // capture inside control flow
+        "(function(x){if(x)return function(){return x;};return null;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

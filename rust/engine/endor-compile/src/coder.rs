@@ -1548,15 +1548,18 @@ impl Coder<'_> {
             "function flavor {flags:#x} deferred (async/generator/method/accessor/class)"
         );
         let scope = self.scope_of(node);
-        // The function scope may declare positional parameters (`Arg`), but
-        // deferred features add other declares: a named function expression
-        // adds a `Define` (the `CURRENT` name binding), an `arguments`
-        // reference adds a `Var`, and a captured parameter carries the
-        // closure flag. Guard each as a named gap.
+        // The function scope may declare positional parameters (`Arg`,
+        // possibly captured) and closure aliases (a `NoToken` use-closure
+        // declare for a variable an inner function captures). Deferred
+        // features add other declares: a named function expression adds a
+        // `Define` (the `CURRENT` name binding) and an `arguments`
+        // reference adds a `Var`. Guard those as named gaps.
         for d in &self.tree.scopes[scope].declares {
+            let is_alias = d.token == Token::NoToken
+                && d.flags & crate::scoper::dflags::USE_CLOSURE != 0;
             assert!(
-                d.token == Token::Arg && d.flags & crate::scoper::dflags::CLOSURE == 0,
-                "function-scope declare {:?} deferred (named-expr / arguments / closures)",
+                d.token == Token::Arg || is_alias,
+                "function-scope declare {:?} deferred (named-expr / arguments)",
                 d.token
             );
         }
@@ -1653,27 +1656,48 @@ impl Coder<'_> {
     /// This slice has no captured closures and no arrow-default, so it is a
     /// no-op; the closure and arrow-default paths assert.
     fn scope_code_retrieve(&mut self, scope: usize) {
-        for d in &self.tree.scopes[scope].declares {
-            assert!(
-                d.flags & crate::scoper::dflags::USE_CLOSURE == 0 || d.symbol.is_none(),
-                "closure retrieval deferred (closure slice)"
-            );
+        // Give each captured variable (a use-closure alias with a name) a
+        // fresh frame slot and count them; `RETRIEVE_1` pulls that many
+        // closures from the function's environment into the frame.
+        let mut count = 0;
+        for (id, _, sym, flags) in self.declares_of(scope) {
+            if flags & crate::scoper::dflags::USE_CLOSURE != 0 && sym.is_some() {
+                self.set_declare_index(scope, id);
+                count += 1;
+            }
         }
+        // Arrow functions that use `this`/`super`/`target` additionally
+        // retrieve those (RETRIEVE_TARGET/THIS); deferred with `super`.
         assert!(
             !self.tree.scopes[scope].arrow_default,
-            "arrow-default retrieval deferred (closure slice)"
+            "arrow-default retrieval deferred (super slice)"
         );
+        if count != 0 {
+            self.add_index(0, XS_CODE_RETRIEVE_1, count);
+        }
     }
 
     /// `fxScopeCodeStore` — store captured closures back. No-op in this
     /// slice (no use-closure declares, no arrow-default, no eval body).
     fn scope_code_store(&mut self, scope: usize) {
-        for d in &self.tree.scopes[scope].declares {
-            assert!(
-                d.flags & crate::scoper::dflags::USE_CLOSURE == 0,
-                "closure store deferred (closure slice)"
-            );
+        // For each captured variable, `STORE_1` the *defining* scope's slot
+        // (the alias's target) into the freshly created function's
+        // environment. Runs in the enclosing scope's frame, where the
+        // target index is already assigned.
+        let aliases: Vec<(usize, u32)> = self.tree.scopes[scope]
+            .declares
+            .iter()
+            .filter(|d| d.flags & crate::scoper::dflags::USE_CLOSURE != 0)
+            .map(|d| d.alias.expect("use-closure declare has an alias target"))
+            .collect();
+        for (ascope, aid) in aliases {
+            let index = self.declare_index(ascope, aid);
+            self.add_index(0, XS_CODE_STORE_1, index);
         }
+        assert!(
+            !self.tree.scopes[scope].arrow_default,
+            "arrow-default store (STORE_ARROW) deferred (super slice)"
+        );
     }
 
     /// `fxScopeCodingParams` — give each positional parameter (`Arg`) its
@@ -1681,14 +1705,28 @@ impl Coder<'_> {
     /// `arguments` (`Var`), and eval-scope params are deferred and were
     /// guarded in `code_function`; this reaches only the plain `Arg` case.
     fn scope_coding_params(&mut self, scope: usize) {
+        use crate::scoper::dflags;
         assert!(
             self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL == 0,
             "eval-scope params deferred"
         );
-        for (id, token, sym, _) in self.declares_of(scope) {
+        for (id, token, sym, flags) in self.declares_of(scope) {
+            // Closure aliases are handled by `fxScopeCodeRetrieve`, not here.
+            if token == Token::NoToken {
+                continue;
+            }
             assert_eq!(token, Token::Arg, "non-Arg parameter declare deferred (params slice)");
             let index = self.set_declare_index(scope, id);
-            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+            if flags & dflags::CLOSURE != 0 {
+                // A captured parameter lives in a closure slot.
+                assert!(
+                    flags & dflags::USE_CLOSURE == 0,
+                    "argument that use-closures itself deferred"
+                );
+                self.add_variable(0, XS_CODE_NEW_CLOSURE, sym.as_deref(), index);
+            } else {
+                self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+            }
         }
     }
 
