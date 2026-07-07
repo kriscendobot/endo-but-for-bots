@@ -204,6 +204,24 @@ fn logical_conditional_sequence() {
 }
 
 #[test]
+fn async_generator_return() {
+    // An `async function*` return awaits and status-checks the value:
+    // XS emits `AWAIT; THROW_STATUS` before `SET_RESULT`, and a bare
+    // `return;` emits nothing (the resume machine supplies the result)
+    // rather than the usual `UNDEFINED; SET_RESULT`. Plain generators and
+    // plain async functions keep the ordinary return shape.
+    assert_identical(&[
+        "var o = { async *f(){ return 1; } };",
+        "var o = { async *f(){ return; } };",
+        "var o = { async *f(x){ return x + 1; } };",
+        "class C { async *f(){ return 1; } }",
+        // contrast: a plain generator / plain async keep the ordinary return
+        "var o = { *f(){ return 1; } };",
+        "var o = { async f(){ return 1; } };",
+    ]);
+}
+
+#[test]
 fn tail_call_run_tail() {
     // XS's `mxTailRecursionFlag`: a call in tail position of a strict,
     // non-generator `return` emits the `RUN_TAIL` / `EVAL_TAIL` family

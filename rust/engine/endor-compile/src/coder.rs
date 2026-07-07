@@ -3354,16 +3354,26 @@ impl Coder<'_> {
         let tail = node.flags & f::STRICT != 0
             && node.flags & f::GENERATOR == 0
             && self.targets[rt].original.is_none();
+        // An async-generator (`async function*`) awaits and status-checks the
+        // returned value: XS emits `AWAIT; THROW_STATUS` before `SET_RESULT`,
+        // and a bare `return;` emits nothing (the resume machine supplies the
+        // result) rather than the usual `UNDEFINED; SET_RESULT`.
+        let is_async_gen = node.flags & f::ASYNC != 0 && node.flags & f::GENERATOR != 0;
         match node.children.first() {
             Some(item) if !matches!(item, Item::Null) => {
                 self.tail = tail;
                 self.code(item);
+                if is_async_gen {
+                    self.add_byte(0, XS_CODE_AWAIT);
+                    self.add_byte(0, XS_CODE_THROW_STATUS);
+                }
                 self.add_byte(-1, XS_CODE_SET_RESULT);
             }
-            _ => {
+            _ if !is_async_gen => {
                 self.add_byte(1, XS_CODE_UNDEFINED);
                 self.add_byte(-1, XS_CODE_SET_RESULT);
             }
+            _ => {}
         }
         self.adjust_environment(rt);
         self.adjust_scope(rt);
