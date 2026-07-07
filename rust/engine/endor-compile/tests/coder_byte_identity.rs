@@ -220,6 +220,39 @@ fn legacy_octal_sloppy_accepts() {
     ]);
 }
 
+// A `const` (or `using`) declaration with no initializer is a SyntaxError
+// (`fxDeclareNodeCode`'s "invalid const" / "invalid using") — a code-time
+// check, so it fires in statement, `switch`-case, and C-style-`for`
+// positions but NOT for a `for (const x of/in …)` iteration binding, which
+// is coded through the reference/assign path. The accept side of that
+// boundary is pinned in the curated for-of/for-in corpora; here we lock
+// the rejections and the still-legal initializer-bearing / for-head forms.
+#[test]
+fn const_without_initializer_rejects() {
+    assert_both_reject(&[
+        "const x;",
+        "const x = 1, y;",
+        "const x, y = 1;",
+        "switch (true) { case true: const x; }",
+        "switch (true) { default: const x; }",
+        "{ const x; }",
+        "for (const x;;) {}",
+    ]);
+}
+
+// The initializer-bearing statement forms and the for-in/for-of iteration
+// bindings (no initializer required) must still compile byte-identically.
+#[test]
+fn const_with_initializer_and_for_head_accepts() {
+    assert_identical(&[
+        "const x = 1;",
+        "const x = 1, y = 2;",
+        "for (const x of [1]) { x; }",
+        "for (const k in {a:1}) { k; }",
+        "{ const z = 3; z; }",
+    ]);
+}
+
 // In-function **direct `eval`** — the eval-scope slice (stage-5 fix2 4/6).
 // A function that contains a direct `eval` publishes its parameters into a
 // `with` environment (`fxScopeCodingParams`' eval branch), materializes an

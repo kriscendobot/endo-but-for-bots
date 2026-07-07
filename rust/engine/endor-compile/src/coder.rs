@@ -387,6 +387,15 @@ pub struct Coder<'a> {
     /// `coder->classNode->instanceInitAccess`). `None` outside a
     /// field-bearing class constructor.
     class_instance_init: Option<(usize, u32)>,
+    /// The first code-time `fxReportParserError` this pass raised (XS
+    /// longjmps out on the first; endor's coder is infallible, so it
+    /// records the first here and `compile`/`compile_module` surface it
+    /// after the pass). Currently the `fxDeclareNodeCode` "invalid const"
+    /// / "invalid using" rejection of a bare `const`/`using` declaration
+    /// with no initializer — a code-time check, so a `for (const x of y)`
+    /// binding (coded through the reference/assign path, never
+    /// `code_declare`) is correctly exempt.
+    error: Option<crate::parser::ParseError>,
 }
 
 impl<'a> Coder<'a> {
@@ -416,6 +425,20 @@ impl<'a> Coder<'a> {
             no_value: false,
             tail: false,
             tag: 0,
+            error: None,
+        }
+    }
+
+    /// Record the first code-time `fxReportParserError` (XS would longjmp
+    /// out here); later ones are ignored, matching XS reporting only the
+    /// first.
+    fn report(&mut self, line: u32, message: &str) {
+        if self.error.is_none() {
+            self.error = Some(crate::parser::ParseError {
+                line,
+                kind: crate::parser::ParseErrorKind::Syntax,
+                message: message.to_string(),
+            });
         }
     }
 
@@ -860,6 +883,9 @@ pub fn compile_with(source: &str, strict: bool) -> Result<Vec<u8>, crate::parser
     // header is coded through `fxScopeCodingEval`.
     coder.eval_flag = true;
     coder.code_program(node_of(&root));
+    if let Some(e) = coder.error.take() {
+        return Err(e);
+    }
     Ok(coder.serialize())
 }
 
@@ -885,6 +911,9 @@ pub fn compile_module(source: &str) -> Result<Vec<u8>, crate::parser::ParseError
     let mut coder = Coder::new(&tree);
     coder.intern_tree(&root);
     coder.code_module(node_of(&root));
+    if let Some(e) = coder.error.take() {
+        return Err(e);
+    }
     Ok(coder.serialize())
 }
 
@@ -2197,13 +2226,21 @@ impl Coder<'_> {
     /// `fxDeclareNodeCode` — a bare declaration with no initializer. `var`
     /// emits nothing (its slot was set up in the scope header); `let`
     /// initializes its slot to `undefined`; `const`/`using` without an
-    /// initializer are syntax errors the parser already rejected.
+    /// initializer are SyntaxErrors reported here — a *code-time* check, so
+    /// a `for (const x of y)` iteration binding (coded through the
+    /// reference/assign path, never dispatched here) is exempt exactly as
+    /// in XS.
     fn code_declare(&mut self, node: &Node) {
-        if node.token == Token::Let {
-            self.code_declare_reference(node);
-            self.add_byte(1, XS_CODE_UNDEFINED);
-            self.code_declare_assign(node);
-            self.add_byte(-1, XS_CODE_POP);
+        match node.token {
+            Token::Const => self.report(node.line, "invalid const"),
+            Token::Using => self.report(node.line, "invalid using"),
+            Token::Let => {
+                self.code_declare_reference(node);
+                self.add_byte(1, XS_CODE_UNDEFINED);
+                self.code_declare_assign(node);
+                self.add_byte(-1, XS_CODE_POP);
+            }
+            _ => {}
         }
     }
 

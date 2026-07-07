@@ -1501,7 +1501,22 @@ These are the remaining child-6/7 surface.
 > template whose cooked value carries `mxStringErrorFlag` (a truncated/illegal
 > `\x`/`\u` escape, a bad `\u{…}` code point/separator, or a legacy octal in
 > template position) is now a SyntaxError, matching `fxStringNodeCode` — while a
-> tagged template still accepts the same source. The fix2/fix3/fix4/fix5
+> tagged template still accepts the same source. **fix5 3/5 closed three
+> lexer/parser validation gaps** (accept/reject parity, no codegen change):
+> **`comments/hashbang`** (6 `endor-rejected` → **0**) — a leading `#!`
+> hashbang comment is skipped before the first token by `Lexer::skip_shebang`
+> (XS's `fxSkipShebang`), invoked from `Parser::new` for the program and
+> module goals; **`literals/string`** (10 `accept-disagree` → **0**) — a plain
+> string literal with a malformed `\x`/`\u` escape (`mxStringErrorFlag`) is
+> rejected in the parser's `String` primary case, and a legacy octal /
+> `\8`/`\9` (`mxStringLegacyFlag`) in a strict scope is rejected in the
+> scoper's `hoist_string` (XS's `fxStringNodeHoist` legacy→error upgrade),
+> once a later `"use strict"` prologue is known; **`statements/const`** (5
+> `accept-disagree` → **0**) — a `const`/`using` declaration with no
+> initializer is a SyntaxError raised at code time by `fxDeclareNodeCode`
+> (endor's `code_declare` records it on a new coder error field that
+> `compile`/`compile_module` surface), so a `for (const x of/in …)` iteration
+> binding stays exempt. The fix2/fix3/fix4/fix5
 > blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
