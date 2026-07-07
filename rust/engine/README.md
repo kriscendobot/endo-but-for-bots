@@ -1329,9 +1329,16 @@ byte-identical vs the oracle:
   array/object destructuring coders (`code_params_binding` accepts
   `ArrayBinding`/`ObjectBinding` param items). Mixed with plain parameters,
   rest, and defaults, in both function expressions and arrows.
+- Slice 34 — **object rest + computed-key destructuring**: completes
+  `fxObjectBindingNodeCodeAssign` — object rest (`{...r}`) collects the
+  source's own enumerable properties minus the explicitly-bound keys via
+  `COPY_OBJECT` (each bound key pushed as an exclusion argument), and
+  computed keys (`{[k]: v}`) read through `GET_PROPERTY_AT`. With nested
+  patterns (which already recurse), **all destructuring is now covered**:
+  array + object, assignment + binding + parameters, holes/rest/defaults/
+  computed/nested.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-object rest / computed-key / nested-pattern destructuring;
 home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
 inference and **direct-`eval` spread**; generator/async
