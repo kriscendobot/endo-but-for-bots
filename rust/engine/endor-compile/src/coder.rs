@@ -3220,7 +3220,17 @@ impl Coder<'_> {
             self.add_byte(1, XS_CODE_UNDEFINED);
             self.add_byte(0, XS_CODE_WITH);
             for (id, token, _, _) in self.declares_of(scope) {
-                if matches!(token, Token::Arg | Token::Var | Token::Const) {
+                // XS publishes every `ARG`/`VAR`/`CONST` declare into the eval
+                // `with` environment. A named function expression's own name is
+                // one of those: XS declares it `fxDefineNodeNew(…,
+                // XS_TOKEN_CONST)` — a define entry whose declare token is
+                // `CONST`, so the publish loop stores it. endor models the
+                // self-name as the sole `Define` in a function param scope
+                // (body function declarations live in the body/block scope),
+                // so it publishes on the same footing — otherwise a direct eval
+                // in a named function expression (`(function fun(){ eval(…) })`)
+                // would not see `fun`, emitting one fewer `STORE_1`.
+                if matches!(token, Token::Arg | Token::Var | Token::Const | Token::Define) {
                     let index = self.declare_index(scope, id);
                     self.add_index(0, XS_CODE_STORE_1, index);
                 }

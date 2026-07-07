@@ -1926,6 +1926,26 @@ fn arrow_receiver_capture_under_eval() {
     ]);
 }
 
+// A **named function expression** whose body has a direct `eval` — the fix5
+// self-name-publish slice. XS declares the self-name `fxDefineNodeNew(…,
+// XS_TOKEN_CONST)`: a define entry whose declare token is `CONST`, so
+// `fxScopeCodingParams`' eval `with`-publish loop stores it alongside the
+// `arguments` `VAR`. endor models the self-name as the sole `Define` in a
+// function param scope, so it must publish on the same footing — otherwise the
+// direct eval sees `arguments` but not the function's own name, one `STORE_1`
+// short. (`arguments-object/10.5-1-s.js`.)
+#[test]
+fn named_function_expression_self_name_under_eval() {
+    assert_identical(&[
+        // the 10.5-1-s shape: self-name + injected `arguments`, both published
+        "(function fun() { eval('arguments = 10'); })(30);",
+        // self-name only referenced through eval
+        "(function f() { eval('f'); })();",
+        // with a parameter, so the publish order is param, self-name, arguments
+        "(function g(a) { eval('a + g'); })(1);",
+    ]);
+}
+
 // Optional **call** (`fn?.(…)`, `a?.b?.()`) — the fix5 optional-chain
 // call-reference slice. When a `?.` link is the *reference* of a call, the
 // callee is pushed as a receiver/value pair, so `fxOptionNodeCodeThis` must

@@ -1486,14 +1486,14 @@ These are the remaining child-6/7 surface.
 > scope-slot fold). The entire class surface stays byte-clean
 > (`statements/class` **0**, `expressions/class` **0**); curated (1711/1711) and
 > module (45/45) corpora stay byte-clean. **fix5 1/5 closed the dominant arrow
-> residual**: `eval-code` is now fully byte-clean (accept-disagree 4 → 0),
-> `expressions/optional-chaining` divergent 1 → 0, and `expressions/arrow-function`
-> 6 → **1** divergent. **FULL STAGE-5 BAR: NOT MET**, now held open by two
-> narrow, fully-attributed residuals: the **enclosing-function
-> closure-reification** fold (2 files: `arrow-function/arrow/binding-tests-3.js`,
-> `arguments-object/10.5-1-s.js`) and the deferred **tagged-template** feature (2
-> `endor-rejected` in `optional-chaining`). The fix2/fix3/fix4/fix5 blocks below
-> are retained as dated round history.
+> residual**: `eval-code` (accept-disagree 4 to 0) and `arguments-object`
+> (divergent 1 to 0) are now fully byte-clean, `expressions/optional-chaining`
+> divergent 1 to 0, and `expressions/arrow-function` 6 to **1** divergent. **FULL
+> STAGE-5 BAR: NOT MET**, now held open by two narrow, fully-attributed
+> residuals: the **enclosing-function synthetic capture-closure** fold (1 file:
+> `arrow-function/arrow/binding-tests-3.js`) and the deferred **tagged-template**
+> feature (2 `endor-rejected` in `optional-chaining`). The fix2/fix3/fix4/fix5
+> blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
 children** (CESU-8 strings, the four named coder rejects, the class tail,
@@ -2078,20 +2078,41 @@ not an optional-chaining change; attributed here, out of this slice's scope.
 `optional-chaining` is thus at `divergent=0 accept-disagree=0`,
 `endor-rejected=2` (both the tagged-template deferral).
 
-**Remaining fix5 1/5 residual — a DISTINCT mechanism (2 files, attributed).**
+**fix5 1/5 slice 1 continuation (the named-function-expression self-name publish
+under eval) — `arguments-object/10.5-1-s.js` CLOSED.** `(function fun(){
+eval("arguments = 10"); })(30)`: an `eval`-poisoned named function expression.
+XS declares the self-name `fxDefineNodeNew(…, XS_TOKEN_CONST)` — a **define
+entry whose declare token is `CONST`**, so `fxScopeCodingParams`' eval
+`with`-publish loop (`if ARG || VAR || CONST → STORE_1 node->index`) publishes
+it alongside the injected `arguments` `VAR`. endor models the self-name as the
+sole `Define` in a function param scope but only published `Arg`/`Var`/`Const`,
+emitting one `STORE_1` too few (endor 133 vs oracle 135). The fix
+(`endor-compile/src/coder.rs`, `scope_coding_params`' eval branch) publishes
+`Token::Define` too — safe because the only `Define` a function param scope ever
+holds is that self-name (body function declarations live in the body/block
+scope; field-init functions are anonymous). **`arguments-object` is now fully
+byte-clean: 260/260, `divergent=0 endor-rejected=0 accept-disagree=0`, BAR MET**
+(was 1 divergent). Locked in `named_function_expression_self_name_under_eval`.
+
+**Remaining fix5 1/5 residual — a DISTINCT mechanism (1 file, attributed).**
 `expressions/arrow-function/arrow/binding-tests-3.js` (`function foo(){ return
-()=>eval("this"); }`) and `arguments-object/10.5-1-s.js` (`(function fun(){
-eval("arguments = 10"); })(30)`) are **not** the receiver-capture-under-eval
-family. They are the **enclosing-function closure-reification** fold: the
-regular function that *encloses* a receiver/name-capturing arrow (or an
-`eval`-poisoned named function expression) must reify its `this`/self-name into
-a closure cell (`NEW_CLOSURE` + `STORE_1`) so the inner capture resolves. In
-binding-tests-3 endor omits `foo`'s `reserve`/`new_closure`/`store_1` for the
-captured `this` (body 71 → 61 bytes); in 10.5-1-s endor emits only one of the
-two `STORE_1`s XS emits in `fun`'s `fxScopeCodeStore` (the `current`/self-name
-closure slot 1 is missing, len 135 → 133). Both need a scoper change to mark
-the enclosing function's `this`/self-name declaration as `USE_CLOSURE` when an
-inner arrow/eval captures it — deferred as a separate, narrower sub-fold.
+()=>eval("this"); }`) is the last arrow divergence (arrow-function 326: 250
+identical, 1 divergent, 75 oracle-rejected; the divergence is
+`byte-length/endor-shorter`, foo's body 71 → 61). It is **not** the self-name
+publish above, nor the receiver-capture-under-eval fold (both closed): it is the
+**enclosing-function synthetic capture-closure** mechanism. When an arrow with a
+direct `eval` (which may reference `this`/`arguments`) is created inside a
+non-arrow function `foo`, XS reserves a **synthetic closure** in `foo`
+(`RESERVE` + `NEW_CLOSURE` + a `with`-publish `STORE_1`) that the arrow's
+`STORE_ARROW`/`RETRIEVE` capture fills — *without* materializing an `arguments`
+object (`fxParamsBindingNodeCode` emits no `ARGUMENTS_SLOPPY`, because `foo`'s
+node never gains `mxArgumentsFlag`). endor creates no such synthetic
+capture-closure in the enclosing function, so it emits the shorter stream. A
+first attempt to model this by propagating `mxArgumentsFlag` to the nearest
+non-arrow function was **rejected**: it produced a *real* `arguments` `VAR`
+(with `ARGUMENTS_SLOPPY` materialization), 2 bytes too long — the wrong
+mechanism. The correct fold is a materialization-free synthetic capture-closure
+in the enclosing function, deferred as a separate, narrower sub-fold.
 
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
