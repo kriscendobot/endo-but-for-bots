@@ -624,6 +624,8 @@ impl Coder<'_> {
             | AndAssign | OrAssign | CoalesceAssign => self.code_compound(node),
             Increment | Decrement => self.code_postfix(node),
             Delete => self.code_delete(&node.children[0]),
+            Object => self.code_object(node),
+            Array => self.code_array(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -1034,6 +1036,91 @@ impl Coder<'_> {
         self.code_this(&node.children[0], 0);
         self.add_byte(1, XS_CODE_CALL);
         self.code(&node.children[1]);
+    }
+
+    /// `fxObjectNodeCode`, the data-property surface. Children
+    /// `[List(items)]` where each item is a `Property` (`k: v`, key an
+    /// interned symbol) or `PropertyAt` (`[e]: v`). The object lives in a
+    /// temporary; each property is `NEW_PROPERTY`/`NEW_PROPERTY_AT`'d onto
+    /// it with a `0` attribute flag (data value).
+    ///
+    /// Folds: `...spread`, `__proto__:` (the `INSTANTIATE` prelude),
+    /// shorthand, and method / getter / setter shorthand all reach the
+    /// function/spread surface and are deferred; they assert here.
+    fn code_object(&mut self, node: &Node) {
+        let object = self.use_temporary();
+        self.add_byte(1, XS_CODE_OBJECT);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, object);
+        if let Some(Item::List(items)) = node.children.first() {
+            for item in items {
+                let p = node_of(item);
+                assert!(
+                    p.flags
+                        & (crate::ast::flags::SHORTHAND
+                            | crate::ast::flags::METHOD
+                            | crate::ast::flags::GETTER
+                            | crate::ast::flags::SETTER
+                            | crate::ast::flags::SPREAD)
+                        == 0,
+                    "object method/shorthand/spread reached (later child)"
+                );
+                match p.token {
+                    Token::Property => {
+                        let key = Self::symbol_of(&p.children[0]).to_string();
+                        assert!(key != "__proto__", "__proto__ property reached (later child)");
+                        self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                        self.code(&p.children[1]);
+                        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
+                        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+                    }
+                    Token::PropertyAt => {
+                        self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                        self.code(&p.children[0]);
+                        self.add_byte(0, XS_CODE_AT);
+                        self.code(&p.children[1]);
+                        self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+                        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+                    }
+                    other => panic!("coder: unsupported object member {:?}", other),
+                }
+            }
+        }
+        self.unuse_temporaries(1);
+    }
+
+    /// `fxArrayNodeCode`, the non-spread branch. Children `[List(items)]`
+    /// (expressions and `Elision` holes). The array lives in a temporary;
+    /// `length` is set to the item count, then each non-elided element is
+    /// `NEW_PROPERTY_AT`'d at its index. Spread elements are deferred.
+    fn code_array(&mut self, node: &Node) {
+        assert!(
+            node.flags & crate::ast::flags::SPREAD == 0,
+            "array spread reached (later child)"
+        );
+        let array = self.use_temporary();
+        self.add_byte(1, XS_CODE_ARRAY);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, array);
+        if let Some(Item::List(items)) = node.children.first() {
+            let count = items.len() as i32;
+            self.add_index(1, XS_CODE_GET_LOCAL_1, array);
+            self.add_integer(1, XS_CODE_INTEGER_1, count);
+            self.add_symbol(-1, XS_CODE_SET_PROPERTY, "length");
+            self.add_byte(-1, XS_CODE_POP);
+            let mut index: i32 = 0;
+            for item in items {
+                let is_elision = matches!(item, Item::Node(n) if n.token == Token::Elision);
+                if !is_elision {
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, array);
+                    self.add_integer(1, XS_CODE_INTEGER_1, index);
+                    self.add_byte(0, XS_CODE_AT);
+                    self.code(item);
+                    self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
+                    self.add_integer(0, XS_CODE_INTEGER_1, 0);
+                }
+                index += 1;
+            }
+        }
+        self.unuse_temporaries(1);
     }
 
     /// `fxPostfixExpressionNodeCode` — codes both `x++`/`x--` and the

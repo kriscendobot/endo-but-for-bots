@@ -319,6 +319,22 @@ fn increment_decrement_delete() {
 }
 
 #[test]
+fn object_and_array_literals() {
+    assert_identical(&[
+        // object data properties (identifier keys)
+        "({});", "({a:1});", "({a:1,b:2});", "({a:x,b:y});",
+        "({a:1+2,b:c.d});", "({outer:{inner:1}});",
+        // computed keys
+        "({[a]:1});", "({[a+b]:c});", "({x:1,[y]:2});",
+        // arrays
+        "[];", "[1];", "[1,2,3];", "[a,b];", "[1+2,c.d];",
+        "[[1],[2]];", "[a,,b];", "[,,1];", "[1,,];",
+        // mixed / nested
+        "[{a:1}];", "({list:[1,2]});", "f([1,2],{a:3});",
+    ]);
+}
+
+#[test]
 fn untagged_templates() {
     assert_identical(&[
         "``;", "`abc`;", "`a\nb`;",
