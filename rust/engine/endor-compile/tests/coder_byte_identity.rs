@@ -697,6 +697,20 @@ fn for_in_of_var_head() {
     ]);
 }
 
+// `for await (… of …)` (child 6). Inside an async function the iteration
+// protocol adds `AWAIT`/`THROW_STATUS` after each `next()` and `.return()`
+// call (the `is_async` branch of the ported `fxForInForOfNodeCode`), now
+// reachable since async functions land the async surface.
+#[test]
+fn for_await_of() {
+    assert_identical(&[
+        "(async function(){for await(x of a)x;});",
+        "(async function(){for await(let x of a)x;});",
+        "(async()=>{for await(x of a)x;});",
+        "(async function(){for await(x of a){f(x);}});",
+    ]);
+}
+
 // Object destructuring (child 6). `fxObjectBindingNodeCodeAssign`:
 // `TO_INSTANCE` the value into a temporary, then read each named property
 // and assign it into the target — for both destructuring assignment
