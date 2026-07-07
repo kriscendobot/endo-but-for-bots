@@ -2004,14 +2004,25 @@ impl Coder<'_> {
             self.add_symbol(0, XS_CODE_NAME, n);
         }
 
-        // Members: concise methods / accessors on the prototype (or the
-        // constructor, when static).
+        // Members: concise methods / accessors emit inline; fields are
+        // collected for the synthesized init functions.
+        let mut static_fields: Vec<&Node> = Vec::new();
+        let mut instance_fields: Vec<&Node> = Vec::new();
         if let Some(Item::List(items)) = node.children.get(2) {
             for item in items {
                 let p = node_of(item);
                 let is_method =
                     p.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
-                assert!(is_method, "class field / private member deferred");
+                if !is_method {
+                    // A field (`x = v` / `static x = v`) — collected for
+                    // the synthesized init function, not emitted here.
+                    if p.flags & f::STATIC != 0 {
+                        static_fields.push(p);
+                    } else {
+                        instance_fields.push(p);
+                    }
+                    continue;
+                }
                 let is_static = p.flags & f::STATIC != 0;
                 // The member target: the constructor (static) or the
                 // prototype (instance).
@@ -2042,18 +2053,105 @@ impl Coder<'_> {
             }
         }
 
+        // Instance fields need the `instanceInit` closure + the constructor
+        // call after `super(...)`; deferred. Private / computed-key fields
+        // need class-scope declares; deferred.
+        assert!(instance_fields.is_empty(), "instance field init deferred (instanceInit)");
+        for p in &static_fields {
+            assert!(
+                p.token == Token::Property,
+                "computed / private static field deferred (needs class-scope declare)"
+            );
+        }
+
         // Store the class into its own name's closure slot (visible in the
-        // body) and tear the scopes down.
+        // body).
         if let Some(ss) = symbol_scope {
             let id = self.tree.scopes[ss].declares[0].id;
             let idx = self.declare_index(ss, id);
             self.add_index(0, XS_CODE_CONST_CLOSURE_1, idx);
         }
+
+        // Static fields run through a synthesized `constructorInit` field
+        // function invoked with the constructor as `this`/home.
+        if !static_fields.is_empty() {
+            self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
+            self.code_field_init_function(&static_fields);
+            self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
+            self.add_byte(-1, XS_CODE_SET_HOME);
+            self.add_byte(1, XS_CODE_CALL);
+            self.add_integer(-2, XS_CODE_RUN_1, 0);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+
         self.scope_coded(class_scope);
         if let Some(ss) = symbol_scope {
             self.scope_coded(ss);
         }
         self.unuse_temporaries(2);
+    }
+
+    /// Emit the synthesized field-initializer function (XS's
+    /// `instanceInit` / `constructorInit`): a `CONSTRUCTOR_FUNCTION` whose
+    /// `BEGIN_STRICT_FIELD` body runs `fxFieldNodeCode` for each field with
+    /// `this` bound to the target (constructor for static, instance for
+    /// instance fields). Mirrors `code_function`'s wrapper (save/restore,
+    /// `CODE`/`END`, environment store) for a scope-free, parameter-free
+    /// synthetic function.
+    fn code_field_init_function(&mut self, fields: &[&Node]) {
+        let saved_return = self.return_target;
+        let saved_scope_level = self.scope_level;
+        let saved_program = self.program_flag;
+        let saved_break = self.first_break_target;
+        let saved_continue = self.first_continue_target;
+        let saved_env = self.environment_level;
+        let saved_eval = self.eval_flag;
+
+        let target = self.create_target();
+        self.program_flag = false;
+        self.scope_level = 0;
+        self.first_break_target = None;
+        self.first_continue_target = None;
+
+        self.add_symbol_opt(1, XS_CODE_CONSTRUCTOR_FUNCTION, None);
+        self.add_branch(0, XS_CODE_CODE_1, target);
+        self.add_index(0, XS_CODE_BEGIN_STRICT_FIELD, 0);
+        self.return_target = Some(self.create_target());
+        for field in fields {
+            self.code_field(field);
+        }
+        let rt = self.return_target.expect("field-init return target");
+        self.place_target(0, rt);
+        self.add_byte(0, XS_CODE_END);
+        self.place_target(0, target);
+
+        // The field function captures the class environment (home/`this`);
+        // at eval scope that is a `FUNCTION_ENVIRONMENT` store (no captured
+        // slots for the simple-field surface).
+        if saved_eval {
+            self.add_byte(1, XS_CODE_FUNCTION_ENVIRONMENT);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+
+        self.return_target = saved_return;
+        self.first_continue_target = saved_continue;
+        self.first_break_target = saved_break;
+        self.scope_level = saved_scope_level;
+        self.program_flag = saved_program;
+        self.eval_flag = saved_eval;
+        self.environment_level = saved_env;
+    }
+
+    /// `fxFieldNodeCode` for a data field: `this`, the initializer value,
+    /// then `NEW_PROPERTY` with the inferred-name flag. Computed / private
+    /// fields (needing `atAccess` / private declares) are deferred.
+    fn code_field(&mut self, p: &Node) {
+        self.add_byte(1, XS_CODE_THIS);
+        let key = Self::symbol_of(&p.children[0]).to_string();
+        self.code(&p.children[1]);
+        self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
+        let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+        self.add_integer(0, XS_CODE_INTEGER_1, flag);
     }
 
     fn code_function(&mut self, node: &Node) {

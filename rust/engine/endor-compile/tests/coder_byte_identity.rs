@@ -1033,3 +1033,13 @@ fn anonymous_class_name_inference() {
         "let K=class C{};",
     ]);
 }
+
+#[test]
+fn class_static_fields() {
+    assert_identical(&[
+        "(class{static x=1;});", "(class{static x=1;static y=2;});",
+        "(class{static x;});", "(class{static m(){}static x=1;});",
+        "(class C{static x=1;});", "(class{static x=1+2;});",
+        "(class{static f=function(){};});",
+    ]);
+}
