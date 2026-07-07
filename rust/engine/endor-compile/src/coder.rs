@@ -438,6 +438,17 @@ impl Coder<'_> {
             Switch => self.code_switch(node),
             Try => self.code_try(node),
             Catch => self.code_catch(node),
+            // `this` (`fxThisNodeCode`): a derived-constructor `this` reads
+            // the frame slot; otherwise the plain `THIS` opcode. Both are
+            // symbol-free.
+            This => {
+                if node.flags & crate::ast::flags::DERIVED != 0 {
+                    self.add_byte(1, XS_CODE_GET_THIS);
+                } else {
+                    self.add_byte(1, XS_CODE_THIS);
+                }
+            }
+            Regexp => self.code_regexp(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -788,6 +799,20 @@ impl Coder<'_> {
     fn code_throw(&mut self, node: &Node) {
         self.code(&node.children[0]);
         self.add_byte(-1, XS_CODE_THROW);
+    }
+
+    /// `fxRegexpNodeCode`. A `new RegExp(pattern, flags)` via the
+    /// dedicated `REGEXP` intrinsic (no `RegExp` symbol lookup). XS
+    /// dispatches `self->modifier` (the pattern string) then `self->value`
+    /// (the flags string); those land in child slots `[1, 0]` here (the
+    /// slot order is the reverse of XS's field order, as the byte stream
+    /// pins: pattern first, flags second).
+    fn code_regexp(&mut self, node: &Node) {
+        self.add_byte(1, XS_CODE_REGEXP);
+        self.add_byte(2, XS_CODE_NEW);
+        self.code(&node.children[1]);
+        self.code(&node.children[0]);
+        self.add_integer(-4, XS_CODE_RUN_1, 2);
     }
 
     /// `fxSwitchNodeCode`. Children `[expression, List(cases)]`; each

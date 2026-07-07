@@ -245,6 +245,15 @@ fn control_flow_throw_debugger() {
 }
 
 #[test]
+fn this_and_regexp() {
+    assert_identical(&[
+        "this;", "this,1;", "typeof this;", "this===this;",
+        "/abc/;", "/abc/g;", "/a.c/gi;", "/x/;", "/[0-9]+/m;",
+        "/a/,/b/;", "if(1)/x/;",
+    ]);
+}
+
+#[test]
 fn control_flow_try() {
     assert_identical(&[
         "try{1;}catch{2;}", "try{1;}finally{2;}",
