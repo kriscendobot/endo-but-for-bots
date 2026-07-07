@@ -658,6 +658,41 @@ fn for_in_of_declaring_heads() {
     ]);
 }
 
+// The `arguments` object (child 6). A function that references `arguments`
+// carries a synthetic `arguments` `Var`; its scope header slots it, and the
+// parameter prelude builds the object (`ARGUMENTS_SLOPPY` mapped / else
+// `ARGUMENTS_STRICT`, operand = the parameter count) and stores it. Covers
+// the no-parameter (mapped) and the strict cases; a *mapped* `arguments`
+// with parameters (which promotes the parameters to closure slots) is
+// deferred pending the scoper marking.
+#[test]
+fn arguments_object() {
+    assert_identical(&[
+        "(function(){return arguments;});", "(function(){arguments[0];});",
+        "(function(){var x=arguments;return x;});", "(function(){f(arguments);});",
+        "(function(){return arguments[0]+arguments[1];});",
+        "(function(){return arguments.length;});",
+        "(function(){return function(){return arguments;};});",
+        // strict `arguments` stays unmapped, so parameters remain local
+        "\"use strict\";(function(){return arguments;});",
+        "\"use strict\";(function(a){return arguments;});",
+        "\"use strict\";(function(a,b){return arguments[0];});",
+    ]);
+}
+
+// `for (var x of/in …)` (child 6). A `var` head hoists to the enclosing
+// function/program scope (coded by the scope header), leaving the loop's
+// block scope non-declaring, so the iteration protocol is the plain form
+// and the binding takes the symbol path.
+#[test]
+fn for_in_of_var_head() {
+    assert_identical(&[
+        "for(var x of a)x;", "for(var x in a)x;", "for(var x of[1,2,3])x;",
+        "for(var k in o){k;}", "for(var x of a)break;", "for(var x of a);",
+        "for(var x of a)f(x);", "(function(){for(var x of a)return x;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

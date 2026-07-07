@@ -1791,10 +1791,11 @@ impl Coder<'_> {
         for d in &self.tree.scopes[scope].declares {
             let is_alias = d.token == Token::NoToken
                 && d.flags & crate::scoper::dflags::USE_CLOSURE != 0;
-            // `Define` is a named function expression's own name.
+            // `Arg`: a parameter. `Define`: a named function expression's
+            // own name. `Var`: the synthetic `arguments` object.
             assert!(
-                matches!(d.token, Token::Arg | Token::Define) || is_alias,
-                "function-scope declare {:?} deferred (arguments)",
+                matches!(d.token, Token::Arg | Token::Define | Token::Var) || is_alias,
+                "function-scope declare {:?} deferred",
                 d.token
             );
         }
@@ -1851,6 +1852,7 @@ impl Coder<'_> {
         }
         self.scope_code_retrieve(scope);
         self.scope_coding_params(scope);
+        self.code_arguments_object(scope, node, is_strict);
         self.code(&node.children[1]); // ParamsBinding
         self.code_function_name(scope);
 
@@ -1964,7 +1966,12 @@ impl Coder<'_> {
                 self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
                 continue;
             }
-            assert_eq!(token, Token::Arg, "non-Arg parameter declare deferred (params slice)");
+            // `fxScopeCodingParams` slots `Arg`/`Var`/`Const` declares —
+            // the parameters plus the synthetic `arguments` `Var`.
+            assert!(
+                matches!(token, Token::Arg | Token::Var | Token::Const),
+                "non-parameter declare {token:?} deferred (params slice)"
+            );
             let index = self.set_declare_index(scope, id);
             if flags & dflags::CLOSURE != 0 {
                 // A captured parameter lives in a closure slot.
@@ -1983,6 +1990,60 @@ impl Coder<'_> {
     /// `ARGUMENT i` and store it into the parameter's slot. Defaults
     /// (a `Binding` item), destructuring (`ArrayBinding`/`ObjectBinding`),
     /// rest (`RestBinding`), and the `arguments` object are deferred.
+    /// `fxParamsBindingNodeCode`'s `arguments`-object prelude. When a
+    /// function references `arguments`, its scope carries a synthetic
+    /// `arguments` `Var`; build the object (`ARGUMENTS_SLOPPY` for a mapped
+    /// sloppy simple-parameter function, else `ARGUMENTS_STRICT`, operand =
+    /// the parameter count) and store it into that slot. Emitted between
+    /// `fxScopeCodingParams` and the parameter binding loop.
+    fn code_arguments_object(&mut self, scope: usize, func: &Node, is_strict: bool) {
+        // The synthetic `arguments` slot: the sole `Var` in a function
+        // scope (parameters are `Arg`; a named-expr name is `Define`).
+        let args = self.tree.scopes[scope]
+            .declares
+            .iter()
+            .find(|d| {
+                d.token == Token::Var
+                    && matches!(&d.symbol, Some(crate::scoper::Sym::Named(s)) if s == "arguments")
+            })
+            .map(|d| (d.id, d.flags));
+        let Some((id, flags)) = args else { return };
+        let index = self.declare_index(scope, id);
+        let count = self.count_binding_items(&func.children[1]);
+        // Mapped only when sloppy with a simple parameter list.
+        let mapped =
+            !is_strict && func.flags & crate::ast::flags::NOT_SIMPLE_PARAMETERS == 0;
+        // A mapped `arguments` object aliases the named parameters, which
+        // requires them to be in closure slots — a scoper marking not yet
+        // ported. Defer the mapped-with-parameters case (the no-parameter
+        // and strict cases need no such marking).
+        assert!(
+            !(mapped && count > 0),
+            "mapped `arguments` with parameters deferred (scoper closure marking)"
+        );
+        let op = if mapped { XS_CODE_ARGUMENTS_SLOPPY } else { XS_CODE_ARGUMENTS_STRICT };
+        self.add_index(1, op, count);
+        let store = if flags & crate::scoper::dflags::CLOSURE != 0 {
+            XS_CODE_VAR_CLOSURE_1
+        } else {
+            XS_CODE_VAR_LOCAL_1
+        };
+        self.add_index(0, store, index);
+        self.add_byte(-1, XS_CODE_POP);
+    }
+
+    /// The `items->length` of a `ParamsBinding` (its parameter count),
+    /// which the `ARGUMENTS_*` opcode carries.
+    fn count_binding_items(&self, params: &Item) -> i32 {
+        match params {
+            Item::Node(p) => match p.children.first() {
+                Some(Item::List(items)) => items.len() as i32,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
     fn code_params_binding(&mut self, node: &Node) {
         let Some(Item::List(items)) = node.children.first() else { return };
         for (index, item) in items.iter().enumerate() {
