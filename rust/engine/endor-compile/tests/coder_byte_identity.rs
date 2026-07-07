@@ -1145,3 +1145,91 @@ fn class_instance_fields_derived() {
         "(class C extends Object{constructor(){super();this.z=3;}x=1;});",
     ]);
 }
+
+// `new.target` (`fxValueNodeCode` for a `Target` node → the single
+// `XS_CODE_TARGET` byte). Read in a construct it is the target constructor,
+// in a plain call `undefined`; the coder emits the same byte for both (the
+// runtime distinguishes). Each fixture runs a function declaration whose
+// body reads `new.target` on both call shapes.
+#[test]
+fn new_target() {
+    assert_identical(&[
+        // inside a construct call is the constructor; a plain call is undefined
+        "var t; function F(){ t = new.target; } new F(); t === F;",
+        "var t; function F(){ t = new.target; } new F(); typeof t;",
+        "function F(){ return typeof new.target; } var r = new F(); typeof r;",
+        "var t; function F(){ t = new.target; } F(); typeof t;",
+        "var t; function F(){ t = new.target; } F(); t === undefined;",
+        "function F(){ return new.target === undefined; } F();",
+        // the factory guard idiom + the ternary on new.target
+        "function F(){ if (new.target === undefined) { return 99; } this.x = 1; } F();",
+        "function F(){ return new.target ? 1 : 2; } F();",
+        "function F(){ return new.target === F; } new F();",
+        // a closure-captured constructor still sees new.target
+        "var t; function make(){ function G(){ t = new.target; } return G; } var g = make(); new g(); t === g;",
+        // per-frame: a construct then a plain call
+        "var t; function F(){ t = new.target; } new F(); F(); t === undefined;",
+    ]);
+}
+
+// Optional chaining (`fxChainNodeCode` + `fxOptionNodeCode`): the `Chain`
+// wrapper installs a short-circuit target and each `?.` link
+// `BRANCH_CHAIN`es to it when its base is nullish, leaving the chain's value
+// `undefined`. Member and computed-member links, single and nested.
+#[test]
+fn optional_chaining() {
+    assert_identical(&[
+        "var o = { a: 1 }; o?.a",
+        "var o2 = null; o2?.a",
+        "var o3 = { a: { b: 7 } }; o3?.a?.b",
+        // nullish base short-circuits the rest of the chain
+        "var o = null; o?.a?.b",
+        "var o = { a: null }; o?.a?.b",
+        // computed-member optional link
+        "var o = { a: 1 }; o?.[\"a\"]",
+        "var o = null; o?.[0]",
+        // an optional link mid-chain, then a plain member
+        "var o = { a: { b: 3 } }; o?.a.b",
+    ]);
+}
+
+// A `for (let …)` head declares a per-iteration binding, so the loop's
+// test/update re-enters through `fxScopeCodeRefresh` (a `REFRESH_LOCAL` per
+// declared slot) — the previously-folded declaring-scope path.
+#[test]
+fn for_let_declaring_scope() {
+    assert_identical(&[
+        "for (let i = 0; i < 3; i = i + 1) {} 9",
+        "let c = 0; for (let i = 0; i < 5; i = i + 1) { c = c + i } c",
+        "for (let i = 0; i < 2; i = i + 1);",
+        "for (let i = 0, j = 3; i < j; i = i + 1) {}",
+    ]);
+}
+
+// A nested function declaration binds a `Define` in its enclosing function
+// body's scope (`fxScopeCodingBlock` slots it, `fxScopeCodeDefineNodes`
+// assigns the function value) — the previously-folded function-declaration
+// declaring path.
+#[test]
+fn nested_function_declaration() {
+    assert_identical(&[
+        "function outer(){ function inner(){ return 1; } return inner(); } outer();",
+        "function make(){ function G(){ return 7; } return G; } make()();",
+        "function f(){ function g(){} function h(){} return 0; } f();",
+    ]);
+}
+
+// Name inference stops at a non-identifier assignment target: `o.m =
+// function(){}` (a member LHS) leaves the value anonymous (no `NAME`),
+// whereas a bare-identifier assignment names it. Both are pinned.
+#[test]
+fn anonymous_function_member_target_no_name() {
+    assert_identical(&[
+        "var o = {}; o.m = function(){};",
+        "var o = {}; o.m = function(){}; o.m();",
+        "var o = {}; o[\"k\"] = function(){};",
+        "function F(){} F.valueOf = function(){ return 1; }; 1 + F;",
+        // a bare-identifier assignment still infers the name
+        "var g; g = function(){}; g.name;",
+    ]);
+}

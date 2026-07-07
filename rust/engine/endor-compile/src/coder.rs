@@ -306,6 +306,12 @@ pub struct Coder<'a> {
     first_break_target: Option<usize>,
     first_continue_target: Option<usize>,
     return_target: Option<usize>,
+    /// XS's `coder->chainTarget` — the short-circuit target of the
+    /// enclosing optional chain (`a?.b?.c`). An `Option` link (`?.`) branches
+    /// here with `BRANCH_CHAIN` when its base is `null`/`undefined`, leaving
+    /// the whole chain's value `undefined`; the `Chain` wrapper creates and
+    /// places it. `None` outside a chain.
+    chain_target: Option<usize>,
     /// The atom table (`parser->symbolTable`), seeded with the built-ins.
     symbols: SymbolTable,
     tree: &'a ScopeTree,
@@ -359,6 +365,7 @@ impl<'a> Coder<'a> {
             first_break_target: None,
             first_continue_target: None,
             return_target: None,
+            chain_target: None,
             symbols: SymbolTable::seeded(),
             tree,
             decl_index: HashMap::new(),
@@ -692,20 +699,39 @@ impl<'a> Coder<'a> {
         }
     }
 
-    /// The declaration kinds the declaration slice codes. Function/host
-    /// `Define`s and class `Private`s are deferred and assert loudly.
+    /// The declaration kinds [`Coder::scope_coding_block`] codes. A `Define`
+    /// (a hoisted function declaration's binding) allocates its slot here
+    /// like any non-`var` declare — a `NEW_LOCAL`/`NEW_CLOSURE` with no
+    /// value init (`fxScopeCodeDefineNodes` assigns the function value
+    /// later). Class `Private`s remain the class slice and assert loudly.
     fn assert_declared_kind(&self, token: Token) {
         assert!(
-            matches!(token, Token::Var | Token::Let | Token::Const | Token::Arg | Token::NoToken),
+            matches!(
+                token,
+                Token::Var | Token::Let | Token::Const | Token::Arg | Token::Define | Token::NoToken
+            ),
             "declaration kind {:?} reached (function/class slice)",
             token
         );
     }
 
-    /// `fxScopeCodeRefresh` for a non-declaring scope (no-op).
-    #[allow(dead_code)]
+    /// `fxScopeCodeRefresh` — before a loop's test/update re-enters, rebind
+    /// each declared slot to a fresh cell (`REFRESH_CLOSURE` for a captured
+    /// binding, `REFRESH_LOCAL` for a plain one) so a closure formed in one
+    /// iteration of `for (let i …)` does not alias the next iteration's `i`.
+    /// A non-declaring scope emits nothing.
     fn scope_code_refresh(&mut self, scope: usize) {
-        assert_eq!(self.declare_count(scope), 0, "declaring scope reached (later child)");
+        if self.declare_count(scope) == 0 {
+            return;
+        }
+        for (id, _token, _sym, flags) in self.declares_of(scope) {
+            let index = self.declare_index(scope, id);
+            if flags & crate::scoper::dflags::CLOSURE != 0 {
+                self.add_index(0, XS_CODE_REFRESH_CLOSURE_1, index);
+            } else {
+                self.add_index(0, XS_CODE_REFRESH_LOCAL_1, index);
+            }
+        }
     }
 
     /// `fxScopeCodeDefineNodes` for a scope with no define nodes (no-op).
@@ -881,9 +907,15 @@ impl Coder<'_> {
                     self.add_byte(1, XS_CODE_THIS);
                 }
             }
+            // `new.target` (`fxValueNodeCode` for a `Target` node): the
+            // running frame's target constructor (`undefined` when the frame
+            // was not entered as a construct). A single stack-pushing byte.
+            Target => self.add_byte(1, XS_CODE_TARGET),
             Regexp => self.code_regexp(node),
             Template => self.code_template(node),
             Access => self.code_access(node),
+            Chain => self.code_chain(node),
+            Option => self.code_option(node),
             Member => self.code_member(node),
             MemberAt => self.code_member_at(node),
             Call => self.code_call(node),
@@ -1849,6 +1881,10 @@ impl Coder<'_> {
         // its constructor's creation operand (`code_class` leaves
         // `pending_name` for the constructor `code_function` to consume, and
         // emits no `NAME` op since the class itself is unnamed).
+        // Only a simple identifier (a declaration or a bare `Access`) names
+        // the value; a member / computed / pattern target leaves the value
+        // anonymous (ES `IsAnonymousFunctionDefinition` + `NamedEvaluation`
+        // apply only to identifier LHS — `o.m = function(){}` stays unnamed).
         let name = match target {
             Item::Node(n) => match n.token {
                 Token::Var | Token::Let | Token::Const | Token::Using | Token::Arg => {
@@ -1859,7 +1895,6 @@ impl Coder<'_> {
             },
             _ => None,
         };
-        assert!(name.is_some(), "non-identifier name-inference target deferred (later slice)");
         self.pending_name = name;
     }
 
@@ -2936,6 +2971,31 @@ impl Coder<'_> {
     /// `fxMemberNodeCode`. Children `[reference, symbol]` → the reference
     /// then a `GET_PROPERTY` (or `GET_SUPER` for a `super.x` reference;
     /// `super` is deferred with classes).
+    /// `fxChainNodeCode` — the wrapper of an optional chain (`a?.b?.c`).
+    /// Child `[expression]`. Install a fresh short-circuit target, code the
+    /// chain expression (its `Option` links branch here when a base is
+    /// nullish), then place the target so a taken branch lands with the
+    /// nullish base as the chain's `undefined`/`null` value. The saved outer
+    /// chain target is restored (chains can nest through call arguments).
+    fn code_chain(&mut self, node: &Node) {
+        let saved = self.chain_target;
+        let target = self.create_target();
+        self.chain_target = Some(target);
+        self.code(&node.children[0]);
+        self.place_target(0, target);
+        self.chain_target = saved;
+    }
+
+    /// `fxOptionNodeCode` — one `?.` link. Child `[base]`. Code the base,
+    /// then `BRANCH_CHAIN` to the enclosing chain's short-circuit target: the
+    /// branch is taken (leaving the nullish base as the result) exactly when
+    /// the base is `null`/`undefined`, otherwise the access continues.
+    fn code_option(&mut self, node: &Node) {
+        self.code(&node.children[0]);
+        let target = self.chain_target.expect("optional `?.` outside a chain");
+        self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, target);
+    }
+
     fn code_member(&mut self, node: &Node) {
         self.code(&node.children[0]);
         let is_super = self.node_is_super(&node.children[0]);

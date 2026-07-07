@@ -347,29 +347,25 @@ mod tests {
     fn corpora_byte_identity_no_undocumented_divergence() {
         // The bounded, in-`cargo test` regression gate for the stage-5
         // byte-identity bar over the curated conformance corpora (every
-        // non-comment line). The byte-identity half of the **stage bar** is
-        // `divergent == 0` — now MET: the CESU-8 string-literal fold is
-        // CLOSED (stage-5 fix child). The coder carries string values as
-        // UTF-16 code units and emits XS's CESU-8 (an astral scalar as a
-        // 6-byte surrogate pair, a lone surrogate as a 3-byte unit, an
-        // embedded NUL as `0xC0 0x80`), so `stage3-string-utf16.js` is
-        // byte-identical and there is **no documented byte-divergence fold
-        // left**. One named fold remains — the accept/reject side, reported
-        // to the supervisor with evidence, not hidden:
+        // non-comment line). The **stage bar** — `divergent == 0` AND full
+        // accept/reject agreement — is now MET with **no documented fold
+        // left on either axis**:
         //
-        //   - **Named coder folds** — constructs the coder still folds on
-        //     with a *deliberate* panic (`unsupported node kind Target`
-        //     for `new.target`, `... Chain` for optional chaining, and
-        //     the `... reached (…child/slice)` declaring-scope /
-        //     function-class-declaration paths) — endor-rejects where the
-        //     oracle accepts. A panic that is NOT one of these deliberate
-        //     fold markers (e.g. an index-out-of-bounds) is a real bug and
-        //     fails this gate.
+        //   - Byte identity: the CESU-8 string-literal fold is CLOSED (the
+        //     coder carries string values as UTF-16 code units and emits
+        //     XS's CESU-8), so every both-accept program is byte-identical.
+        //   - Accept/reject: the named coder folds are CLOSED too —
+        //     `new.target` (`Target`), optional chaining (`Chain`/`Option`),
+        //     the `for (let …)` declaring-scope refresh, and the nested
+        //     function-declaration (`Define`) path all code byte-identically
+        //     (stage-5 fix child, the named-coder-rejects slice), so the
+        //     coder no longer folds on any construct the curated corpus
+        //     reaches. The documented-fold allowlist is therefore **empty**.
         //
-        // This gate asserts **zero byte divergence** and **no rejection
-        // outside the named coder folds** — so any NEW byte divergence (a
-        // regression in a currently-identical program, including a CESU-8
-        // regression) or any new coder panic on a new construct fails the
+        // This gate now asserts **zero byte divergence** AND **zero
+        // endor-rejection** — so any NEW byte divergence (a regression in a
+        // currently-identical program, including a CESU-8 regression) or ANY
+        // coder panic (a re-opened fold or an accidental bug panic) fails the
         // build. The whole-`language/` sweep lives in the `compile-diff`
         // binary (bounded per subtree to contain oracle RSS).
         let programs = corpora_programs();
@@ -387,19 +383,13 @@ mod tests {
             report.divergences
         );
 
-        // Every endor-rejection is a *deliberate* coder fold —
-        // recognizable by its panic marker, not an accidental bug panic.
-        let named = ["unsupported node kind", "reached (", "declaring scope"];
-        let undocumented_rej: Vec<_> = report
-            .endor_rejections
-            .iter()
-            .filter(|(_, why)| !named.iter().any(|m| why.contains(m)))
-            .collect();
-        assert!(
-            undocumented_rej.is_empty(),
-            "undocumented endor-rejection(s) outside the named coder folds {:?}: {:#?}",
-            named,
-            undocumented_rej
+        // Accept/reject: zero endor-rejection. The named coder folds are
+        // closed, so there is no allowlist — any coder panic (a re-opened
+        // fold or an accidental bug) fails this gate.
+        assert_eq!(
+            report.endor_rejected, 0,
+            "endor-rejection(s) where the oracle accepts (a re-opened coder fold): {:#?}",
+            report.endor_rejections
         );
 
         // Accept/reject agreement in the benign direction must be perfect
