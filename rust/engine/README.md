@@ -1365,11 +1365,19 @@ byte-identical vs the oracle:
   `Store` — an arrow that transitively uses `this`/`super`/`target`
   retrieves the receiver and target (`RETRIEVE_TARGET`/`RETRIEVE_THIS`) and
   stores them on creation (`STORE_ARROW`).
+- Slice 41 — **direct-`eval` parameters**: a syntactic `eval(...)` call
+  closes with the `EVAL` intrinsic (`INTEGER count` + `EVAL`, or
+  `GET_LOCAL counter` + `EVAL` for spread) instead of `RUN`; the scoper
+  already poisons the enclosing scopes. Program/block-level `eval` (with or
+  without declarations, spread, as a value) is byte-identical; `a.eval()`
+  is correctly a normal call.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-anonymous-class name inference and **direct-`eval` spread**; classes
+anonymous-class name inference; direct-`eval` **inside a function** (the
+poisoned param scope asserts); classes
 (constructor/derived, methods/accessors, static members, private fields/
 methods/brands, static blocks, and `super` in class bodies /
-derived-constructor `super(...)`); `using` heads (a parser gap); and
+derived-constructor `super(...)`) — the scoper defers class hoisting, so
+classes need scoper work first; `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
