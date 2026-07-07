@@ -1586,15 +1586,33 @@ new kill-criterion evidence in this sweep. The classes:
    real byte mismatch on accepted programs, narrow and nameable (a scoper
    closure-capture promotion gap).
 2. **Class β — private class-member installation coding (divergent).** The
-   private brand / home-object / accessor / method install sequence
-   (a `store_1`/`pop` ordering) is not yet byte-exact:
-   `class/elements/private-accessor-name/*`, `private-*-on-nested-class`,
-   `private-*-shadowed-*-on-nested-class`, `privatefield{get,set}-typeerror-1`,
-   `{get,set}-access-of-*-private-*` (≈56 of the `class` divergences,
-   representative: `class/elements/private-accessor-name/inst-private-name-common.js`).
-   fix2's private-read child closed the private-member **reject** fold, so
-   these programs now *compile* — the residual is that the installation bytes
-   are not identical yet.
+   private brand / home-object / accessor / method install sequence is not
+   yet fully byte-exact. fix2's private-read child closed the private-member
+   **reject** fold (these programs now *compile*); fix3's Class β child then
+   closed the **accessor-pair brand double-capture** sub-shape — a `get #x`/
+   `set #x` pair now shares one brand closure (`fxScopeLookup` resolves both
+   `symbolAccess` nodes to the first class-scope declare), dropping the
+   `private-accessor-name/*` divergences (`statements/class` 100 → 75). Two
+   sub-shapes remain, **both scoper-structural** (endor still synthesizes the
+   member-closure field-init function at code time rather than binding the
+   field initializers inside a real `instanceInit` **function scope** the way
+   XS does, so the initializers' frame and their private-brand reads are not
+   isolated):
+     - **nested-class private-member scope count** (`private-*-on-nested-class`
+       family): a nested class declaring private members leaks its closure
+       slots into the enclosing frame, over-counting a `RESERVE` (operand-only
+       divergence, e.g. `private-field-on-nested-class.js`, program `RESERVE`
+       `0x0d` vs oracle `0x09`);
+     - **field-initializer private-brand read index**
+       (`privatefield{get,set}-typeerror-1`, `{get,set}-access-of-*-private-*`):
+       a `this.#x` read in a field initializer resolves to the class-scope
+       brand index instead of the field function's captured retrieve-slot
+       (`GET_PRIVATE` operand divergence).
+   Both close together when the member-closure field-init path is unified with
+   the plain-data-field `instanceInit` function scope (binding every instance
+   initializer inside it, with the member `symbolAccess`/`valueAccess`/
+   `atAccess` captured as use-closure aliases) — a single larger scoper+coder
+   fold, deferred here to avoid regressing the byte-clean class corpora.
 3. **Class γ — in-function / in-initializer direct-eval scope emission
    (divergent).** A nested function or a class-field initializer containing a
    direct `eval(...)` emits a differing function-environment prologue
