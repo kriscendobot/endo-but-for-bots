@@ -1724,6 +1724,45 @@ fn class_field_init_closure_capture() {
     ]);
 }
 
+// Classes β + ε — computed-key / private / static field initializers bound
+// inside a real `instanceInit` / `constructorInit` **function scope** (XS's
+// `mxFieldFlag` field function). A field value's inner function/class captures
+// outer bindings AND private brands through the field function, not the class
+// scope: a nested class's private slots no longer leak into the enclosing
+// frame (the `RESERVE` count), a `this.#x` read in an initializer resolves to
+// the field function's captured retrieve slot (`GET_PRIVATE`), and the field
+// value temporaries land at the counted frame depth. These fixtures pin the
+// closed shapes (nested-class private `RESERVE`, field-init brand read,
+// init-value temp depth, static-field-init, shared accessor-pair brand).
+#[test]
+fn class_field_init_function_scope() {
+    assert_identical(&[
+        // nested-class private-member RESERVE: a nested class in a field value
+        // keeps its own private/temporary slots in the field function frame
+        "class C { #outer = 1; B = class { method(o){ return o.#outer } }; }",
+        "class C { #outer=1; B = class { #inner = 2; method(o){ return o.#outer } }; }",
+        // init-value temporary depth: two computed keys + peak temp
+        "var x = 0; class C { [x++] = x++; [x++] = x++; }",
+        // field-initializer private-brand read (GET_PRIVATE via the retrieve slot)
+        "class C { #x = 1; g = this.#x; }",
+        "class C { #a = 1; #b = 2; sum = this.#a + this.#b; }",
+        // a private method value read in an initializer
+        "class C { #m(){return 7} v = this.#m(); }",
+        // shared getter/setter brand (one slot, not two)
+        "class C { get #x(){return 1} set #x(v){} y = this.#x; }",
+        // the static twin (constructorInit): private-brand read + capture
+        "class C { static #x = 1; static g = C.#x; }",
+        "class C { static #s = 1; static m(){ return C.#s } }",
+        "let y=5; class C { static a = y; static b = y+1; }",
+        "class C { static get #p(){return 1} static set #p(v){} static q = C.#p; }",
+        // a simple static block runs inside constructorInit
+        "class C { static { this.p = 1; } }",
+        // the cross-construct mix on a derived class
+        "class Base {} class C extends Base { #x = 1; g = this.#x; }",
+        "const f=()=>0; class C { #x = 1; static #s = 2; g = this.#x; static h = C.#s; k = f; }",
+    ]);
+}
+
 #[test]
 fn module_default_and_reexport() {
     assert_identical_module(&[
