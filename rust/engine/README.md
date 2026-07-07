@@ -1253,6 +1253,14 @@ byte-identical vs the oracle:
   scoper folds XS's symbolScope into the function scope, so this is a
   targeted `code_function_name` emission. A name captured by an inner
   function (a closure-slot name) stays deferred.
+- Slice 20 — **`for-in` / `for-of` iteration**: `fxForInForOfNodeCode` — seed
+  the iterator (`FOR_IN`/`FOR_OF`), cache `next`, and drive a `next()` loop
+  inside a `try`/`finally` that closes the iterator (`.return()`) on
+  break/continue/return/throw, reusing the selector/alias/finalize/jump
+  target machinery (shared with `try`). Non-declaring heads (plain
+  reference / member / computed target), labeled break, nesting, and use
+  inside functions all covered; declaring heads (`for (let/const/var …)`),
+  `using`, and `for await` stay deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
@@ -1261,6 +1269,6 @@ mapped/closure parameters); home-object/`super` (and arrow capture of
 generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
-`for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
-import/export linkage + the module-body wrapper. These are the remaining
-child-6/7 surface.
+declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
+module import/export linkage + the module-body wrapper. These are the
+remaining child-6/7 surface.
