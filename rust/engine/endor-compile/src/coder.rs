@@ -2659,6 +2659,18 @@ impl Coder<'_> {
         // value-temporary depth) and the closure-slot access indices. The
         // static member-closure path reserves `k` member-closure slots.
         if let Some(fi) = fi {
+            // A field-init function scope holds only member-access / value
+            // use-closure aliases; a real (non-alias) declare means a
+            // `static { … }` block hoisted a lexical declaration into it (its
+            // own frame reservation + block coding is the remaining class-tail
+            // fold). Keep it a loud, named fold rather than a mis-emit.
+            if self.tree.scopes[fi]
+                .declares
+                .iter()
+                .any(|d| d.flags & crate::scoper::dflags::USE_CLOSURE == 0)
+            {
+                panic!("static block with lexical declarations deferred");
+            }
             let reserve = *self.tree.scope_counts.get(&fi).unwrap_or(&0);
             if reserve != 0 {
                 self.add_index(0, XS_CODE_RESERVE_1, reserve);

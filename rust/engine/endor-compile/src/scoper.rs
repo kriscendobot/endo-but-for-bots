@@ -570,14 +570,6 @@ fn class_has_constructor_init_member(class: &Node) -> bool {
         _ => false,
     })
 }
-/// A class member that is a **plain instance data field**: a non-static,
-/// non-method/getter/setter `Property` (literal key). These are the members
-/// whose initializers XS moves into the `instanceInit` function.
-fn is_instance_plain_data_field(m: &Node) -> bool {
-    use crate::ast::flags as f;
-    m.token == Token::Property
-        && m.flags & (f::STATIC | f::METHOD | f::GETTER | f::SETTER) == 0
-}
 #[allow(dead_code)]
 fn child_list<'a>(n: &'a Node, i: usize) -> Option<&'a [Item]> {
     match n.children.get(i) {
@@ -610,21 +602,6 @@ impl Scoper {
         id
     }
 
-    /// A synthetic strict `Function` scope for a class's `instanceInit`
-    /// field-init function (XS's `mxStrictFlag | mxSuperFlag | mxFieldFlag`
-    /// function node). Parented to the current scope (the class body) without
-    /// changing `self.scope`; the caller enters it explicitly.
-    fn scope_new_field_init(&mut self) -> usize {
-        let parent = self.scope;
-        // No backing AST node (the surgery is synthesized), so `node_ptr` is
-        // 0; only its own `flags` matter and it is strict.
-        let mut sc = Scope::new(parent, Token::Function, 0, SCOPE_STRICT);
-        sc.flags |= SCOPE_STRICT;
-        let id = self.scopes.len();
-        self.scopes.push(sc);
-        id
-    }
-
     /// Create a field-init function scope (XS's `instanceInit` /
     /// `constructorInit`) at hoist time, parented to the current (class body)
     /// scope, and hoist each member's value (or, for a `static { … }` block,
@@ -645,7 +622,7 @@ impl Scoper {
         let fs = self.function_scope;
         let bs = self.body_scope;
         self.function_scope = Some(fi);
-        self.body_scope = None;
+        self.body_scope = Some(fi);
         for m in members {
             if is_static && m.token == Token::Body {
                 // A static block: hoist its statements (child 0) directly.
@@ -673,46 +650,6 @@ impl Scoper {
         let symbol = d.symbol.clone()?;
         let line = d.line;
         self.scope_lookup(fi, &symbol, line, false, false).map(|(_, id)| id)
-    }
-
-    /// Whether the class has ≥1 plain instance data field and *no* computed
-    /// or private instance data field — the condition under which the
-    /// instance field initializers bind inside a synthesized `instanceInit`
-    /// function scope (`is_instance_plain_data_field`).
-    fn class_instance_fields_all_plain(&self, node: &Node) -> bool {
-        use crate::ast::flags as f;
-        let Some(Item::List(items)) = node.children.get(2) else {
-            return false;
-        };
-        let mut has_plain = false;
-        for item in items {
-            let Item::Node(m) = item else { continue };
-            let is_method = m.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
-            let is_static = m.flags & f::STATIC != 0;
-            if is_static || m.token == Token::Body {
-                continue;
-            }
-            // A non-static **private** member (data or method) contributes
-            // a `symbolAccess`/`valueAccess` member closure to the field-init
-            // function; a **computed-key** data field contributes `atAccess`.
-            // Either interleaves with outer captures — keep the old
-            // member-closure-only field function for those classes.
-            if m.token == Token::PrivateProperty || (m.token == Token::PropertyAt && !is_method) {
-                return false;
-            }
-            // A public method/getter/setter is coded inline (not in the
-            // field function) — ignore it.
-            if is_method {
-                continue;
-            }
-            // A non-static plain data field.
-            if is_instance_plain_data_field(m) {
-                has_plain = true;
-            } else {
-                return false;
-            }
-        }
-        has_plain
     }
 
     /// Build a fresh declare with a scope-stable id, without inserting it.
