@@ -1238,12 +1238,21 @@ byte-identical vs the oracle:
   a `...rest` param binds its target from `ARGUMENTS i` (collecting the
   remaining arguments into an array) rather than `ARGUMENT i`; excluded
   from the `BEGIN` count. With or without leading fixed parameters.
+- Slice 18 — **captured closures**: the closure slot contract. A variable
+  an inner function references is promoted to a closure slot in its defining
+  scope (`NEW_CLOSURE` / `VAR_CLOSURE`); the capturing inner function's
+  `fxScopeCodeRetrieve` emits `RETRIEVE_1` to pull the closures into its
+  frame (accesses resolve to `GET_CLOSURE`), and `fxScopeCodeStore` emits
+  `STORE_1` of the defining scope's slot into the new function's environment
+  on creation. Parameters and locals, nested/multi-capture, arrow closures,
+  and mutation of captured bindings all covered; arrow capture of
+  `this`/`super`/`target` and the `arguments` object stay deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
-mapped/closure parameters); captured closures (`fxScopeCodeRetrieve`/`Store`)
-and home-object/`super`; **named function expressions** (the `CURRENT` name
-binding) and object-method/property **name inference**; generator/async
+mapped/closure parameters); home-object/`super` (and arrow capture of
+`this`/`super`/`target`); **named function expressions** (the `CURRENT`
+name binding) and object-method/property **name inference**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 `for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
