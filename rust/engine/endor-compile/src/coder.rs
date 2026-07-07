@@ -649,6 +649,26 @@ impl<'a> Coder<'a> {
             "define nodes reached in control-flow coder (function slice)"
         );
     }
+
+    /// `fxScopeCodeDefineNodes` for a function's own scope: bind a named
+    /// function expression's name to the running function (`CURRENT`) in a
+    /// `const` slot, so the body can refer to itself. The slot was
+    /// allocated in `scope_coding_params`; the reference is a no-op (the
+    /// name resolves to its own slot).
+    fn code_function_name(&mut self, scope: usize) {
+        let names: Vec<u32> = self.tree.scopes[scope]
+            .declares
+            .iter()
+            .filter(|d| d.token == Token::Define)
+            .map(|d| d.id)
+            .collect();
+        for id in names {
+            let index = self.declare_index(scope, id);
+            self.add_byte(1, XS_CODE_CURRENT);
+            self.add_index(0, XS_CODE_CONST_LOCAL_1, index);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+    }
 }
 
 /// The public entry: compile `source` as a Script to XS bytecode, or
@@ -1557,9 +1577,10 @@ impl Coder<'_> {
         for d in &self.tree.scopes[scope].declares {
             let is_alias = d.token == Token::NoToken
                 && d.flags & crate::scoper::dflags::USE_CLOSURE != 0;
+            // `Define` is a named function expression's own name.
             assert!(
-                d.token == Token::Arg || is_alias,
-                "function-scope declare {:?} deferred (named-expr / arguments)",
+                matches!(d.token, Token::Arg | Token::Define) || is_alias,
+                "function-scope declare {:?} deferred (arguments)",
                 d.token
             );
         }
@@ -1611,7 +1632,7 @@ impl Coder<'_> {
         self.scope_code_retrieve(scope);
         self.scope_coding_params(scope);
         self.code(&node.children[1]); // ParamsBinding
-        self.scope_code_define_nodes(scope);
+        self.code_function_name(scope);
 
         self.return_target = Some(self.create_target());
         self.code(&node.children[2]); // Body
@@ -1713,6 +1734,14 @@ impl Coder<'_> {
         for (id, token, sym, flags) in self.declares_of(scope) {
             // Closure aliases are handled by `fxScopeCodeRetrieve`, not here.
             if token == Token::NoToken {
+                continue;
+            }
+            // A named function expression's own name is a `Define` bound to
+            // `CURRENT`; give it a slot here, initialized in the define pass.
+            if token == Token::Define {
+                let index = self.set_declare_index(scope, id);
+                assert!(flags & dflags::CLOSURE == 0, "captured function name deferred");
+                self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
                 continue;
             }
             assert_eq!(token, Token::Arg, "non-Arg parameter declare deferred (params slice)");

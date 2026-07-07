@@ -583,6 +583,20 @@ fn captured_closures() {
     ]);
 }
 
+// Named function expressions (child 6). A `function g(){…}` *value* binds
+// its own name `g` in a `const` slot of its scope, initialized to the
+// running function (`CURRENT`), so the body can refer to itself. Deferred:
+// a name captured by an inner function (a closure-slot name).
+#[test]
+fn named_function_expressions() {
+    assert_identical(&[
+        "(function g(){});", "(function g(){return g;});",
+        "(function g(){return 1;});", "(function fact(n){return fact;});",
+        "var f=function g(){};", "(function g(a){return a;});",
+        "[function g(){}];", "(function g(){return g();});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
