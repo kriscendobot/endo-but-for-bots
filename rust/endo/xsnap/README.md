@@ -27,19 +27,19 @@ build script falls back to copying it.
 
 `xsnap` is a pure library crate. The XS engine host modes (worker,
 manager child, standalone archive runner) are exposed as library
-entry points and invoked from the unified `endor` binary in the
+entry points and invoked from the unified `endot` binary in the
 `endo` crate:
 
 ```sh
 # Standalone: load a compartment-map zip, execute, exit
-endor run bundle.zip
+endot run bundle.zip
 
 # Supervised worker (CapTP over fd 3/4)
-endor worker
+endot worker
 
 # Supervised manager child (multiplexed CapTP over fd 3/4,
 # hosts the pet-name store and formula graph)
-endor manager
+endot manager
 ```
 
 `-e xs` is accepted but optional — XS is the default engine. The
@@ -63,16 +63,16 @@ inside a zipped compartment-map archive.
 From the workspace root:
 
 ```sh
-# 1. Build the archive creator and the unified `endor` binary
+# 1. Build the archive creator and the unified `endot` binary
 cargo build -p xsnap --example make-demo-archive
-cargo build -p endo --bin endor
+cargo build -p endo --bin endot
 
 # 2. Create the demo zip
 cargo run -p xsnap --example make-demo-archive
 # -> Wrote target/dir-handle-demo.zip
 
 # 3. Run it
-target/debug/endor run target/dir-handle-demo.zip
+target/debug/endot run target/dir-handle-demo.zip
 ```
 
 ### Expected output
@@ -99,7 +99,7 @@ target/debug/endor run target/dir-handle-demo.zip
 === Demo complete ===
 ```
 
-Each line is prefixed with `endor: [trace]` on stderr.
+Each line is prefixed with `endot: [trace]` on stderr.
 
 ### What the demo shows
 
@@ -139,7 +139,7 @@ dir-handle-demo.zip
     └── index.js            # the demo script
 ```
 
-`endor run` loads the zip, creates an XS Compartment for
+`endot run` loads the zip, creates an XS Compartment for
 each entry in the compartment map, and imports the entry module.
 Host functions (`readFileText`, `openDir`, etc.) are passed
 into the Compartment as `globals` endowments, so the sandboxed

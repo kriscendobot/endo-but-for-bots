@@ -3,7 +3,7 @@
 //!
 //! This is the Rust counterpart of the Node.js `@endo/daemon` iroh transport
 //! (`packages/daemon/src/networks/iroh.js`). It is deliberately
-//! wire-compatible so an `endor` daemon and a Node.js Endo daemon can
+//! wire-compatible so an `endot` daemon and a Node.js Endo daemon can
 //! cross-connect:
 //!
 //! - the same ALPN, [`ALPN`] = `endo/captp/0`;
@@ -263,7 +263,7 @@ impl IrohSession {
 
 /// A cheap, cloneable handle to a live iroh QUIC connection.
 ///
-/// Exposes only what a byte bridge needs, so a consumer (e.g. the `endor`
+/// Exposes only what a byte bridge needs, so a consumer (e.g. the `endot`
 /// supervisor) can manage a connection's lifetime without depending on iroh
 /// directly.
 #[derive(Clone)]

@@ -5,7 +5,7 @@
 //!   cargo run --example make-demo-archive
 //!
 //! Produces `target/dir-handle-demo.zip` which can be executed with:
-//!   target/debug/endor run target/dir-handle-demo.zip
+//!   target/debug/endot run target/dir-handle-demo.zip
 
 use std::io::Write;
 

@@ -23,7 +23,7 @@ use crate::types::{Envelope, Handle, Message, WorkerInfo};
 /// How the daemon should host the manager.
 ///
 /// `InProcessXs` is the default: a dedicated `std::thread` inside
-/// `endor daemon` runs the XS manager machine and talks to the
+/// `endot daemon` runs the XS manager machine and talks to the
 /// supervisor through a channel transport. `NodeChild` is the
 /// legacy Node.js daemon child, retained for one release behind
 /// `ENDO_MANAGER_NODE=1`.
@@ -91,7 +91,7 @@ impl Endo {
     /// pipe path.
     pub async fn serve(&mut self) -> Result<(), EndoError> {
         eprintln!(
-            "endor: starting (pid {})",
+            "endot: starting (pid {})",
             std::process::id()
         );
 
@@ -127,11 +127,11 @@ impl Endo {
                     Arc::clone(&self.shutdown_notify),
                     &self.paths,
                 )?;
-                eprintln!("endor: in-process XS manager started, waiting for socket");
+                eprintln!("endot: in-process XS manager started, waiting for socket");
             }
             ManagerMode::NodeChild => {
                 self.spawn_node_daemon()?;
-                eprintln!("endor: node daemon started, waiting for socket");
+                eprintln!("endot: node daemon started, waiting for socket");
             }
         }
 
@@ -139,7 +139,7 @@ impl Endo {
         wait_for_socket(&self.paths.sock_path, Duration::from_secs(10)).await?;
 
         eprintln!(
-            "endor: ready (sock {})",
+            "endot: ready (sock {})",
             self.paths.sock_path.display()
         );
 
@@ -165,7 +165,7 @@ impl Endo {
         match tokio::time::timeout(Duration::from_secs(5), self.supervisor.wait()).await {
             Ok(()) => {}
             Err(_) => {
-                eprintln!("endor: supervisor wait timed out, forcing exit");
+                eprintln!("endot: supervisor wait timed out, forcing exit");
             }
         }
         pidfile::remove_pid(&self.paths.ephemeral_path);
@@ -220,7 +220,7 @@ impl Endo {
         let shutdown_notify = Arc::clone(&self.shutdown_notify);
         let sup_for_exit = Arc::clone(&self.supervisor);
         let on_exit: Box<dyn FnOnce() + Send> = Box::new(move || {
-            eprintln!("endor: node daemon exited");
+            eprintln!("endot: node daemon exited");
             shutdown_notify.notify_one();
             sup_for_exit.stop();
         });
@@ -250,7 +250,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
     let cas_dir = cas.dir();
     match msg.envelope.verb.as_str() {
         "ready" => {
-            eprintln!("endor: daemon reports ready");
+            eprintln!("endot: daemon reports ready");
         }
         "listen-path" => {
             // Daemon requests socket listener on a Unix path.
@@ -258,7 +258,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
             let sock_path = match codec::decode_listen_path_request(&msg.envelope.payload) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("endor: listen request decode error: {e}");
+                    eprintln!("endot: listen request decode error: {e}");
                     return;
                 }
             };
@@ -281,7 +281,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
                         },
                         response_tx: None,
                     });
-                    eprintln!("endor: socket listener started at {sock_path}");
+                    eprintln!("endot: socket listener started at {sock_path}");
                 }
                 Err(e) => {
                     sup.deliver(Message {
@@ -295,7 +295,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
                         },
                         response_tx: None,
                     });
-                    eprintln!("endor: socket listener failed: {e}");
+                    eprintln!("endot: socket listener failed: {e}");
                 }
             }
         }
@@ -315,7 +315,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
                     );
                 }
                 Err(e) => {
-                    eprintln!("endor: listen-iroh decode error: {e}");
+                    eprintln!("endot: listen-iroh decode error: {e}");
                     sup.deliver(Message {
                         from: 0,
                         to: msg.from,
@@ -447,7 +447,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
             let worker_handle = msg.from;
             let sha256 = String::from_utf8_lossy(&msg.envelope.payload).into_owned();
             eprintln!(
-                "endor: worker {} suspended (sha256={})",
+                "endot: worker {} suspended (sha256={})",
                 worker_handle,
                 &sha256[..sha256.len().min(16)]
             );
@@ -563,7 +563,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
                     }
                 }
                 Err(e) => {
-                    eprintln!("endor: cas-store decode error: {e}");
+                    eprintln!("endot: cas-store decode error: {e}");
                 }
             }
         }
@@ -600,7 +600,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
                     }
                 }
                 Err(e) => {
-                    eprintln!("endor: cas-fetch decode error: {e}");
+                    eprintln!("endot: cas-fetch decode error: {e}");
                 }
             }
         }
@@ -636,7 +636,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
             match cas.gc(&live_roots) {
                 Ok(report) => {
                     eprintln!(
-                        "endor: GC freed {} entries ({} bytes)",
+                        "endot: GC freed {} entries ({} bytes)",
                         report.freed_count, report.freed_bytes
                     );
                     sup.deliver(Message {
@@ -699,7 +699,7 @@ fn handle_control_message(sup: &Arc<Supervisor>, spawn_sup: &Arc<Supervisor>, ca
         }
         other => {
             if crate::supervisor::is_debug_public() {
-                eprintln!("endor: unhandled control verb: {other}");
+                eprintln!("endot: unhandled control verb: {other}");
             }
         }
     }
@@ -766,7 +766,7 @@ fn resume_shared(
         nonce: 0,
     });
     if sup_to_machine_tx.send(init_bytes).is_err() {
-        eprintln!("endor: resume: failed to send restore init");
+        eprintln!("endot: resume: failed to send restore init");
         return;
     }
 
@@ -778,7 +778,7 @@ fn resume_shared(
         }
         let bytes = codec::encode_envelope(&env);
         if sup_to_machine_tx.send(bytes).is_err() {
-            eprintln!("endor: resume: failed to send pending message");
+            eprintln!("endot: resume: failed to send pending message");
             return;
         }
     }
@@ -829,7 +829,7 @@ fn resume_shared(
                         });
                     }
                     Err(e) => {
-                        eprintln!("endor: resume decode error: {e}");
+                        eprintln!("endot: resume decode error: {e}");
                     }
                 },
                 Err(_) => return,
@@ -850,9 +850,9 @@ fn resume_shared(
             ));
         let result = xsnap::run_xs_worker_inproc(transport);
         if let Err(e) = result {
-            eprintln!("endor: resumed worker {handle} exited with error: {e}");
+            eprintln!("endot: resumed worker {handle} exited with error: {e}");
         } else {
-            eprintln!("endor: resumed worker {handle} exited cleanly");
+            eprintln!("endot: resumed worker {handle} exited cleanly");
         }
         sup_for_exit.unregister(handle);
     });
@@ -888,7 +888,7 @@ fn resume_process(
     let spawned = match spawn_with_pipes(&command, &args, &mut cmd) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("endor: resume_process: spawn failed: {e}");
+            eprintln!("endot: resume_process: spawn failed: {e}");
             sup.unregister(handle);
             return;
         }
@@ -916,7 +916,7 @@ fn resume_process(
         "restore",
         restore_payload,
     ) {
-        eprintln!("endor: resume_process: wire_worker_tasks failed: {e}");
+        eprintln!("endot: resume_process: wire_worker_tasks failed: {e}");
         sup.unregister(handle);
         return;
     }

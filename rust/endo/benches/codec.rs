@@ -51,7 +51,7 @@ fn bench_encode_spawn_request(c: &mut Criterion) {
         b.iter(|| {
             codec::encode_spawn_request(
                 black_box("separate"),
-                black_box("/usr/local/bin/endor"),
+                black_box("/usr/local/bin/endot"),
                 black_box(&args),
             )
         })
@@ -64,7 +64,7 @@ fn bench_decode_spawn_request(c: &mut Criterion) {
         "--state-dir=/tmp/state".to_string(),
         "--ephemeral-dir=/tmp/eph".to_string(),
     ];
-    let encoded = codec::encode_spawn_request("separate", "/usr/local/bin/endor", &args);
+    let encoded = codec::encode_spawn_request("separate", "/usr/local/bin/endot", &args);
     c.bench_function("decode_spawn_request", |b| {
         b.iter(|| codec::decode_spawn_request(black_box(&encoded)).unwrap())
     });
@@ -74,7 +74,7 @@ fn bench_decode_spawn_legacy(c: &mut Criterion) {
     // Legacy 2-entry map without platform key (backward compat path).
     let args: Vec<String> = vec!["worker".to_string()];
     // Build a legacy payload manually (encode with old format).
-    let legacy = codec::encode_spawn_request("", "/usr/local/bin/endor", &args);
+    let legacy = codec::encode_spawn_request("", "/usr/local/bin/endot", &args);
     // That still encodes platform="" — build a true legacy one without platform.
     // For a fair test, just use the 3-key version but measure the decode path.
     c.bench_function("decode_spawn_legacy_compat", |b| {
@@ -89,7 +89,7 @@ fn bench_encode_worker_list(c: &mut Criterion) {
             .map(|i| WorkerInfo {
                 handle: i as i64,
                 platform: "separate".to_string(),
-                cmd: "/usr/local/bin/endor".to_string(),
+                cmd: "/usr/local/bin/endot".to_string(),
                 args: vec!["worker".to_string()],
                 pid: 1000 + i as u32,
                 started: SystemTime::UNIX_EPOCH,

@@ -167,9 +167,9 @@ pub fn wire_worker_tasks(
     let sup_wait = Arc::clone(sup);
     tokio::spawn(async move {
         let mut child = child;
-        eprintln!("endor: wait task for handle={handle} started");
+        eprintln!("endot: wait task for handle={handle} started");
         let status = child.wait().await;
-        eprintln!("endor: wait task for handle={handle} child exited: {status:?}, delivering to parent={parent_handle}");
+        eprintln!("endot: wait task for handle={handle} child exited: {status:?}, delivering to parent={parent_handle}");
         sup_wait.deliver(Message {
             from: handle,
             to: parent_handle,
@@ -181,7 +181,7 @@ pub fn wire_worker_tasks(
             },
             response_tx: None,
         });
-        eprintln!("endor: wait task for handle={handle} delivered exited to parent={parent_handle}");
+        eprintln!("endot: wait task for handle={handle} delivered exited to parent={parent_handle}");
         sup_wait.unregister(handle);
         if let Some(f) = on_exit {
             f();

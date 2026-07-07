@@ -41,7 +41,7 @@ pub fn start_socket_listener(
 
     let listener = UnixListener::bind(&sock_path)?;
     eprintln!(
-        "endor: socket listener started on {}",
+        "endot: socket listener started on {}",
         sock_path.display()
     );
 
@@ -75,7 +75,7 @@ pub fn start_socket_listener(
                     );
                 }
                 Err(e) => {
-                    eprintln!("endor: socket accept error: {e}");
+                    eprintln!("endot: socket accept error: {e}");
                     break;
                 }
             }
@@ -137,7 +137,7 @@ fn wire_client_tasks(
                     return;
                 }
                 Err(e) => {
-                    eprintln!("endor: client {conn_handle} read error: {e}");
+                    eprintln!("endot: client {conn_handle} read error: {e}");
                     sup_read.deliver(Message {
                         from: conn_handle,
                         to: daemon_handle,
@@ -166,7 +166,7 @@ fn wire_client_tasks(
                 Some(msg) => {
                     if msg.envelope.verb == "deliver" {
                         if let Err(e) = write_netstring(&mut writer, &msg.envelope.payload).await {
-                            eprintln!("endor: client {conn_handle} write error: {e}");
+                            eprintln!("endot: client {conn_handle} write error: {e}");
                             return;
                         }
                     }
@@ -174,7 +174,7 @@ fn wire_client_tasks(
                     for msg in inbox.drain() {
                         if msg.envelope.verb == "deliver" {
                             if let Err(e) = write_netstring(&mut writer, &msg.envelope.payload).await {
-                                eprintln!("endor: client {conn_handle} write error: {e}");
+                                eprintln!("endot: client {conn_handle} write error: {e}");
                                 return;
                             }
                         }

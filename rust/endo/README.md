@@ -1,7 +1,7 @@
 # endo (Rust)
 
 Rust implementation of Endo components.
-Provides the unified `endor` binary, which can act as the top-level
+Provides the unified `endot` binary, which can act as the top-level
 endo daemon (the capability bus), a manager child (which bootstraps
 the pet-name store and formula graph), a worker, or a standalone
 archive runner depending on the subcommand.
@@ -9,8 +9,8 @@ archive runner depending on the subcommand.
 ## Building
 
 ```sh
-# Builds the unified `endor` binary (and pulls in xsnap as a library).
-cargo build --release -p endo --bin endor
+# Builds the unified `endot` binary (and pulls in xsnap as a library).
+cargo build --release -p endo --bin endot
 ```
 
 The xsnap library ships JS bundles (`daemon_bootstrap.js` — the
@@ -19,39 +19,39 @@ churn — and `worker_bootstrap.js`) that must be generated first via
 `packages/daemon/scripts/bundle-bus-daemon-rust-xs.mjs` and
 `packages/daemon/scripts/bundle-bus-worker-xs.mjs`.
 
-The binary lands at `target/release/endor`.
+The binary lands at `target/release/endot`.
 
 ## Binaries
 
-### endor
+### endot
 
 Unified binary. All subprocesses are spawned by self-execing this
 same binary via `std::env::current_exe()`.
 
 ```sh
 # Foreground (legacy Node.js manager, requires ENDO_DAEMON_PATH)
-endor daemon
+endot daemon
 
-# Foreground (XS manager child, self-exec'd as `endor manager -e xs`)
-ENDO_MANAGER_XS=1 endor daemon
+# Foreground (XS manager child, self-exec'd as `endot manager -e xs`)
+ENDO_MANAGER_XS=1 endot daemon
 
 # Detached (daemonizes via setsid)
-endor start
+endot start
 
 # Stop a running daemon
-endor stop
+endot stop
 
 # Check liveness
-endor ping
+endot ping
 ```
 
 Child-facing subcommands (normally invoked by the daemon, but
 documented here for completeness):
 
 ```sh
-endor manager [-e xs]               # supervised manager child
-endor worker  [-e xs]               # supervised worker child
-endor run     [-e xs] <archive.zip> # standalone archive runner
+endot manager [-e xs]               # supervised manager child
+endot worker  [-e xs]               # supervised worker child
+endot run     [-e xs] <archive.zip> # standalone archive runner
 ```
 
 XS is the default engine for every child-facing subcommand, so `-e xs`
@@ -70,7 +70,7 @@ available as an XS-hosted bundle.
 |----------|---------|
 | `ENDO_DAEMON_PATH` | Path to Node.js manager script (legacy manager role) |
 | `ENDO_MANAGER_XS` | Set to run the manager child as an XS subprocess instead of the legacy Node.js manager |
-| `ENDO_XS_BIN` | Optional override for the XS manager binary. When unset, `endor` self-execs via `current_exe()`. |
+| `ENDO_XS_BIN` | Optional override for the XS manager binary. When unset, `endot` self-execs via `current_exe()`. |
 | `ENDO_WORKER_BIN` | Path to worker binary (used by the JS manager for its own spawn requests) |
 | `ENDO_NODE_PATH` | Path to Node.js binary |
 | `ENDO_TRACE` | Enable debug envelope tracing |
@@ -107,9 +107,9 @@ CapTP traffic is bridged as `deliver` envelopes.
 
 ### Iroh networking
 
-`endor` can host an [iroh](https://www.iroh.computer) QUIC transport that is
+`endot` can host an [iroh](https://www.iroh.computer) QUIC transport that is
 wire-compatible with the Node.js `@endo/daemon` iroh transport, so a Rust
-`endor` and a Node.js daemon can cross-connect ("dial keys, not IPs").
+`endot` and a Node.js daemon can cross-connect ("dial keys, not IPs").
 
 The transport lives in the [`endo_iroh`](../endo_iroh) crate, built and tested
 independently of the XS engine.
@@ -176,8 +176,8 @@ reasons **out of scope for the iroh work**:
    Same-host direct-address dialing (`ENDO_IROH_LOCAL=1`) works and is what
    the integration tests use.
 
-Items 1 and 2 block a live `endor` boot regardless of the iroh work; once they
-are resolved, `ENDO_MANAGER_XS=1 ENDO_IROH=1 endor daemon` (add
+Items 1 and 2 block a live `endot` boot regardless of the iroh work; once they
+are resolved, `ENDO_MANAGER_XS=1 ENDO_IROH=1 endot daemon` (add
 `ENDO_IROH_LOCAL=1` for same-host) completes the path.
 
 ## Integration tests
@@ -188,14 +188,14 @@ From the workspace root:
 cd packages/daemon
 
 # Legacy Node.js manager under the Rust daemon
-ENDO_BIN=../../target/release/endor \
-  ENDO_WORKER_BIN='../../target/release/endor worker' \
+ENDO_BIN=../../target/release/endot \
+  ENDO_WORKER_BIN='../../target/release/endot worker' \
   yarn ava test/endo.test.js --timeout=120s
 
 # XS manager under the Rust daemon (Node.js-free), using self-exec
 ENDO_MANAGER_XS=1 \
-  ENDO_BIN=../../target/release/endor \
-  ENDO_WORKER_BIN='../../target/release/endor worker' \
+  ENDO_BIN=../../target/release/endot \
+  ENDO_WORKER_BIN='../../target/release/endot worker' \
   yarn ava test/endo.test.js --timeout=120s
 ```
 
