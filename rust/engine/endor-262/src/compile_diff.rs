@@ -220,6 +220,30 @@ pub fn compile_one(source: &str) -> CompileVerdict {
     let endor = endor_compile(source);
     let endor_accepts = matches!(endor, Ok(Ok(_)));
 
+    // A **runtime** `SyntaxError` thrown by a *compiled* program is not a
+    // compile rejection. A direct or indirect `eval` whose body fails
+    // `EvalDeclarationInstantiation` (a `var`/lexical collision) or fails to
+    // parse throws `SyntaxError` at run time — after XS has already emitted the
+    // outer program's bytecode. The oracle path runs the program (`run`), so
+    // `oracle_compile` sees the throw and, unable to know its phase,
+    // conservatively reads any `SyntaxError` as a parse reject. Recover the
+    // truth with positive evidence: if endor compiled `source` to bytecode
+    // byte-identical to XS's, both engines parsed AND coded it the same, so the
+    // oracle's `SyntaxError` was necessarily post-compilation (runtime), and
+    // this is the byte-clean compile ACCEPT it is. This can never mask a
+    // genuine parse rejection — there endor either rejects or produces
+    // different bytes, so the exact-match guard fails and the normal
+    // classification below applies. (The module goal — `compile_one_module` —
+    // uses `compile_module`, a parse+code path with no run, so it needs no
+    // such recovery.)
+    if !oracle_accepts && !oracle_bytes.is_empty() {
+        if let Ok(Ok(endor_bytes)) = &endor {
+            if *endor_bytes == oracle_bytes {
+                return CompileVerdict::Identical;
+            }
+        }
+    }
+
     match (oracle_accepts, endor_accepts) {
         (true, true) => {
             let endor_bytes = match endor {
@@ -602,6 +626,44 @@ mod tests {
             report.identical, report.total
         );
         assert!(report.identical > 0, "expected accepted module programs");
+    }
+
+    #[test]
+    fn runtime_syntax_error_from_eval_is_a_compile_accept() {
+        // A compiled program whose direct/indirect `eval` throws a **runtime**
+        // `SyntaxError` (a `var`/lexical collision in
+        // `EvalDeclarationInstantiation`, or an eval-body parse failure) is a
+        // compile ACCEPT, not a parse rejection: XS emits the outer bytecode
+        // and endor compiles it byte-identically. `compile_one` must classify
+        // these `Identical`, not `OracleRejected` — the eval-code fix5 slice.
+        let cases = [
+            "let x; eval('var x;');",        // sloppy var/lex collision at runtime
+            "{ let x; { eval('var x;'); } }", // lower-scope collision
+            "var x; (0,eval)(\"x = 1; x\\u000A++\");", // indirect eval parse failure
+        ];
+        for src in cases {
+            // Precondition: the oracle runs it, emits bytecode, then throws a
+            // *runtime* SyntaxError (the case this recovery targets).
+            let o = endor_oracle::run(src).expect("oracle machine");
+            assert!(!o.completed, "{src:?}: expected a runtime throw");
+            assert!(o.error.contains("SyntaxError"), "{src:?}: expected SyntaxError, got {:?}", o.error);
+            assert!(!o.bytecode.is_empty(), "{src:?}: oracle must have compiled it");
+            assert_eq!(
+                compile_one(src),
+                CompileVerdict::Identical,
+                "{src:?}: a runtime-SyntaxError eval program with byte-identical \
+                 compilation must classify Identical (compile accept), not a reject"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_parse_rejection_is_not_reclassified() {
+        // The recovery in `compile_one` fires ONLY on exact byte-identity, so a
+        // real parse rejection (endor rejects, or the bytes differ) is never
+        // silently promoted to `Identical`. `var = ;` fails to parse in both
+        // engines — it must stay a both-reject agreement (`OracleRejected`).
+        assert_eq!(compile_one("var = ;"), CompileVerdict::OracleRejected);
     }
 }
 

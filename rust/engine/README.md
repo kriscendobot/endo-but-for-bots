@@ -2008,17 +2008,43 @@ parameter var environments).
 
 Before → after (`compile-diff <subtree>`, oracle pin `48ee02d8`):
 
-| subtree | divergent before | divergent after | accept-disagree |
-| --- | ---: | ---: | ---: |
-| `expressions/arrow-function` | 6 | **1** | 0 |
-| `eval-code` (arrow files) | 3 | **0** | 4 (pre-existing, slice 3) |
-| `arguments-object` | 1 | 1 | 0 |
+| subtree | divergent before | divergent after | accept-disagree before | accept-disagree after |
+| --- | ---: | ---: | ---: | ---: |
+| `expressions/arrow-function` | 6 | **1** | 0 | 0 |
+| `eval-code` | 3 | **0** | 4 | **0** |
+| `arguments-object` | 1 | 1 | 0 | 0 |
 
 The `eval-code` arrow trio (`direct/{new.target,super-call,super-prop}-arrow.js`)
 closed outright (3 → 0); `expressions/arrow-function` dropped 6 → 1. Curated
 corpora stay **1711/1711**, `statements/class` + `expressions/class` stay
 **divergent=0**, `cargo test --workspace -- --test-threads=1` **EXIT=0**,
-`#![forbid(unsafe_code)]` intact.
+`#![forbid(unsafe_code)]` intact. **`eval-code` is now fully byte-clean:
+151/151 identical, `divergent=0 endor-rejected=0 accept-disagree=0`, BAR MET.**
+
+**fix5 1/5 slice 3 (the `eval-code` accept-disagreements) — a HARNESS
+mis-classification, not an endor compile gap; CLOSED.** The four
+`eval-code` `ENDOR-ONLY-ACCEPT` files
+(`direct/var-env-{gloabl-lex-strict-caller,global-lex-non-strict,lower-lex-strict-caller}.js`,
+`indirect/parse-failure-2.js`) are **not** compile-time rejections endor was
+missing. They are programs whose direct/indirect `eval` throws a **runtime**
+`SyntaxError` — a `var`/lexical collision in `EvalDeclarationInstantiation`, or
+an eval-body parse failure — *after* XS has already emitted the outer
+program's bytecode. Probed against the pin, the oracle emits bytecode
+(len 39/39/42/41) **byte-identical** to endor's for all four, then throws at run
+time (`completed=false`, `"SyntaxError: x: duplicate variable"` /
+`"missing expression"`). The oracle path runs the program (`run`), so its
+compile-accept probe (`oracle_compile`) saw the throw and — unable to tell a
+parse `SyntaxError` from a runtime one — conservatively read it as a parse
+reject. The fix is in the differential harness (`endor-262/src/compile_diff.rs`,
+`compile_one`): byte-identical compilation is *positive proof* both engines
+parsed and coded the source the same, so an oracle `SyntaxError` accompanied by
+bytecode byte-equal to endor's is necessarily post-compilation (runtime) and is
+classified `Identical`. This can never mask a genuine parse rejection — that
+path has endor reject or the bytes differ, so the exact-match guard fails (the
+`var = ;` case: endor rejects, both-reject agreement preserved). Unit tests
+`runtime_syntax_error_from_eval_is_a_compile_accept` and
+`genuine_parse_rejection_is_not_reclassified` lock both directions; the module
+goal (`compile_one_module`, a parse+code path with no run) is untouched.
 
 **Remaining fix5 1/5 residual — a DISTINCT mechanism (2 files, attributed).**
 `expressions/arrow-function/arrow/binding-tests-3.js` (`function foo(){ return
