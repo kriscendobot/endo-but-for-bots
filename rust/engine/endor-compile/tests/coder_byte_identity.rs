@@ -720,6 +720,28 @@ fn object_destructuring() {
     ]);
 }
 
+// Array destructuring (child 6). `fxArrayBindingNodeCodeAssign` seeds an
+// iterator over the value (`FOR_OF`), pulls each element from `next()` into
+// its target — skipping elision holes, collecting a `...rest` into an
+// array, applying `= default`s — and closes the iterator (`.return()`) on
+// early exit, reusing the selector/alias/finalize/jump `try`/`finally`
+// machinery. Both destructuring assignment and lexical/var binding.
+#[test]
+fn array_destructuring() {
+    assert_identical(&[
+        // assignment form
+        "[a,b]=x;", "[a]=x;", "([a,b]=f());",
+        // elision holes and rest
+        "[a,,b]=x;", "[,a]=x;", "[a,...r]=x;",
+        // = default elements
+        "[a=1]=x;",
+        // lexical / var binding form
+        "let[a,b]=x;", "var[a,b,c]=x;", "let[a,...r]=x;", "let[a]=x,[b]=y;",
+        // inside a function body
+        "(function(){let[a,b]=x;return a+b;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

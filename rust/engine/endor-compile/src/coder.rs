@@ -1990,6 +1990,191 @@ impl Coder<'_> {
     /// `ARGUMENT i` and store it into the parameter's slot. Defaults
     /// (a `Binding` item), destructuring (`ArrayBinding`/`ObjectBinding`),
     /// rest (`RestBinding`), and the `arguments` object are deferred.
+    /// `fxArrayBindingNodeCodeAssign` — array destructuring. Seeds an
+    /// iterator over the value (`FOR_OF`), pulls each element from
+    /// `next()` into its target (skipping holes, collecting a `...rest`
+    /// into an array), and closes the iterator (`.return()`) on early exit,
+    /// inside the selector/alias/finalize/jump `try`/`finally` machinery
+    /// (only the return target crosses it — array patterns are not loops).
+    fn code_array_binding_assign(&mut self, node: &Node, _flag: i32) {
+        let items: &[Item] = match node.children.first() {
+            Some(Item::List(v)) => v,
+            _ => &[],
+        };
+        let iterator = self.use_temporary();
+        let next = self.use_temporary();
+        let done = self.use_temporary();
+        let selector = self.use_temporary();
+        let rest = self.use_temporary();
+        let result = self.use_temporary();
+
+        self.return_target = self.alias_targets(self.return_target);
+        let catch_target = self.create_target();
+        let normal_target = self.create_target();
+        let finally_target = self.create_target();
+
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_byte(0, XS_CODE_FOR_OF);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, iterator);
+        self.add_byte(1, XS_CODE_FALSE);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+        self.add_integer(1, XS_CODE_INTEGER_1, 0);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, selector);
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+
+        let n = items.len();
+        // The index of a trailing rest binding, if any.
+        let rest_at = items
+            .iter()
+            .position(|it| matches!(it, Item::Node(x) if x.token == Token::RestBinding));
+        if n > 0 {
+            self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+            self.add_symbol(0, XS_CODE_GET_PROPERTY, "next");
+            self.add_index(0, XS_CODE_PULL_LOCAL_1, next);
+
+            let regular_end = rest_at.unwrap_or(n);
+            for item in &items[..regular_end] {
+                let step_target = self.create_target();
+                let el = node_of(item);
+                if el.token == Token::SkipBinding {
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, done);
+                    self.add_branch(-1, XS_CODE_BRANCH_IF_1, step_target);
+                    self.add_byte(1, XS_CODE_TRUE);
+                    self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, next);
+                    self.add_byte(1, XS_CODE_CALL);
+                    self.add_integer(-2, XS_CODE_RUN_1, 0);
+                    self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+                    self.add_index(0, XS_CODE_PULL_LOCAL_1, done);
+                    self.place_target(1, step_target);
+                } else {
+                    let done_target = self.create_target();
+                    let next_target = self.create_target();
+                    self.code_reference(item, 1);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, done);
+                    self.add_branch(-1, XS_CODE_BRANCH_IF_1, step_target);
+                    self.add_byte(1, XS_CODE_TRUE);
+                    self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, next);
+                    self.add_byte(1, XS_CODE_CALL);
+                    self.add_integer(-2, XS_CODE_RUN_1, 0);
+                    self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+                    self.add_byte(1, XS_CODE_DUB);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+                    self.add_index(0, XS_CODE_SET_LOCAL_1, done);
+                    self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+                    self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+                    self.add_branch(0, XS_CODE_BRANCH_1, next_target);
+                    self.place_target(1, done_target);
+                    self.add_byte(-1, XS_CODE_POP);
+                    self.place_target(1, step_target);
+                    self.add_byte(1, XS_CODE_UNDEFINED);
+                    self.place_target(1, next_target);
+                    self.code_assign(item, 1);
+                    self.add_byte(-1, XS_CODE_POP);
+                }
+            }
+            if let Some(ri) = rest_at {
+                let rest_node = node_of(&items[ri]);
+                let binding = &rest_node.children[0];
+                let next_target = self.create_target();
+                let done_target = self.create_target();
+
+                self.code_reference(binding, 1);
+                self.add_byte(1, XS_CODE_ARRAY);
+                self.add_index(-1, XS_CODE_PULL_LOCAL_1, rest);
+
+                self.add_index(1, XS_CODE_GET_LOCAL_1, done);
+                self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+
+                self.place_target(0, next_target);
+                self.add_byte(1, XS_CODE_TRUE);
+                self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+                self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+                self.add_index(1, XS_CODE_GET_LOCAL_1, next);
+                self.add_byte(1, XS_CODE_CALL);
+                self.add_integer(-2, XS_CODE_RUN_1, 0);
+                self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+                self.add_index(1, XS_CODE_SET_LOCAL_1, result);
+                self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+                self.add_index(0, XS_CODE_SET_LOCAL_1, done);
+                self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+
+                self.add_index(1, XS_CODE_GET_LOCAL_1, rest);
+                self.add_byte(1, XS_CODE_DUB);
+                self.add_symbol(0, XS_CODE_GET_PROPERTY, "length");
+                self.add_byte(0, XS_CODE_AT);
+                self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+                self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+                self.add_byte(-2, XS_CODE_SET_PROPERTY_AT);
+                self.add_byte(-1, XS_CODE_POP);
+
+                self.add_branch(0, XS_CODE_BRANCH_1, next_target);
+                self.place_target(1, done_target);
+
+                self.add_index(0, XS_CODE_GET_LOCAL_1, rest);
+                self.code_assign(binding, 1);
+                self.add_byte(-1, XS_CODE_POP);
+            }
+        }
+        self.add_branch(0, XS_CODE_BRANCH_1, normal_target);
+
+        let mut selection = 1;
+        self.return_target =
+            self.finalize_targets(self.return_target, selector, &mut selection, finally_target);
+        self.place_target(0, normal_target);
+        self.add_integer(1, XS_CODE_INTEGER_1, selection);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, selector);
+        self.add_byte(-1, XS_CODE_POP);
+        self.place_target(0, finally_target);
+        self.add_byte(0, XS_CODE_UNCATCH);
+        self.place_target(0, catch_target);
+
+        let next_target = self.create_target();
+        self.add_index(1, XS_CODE_GET_LOCAL_1, selector);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, next_target);
+        self.add_byte(1, XS_CODE_EXCEPTION);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+        self.add_byte(-1, XS_CODE_POP);
+        let catch_target2 = self.create_target();
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target2);
+        self.place_target(0, next_target);
+
+        let done_target = self.create_target();
+        let return_target = self.create_target();
+        self.add_index(1, XS_CODE_GET_LOCAL_1, done);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "return");
+        self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, return_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_byte(0, XS_CODE_SWAP);
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_integer(-2, XS_CODE_RUN_1, 0);
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.place_target(0, return_target);
+        self.add_byte(-1, XS_CODE_POP);
+        self.place_target(0, done_target);
+
+        let next_target2 = self.create_target();
+        self.add_index(1, XS_CODE_GET_LOCAL_1, selector);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, next_target2);
+        self.add_byte(0, XS_CODE_UNCATCH);
+        self.place_target(0, catch_target2);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+        self.add_byte(-1, XS_CODE_THROW);
+        self.place_target(0, next_target2);
+
+        let mut selection = 1;
+        let rt = self.return_target;
+        self.jump_targets(rt, selector, &mut selection);
+
+        self.unuse_temporaries(6);
+    }
+
     /// `fxObjectBindingNodeCodeAssign` — object destructuring. The value on
     /// the stack is `TO_INSTANCE`'d into a temporary, then each
     /// `PropertyBinding` reads its named property and assigns it into the
@@ -2813,6 +2998,9 @@ impl Coder<'_> {
                 // fxObjectBindingNodeCodeAssign: destructure the value's own
                 // properties into each target.
                 Token::ObjectBinding => self.code_object_binding_assign(n, flag),
+                // fxArrayBindingNodeCodeAssign: iterate the value and
+                // destructure each element into its target.
+                Token::ArrayBinding => self.code_array_binding_assign(n, flag),
                 other => panic!("coder: no reference for assignment target {:?}", other),
             },
             _ => panic!("coder: no reference for assignment target"),
