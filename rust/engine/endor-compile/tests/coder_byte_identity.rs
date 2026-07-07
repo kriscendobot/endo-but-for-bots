@@ -204,6 +204,37 @@ fn logical_conditional_sequence() {
 }
 
 #[test]
+fn tail_call_run_tail() {
+    // XS's `mxTailRecursionFlag`: a call in tail position of a strict,
+    // non-generator `return` emits the `RUN_TAIL` / `EVAL_TAIL` family
+    // instead of `RUN` / `EVAL`. The flag threads through the
+    // short-circuit / `?:` / comma operators to the tail-position operand,
+    // and is suppressed for sloppy code, generators, and returns routed
+    // through a `try`/`finally` finalizer.
+    assert_identical(&[
+        // strict `return f()` — the tail call
+        "'use strict'; function f(g){ return g(); }",
+        "'use strict'; function f(g){ return g(1, 2, 3); }",
+        "'use strict'; function f(g, a){ return g(...a); }",
+        // the flag threads to the tail-position operand
+        "'use strict'; function f(g, h){ return g() || h(); }",
+        "'use strict'; function f(g, h){ return g() && h(); }",
+        "'use strict'; function f(g, h){ return g() ?? h(); }",
+        "'use strict'; function f(c, g, h){ return c ? g() : h(); }",
+        "'use strict'; function f(g, h){ return (g(), h()); }",
+        // strict class / object methods are tail-call sites too
+        "class C { m(g){ return g(); } }",
+        "'use strict'; var o = { m(g){ return g(); } };",
+        // suppression: sloppy mode keeps the plain RUN
+        "function f(g){ return g(); }",
+        // suppression: a generator return is never a tail call
+        "'use strict'; function* f(g){ return g(); }",
+        // suppression: a return routed through `finally` is not a tail call
+        "'use strict'; function f(g){ try { return g(); } finally {} }",
+    ]);
+}
+
+#[test]
 fn statements_if_block() {
     assert_identical(&[
         "1;", "1;2;", "1;2;3;", ";", ";;", "1;;2;",

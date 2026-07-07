@@ -361,6 +361,14 @@ pub struct Coder<'a> {
     /// producing one. Captured (and cleared) at the top of `code_node` so
     /// it applies only to the immediate expression, not nested ones.
     no_value: bool,
+    /// XS's `mxTailRecursionFlag`, staged for the *next* dispatched node: a
+    /// call in tail position (a strict, non-generator `return f()`, and the
+    /// tail-position operands short-circuit/comma/`?:` threads down to) emits
+    /// the `RUN_TAIL` / `EVAL_TAIL` family instead of `RUN` / `EVAL`. Set on
+    /// the return expression by `code_return` and re-set on the tail-position
+    /// child by each propagating operator; captured (and cleared) at the top
+    /// of `code_node` so it applies only to the immediate expression.
+    tail: bool,
     /// XS's `coder->importFlag` / `coder->importMetaFlag` — set when the
     /// module body codes a dynamic `import(...)` / `import.meta`, folded into
     /// the `MODULE` opcode's flag byte. Only meaningful while coding a
@@ -400,6 +408,7 @@ impl<'a> Coder<'a> {
             pending_name: None,
             pending_accessor: false,
             no_value: false,
+            tail: false,
         }
     }
 
@@ -869,6 +878,10 @@ impl Coder<'_> {
         // statement/for-iteration) expression; capture and clear it so it
         // never leaks into nested expressions.
         let no_value = std::mem::take(&mut self.no_value);
+        // XS's `mxTailRecursionFlag`, staged for exactly this node; capture
+        // and clear it so it reaches only the propagators/consumers below and
+        // never leaks into a nested expression.
+        let tail = std::mem::take(&mut self.tail);
         match node.token {
             Program => self.code_program(node),
             Module => self.code_module(node),
@@ -925,11 +938,11 @@ impl Coder<'_> {
                 self.code(&node.children[1]);
                 self.add_byte(-1, binary_code(node.token));
             }
-            And => self.code_and(node),
-            Or => self.code_or(node),
-            Coalesce => self.code_coalesce(node),
-            QuestionMark => self.code_question_mark(node),
-            Expressions => self.code_expressions(node),
+            And => self.code_and(node, tail),
+            Or => self.code_or(node, tail),
+            Coalesce => self.code_coalesce(node, tail),
+            QuestionMark => self.code_question_mark(node, tail),
+            Expressions => self.code_expressions(node, tail),
             // control flow (symbol-free surface)
             Label => self.code_label(node),
             While => self.code_while(node),
@@ -961,14 +974,14 @@ impl Coder<'_> {
             Template => self.code_template(node),
             Access => self.code_access(node),
             Chain => self.code_chain(node),
-            Option => self.code_option(node),
+            Option => self.code_option(node, tail),
             Member => self.code_member(node),
             PrivateMember => self.code_private_member(node),
             PrivateIdentifier => self.code_private_identifier(node),
             MemberAt => self.code_member_at(node),
-            Call => self.code_call(node),
+            Call => self.code_call(node, tail),
             New => self.code_new(node),
-            Params => self.code_params(node, false),
+            Params => self.code_params(node, false, false),
             Assign => self.code_assign_node(node),
             AddAssign | SubtractAssign | MultiplyAssign | DivideAssign | ModuloAssign
             | ExponentiationAssign | BitAndAssign | BitOrAssign | BitXorAssign
@@ -1385,56 +1398,69 @@ impl Coder<'_> {
     }
 
     /// `fxAndExpressionNodeCode`.
-    fn code_and(&mut self, node: &Node) {
+    fn code_and(&mut self, node: &Node, tail: bool) {
         let end_target = self.create_target();
         self.code(&node.children[0]);
         self.add_byte(1, XS_CODE_DUB);
         self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, end_target);
         self.add_byte(-1, XS_CODE_POP);
+        // `a && b()`: the right operand is the tail-position value.
+        self.tail = tail;
         self.code(&node.children[1]);
         self.place_target(0, end_target);
     }
 
     /// `fxOrExpressionNodeCode`.
-    fn code_or(&mut self, node: &Node) {
+    fn code_or(&mut self, node: &Node, tail: bool) {
         let end_target = self.create_target();
         self.code(&node.children[0]);
         self.add_byte(1, XS_CODE_DUB);
         self.add_branch(-1, XS_CODE_BRANCH_IF_1, end_target);
         self.add_byte(-1, XS_CODE_POP);
+        self.tail = tail;
         self.code(&node.children[1]);
         self.place_target(0, end_target);
     }
 
     /// `fxCoalesceExpressionNodeCode`.
-    fn code_coalesce(&mut self, node: &Node) {
+    fn code_coalesce(&mut self, node: &Node, tail: bool) {
         let end_target = self.create_target();
         self.code(&node.children[0]);
         self.add_branch(-1, XS_CODE_BRANCH_COALESCE_1, end_target);
+        self.tail = tail;
         self.code(&node.children[1]);
         self.place_target(0, end_target);
     }
 
     /// `fxQuestionMarkNodeCode`.
-    fn code_question_mark(&mut self, node: &Node) {
+    fn code_question_mark(&mut self, node: &Node, tail: bool) {
         let else_target = self.create_target();
         let end_target = self.create_target();
         self.code(&node.children[0]);
         self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, else_target);
+        // Both arms are tail-position values (`return c ? f() : g()`).
+        self.tail = tail;
         self.code(&node.children[1]);
         self.add_branch(0, XS_CODE_BRANCH_1, end_target);
         self.place_target(-1, else_target);
+        self.tail = tail;
         self.code(&node.children[2]);
         self.place_target(0, end_target);
     }
 
     /// `fxExpressionsNodeCode` (sequence): each item but the first is
     /// preceded by a `POP` of the previous value.
-    fn code_expressions(&mut self, node: &Node) {
+    fn code_expressions(&mut self, node: &Node, tail: bool) {
         if let Some(Item::List(items)) = node.children.first() {
+            let last = items.len().saturating_sub(1);
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     self.add_byte(-1, XS_CODE_POP);
+                }
+                // Only the final expression of a comma sequence is the
+                // tail-position value.
+                if i == last {
+                    self.tail = tail;
                 }
                 self.code(item);
             }
@@ -3318,8 +3344,19 @@ impl Coder<'_> {
     fn code_return(&mut self, node: &Node) {
         assert!(!self.program_flag, "return at program scope is a syntax error");
         let rt = self.return_target.expect("return target");
+        // XS `fxReturnNodeCode`: mark the return expression for tail-call
+        // emission when the return is strict, non-generator, and its target
+        // is a direct branch (not a `try`/`finally` alias that reroutes the
+        // return through a finalizer). `code_node` consumes the flag on the
+        // immediate expression; the short-circuit / `?:` / comma operators
+        // thread it to their tail-position operand.
+        use crate::ast::flags as f;
+        let tail = node.flags & f::STRICT != 0
+            && node.flags & f::GENERATOR == 0
+            && self.targets[rt].original.is_none();
         match node.children.first() {
             Some(item) if !matches!(item, Item::Null) => {
+                self.tail = tail;
                 self.code(item);
                 self.add_byte(-1, XS_CODE_SET_RESULT);
             }
@@ -3355,7 +3392,8 @@ impl Coder<'_> {
     /// then `BRANCH_CHAIN` to the enclosing chain's short-circuit target: the
     /// branch is taken (leaving the nullish base as the result) exactly when
     /// the base is `null`/`undefined`, otherwise the access continues.
-    fn code_option(&mut self, node: &Node) {
+    fn code_option(&mut self, node: &Node, tail: bool) {
+        self.tail = tail;
         self.code(&node.children[0]);
         let target = self.chain_target.expect("optional `?.` outside a chain");
         self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, target);
@@ -3413,7 +3451,7 @@ impl Coder<'_> {
 
     /// `fxCallNodeCode`. Children `[reference, params]`: set up the callee
     /// and its `this`, `CALL`, then the argument list + `RUN`.
-    fn code_call(&mut self, node: &Node) {
+    fn code_call(&mut self, node: &Node, tail: bool) {
         // A syntactic `eval(...)` call (the callee is the identifier
         // `eval` — XS keys on the name, not resolution) closes with the
         // `EVAL` intrinsic instead of `RUN`; the scoper has already
@@ -3421,7 +3459,10 @@ impl Coder<'_> {
         let is_eval = Self::is_direct_eval(&node.children[0]);
         self.code_this(&node.children[0], 0);
         self.add_byte(1, XS_CODE_CALL);
-        self.code_params(node_of(&node.children[1]), is_eval);
+        // XS: `fxCallNodeCode` relays the tail-recursion flag to the params
+        // node, whose `RUN` / `EVAL` becomes the `RUN_TAIL` / `EVAL_TAIL`
+        // variant. The callee reference is coded above, out of tail position.
+        self.code_params(node_of(&node.children[1]), is_eval, tail);
     }
 
     /// Whether a call's reference is the `eval` identifier
@@ -3719,15 +3760,16 @@ impl Coder<'_> {
     fn code_new(&mut self, node: &Node) {
         self.code(&node.children[0]);
         self.add_byte(2, XS_CODE_NEW);
-        // `new` is never a direct-`eval` call.
-        self.code_params(node_of(&node.children[1]), false);
+        // `new` is never a direct-`eval` call, and never a tail call (XS's
+        // `fxCallNewNodeCode` does not relay the tail-recursion flag).
+        self.code_params(node_of(&node.children[1]), false, false);
     }
 
     /// `fxParamsNodeCode`, the non-spread / non-eval branch. Children
     /// `[List(items)]`; each arg is pushed then a single `RUN_1 count`
     /// pops callee+this+args and leaves the result. Spread arguments and
     /// direct-`eval` parameter passing (the `EVAL` opcode) are deferred.
-    fn code_params(&mut self, node: &Node, is_eval: bool) {
+    fn code_params(&mut self, node: &Node, is_eval: bool, tail: bool) {
         let items: &[Item] = match node.children.first() {
             Some(Item::List(v)) => v,
             _ => &[],
@@ -3757,7 +3799,13 @@ impl Coder<'_> {
                 }
             }
             self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
-            self.add_byte(-3 - c, if is_eval { XS_CODE_EVAL } else { XS_CODE_RUN });
+            let op = match (is_eval, tail) {
+                (true, true) => XS_CODE_EVAL_TAIL,
+                (true, false) => XS_CODE_EVAL,
+                (false, true) => XS_CODE_RUN_TAIL,
+                (false, false) => XS_CODE_RUN,
+            };
+            self.add_byte(-3 - c, op);
             self.unuse_temporaries(1);
         } else {
             let mut c: i32 = 0;
@@ -3768,9 +3816,9 @@ impl Coder<'_> {
             if is_eval {
                 // The arg count is pushed, then `EVAL` consumes it.
                 self.add_integer(1, XS_CODE_INTEGER_1, c);
-                self.add_byte(-3 - c, XS_CODE_EVAL);
+                self.add_byte(-3 - c, if tail { XS_CODE_EVAL_TAIL } else { XS_CODE_EVAL });
             } else {
-                self.add_integer(-2 - c, XS_CODE_RUN_1, c);
+                self.add_integer(-2 - c, if tail { XS_CODE_RUN_TAIL_1 } else { XS_CODE_RUN_1 }, c);
             }
         }
     }
