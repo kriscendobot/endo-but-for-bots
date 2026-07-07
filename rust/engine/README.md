@@ -1168,3 +1168,36 @@ call/`new`/member (incl. optional chaining), object/array/template
 construction, and function/class bodies. The current coder `panic!`s (in
 tests) rather than emit a wrong byte for these — a named gap, never a
 silent divergence.
+
+**Child 6 progress (the back half, in slices).** Child 6 lands the
+symbol-dependent and control-flow surface incrementally, each slice
+byte-identical vs the oracle:
+
+- Slices 1–8: symbol-free and atom-table control flow and expressions —
+  loops (`while`/`do`/C-`for`), labeled break/continue, `switch`, `throw`,
+  `debugger`, `try`/`catch`/`finally`, `this`, regexp and template
+  literals, the atom table + global variable/member access, calls +
+  computed member, assignment/compound/`new`, increment/decrement/`delete`,
+  and object + array literals.
+- Slice 9 — **declarations**: `var`/`let`/`const` at program (eval) scope,
+  the `fxScopeCodingEval` header (sloppy `var`/`Define` hoist + direct-eval
+  `WITH` publish; strict reserve + block coding), `fxScopeCodingBlock` /
+  `fxScopeCoded` slot allocation and `UNWIND` teardown, and the
+  binding/declare/access resolution that picks a frame-slot op
+  (`NEW_LOCAL`/`LET_LOCAL`/`CONST_LOCAL`/`VAR_LOCAL`, `GET_LOCAL`/
+  `SET_LOCAL`) over the symbol path. The scoper now exposes a per-node
+  access-resolution map, and the program node is stamped `mxEvalFlag` so
+  its top scope is coded as `EVAL` (an eval program's lexicals are plain
+  `LOCAL`s, not the program-scope `CLOSURE` marking `fxScopeBound`
+  applies). Block-scoped lexicals code and unwind correctly.
+- Slice 10 — **`with`**: `fxWithNodeCode` (`TO_INSTANCE`/`WITH`, the body
+  under a forced eval flag, `WITHOUT`); sloppy-only.
+
+**Still folded (named gaps, coder still `panic!`s):** function bodies in
+every flavor (plain/generator/async/async-generator, params with
+defaults/destructuring/rest, `arguments`, closures, arrows, home-object/
+`super`); classes (constructor/derived, methods/accessors, static members,
+private fields/methods/brands, static blocks); `for-in`/`for-of`/
+`for-await-of` and `for(let …)` refresh; generator/async `yield`/`await`;
+and module import/export linkage + the module-body wrapper. These are the
+remaining child-6/7 surface.
