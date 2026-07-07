@@ -866,10 +866,12 @@ mod tests {
 
     #[test]
     fn compiler_seam_endor_fold_is_a_clean_abort_not_a_panic() {
-        // A construct the coder folds on (`new.target`) must, through the
-        // `Endor` seam, produce empty bytecode that endor-vm treats as an
-        // abort — never a harness panic. The seam is total over coder folds.
-        let src = "function f() { return new.target } f()";
+        // A construct the coder folds on (a private class field — `new.target`,
+        // optional chaining, and the declaring-scope paths are now ported, so
+        // this uses a still-deferred construct) must, through the `Endor`
+        // seam, produce empty bytecode that endor-vm treats as an abort —
+        // never a harness panic. The seam is total over coder folds.
+        let src = "class C { #x = 1; } new C()";
         let endor = dual_run_with(src, Compiler::Endor).expect("oracle reference runs");
         assert!(
             endor.bytecode.is_empty(),
