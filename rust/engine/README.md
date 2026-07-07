@@ -1393,11 +1393,19 @@ byte-identical vs the oracle:
   prototype otherwise). No extra scoper declares (computed method keys,
   unlike computed fields, need no `atAccess`). Instance/static/getter/
   generator computed methods.
+- Slice 45 — **derived classes + `super()`**: `class extends E` derives the
+  prototype from `E` (`EXTEND`); the derived constructor uses
+  `BEGIN_STRICT_DERIVED` / `END_DERIVED` (`code_function` now handles the
+  `DERIVED` flag), and `super(...)` (`fxSuperNodeCode`) invokes the parent
+  constructor (`SUPER` + the argument list) and installs the result as
+  `this` (`SET_THIS`). Covers the synthesized default constructor
+  (`constructor(...args){super(...args)}`), explicit constructors, and
+  static/instance members.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-`extends` / derived constructors +
-`super(...)`, class **fields** and **private** members, and static blocks —
-these need more class-hoisting scoper work; anonymous-class name inference;
-`using` heads (a parser gap); and
+class **fields** and **private** members, static blocks, and the
+instance-field-init call after `super(...)` — these need more class-hoisting
+scoper work (the class scope's per-member `CONST_CLOSURE` declares);
+anonymous-class name inference; `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
