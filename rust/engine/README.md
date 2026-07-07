@@ -1228,12 +1228,18 @@ byte-identical vs the oracle:
   parameter branch — the parameter scope allocates the binding slot, the
   caught `EXCEPTION` stores into it, then the body block codes and both
   scopes unwind.
+- Slice 16 — **default parameters**: `fxBindingNodeCodeReference`/`Assign`
+  — the `= default` param dance (`DUB` / `STRICT_NOT_EQUAL` vs `undefined`
+  / `BRANCH_IF` past the initializer, then the inner target's store).
+  `code_params_binding` admits `Binding` items; the defaulted param is
+  excluded from the `BEGIN` count (like XS's non-simple-parameter count).
+  Covers a later param defaulting from an earlier one.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-parameter defaults/destructuring/rest and the `arguments` object; captured
-closures (`fxScopeCodeRetrieve`/`Store`) and home-object/`super`; **named
-function expressions** (the `CURRENT` name binding) and object-method/
-property **name inference**; generator/async
+parameter destructuring/rest and the `arguments` object (which forces
+mapped/closure parameters); captured closures (`fxScopeCodeRetrieve`/`Store`)
+and home-object/`super`; **named function expressions** (the `CURRENT` name
+binding) and object-method/property **name inference**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 `for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
