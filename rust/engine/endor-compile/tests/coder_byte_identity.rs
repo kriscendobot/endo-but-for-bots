@@ -621,6 +621,27 @@ fn for_in_of_iteration() {
     ]);
 }
 
+// Object concise methods and accessors (child 6). A concise method / getter
+// / setter emits its (anonymous) function value with the `FUNCTION`
+// creation-op, and the `NEW_PROPERTY` attribute carries the method (+
+// getter/setter) bits so the runtime binds the home object and installs the
+// accessor. Covers identifier and computed keys. Deferred: `super` in a
+// method body.
+#[test]
+fn object_methods_and_accessors() {
+    assert_identical(&[
+        // concise methods
+        "({m(){}});", "({m(a){return a;}});", "({m(a,b){return a+b;}});",
+        "({m(){return 42;}});", "({m(){var x=1;return x;}});", "({m(){},n(){}});",
+        // getters / setters
+        "({get x(){return 1;}});", "({set x(v){}});",
+        "({get x(){return 1;},set x(v){}});", "({get x(){return this;}});",
+        // mixed with data properties, and computed keys
+        "({a:1,m(){}});", "({m(){},a:1,get g(){return 2;}});",
+        "({[k](){}});", "({get[k](){return 1;}});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

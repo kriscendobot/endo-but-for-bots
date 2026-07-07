@@ -102,6 +102,14 @@ const XS_DONT_ENUM_FLAG: i32 = 4;
 /// `.name` from the property key.
 const XS_NAME_FLAG: i32 = 1;
 
+/// `XS_METHOD_FLAG` / `XS_GETTER_FLAG` / `XS_SETTER_FLAG` (`xsCommon.h`) —
+/// the `NEW_PROPERTY` attribute bits marking a concise method or an
+/// accessor (the runtime binds the value's home object and, for accessors,
+/// installs it as a getter/setter).
+const XS_METHOD_FLAG: i32 = 16;
+const XS_GETTER_FLAG: i32 = 32;
+const XS_SETTER_FLAG: i32 = 64;
+
 /// The built-in symbols `fxInitializeParser` interns *before* lexing, in
 /// exact source order (`xsScript.c`). They occupy their hash buckets ahead
 /// of every program symbol, so their position is part of the ID contract
@@ -287,6 +295,12 @@ pub struct Coder<'a> {
     /// `FUNCTION` operand). Set by the naming site, consumed by
     /// `code_function`.
     pending_name: Option<String>,
+    /// Staged for the next function value: it is an object/class accessor
+    /// (getter/setter). XS marks the function node itself `mxGetterFlag`/
+    /// `mxSetterFlag`, but the Rust parser stamps those on the *property*,
+    /// so the naming site relays it here to pick the `FUNCTION`
+    /// creation-op. Captured (and cleared) at the top of `code_function`.
+    pending_accessor: bool,
     /// XS's `mxExpressionNoValue`, staged for the *next* dispatched node: a
     /// statement or `for` iteration discards its expression's value, so a
     /// trailing increment/decrement or short-circuit assignment skips
@@ -314,6 +328,7 @@ impl<'a> Coder<'a> {
             decl_index: HashMap::new(),
             defined: std::collections::HashSet::new(),
             pending_name: None,
+            pending_accessor: false,
             no_value: false,
         }
     }
@@ -1755,9 +1770,9 @@ impl Coder<'_> {
         use crate::ast::flags as f;
         let flags = node.flags;
         assert_eq!(
-            flags & (f::ASYNC | f::GENERATOR | f::METHOD | f::GETTER | f::SETTER | f::FIELD | f::BASE | f::DERIVED),
+            flags & (f::ASYNC | f::GENERATOR | f::FIELD | f::BASE | f::DERIVED),
             0,
-            "function flavor {flags:#x} deferred (async/generator/method/accessor/class)"
+            "function flavor {flags:#x} deferred (async/generator/class)"
         );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
@@ -1808,8 +1823,14 @@ impl Coder<'_> {
         self.first_break_target = None;
         self.first_continue_target = None;
 
-        // Function-creation op (this slice: plain or arrow only).
-        let create_op = if is_arrow { XS_CODE_FUNCTION } else { XS_CODE_CONSTRUCTOR_FUNCTION };
+        // Function-creation op: arrows, methods, and accessors are plain
+        // `FUNCTION`; everything else a `CONSTRUCTOR_FUNCTION`. The accessor
+        // flag rides on the property in the Rust AST, so it arrives as a
+        // staged hint from the object/class coder.
+        let is_accessor = std::mem::take(&mut self.pending_accessor);
+        let plain_function =
+            is_accessor || flags & (f::ARROW | f::METHOD | f::GETTER | f::SETTER) != 0;
+        let create_op = if plain_function { XS_CODE_FUNCTION } else { XS_CODE_CONSTRUCTOR_FUNCTION };
         self.add_symbol_opt(1, create_op, name.as_deref());
         self.add_branch(0, XS_CODE_CODE_1, target);
 
@@ -2070,6 +2091,25 @@ impl Coder<'_> {
             && matches!(&p.children[0], Item::Symbol(s) if s == "__proto__")
     }
 
+    /// The `NEW_PROPERTY` attribute for an object literal member: a concise
+    /// method / getter / setter carries the method (+ accessor) bits; a data
+    /// property whose value is an anonymous function/class infers its name
+    /// from the key (`XS_NAME_FLAG`); a plain data property is `0`.
+    fn property_flag(p: &Node) -> i32 {
+        use crate::ast::flags as f;
+        if p.flags & f::METHOD != 0 {
+            XS_NAME_FLAG | XS_METHOD_FLAG
+        } else if p.flags & f::GETTER != 0 {
+            XS_NAME_FLAG | XS_METHOD_FLAG | XS_GETTER_FLAG
+        } else if p.flags & f::SETTER != 0 {
+            XS_NAME_FLAG | XS_METHOD_FLAG | XS_SETTER_FLAG
+        } else if Self::infers_name(&p.children[1]) {
+            XS_NAME_FLAG
+        } else {
+            0
+        }
+    }
+
     fn code_object(&mut self, node: &Node) {
         let object = self.use_temporary();
         let items: &[Item] = match node.children.first() {
@@ -2110,32 +2150,25 @@ impl Coder<'_> {
                     self.add_byte(-1, XS_CODE_POP);
                     continue;
                 }
-                assert!(
-                    p.flags
-                        & (crate::ast::flags::METHOD
-                            | crate::ast::flags::GETTER
-                            | crate::ast::flags::SETTER)
-                        == 0,
-                    "object method/accessor reached (later child)"
-                );
+                let is_accessor = p.flags & (crate::ast::flags::GETTER | crate::ast::flags::SETTER) != 0;
                 match p.token {
                     Token::Property => {
                         let key = Self::symbol_of(&p.children[0]).to_string();
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+                        self.pending_accessor = is_accessor;
                         self.code(&p.children[1]);
                         self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
-                        // An anonymous function/class value infers its
-                        // `.name` from the key (`XS_NAME_FLAG`).
-                        let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+                        let flag = Self::property_flag(p);
                         self.add_integer(0, XS_CODE_INTEGER_1, flag);
                     }
                     Token::PropertyAt => {
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
                         self.code(&p.children[0]);
                         self.add_byte(0, XS_CODE_AT);
+                        self.pending_accessor = is_accessor;
                         self.code(&p.children[1]);
                         self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
-                        let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+                        let flag = Self::property_flag(p);
                         self.add_integer(0, XS_CODE_INTEGER_1, flag);
                     }
                     other => panic!("coder: unsupported object member {:?}", other),
