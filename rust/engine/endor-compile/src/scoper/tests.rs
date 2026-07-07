@@ -157,13 +157,19 @@ w -> global
 
 #[test]
 fn direct_eval_poisons_scopes() {
+    // A direct `eval` poisons the enclosing scopes (`eval` marker) and, like
+    // `mxArgumentsFlag`, injects the synthetic `arguments` `Var` into the
+    // function scope (`fxFunctionNodeHoist`) — even when the eval is only
+    // discovered while hoisting the body. `fxScopeBound` closure-marks every
+    // declare of an eval scope.
     assert_dump(
         "function f() { var x; eval('x'); }",
         "\
 s0 PROGRAM eval scopeCount=0 declareCount=0
   d0 DEFINE f closure useClosure
   define f
-  s1 FUNCTION eval scopeCount=1 declareCount=0
+  s1 FUNCTION eval scopeCount=2 declareCount=1
+    d0 VAR arguments closure
     s2 BLOCK eval declareCount=1
       d0 VAR x closure
 --- accesses ---

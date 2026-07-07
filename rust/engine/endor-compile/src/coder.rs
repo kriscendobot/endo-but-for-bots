@@ -2699,6 +2699,19 @@ impl Coder<'_> {
         let scope_count = *self.tree.scope_counts.get(&scope).unwrap_or(&0);
         let scope_eval = self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0;
 
+        // A direct `eval` inside a **parameter default** needs the parameter
+        // var-environment split (an `EVAL_ENVIRONMENT` after the parameters,
+        // per `fxParamsBindingNodeCode`), which this slice does not port. The
+        // function node is direct-`eval`-marked but its body scope is not
+        // (the eval lives in the parameters, not the body); a body-level
+        // direct `eval` marks both and codes correctly. Guard the parameter
+        // case as a loud fold rather than mis-emit.
+        if self.tree.scopes[scope].direct_eval
+            && !self.tree.scopes[self.scope_of(node_of(&node.children[2]))].direct_eval
+        {
+            panic!("eval in a parameter default (parameter var-environment) deferred");
+        }
+
         // Save the coder's per-function state.
         let saved_env = self.environment_level;
         let saved_eval = self.eval_flag;
@@ -2915,19 +2928,16 @@ impl Coder<'_> {
 
     /// `fxScopeCodingParams` — give each positional parameter (`Arg`) its
     /// frame slot with a `NEW_LOCAL`. Captured parameters (`NEW_CLOSURE`),
-    /// `arguments` (`Var`), and eval-scope params are deferred and were
-    /// guarded in `code_function`; this reaches only the plain `Arg` case.
-    /// A function containing a direct `eval` (an `SCOPE_EVAL` parameter
-    /// scope) is a named gap: it needs the whole in-function eval-body slice
-    /// (the `EVAL` opcode's environment plumbing and in-function sloppy-eval
-    /// references), not just the parameter `with`/`STORE` dance, so it
-    /// asserts loudly here. Program/block-level `eval` is already ported.
+    /// `arguments` (`Var`), and — for a function that contains a direct
+    /// `eval` (an `SCOPE_EVAL` parameter scope) — the `with`/`STORE`
+    /// parameter-publish dance that hands the parameters to the eval
+    /// environment. Sloppy eval opens a `null` `with` first (so unresolved
+    /// eval-created names fall through to the enclosing frame), then a
+    /// second `undefined` `with` into which each parameter's slot is
+    /// `STORE`d; strict eval skips the leading `null` `with` (no name
+    /// creation) but still publishes the parameters.
     fn scope_coding_params(&mut self, scope: usize) {
         use crate::scoper::dflags;
-        assert!(
-            self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL == 0,
-            "eval-scope params deferred"
-        );
         for (id, token, sym, flags) in self.declares_of(scope) {
             // Closure aliases are handled by `fxScopeCodeRetrieve`, not here.
             if token == Token::NoToken {
@@ -2958,6 +2968,28 @@ impl Coder<'_> {
             } else {
                 self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(&sym), index);
             }
+        }
+        // The eval parameter-publish dance (`fxScopeCodingParams`' eval
+        // branch): only when this parameter scope is reached by a direct
+        // `eval`.
+        if self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0 {
+            let strict = self.tree.scopes[scope].flags & crate::ast::flags::STRICT != 0;
+            if !strict {
+                self.add_byte(1, XS_CODE_NULL);
+                self.add_byte(0, XS_CODE_WITH);
+                self.add_byte(-1, XS_CODE_POP);
+                self.environment_level += 1;
+            }
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(0, XS_CODE_WITH);
+            for (id, token, _, _) in self.declares_of(scope) {
+                if matches!(token, Token::Arg | Token::Var | Token::Const) {
+                    let index = self.declare_index(scope, id);
+                    self.add_index(0, XS_CODE_STORE_1, index);
+                }
+            }
+            self.add_byte(-1, XS_CODE_POP);
+            self.environment_level += 1;
         }
     }
 
@@ -3326,15 +3358,118 @@ impl Coder<'_> {
         }
     }
 
-    /// `fxBodyNodeCode` — a function body block. This slice handles the
-    /// non-eval / non-declaring body: scope-code the block, dispatch the
-    /// statement, unwind. Child `[statement]`.
+    /// `fxBodyNodeCode` — a function body block. The strict / non-eval body
+    /// scope-codes the block like any block (`fxScopeCodingBody`'s `else`
+    /// arm is `fxScopeCodingBlock`, whose eval `with`-publish already ports);
+    /// a **sloppy direct-`eval` body** takes the two-`with` dance
+    /// (`fxScopeCodingBody`): the `var`/function declarations publish into a
+    /// `null` `with`, then the lexical declarations into an `undefined` one,
+    /// so an eval-created name resolves to the right frame. Child
+    /// `[statement]`.
     fn code_body(&mut self, node: &Node) {
         let scope = self.scope_of(node);
-        self.scope_coding_block(scope);
-        self.code_define_nodes(&node.children[0]);
-        self.code(&node.children[0]);
-        self.scope_coded(scope);
+        // `fxScopeCodingBody`/`fxScopeCodedBody` key on the body *node*'s
+        // `mxEvalFlag`, which the parser/hoister sets only for a **direct
+        // `eval`** in this function — not on a `with`-poisoned scope (which
+        // sets the *scope* flag but leaves the node clean). Keying on the
+        // node flag keeps a `with`-only body on the ordinary block path,
+        // where the parameter-scope `with` dance already suffices.
+        let is_eval = self.tree.scopes[scope].direct_eval;
+        let strict = self.tree.scopes[scope].flags & crate::ast::flags::STRICT != 0;
+        if is_eval && !strict {
+            self.scope_coding_body_eval(scope);
+            self.code_define_nodes(&node.children[0]);
+            self.code(&node.children[0]);
+            self.scope_coded_body_eval(scope);
+        } else {
+            self.scope_coding_block(scope);
+            self.code_define_nodes(&node.children[0]);
+            self.code(&node.children[0]);
+            self.scope_coded(scope);
+        }
+    }
+
+    /// `fxScopeCodingBody` — the sloppy direct-`eval` function-body prelude.
+    /// Every declaration in an eval scope is closure-marked (so eval can
+    /// reach it), so the `var`/function declarations get a `NEW_CLOSURE`
+    /// slot and initialize (`null` for a hoisted function `Define`,
+    /// `undefined` for a `var`), then publish into a `null` `with`
+    /// environment; the lexical (`let`/`const`) declarations then get their
+    /// own `NEW_CLOSURE`/`NEW_TEMPORARY` slots and publish into an
+    /// `undefined` `with`. Two `with` frames are pushed (`environment_level`
+    /// += 2), unwound by [`Coder::scope_coded_body_eval`].
+    fn scope_coding_body_eval(&mut self, scope: usize) {
+        // Pass 1: `var` / function-declaration (`Define`) slots.
+        for (id, token, sym, _) in self.declares_of(scope) {
+            match token {
+                Token::Define => {
+                    let index = self.set_declare_index(scope, id);
+                    self.add_variable(0, XS_CODE_NEW_CLOSURE, Self::sym_name(&sym), index);
+                    self.add_byte(1, XS_CODE_NULL);
+                    self.add_index(0, XS_CODE_VAR_CLOSURE_1, index);
+                    self.add_byte(-1, XS_CODE_POP);
+                }
+                Token::Var => {
+                    let index = self.set_declare_index(scope, id);
+                    self.add_variable(0, XS_CODE_NEW_CLOSURE, Self::sym_name(&sym), index);
+                    self.add_byte(1, XS_CODE_UNDEFINED);
+                    self.add_index(0, XS_CODE_VAR_CLOSURE_1, index);
+                    self.add_byte(-1, XS_CODE_POP);
+                }
+                _ => {}
+            }
+        }
+        // The `var`/function publish into a `null` `with`.
+        self.add_byte(1, XS_CODE_NULL);
+        self.add_byte(0, XS_CODE_WITH);
+        for (id, token, _, _) in self.declares_of(scope) {
+            if matches!(token, Token::Define | Token::Var) {
+                let index = self.declare_index(scope, id);
+                self.add_index(0, XS_CODE_STORE_1, index);
+            }
+        }
+        self.add_byte(-1, XS_CODE_POP);
+        self.environment_level += 1;
+        // Pass 2: lexical (`let`/`const`) slots.
+        for (id, token, sym, _) in self.declares_of(scope) {
+            if matches!(token, Token::Define | Token::Var) {
+                continue;
+            }
+            let index = self.set_declare_index(scope, id);
+            match Self::sym_name(&sym) {
+                Some(name) => self.add_variable(0, XS_CODE_NEW_CLOSURE, Some(name), index),
+                None => self.add_index(0, XS_CODE_NEW_TEMPORARY, index),
+            }
+        }
+        // The lexical publish into an `undefined` `with`.
+        self.add_byte(1, XS_CODE_UNDEFINED);
+        self.add_byte(0, XS_CODE_WITH);
+        for (id, token, sym, _) in self.declares_of(scope) {
+            if matches!(token, Token::Define | Token::Var) {
+                continue;
+            }
+            if Self::sym_name(&sym).is_some() {
+                let index = self.declare_index(scope, id);
+                self.add_index(0, XS_CODE_STORE_1, index);
+            }
+        }
+        self.add_byte(-1, XS_CODE_POP);
+        self.environment_level += 1;
+    }
+
+    /// `fxScopeCodedBody` — teardown for the sloppy direct-`eval` body:
+    /// unwind the two `with` frames that [`Coder::scope_coding_body_eval`]
+    /// pushed, then the declared slots.
+    fn scope_coded_body_eval(&mut self, scope: usize) {
+        let count = self.declare_count(scope);
+        self.environment_level -= 1;
+        self.add_byte(0, XS_CODE_WITHOUT);
+        self.environment_level -= 1;
+        self.add_byte(0, XS_CODE_WITHOUT);
+        if count != 0 {
+            self.add_index(0, XS_CODE_UNWIND_1, count);
+            self.scope_level -= count;
+        }
     }
 
     /// `fxReturnNodeCode` — `return [expr];` inside a function. Code the

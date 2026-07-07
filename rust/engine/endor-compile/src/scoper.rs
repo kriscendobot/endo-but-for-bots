@@ -195,6 +195,13 @@ pub struct Scope {
     /// `mxDefaultFlag` was propagated here by [`fx_scope_arrow`] — an
     /// arrow function that transitively uses `this` / `super` / `target`.
     pub arrow_default: bool,
+    /// Whether this scope's node carries the **direct-`eval`** hoist extra
+    /// (`hoist_call`'s `add_extra`), as opposed to a `with`-poisoned scope
+    /// (which sets [`SCOPE_EVAL`] on `flags` but leaves the node clean). The
+    /// coder's `fxScopeCodingBody`/`fxScopeCodedBody` key on this, not on the
+    /// poisoned `flags`. Computed once the node's extras are populated
+    /// ([`fx_scope_hoisted`]).
+    pub direct_eval: bool,
 }
 
 impl Scope {
@@ -213,6 +220,7 @@ impl Scope {
             define_count: 0,
             disposable_count: 0,
             arrow_default: false,
+            direct_eval: false,
         }
     }
 }
@@ -593,6 +601,13 @@ impl Scoper {
 
     /// `fxScopeHoisted` — the count fix-ups when a scope closes.
     fn fx_scope_hoisted(&mut self, si: usize) {
+        // The node's direct-`eval` extra is now populated (a body-level
+        // `eval` call was hoisted before this). Record it so the coder can
+        // tell a genuine direct `eval` from a `with`-poisoned scope.
+        let ptr = self.scopes[si].node_ptr;
+        if self.node_extra.get(&ptr).copied().unwrap_or(0) & SCOPE_EVAL != 0 {
+            self.scopes[si].direct_eval = true;
+        }
         let tok = self.scopes[si].token;
         if tok == Token::Block {
             // Drop the NoToken var placeholders; fix declareNodeCount. Ids
@@ -942,15 +957,26 @@ impl Scoper {
         if let Some(params) = child(node, 1) {
             self.hoist_item(params)?;
         }
-        // arguments injection
-        let nf = self.node_flags(node);
-        if (nf & (flags::ARGUMENTS | SCOPE_EVAL) != 0) && (nf & flags::ARROW == 0) {
-            let d = self.new_declare(si, Token::Var, Some(Sym::Named("arguments".to_string())), node.line);
-            self.scope_add_declare(si, d);
-        }
+        // `arguments` injection (`fxFunctionNodeHoist`, before the body).
+        // A function that references or declares `arguments`, or that the
+        // parser already marked as containing `eval`, has the flag *now* —
+        // inject here, before the body's own `var arguments`/`arguments`
+        // parameter is hoisted, so the two merge into one declare (XS relies
+        // on the synthetic being present first).
+        let injected = self.inject_arguments(si, node);
         // body (children[2])
         if let Some(body) = child(node, 2) {
             self.hoist_item(body)?;
+        }
+        // A *body-level direct `eval`* only marks the function node once its
+        // call is hoisted (`hoist_call`'s `add_extra`), too late for the pass
+        // above. Inject now if that discovery set the flag and nothing was
+        // injected yet. Such a function has no `var arguments`/`arguments`
+        // parameter (those would have set the flag at parse), so this never
+        // double-injects; the body's declares live in the separate body
+        // scope, so the `arguments` `Var` still follows the parameters.
+        if !injected {
+            self.inject_arguments(si, node);
         }
         self.fx_scope_hoisted(si);
         self.body_scope = body_scope;
@@ -1209,18 +1235,36 @@ impl Scoper {
         if let Some(params) = child(node, 1) {
             self.hoist_item(params)?;
         }
-        let nf = self.node_flags(node);
-        if (nf & (flags::ARGUMENTS | SCOPE_EVAL) != 0) && (nf & flags::ARROW == 0) {
-            let d = self.new_declare(si, Token::Var, Some(Sym::Named("arguments".to_string())), node.line);
-            self.scope_add_declare(si, d);
-        }
+        // See `hoist_function` for the two-phase `arguments` injection: once
+        // before the body (references / parser-known `eval`) so a body
+        // `var arguments` merges, and once after (body-level direct `eval`
+        // discovered during the body walk).
+        let injected = self.inject_arguments(si, node);
         if let Some(body) = child(node, 2) {
             self.hoist_item(body)?;
+        }
+        if !injected {
+            self.inject_arguments(si, node);
         }
         self.fx_scope_hoisted(si);
         self.body_scope = body_scope;
         self.function_scope = function_scope;
         Ok(())
+    }
+
+    /// `fxFunctionNodeHoist`'s synthetic `arguments` `Var`: a non-arrow
+    /// function that references `arguments` or contains a direct `eval` gets
+    /// an `arguments` binding in its function scope. Returns whether it was
+    /// injected (so the caller does not re-inject).
+    fn inject_arguments(&mut self, si: usize, node: &Node) -> bool {
+        let nf = self.node_flags(node);
+        if (nf & (flags::ARGUMENTS | SCOPE_EVAL) != 0) && (nf & flags::ARROW == 0) {
+            let d = self.new_declare(si, Token::Var, Some(Sym::Named("arguments".to_string())), node.line);
+            self.scope_add_declare(si, d);
+            true
+        } else {
+            false
+        }
     }
 
     fn hoist_for(&mut self, node: &Node) -> Result<(), ParseError> {

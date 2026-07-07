@@ -147,6 +147,53 @@ fn assert_identical(corpus: &[&str]) {
     }
 }
 
+// In-function **direct `eval`** — the eval-scope slice (stage-5 fix2 4/6).
+// A function that contains a direct `eval` publishes its parameters into a
+// `with` environment (`fxScopeCodingParams`' eval branch), materializes an
+// `arguments` object, and — in sloppy mode — runs the two-`with` body dance
+// (`fxScopeCodingBody`) so an eval-created `var`/lexical resolves to the
+// right frame. Strict differs (no leading `null` `with`, block-shaped body).
+// Program- and block-level direct eval were already byte-identical; these
+// fixtures pin the in-function forms: sloppy + strict, no-param / param /
+// default / rest, body `var`/`let`/function declarations, function
+// declarations vs expressions, and nested functions.
+#[test]
+fn eval_scope_in_function() {
+    assert_identical(&[
+        // sloppy: no params, simple params, arguments materialization
+        "(function() { eval('1'); });",
+        "(function(a) { eval('a'); });",
+        "(function(a, b) { eval('a'); });",
+        // strict: no leading `null` with; block-shaped body
+        "'use strict'; (function() { eval('1'); });",
+        "'use strict'; (function(a) { eval('a'); });",
+        // body declarations under a sloppy eval (the two-`with` dance)
+        "(function() { eval('1'); var y; });",
+        "(function() { eval('1'); let z; });",
+        "(function() { eval('1'); function g(){} });",
+        "(function() { eval('1'); var y; let z; function g(){} });",
+        "(function(a, b) { eval('a'); var y; });",
+        // strict body declarations (the block path with the eval publish)
+        "'use strict'; (function() { eval('1'); var y; let z; function g(){} });",
+        // default / rest parameters with a body-level eval
+        "(function(a = 1) { eval('a'); });",
+        "(function(...a) { eval('a'); });",
+        // function *declaration* (hoisted) carrying a body eval
+        "function f() { let x; eval('1'); }",
+        "function f() { eval('1'); var y; }",
+        // nested functions: each eval marks only its own function
+        "(function() { eval('1'); (function() { eval('2'); var z; }); });",
+        "(function() { (function() { eval('2'); }); });",
+        // `arguments` referenced/declared alongside a body eval
+        "(function() { eval('1'); return arguments; });",
+        "(function() { var arguments = 1; eval('1'); return arguments; });",
+        // regression: a `with` poisons the scope but is NOT a direct eval —
+        // no body dance, only the parameter-scope `with` publish
+        "(function() { with({}) {} });",
+        "(function() { with(arguments) {} return arguments; });",
+    ]);
+}
+
 #[test]
 fn literals_and_operators() {
     assert_identical(&[
