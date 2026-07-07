@@ -1406,11 +1406,22 @@ byte-identical vs the oracle:
   creation operand (XS emits no `NAME` op on the class value); `code_class`
   already leaves `pending_name` for the constructor, so only the
   `set_pending_name` guard needed lifting.
+- Slice 47 — **static class fields**: the parser leaves the Class node's
+  `constructorInit`/`instanceInit` children NULL — the init-function synthesis
+  is deferred to the coder. `code_class` now collects non-method members as
+  fields and, for **static** data fields, synthesizes the `constructorInit`
+  field function: a `CONSTRUCTOR_FUNCTION` whose `BEGIN_STRICT_FIELD` body runs
+  `fxFieldNodeCode` (`THIS` + value + `NEW_PROPERTY` + name flag) per field,
+  invoked with the constructor as this/home (`GET_LOCAL` constructor / `SET_HOME`
+  / `CALL` / `RUN_1 0` / `POP`). The synthetic field function mirrors
+  `code_function`'s wrapper (`CODE`/`END`, `FUNCTION_ENVIRONMENT` store) without
+  a scoper scope. Byte-identical for single/multiple, bare, mixed-with-methods,
+  and expression/anon-fn static values on named and anonymous classes.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-class **fields** and **private** members, static blocks, and the
+**instance** fields and **private** members, static blocks, and the
 instance-field-init call after `super(...)` — these need more class-hoisting
-scoper work (the class scope's per-member `CONST_CLOSURE` declares);
+scoper work (the class scope's `instanceInit`/`CONST_CLOSURE` declares);
 `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
