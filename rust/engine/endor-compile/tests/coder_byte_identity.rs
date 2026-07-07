@@ -661,10 +661,10 @@ fn for_in_of_declaring_heads() {
 // The `arguments` object (child 6). A function that references `arguments`
 // carries a synthetic `arguments` `Var`; its scope header slots it, and the
 // parameter prelude builds the object (`ARGUMENTS_SLOPPY` mapped / else
-// `ARGUMENTS_STRICT`, operand = the parameter count) and stores it. Covers
-// the no-parameter (mapped) and the strict cases; a *mapped* `arguments`
-// with parameters (which promotes the parameters to closure slots) is
-// deferred pending the scoper marking.
+// `ARGUMENTS_STRICT`, operand = the parameter count) and stores it. A
+// *mapped* `arguments` (sloppy, simple parameter list) aliases the named
+// parameters, so the scoper closure-marks them (`NEW_CLOSURE`/`VAR_CLOSURE`/
+// `GET_CLOSURE`); a strict `arguments` stays unmapped with local parameters.
 #[test]
 fn arguments_object() {
     assert_identical(&[
@@ -673,6 +673,10 @@ fn arguments_object() {
         "(function(){return arguments[0]+arguments[1];});",
         "(function(){return arguments.length;});",
         "(function(){return function(){return arguments;};});",
+        // mapped `arguments` with parameters → the parameters are closures
+        "(function(a){return arguments;});", "(function(a){a;return arguments;});",
+        "(function(a,b){return arguments.length;});",
+        "(function(a,b,c){return arguments[0]+a;});",
         // strict `arguments` stays unmapped, so parameters remain local
         "\"use strict\";(function(){return arguments;});",
         "\"use strict\";(function(a){return arguments;});",

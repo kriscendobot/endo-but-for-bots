@@ -1498,10 +1498,36 @@ impl Scoper {
     }
 
     fn bind_params_binding(&mut self, node: &Node) -> Result<(), ParseError> {
-        // The getter/setter/arity early errors and arguments mapping are a
-        // coder concern; the scope-shape contract only needs the items
-        // bound, so distribute them (the arity checks live in the parser
-        // and coder children).
+        // `fxParamsBindingNodeBind`: a *mapped* `arguments` object (a sloppy
+        // function that references `arguments` and has a simple parameter
+        // list) aliases the named parameters, so each parameter is promoted
+        // to a closure slot. Marking the declare (no count change, like a
+        // capture) is enough; the coder then emits `NEW_CLOSURE`/
+        // `VAR_CLOSURE`/`GET_CLOSURE` for it.
+        if let Some(fscope) = self.scope {
+            let nf = self.scope_node_flags(fscope);
+            if nf & flags::ARGUMENTS != 0 && nf & flags::STRICT == 0 {
+                if let Some(Item::List(items)) = child(node, 0) {
+                    let all_arg = items
+                        .iter()
+                        .all(|it| matches!(it, Item::Node(n) if n.token == Token::Arg));
+                    if all_arg {
+                        let names: Vec<String> = items
+                            .iter()
+                            .filter_map(|it| match it {
+                                Item::Node(arg) => child_sym(arg, 0),
+                                _ => None,
+                            })
+                            .collect();
+                        for name in names {
+                            if let Some(id) = self.scope_get_declare(fscope, &Sym::Named(name)) {
+                                self.declare_mut(fscope, id).flags |= dflags::CLOSURE;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.bind_children(node)
     }
 

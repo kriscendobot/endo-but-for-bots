@@ -2010,17 +2010,10 @@ impl Coder<'_> {
         let Some((id, flags)) = args else { return };
         let index = self.declare_index(scope, id);
         let count = self.count_binding_items(&func.children[1]);
-        // Mapped only when sloppy with a simple parameter list.
+        // Mapped only when sloppy with a simple parameter list (the scoper
+        // then closure-marks the parameters so the object can alias them).
         let mapped =
             !is_strict && func.flags & crate::ast::flags::NOT_SIMPLE_PARAMETERS == 0;
-        // A mapped `arguments` object aliases the named parameters, which
-        // requires them to be in closure slots — a scoper marking not yet
-        // ported. Defer the mapped-with-parameters case (the no-parameter
-        // and strict cases need no such marking).
-        assert!(
-            !(mapped && count > 0),
-            "mapped `arguments` with parameters deferred (scoper closure marking)"
-        );
         let op = if mapped { XS_CODE_ARGUMENTS_SLOPPY } else { XS_CODE_ARGUMENTS_STRICT };
         self.add_index(1, op, count);
         let store = if flags & crate::scoper::dflags::CLOSURE != 0 {
