@@ -697,6 +697,29 @@ fn for_in_of_var_head() {
     ]);
 }
 
+// Object destructuring (child 6). `fxObjectBindingNodeCodeAssign`:
+// `TO_INSTANCE` the value into a temporary, then read each named property
+// and assign it into the target — for both destructuring assignment
+// (`({a,b} = x)`) and lexical/var binding (`let {a,b} = x`). Shorthand,
+// renamed (`{a: p}`), `= default` elements, and nested-value sources
+// covered. Deferred (asserted): object rest (`{...r}`), computed keys
+// (`{[k]: v}`), nested *patterns* (`{a: {b}}`), and array destructuring
+// (which needs the iterator protocol).
+#[test]
+fn object_destructuring() {
+    assert_identical(&[
+        // assignment form (global and member-source targets)
+        "({a,b}=x);", "({a}=x);", "({a,b,c}=o);", "({first,second}=pair);",
+        "({a:p,b:q}=x);", "({a,b}=f());",
+        // lexical / var binding form
+        "let{a,b}=x;", "var{a,b}=x;", "const{a}=x;", "let{a}=obj;",
+        "let{x,y,z}=p;", "let{a:p}=x;", "let{a}=x,{b}=y;",
+        // `= default` elements, and inside a function body
+        "({a=1}=x);", "let{a=1,b=2}=x;",
+        "(function(){let{a,b}=x;return a+b;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

@@ -1990,6 +1990,45 @@ impl Coder<'_> {
     /// `ARGUMENT i` and store it into the parameter's slot. Defaults
     /// (a `Binding` item), destructuring (`ArrayBinding`/`ObjectBinding`),
     /// rest (`RestBinding`), and the `arguments` object are deferred.
+    /// `fxObjectBindingNodeCodeAssign` — object destructuring. The value on
+    /// the stack is `TO_INSTANCE`'d into a temporary, then each
+    /// `PropertyBinding` reads its named property and assigns it into the
+    /// binding target. Deferred: object rest (`{...r}`), computed keys
+    /// (`PropertyBindingAt`), and `= default` inside a pattern element are
+    /// handled by the target's own coder, but the spread / at branches
+    /// assert.
+    fn code_object_binding_assign(&mut self, node: &Node, _flag: i32) {
+        assert!(
+            node.flags & crate::ast::flags::SPREAD == 0,
+            "object rest destructuring deferred"
+        );
+        let items: &[Item] = match node.children.first() {
+            Some(Item::List(v)) => v,
+            _ => &[],
+        };
+        let object = self.use_temporary();
+        let _at = self.use_temporary();
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_byte(0, XS_CODE_TO_INSTANCE);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, object);
+        for item in items {
+            let p = node_of(item);
+            assert_eq!(
+                p.token,
+                Token::PropertyBinding,
+                "computed-key / rest object destructuring deferred"
+            );
+            let key = Self::symbol_of(&p.children[0]).to_string();
+            let binding = &p.children[1];
+            self.code_reference(binding, 1);
+            self.add_index(1, XS_CODE_GET_LOCAL_1, object);
+            self.add_symbol(0, XS_CODE_GET_PROPERTY, &key);
+            self.code_assign(binding, 1);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+        self.unuse_temporaries(2);
+    }
+
     /// `fxParamsBindingNodeCode`'s `arguments`-object prelude. When a
     /// function references `arguments`, its scope carries a synthetic
     /// `arguments` `Var`; build the object (`ARGUMENTS_SLOPPY` for a mapped
@@ -2771,6 +2810,9 @@ impl Coder<'_> {
                     self.place_target(0, target);
                     self.code_assign(&n.children[0], flag);
                 }
+                // fxObjectBindingNodeCodeAssign: destructure the value's own
+                // properties into each target.
+                Token::ObjectBinding => self.code_object_binding_assign(n, flag),
                 other => panic!("coder: no reference for assignment target {:?}", other),
             },
             _ => panic!("coder: no reference for assignment target"),
