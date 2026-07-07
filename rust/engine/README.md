@@ -1261,12 +1261,17 @@ byte-identical vs the oracle:
   reference / member / computed target), labeled break, nesting, and use
   inside functions all covered; declaring heads (`for (let/const/var …)`),
   `using`, and `for await` stay deferred.
+- Slice 21 — **object-property name inference**: `fxObjectNodeCode`'s
+  `NEW_PROPERTY`/`NEW_PROPERTY_AT` attribute carries `XS_NAME_FLAG` when the
+  property value is an anonymous function (`fxNodeCodeName`), so the
+  interpreter infers the value's `.name` from the key (data + computed
+  keys; named / non-function values unaffected).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
-`this`/`super`/`target`); object-method/property **name inference**;
-generator/async
+`this`/`super`/`target`); object **methods/accessors/shorthand/spread** and
+anonymous-class name inference; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
