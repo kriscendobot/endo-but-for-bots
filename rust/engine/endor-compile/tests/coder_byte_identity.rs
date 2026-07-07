@@ -153,6 +153,9 @@ fn literals_and_operators() {
         // literals of every scalar kind
         "1", "0", "-0", "300", "70000", "2147483647", "1.5", "0.1", "1e300",
         "true", "false", "null", "\"\"", "\"hi\"", "\"a b c\"",
+        // bigint literals (limb encoding)
+        "0n", "1n", "255n", "256n", "10n", "0xdeadbeefn", "4294967295n",
+        "4294967296n", "18446744073709551616n", "0o17n", "0b1010n",
         // arithmetic / precedence
         "1+2", "1-2", "1*2", "1/2", "1%2", "2**3", "1+2*3", "1*2+3", "(1+2)*3",
         "2**3**2", "1-2-3",

@@ -63,6 +63,11 @@ enum Payload {
     /// A symbol operand (`GET_VARIABLE`…). Deferred; carries the atom's
     /// assigned id (child 6 wires atom-table assignment).
     Symbol { id: i32 },
+    /// A BigInt operand (`BIGINT_1`): the value as XS stores it — a
+    /// little-endian array of `txU4` limbs (`bigint->data`) — with
+    /// `measure` (== `bytes.len()`, `bigint->size * 4`) the emitted
+    /// length and width selector.
+    BigInt { bytes: Vec<u8>, measure: i32 },
 }
 
 /// One code record — XS's `txByteCode` with its subtype fields. `id` is
@@ -142,6 +147,12 @@ impl<'a> Coder<'a> {
     fn add_string(&mut self, delta: i32, id: i32, bytes: Vec<u8>) {
         let len = bytes.len() as i32;
         self.add(delta, Payload::Str { bytes, len }, id);
+    }
+
+    /// `fxCoderAddBigInt`.
+    fn add_bigint(&mut self, delta: i32, id: i32, bytes: Vec<u8>) {
+        let measure = bytes.len() as i32;
+        self.add(delta, Payload::BigInt { bytes, measure }, id);
     }
 
     fn create_target(&mut self) -> usize {
@@ -252,6 +263,14 @@ impl Coder<'_> {
                 let mut bytes = s.clone().into_bytes();
                 bytes.push(0);
                 self.add_string(1, XS_CODE_STRING_1, bytes);
+            }
+            Bigint => {
+                let lit = match &node.value {
+                    Value::BigInt(b) => b,
+                    _ => panic!("BigInt node without bigint value"),
+                };
+                let bytes = bigint_limbs_le(&lit.digits, lit.radix as u32);
+                self.add_bigint(1, XS_CODE_BIGINT_1, bytes);
             }
             // unary (`fxUnaryExpressionNodeCode`): operand then op, delta 0
             Void | Not | BitNot | Minus | Plus | Typeof => {
@@ -563,6 +582,20 @@ fn size1_step(c: &mut Code, size: &mut i32, delta: &mut i32, targets: &mut [Targ
             width_select_integer_family(c, size);
         }
         XS_CODE_NUMBER => *size += 9,
+        // bigint: width-select on the measure, then the limb bytes
+        XS_CODE_BIGINT_1 => {
+            let measure = match &c.payload {
+                Payload::BigInt { measure, .. } => *measure,
+                _ => 0,
+            };
+            if measure > 255 {
+                c.id += 1;
+                *size += 3;
+            } else {
+                *size += 2;
+            }
+            *size += measure;
+        }
         XS_CODE_HOST => *size += 3,
         _ => {
             if is_symbol_op(c.id) {
@@ -686,6 +719,16 @@ fn size2_step(c: &mut Code, size: &mut i32, delta: &mut i32, targets: &mut [Targ
                 *size += 5 + *len;
             }
         }
+        XS_CODE_BIGINT_1 => {
+            if let Payload::BigInt { measure, .. } = &c.payload {
+                *size += 2 + *measure;
+            }
+        }
+        XS_CODE_BIGINT_2 => {
+            if let Payload::BigInt { measure, .. } = &c.payload {
+                *size += 3 + *measure;
+            }
+        }
         XS_CODE_HOST => *size += 3,
         _ => {
             if is_symbol_op(c.id) {
@@ -773,6 +816,18 @@ fn emit_step(c: &Code, out: &mut Vec<u8>, targets: &[Target]) {
                 out.extend_from_slice(bytes);
             }
         }
+        XS_CODE_BIGINT_1 => {
+            if let Payload::BigInt { bytes, measure } = &c.payload {
+                out.push(*measure as u8);
+                out.extend_from_slice(bytes);
+            }
+        }
+        XS_CODE_BIGINT_2 => {
+            if let Payload::BigInt { bytes, measure } = &c.payload {
+                out.extend_from_slice(&(*measure as u16).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
         XS_CODE_HOST => {
             out.extend_from_slice(&(index_value(c) as u16).to_le_bytes());
         }
@@ -819,6 +874,39 @@ fn symbol_id(c: &Code) -> i32 {
 /// `sizeof(txID)` at the oracle pin (`mx32bitID` undefined → 2 bytes),
 /// matching `endor_vm::opcode::ID_SIZE`.
 const ID_SIZE: i32 = 2;
+
+/// XS stores a BigInt literal as `bigint->data`: an array of `txU4` limbs
+/// in machine (little-endian) byte order, `bigint->size` of them, trimmed
+/// of high zero limbs but never below one limb (so `0n` is one zero
+/// limb). `fxBigIntEncode` memcpys those limb bytes; `fxBigIntMeasure` is
+/// `size * 4`. The parse path (decimal `fxBigIntParse`, or the shift-based
+/// hex/octal/binary parsers) all converge on the same canonical limbs, so
+/// a radix-accumulate reproduces `data` exactly. Returns the limb bytes.
+fn bigint_limbs_le(digits: &str, radix: u32) -> Vec<u8> {
+    let mut limbs: Vec<u32> = vec![0];
+    for ch in digits.chars() {
+        let d = ch.to_digit(radix).expect("bigint digit in radix") as u64;
+        // limbs = limbs * radix + d  (base 2^32, little-endian)
+        let mut carry = d;
+        for limb in limbs.iter_mut() {
+            let v = (*limb as u64) * (radix as u64) + carry;
+            *limb = v as u32;
+            carry = v >> 32;
+        }
+        while carry > 0 {
+            limbs.push(carry as u32);
+            carry >>= 32;
+        }
+    }
+    while limbs.len() > 1 && *limbs.last().unwrap() == 0 {
+        limbs.pop();
+    }
+    let mut bytes = Vec::with_capacity(limbs.len() * 4);
+    for l in limbs {
+        bytes.extend_from_slice(&l.to_le_bytes());
+    }
+    bytes
+}
 
 // --------------------------- opcode classes ----------------------------
 
