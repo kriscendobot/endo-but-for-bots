@@ -3024,21 +3024,6 @@ impl Coder<'_> {
         }
     }
 
-    /// Whether a declaration binds to itself (`node->declaration != NULL`
-    /// after `fxScopeLookup`), the store-all eligibility gate. A `var`/`Define`
-    /// in a `Program` scope, or in a **sloppy** `Eval` scope, resolves to null
-    /// (eval-created names may shadow it), so it has no slot to capture; every
-    /// other declare binds to its own slot.
-    fn declare_has_declaration(&self, scope: usize, token: Token) -> bool {
-        let sc = &self.tree.scopes[scope];
-        let strict = sc.flags & crate::ast::flags::STRICT != 0;
-        match sc.token {
-            Token::Program => !matches!(token, Token::Var | Token::Define),
-            Token::Eval => strict || !matches!(token, Token::Var | Token::Define),
-            _ => true,
-        }
-    }
-
     /// `fxScopeCodeStoreAll` — the enclosing-frame capture an eval function
     /// performs. Walk outward from `scope`; in each scope store every declare
     /// that (a) is not itself a use-closure alias, (b) has an assigned frame
@@ -3057,12 +3042,12 @@ impl Coder<'_> {
             if self.tree.scopes[si].token == Token::With {
                 break;
             }
-            let declares: Vec<(u32, u32, Token)> = self.tree.scopes[si]
+            let declares: Vec<(u32, u32, bool)> = self.tree.scopes[si]
                 .declares
                 .iter()
-                .map(|d| (d.id, d.flags, d.token))
+                .map(|d| (d.id, d.flags, d.bound))
                 .collect();
-            for (id, flags, token) in declares {
+            for (id, flags, bound) in declares {
                 if stored.remove(&(si, id)) {
                     // Already stored as a use-closure alias target — XS clears
                     // the transient eval mark and moves on.
@@ -3071,10 +3056,12 @@ impl Coder<'_> {
                 if flags & crate::scoper::dflags::USE_CLOSURE != 0 {
                     continue;
                 }
-                // `node->declaration` must be non-null: a `var`/`Define` in a
-                // sloppy `Eval`/`Program` scope binds to nothing (`fxScopeLookup`
-                // returns null there), so it has no frame slot to store.
-                if !self.declare_has_declaration(si, token) {
+                // `node->declaration` must be non-null: a synthesized slot (the
+                // injected `arguments` `Var`, a class's anonymous field-init
+                // closures) or a `var`/`Define` that resolved to nothing in a
+                // sloppy `Eval`/`Program` scope was never bound, so it has no
+                // frame slot for an `eval` to reach.
+                if !bound {
                     continue;
                 }
                 if let Some(index) = self.declare_index_opt(si, id) {

@@ -138,6 +138,14 @@ pub struct Declare {
     /// For a closure alias (`NoToken` in a function scope) the ancestor
     /// declaration it forwards to: `(scope, declare id)`.
     pub alias: Option<(usize, u32)>,
+    /// `node->declaration != NULL` — set when this declaration was bound by a
+    /// real declaration-statement self-lookup (`fxDeclareNodeBind` /
+    /// `fxDefineNodeBind`). A synthesized slot (the injected `arguments`
+    /// `Var`, a class's anonymous `instanceInit`/`constructorInit` closures) is
+    /// never bind-dispatched, so it stays `false` and `fxScopeCodeStoreAll`
+    /// does not capture it. Also `false` for a `var`/`Define` that resolved to
+    /// nothing in a sloppy `Eval`/`Program` scope.
+    pub bound: bool,
     /// `node->importSpecifier` — the import/re-export linkage when this is a
     /// module-scope import binding (`None` for a plain local).
     pub import_spec: Option<ImportSpec>,
@@ -602,6 +610,7 @@ impl Scoper {
             flags: 0,
             line,
             alias: None,
+            bound: false,
             import_spec: None,
             export_specs: Vec::new(),
         }
@@ -1874,6 +1883,11 @@ impl Scoper {
         if let Some(sym) = child_sym(node, 0) {
             let scope = self.scope.unwrap();
             let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, false, false);
+            // `self->declaration = declaration` — record that this declaration
+            // binds (drives `fxScopeCodeStoreAll` eligibility).
+            if let Some((rscope, rid)) = resolved {
+                self.declare_mut(rscope, rid).bound = true;
+            }
             self.record_access(&sym, node.line, resolved);
             self.resolutions.insert(node_ptr(node), resolved);
         }
@@ -1884,6 +1898,9 @@ impl Scoper {
         if let Some(sym) = child_sym(node, 0) {
             let scope = self.scope.unwrap();
             let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, false, false);
+            if let Some((rscope, rid)) = resolved {
+                self.declare_mut(rscope, rid).bound = true;
+            }
             self.record_access(&sym, node.line, resolved);
             self.resolutions.insert(node_ptr(node), resolved);
         }
