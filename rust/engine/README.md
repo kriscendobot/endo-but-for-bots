@@ -1350,12 +1350,16 @@ byte-identical vs the oracle:
 - Slice 37 — **async generators**: the `ASYNC_GENERATOR_FUNCTION` create op
   + `START_ASYNC_GENERATOR`, and `fxYieldNodeCode`'s async branch (yield the
   raw value, `YIELD`/`BRANCH_STATUS`, then `AWAIT` + `THROW_STATUS`).
+- Slice 38 — **`yield*` delegation**: `fxDelegateNodeCode` — the full
+  iterator-delegation state machine (`FOR_OF`/`FOR_AWAIT_OF` seed,
+  `YIELD_STAR` forwarding, `CHECK_INSTANCE`, and the loop/return/throw/normal
+  sections with `CATCH`/`UNCATCH` + `BRANCH_CHAIN`/`COALESCE` completion
+  routing), async variant awaiting each step. Completes generators/async.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
-inference and **direct-`eval` spread**; `yield*`
-(`Delegate`); classes (constructor/
+inference and **direct-`eval` spread**; classes (constructor/
 derived, methods/accessors, static members, private fields/methods/brands,
 static blocks); `for await` / `using` heads; and
 module import/export linkage + the module-body wrapper. These are the
