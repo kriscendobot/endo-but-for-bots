@@ -1983,6 +1983,58 @@ target and is now byte-clean (62 + 50 → 0). `accept-disagree == 0` and
 divergence anywhere ⇒ **no new kill-criterion evidence**; the residual is one
 named scoper fold, not a feasibility wall.
 
+**fix5 1/5 (the arrow receiver-capture-under-`eval` scope-slot fold) — 8 of 10
+arrow divergences CLOSED.** The dominant fix4-verify residual was the
+arrow-function scope-classification family. Its largest sub-mechanism is now
+closed: `fxScopeCodeRetrieve`/`fxScopeCodeStore` (`endor-compile/src/coder.rs`)
+emit the receiver-capture triple `RETRIEVE_1 / RETRIEVE_TARGET / RETRIEVE_THIS`
+(into the arrow body) and the matching `STORE_ARROW` (in the enclosing frame)
+under XS's exact condition `(node->flags & mxArrowFlag) && ((node->flags &
+mxDefaultFlag) || (self->flags & mxEvalFlag))`. endor had only mirrored the
+`mxDefaultFlag` half (the `arrow_default` bool — an arrow that lexically uses
+`this`/`super`/`target`); it was **missing the `mxEvalFlag` half**: an arrow
+whose own scope is direct-`eval`-poisoned captures the receiver even when
+nothing lexically names `this`, because a direct eval in a body with a distinct
+lexical environment (a `let`, or a destructuring/rest parameter var
+environment) can reach `this`/`new.target` at runtime. The fix adds a
+`Scope::is_arrow` field (the bare `mxArrowFlag`, distinct from the
+`arrow_default` conjunction) and a shared `arrow_receiver_capture(scope)`
+predicate for both the retrieve and store sites; the environment-op selection
+(`ENVIRONMENT` vs `FUNCTION_ENVIRONMENT`) was already XS-correct (the eval case
+routes through `FUNCTION_ENVIRONMENT`, matching XS's first `if`). New locked
+byte-identity fixtures pin the shape (`arrow_receiver_capture_under_eval`:
+body-lex-distinct, plain body eval, destructuring/rest/element-then-rest
+parameter var environments).
+
+Before → after (`compile-diff <subtree>`, oracle pin `48ee02d8`):
+
+| subtree | divergent before | divergent after | accept-disagree |
+| --- | ---: | ---: | ---: |
+| `expressions/arrow-function` | 6 | **1** | 0 |
+| `eval-code` (arrow files) | 3 | **0** | 4 (pre-existing, slice 3) |
+| `arguments-object` | 1 | 1 | 0 |
+
+The `eval-code` arrow trio (`direct/{new.target,super-call,super-prop}-arrow.js`)
+closed outright (3 → 0); `expressions/arrow-function` dropped 6 → 1. Curated
+corpora stay **1711/1711**, `statements/class` + `expressions/class` stay
+**divergent=0**, `cargo test --workspace -- --test-threads=1` **EXIT=0**,
+`#![forbid(unsafe_code)]` intact.
+
+**Remaining fix5 1/5 residual — a DISTINCT mechanism (2 files, attributed).**
+`expressions/arrow-function/arrow/binding-tests-3.js` (`function foo(){ return
+()=>eval("this"); }`) and `arguments-object/10.5-1-s.js` (`(function fun(){
+eval("arguments = 10"); })(30)`) are **not** the receiver-capture-under-eval
+family. They are the **enclosing-function closure-reification** fold: the
+regular function that *encloses* a receiver/name-capturing arrow (or an
+`eval`-poisoned named function expression) must reify its `this`/self-name into
+a closure cell (`NEW_CLOSURE` + `STORE_1`) so the inner capture resolves. In
+binding-tests-3 endor omits `foo`'s `reserve`/`new_closure`/`store_1` for the
+captured `this` (body 71 → 61 bytes); in 10.5-1-s endor emits only one of the
+two `STORE_1`s XS emits in `fun`'s `fxScopeCodeStore` (the `current`/self-name
+closure slot 1 is missing, len 135 → 133). Both need a scoper change to mark
+the enclosing function's `this`/self-name declaration as `USE_CLOSURE` when an
+inner arrow/eval captures it — deferred as a separate, narrower sub-fold.
+
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
 `SyntaxError: missing ;`); endor rejects it identically (`missing ;`) at

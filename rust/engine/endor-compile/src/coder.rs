@@ -3034,16 +3034,33 @@ impl Coder<'_> {
                 count += 1;
             }
         }
-        // An arrow that transitively uses `this`/`super`/`target` also
-        // retrieves the captured receiver and target — and always emits the
-        // `RETRIEVE_1`, even for a zero closure count.
-        if self.tree.scopes[scope].arrow_default {
+        // An arrow that transitively uses `this`/`super`/`target` (the
+        // `mxDefaultFlag` half) OR whose own scope is direct-`eval`-poisoned
+        // (the `mxEvalFlag` half) retrieves the captured receiver and target —
+        // and always emits the `RETRIEVE_1`, even for a zero closure count.
+        // XS: `(node->flags & mxArrowFlag) && ((node->flags & mxDefaultFlag) ||
+        // (self->flags & mxEvalFlag))`.
+        if self.arrow_receiver_capture(scope) {
             self.add_index(0, XS_CODE_RETRIEVE_1, count);
             self.add_byte(0, XS_CODE_RETRIEVE_TARGET);
             self.add_byte(0, XS_CODE_RETRIEVE_THIS);
         } else if count != 0 {
             self.add_index(0, XS_CODE_RETRIEVE_1, count);
         }
+    }
+
+    /// The XS receiver-capture condition shared by `fxScopeCodeRetrieve`
+    /// (`RETRIEVE_TARGET`/`RETRIEVE_THIS`) and `fxScopeCodeStore`
+    /// (`STORE_ARROW`): the scope's node is an arrow AND it either transitively
+    /// uses `this`/`super`/`target` (`mxDefaultFlag`, tracked as
+    /// `arrow_default`) or its own scope is `eval`-poisoned (`mxEvalFlag`). The
+    /// eval half is why a bare `arrow_default` check is insufficient: a
+    /// `() => { let x; eval(...); }` arrow captures no receiver by use, yet a
+    /// direct eval in a body with a distinct lexical environment still forces
+    /// the receiver into the arrow's environment.
+    fn arrow_receiver_capture(&self, scope: usize) -> bool {
+        let sc = &self.tree.scopes[scope];
+        sc.is_arrow && (sc.arrow_default || sc.flags & crate::scoper::SCOPE_EVAL != 0)
     }
 
     /// `fxScopeCodeStore` — store captured closures back. Runs in the
@@ -3067,8 +3084,9 @@ impl Coder<'_> {
             stored.insert((ascope, aid));
         }
         // Store the captured receiver/target into a `this`/`super`/`target`
-        // arrow's environment.
-        if self.tree.scopes[scope].arrow_default {
+        // (or `eval`-poisoned) arrow's environment — same condition as the
+        // `RETRIEVE_TARGET`/`RETRIEVE_THIS` retrieve above.
+        if self.arrow_receiver_capture(scope) {
             self.add_byte(0, XS_CODE_STORE_ARROW);
         }
         // An **eval** function captures its entire enclosing lexical frame:

@@ -203,6 +203,12 @@ pub struct Scope {
     /// `mxDefaultFlag` was propagated here by [`fx_scope_arrow`] — an
     /// arrow function that transitively uses `this` / `super` / `target`.
     pub arrow_default: bool,
+    /// Whether this scope's creating node carries `mxArrowFlag`. Read by the
+    /// coder's `fxScopeCodeRetrieve`/`fxScopeCodeStore` mirror, whose
+    /// receiver-capture (`RETRIEVE_TARGET`/`RETRIEVE_THIS`/`STORE_ARROW`)
+    /// condition is `arrow && (default || eval)`; the eval half needs the
+    /// bare arrow-ness, not just the `arrow_default` conjunction.
+    pub is_arrow: bool,
     /// Whether this scope's node carries the **direct-`eval`** hoist extra
     /// (`hoist_call`'s `add_extra`), as opposed to a `with`-poisoned scope
     /// (which sets [`SCOPE_EVAL`] on `flags` but leaves the node clean). The
@@ -228,6 +234,7 @@ impl Scope {
             define_count: 0,
             disposable_count: 0,
             arrow_default: false,
+            is_arrow: node_base_flags & flags::ARROW != 0,
             direct_eval: false,
         }
     }

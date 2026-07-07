@@ -1898,3 +1898,30 @@ fn module_default_and_reexport() {
         "let n = 0; export function inc() { n = n + 1; } export function val() { return n; }",
     ]);
 }
+
+// Arrow **receiver capture under direct `eval`** — the fix5 arrow scope-slot
+// fold. `fxScopeCodeRetrieve`/`fxScopeCodeStore` emit
+// `RETRIEVE_TARGET`/`RETRIEVE_THIS` (into the body) and `STORE_ARROW` (in the
+// enclosing frame) when the scope's node is an arrow AND either it
+// transitively uses `this`/`super`/`target` (`mxDefaultFlag`) OR its own
+// scope is `eval`-poisoned (`mxEvalFlag`). The eval half is the divergence
+// this fixture locks: an arrow with a body direct `eval` (a distinct lexical
+// environment from a `let`, or a destructuring/rest parameter var
+// environment) captures the receiver even when nothing lexically names
+// `this`. Pre-fix endor keyed only on `arrow_default` and emitted the shorter
+// stream (missing the retrieve triple + store_arrow).
+#[test]
+fn arrow_receiver_capture_under_eval() {
+    assert_identical(&[
+        // body lexical env distinct from the var env (a `let`) + direct eval
+        "var a = () => { let x; eval('var x;'); };",
+        // plain arrow body direct eval, no lexical declaration
+        "var a = () => eval('1');",
+        // destructuring parameter (a separate parameter var environment) + eval
+        "var f = ([a]) => { eval('a'); };",
+        // rest parameter var environment + eval
+        "var f = (...b) => { eval('b'); };",
+        // element-then-rest destructuring param + eval
+        "var f = ([a], ...b) => { eval('a'); };",
+    ]);
+}
