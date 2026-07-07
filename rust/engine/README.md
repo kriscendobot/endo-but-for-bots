@@ -1401,11 +1401,16 @@ byte-identical vs the oracle:
   `this` (`SET_THIS`). Covers the synthesized default constructor
   (`constructor(...args){super(...args)}`), explicit constructors, and
   static/instance members.
+- Slice 46 — **anonymous-class name inference**: an anonymous `class`
+  assigned to a simple identifier takes that name via its **constructor's**
+  creation operand (XS emits no `NAME` op on the class value); `code_class`
+  already leaves `pending_name` for the constructor, so only the
+  `set_pending_name` guard needed lifting.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 class **fields** and **private** members, static blocks, and the
 instance-field-init call after `super(...)` — these need more class-hoisting
 scoper work (the class scope's per-member `CONST_CLOSURE` declares);
-anonymous-class name inference; `using` heads (a parser gap); and
+`using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
