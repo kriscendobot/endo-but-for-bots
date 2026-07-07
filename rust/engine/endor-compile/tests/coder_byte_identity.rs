@@ -222,6 +222,31 @@ fn mapped_arguments_parameter_named_arguments() {
     ]);
 }
 
+// A **nested** function containing a direct `eval` captures its ENTIRE
+// enclosing lexical frame, not just the names it lexically reads:
+// `fxScopeCodeStore`'s `fxScopeCodeStoreAll` walk stores every already-slotted
+// enclosing declaration into the eval function's environment (so a name the
+// `eval` reads at runtime resolves to the live slot). The store-all walk stops
+// at the nearest enclosing function/module and skips `var`/`Define` declares in
+// a sloppy `Eval`/`Program` scope (they bind to null). Class γ: the residual
+// `expressions/assignment/S11.13.1_A6_T1,T2` divergence.
+#[test]
+fn nested_function_eval_captures_enclosing_frame() {
+    assert_identical(&[
+        // sloppy: the inner IIFE captures both enclosing `var`s (`a`, `b`) via
+        // store-all even though it only lexically reads `a`; the outer function
+        // is itself eval-poisoned but its own store-all over the eval program
+        // scope finds only null-binding `var`s and emits nothing.
+        "function outer() { var a = 1; var b = 2; var c = (function() { a = (eval(\"var a;\"), 1); return a + b; })(); return c; }",
+        // the T1/T2 shape: `eval(\"var x;\")` in a sequence inside the IIFE.
+        "function testAssignment() { var x = 0; var innerX = (function() { x = (eval(\"var x;\"), 1); return x; })(); return innerX; }",
+        // strict: the inner eval function captures the enclosing `let`.
+        "'use strict'; function outer() { let a = 1; return (function() { eval(\"a\"); return a; })(); }",
+        // deeper nesting: two enclosing frames captured through the walk.
+        "function a() { var x = 1; function b() { var y = 2; return (function() { eval(\"x\"); return x + y; })(); } return b(); }",
+    ]);
+}
+
 #[test]
 fn literals_and_operators() {
     assert_identical(&[

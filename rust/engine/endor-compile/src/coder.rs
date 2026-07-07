@@ -442,6 +442,14 @@ impl<'a> Coder<'a> {
             .expect("declaration index assigned before access")
     }
 
+    /// The frame slot a declaration was assigned, or `None` if it never got
+    /// one. `fxScopeCodeStoreAll` keys on `node->declaration` being non-null
+    /// (the declare was bound and slotted); a declare with an assigned frame
+    /// index is exactly that, so this is the store-all eligibility test.
+    fn declare_index_opt(&self, scope: usize, id: u32) -> Option<i32> {
+        self.decl_index.get(&(scope, id)).copied()
+    }
+
     /// Pre-intern every source symbol in AST pre-order, mirroring XS's
     /// lex-time interning so the atom table's insertion order (and thus the
     /// bucket-list order that decides within-bucket IDs) matches. Runs once
@@ -2986,27 +2994,105 @@ impl Coder<'_> {
         }
     }
 
-    /// `fxScopeCodeStore` — store captured closures back. No-op in this
-    /// slice (no use-closure declares, no arrow-default, no eval body).
+    /// `fxScopeCodeStore` — store captured closures back. Runs in the
+    /// enclosing scope's frame, where every target slot is already assigned.
     fn scope_code_store(&mut self, scope: usize) {
         // For each captured variable, `STORE_1` the *defining* scope's slot
         // (the alias's target) into the freshly created function's
-        // environment. Runs in the enclosing scope's frame, where the
-        // target index is already assigned.
+        // environment. XS also marks each stored target with `mxEvalFlag`
+        // (`node->declaration->flags |= flags`) so the follow-on
+        // `fxScopeCodeStoreAll` walk skips it; we track the same set here.
         let aliases: Vec<(usize, u32)> = self.tree.scopes[scope]
             .declares
             .iter()
             .filter(|d| d.flags & crate::scoper::dflags::USE_CLOSURE != 0)
             .map(|d| d.alias.expect("use-closure declare has an alias target"))
             .collect();
+        let mut stored: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
         for (ascope, aid) in aliases {
             let index = self.declare_index(ascope, aid);
             self.add_index(0, XS_CODE_STORE_1, index);
+            stored.insert((ascope, aid));
         }
         // Store the captured receiver/target into a `this`/`super`/`target`
         // arrow's environment.
         if self.tree.scopes[scope].arrow_default {
             self.add_byte(0, XS_CODE_STORE_ARROW);
+        }
+        // An **eval** function captures its entire enclosing lexical frame:
+        // `fxScopeCodeStoreAll` walks the enclosing scopes up to (and
+        // including) the nearest function/module, storing every already-slotted
+        // declaration that was not already stored as a use-closure alias, so a
+        // name the direct `eval` reads at runtime resolves to the live slot.
+        if self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0 {
+            if let Some(parent) = self.tree.scopes[scope].parent {
+                self.scope_code_store_all(parent, &mut stored);
+            }
+        }
+    }
+
+    /// Whether a declaration binds to itself (`node->declaration != NULL`
+    /// after `fxScopeLookup`), the store-all eligibility gate. A `var`/`Define`
+    /// in a `Program` scope, or in a **sloppy** `Eval` scope, resolves to null
+    /// (eval-created names may shadow it), so it has no slot to capture; every
+    /// other declare binds to its own slot.
+    fn declare_has_declaration(&self, scope: usize, token: Token) -> bool {
+        let sc = &self.tree.scopes[scope];
+        let strict = sc.flags & crate::ast::flags::STRICT != 0;
+        match sc.token {
+            Token::Program => !matches!(token, Token::Var | Token::Define),
+            Token::Eval => strict || !matches!(token, Token::Var | Token::Define),
+            _ => true,
+        }
+    }
+
+    /// `fxScopeCodeStoreAll` — the enclosing-frame capture an eval function
+    /// performs. Walk outward from `scope`; in each scope store every declare
+    /// that (a) is not itself a use-closure alias, (b) has an assigned frame
+    /// slot (`node->declaration` in XS), and (c) was not already stored as a
+    /// use-closure target of this function (the `stored` set stands in for
+    /// XS's transient `mxEvalFlag` mark, cleared on the walk). Break at a
+    /// `with` scope (its object shadows the frame) and stop after the first
+    /// function/module scope.
+    fn scope_code_store_all(
+        &mut self,
+        scope: usize,
+        stored: &mut std::collections::HashSet<(usize, u32)>,
+    ) {
+        let mut cursor = Some(scope);
+        while let Some(si) = cursor {
+            if self.tree.scopes[si].token == Token::With {
+                break;
+            }
+            let declares: Vec<(u32, u32, Token)> = self.tree.scopes[si]
+                .declares
+                .iter()
+                .map(|d| (d.id, d.flags, d.token))
+                .collect();
+            for (id, flags, token) in declares {
+                if stored.remove(&(si, id)) {
+                    // Already stored as a use-closure alias target — XS clears
+                    // the transient eval mark and moves on.
+                    continue;
+                }
+                if flags & crate::scoper::dflags::USE_CLOSURE != 0 {
+                    continue;
+                }
+                // `node->declaration` must be non-null: a `var`/`Define` in a
+                // sloppy `Eval`/`Program` scope binds to nothing (`fxScopeLookup`
+                // returns null there), so it has no frame slot to store.
+                if !self.declare_has_declaration(si, token) {
+                    continue;
+                }
+                if let Some(index) = self.declare_index_opt(si, id) {
+                    self.add_index(0, XS_CODE_STORE_1, index);
+                }
+            }
+            let token = self.tree.scopes[si].token;
+            if matches!(token, Token::Function | Token::Module) {
+                break;
+            }
+            cursor = self.tree.scopes[si].parent;
         }
     }
 
