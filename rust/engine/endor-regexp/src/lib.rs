@@ -40,6 +40,7 @@ mod opcode;
 
 pub mod compile;
 pub mod matcher;
+pub mod unicode;
 
 pub use compile::{compile, CompileError, Program};
 pub use matcher::{match_regexp, MatchOutcome};
@@ -150,5 +151,76 @@ mod tests {
             Err(CompileError::Unsupported(_)) => {}
             other => panic!("expected named Unsupported, got {:?}", other),
         }
+    }
+
+    // ---- compile-time accept/reject validation (the lexer's verdict) ----
+    //
+    // The endor lexer rejects a regexp literal exactly when `compile`
+    // returns `Syntax`; `Ok` and `Unsupported` both stand as accept (an
+    // unported matcher surface whose syntax the oracle accepts). These
+    // fixtures lock that verdict against the C-XS oracle for each class the
+    // `language/literals/regexp` slice closed.
+
+    /// The lexer's accept/reject verdict for a literal.
+    fn accepts(pattern: &str, flags: &str) -> bool {
+        !matches!(compile(pattern, flags), Err(CompileError::Syntax(_)))
+    }
+
+    #[test]
+    fn reject_named_group_syntax() {
+        // Ill-formed group names are SyntaxErrors (mxInvalidName).
+        assert!(!accepts("(?<>a)", ""), "empty group name");
+        assert!(!accepts("(?<42a>a)", ""), "name starts with a digit");
+        assert!(!accepts("(?<:a>a)", ""), "punctuator-starting name");
+        assert!(!accepts("(?<a:>a)", ""), "punctuator within name");
+        assert!(!accepts("(?<aa)", ""), "unterminated groupspecifier");
+        assert!(!accepts("(?<a\\>.)", ""), "escaped `>` is not id-continue");
+        assert!(!accepts("(?<\u{2764}>a)", ""), "non-id-start (BMP symbol)");
+        assert!(!accepts("(?<a\\uD801>.)", ""), "lone surrogate in name");
+        assert!(!accepts("(?<a\\u{10FFFF}>.)", ""), "astral non-id in name");
+    }
+
+    #[test]
+    fn reject_duplicate_and_dangling_names() {
+        assert!(!accepts("(?<a>a)(?<a>a)", ""), "duplicate group name");
+        assert!(!accepts("(?<a>.)\\k<b>", ""), "dangling \\k reference");
+        assert!(!accepts("(?<a>a)\\k<ab>", ""), "dangling \\k reference (2)");
+        assert!(!accepts("\\k<a>(?<b>x)", ""), "forward dangling reference");
+        assert!(!accepts("(?<a>.)\\k<a", ""), "incomplete \\k name");
+        assert!(!accepts("\\k<a>", "u"), "\\k with no group (u)");
+    }
+
+    #[test]
+    fn accept_wellformed_named_group() {
+        // A syntactically valid named group / reference is accepted at
+        // compile time (its matcher is a named Unsupported).
+        assert!(accepts("(?<a>.)\\k<a>", ""), "matched named backreference");
+        assert!(accepts("(?<name>x)", ""), "plain named group");
+        // Non-`u` `\k` without a named group is an identity escape, not a
+        // reference — accepted.
+        assert!(accepts("\\k<a>", ""), "non-u \\k without group is literal");
+    }
+
+    #[test]
+    fn reject_u_mode_syntax() {
+        assert!(!accepts("{", "u"), "bare open-brace under u");
+        assert!(!accepts("\\M", "u"), "identity escape under u");
+        assert!(!accepts("(?<a>\\a)", "u"), "identity escape in named group (u)");
+        assert!(!accepts("\\u{110000}", "u"), "u code point out of range");
+        assert!(!accepts("\\u{1,}", "u"), "u-escape non-hex");
+        assert!(!accepts("\\u{1F_639}", "u"), "u-escape separator");
+        assert!(!accepts("\\1", "u"), "\\1 backref with no group (u)");
+        assert!(!accepts(".(?=.)?", "u"), "quantified lookahead (u)");
+        // Valid u-mode escapes still stand (matcher is Unsupported).
+        assert!(accepts("\\u{1F600}", "u"), "valid astral u-escape");
+    }
+
+    #[test]
+    fn reject_non_u_assertion_and_flag_errors() {
+        assert!(!accepts(".(?<=.)?", ""), "quantified lookbehind");
+        assert!(!accepts(".", "gig"), "duplicate flag");
+        assert!(!accepts(".", "G"), "invalid flag");
+        assert!(!accepts("?", ""), "nothing to repeat");
+        assert!(!accepts("{2}", ""), "quantifier with no atom");
     }
 }

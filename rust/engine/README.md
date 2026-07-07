@@ -1555,7 +1555,25 @@ These are the remaining child-6/7 surface.
 > initializer is a SyntaxError raised at code time by `fxDeclareNodeCode`
 > (endor's `code_declare` records it on a new coder error field that
 > `compile`/`compile_module` surface), so a `for (const x of/in …)` iteration
-> binding stays exempt. The fix2/fix3/fix4/fix5
+> binding stays exempt. **fix5 4/5 closed the regexp-literal validation gap**
+> (accept/reject parity, no matcher change): **`literals/regexp`** (whole dir,
+> 82 `accept-disagree` → **0**). XS validates every regexp literal at COMPILE
+> time — its lexer runs `fxCompileRegExp` (`fxGetNextRegExp`), so a
+> syntactically invalid pattern or flag set is a parse-time SyntaxError. Endor
+> now mirrors that: `Lexer::read_regexp` runs the ported `endor_regexp::compile`
+> parser and rejects the literal when it returns a genuine `Syntax` error,
+> while an `Unsupported` surface (a matcher feature — the `u`/`v` flag, named
+> captures, `\p`, inline modifiers, astral — whose SYNTAX the oracle accepts)
+> stands as accept, so accept/reject agrees without running an unported
+> matcher. The parser was extended to fully VALIDATE those surfaces before
+> bailing `Unsupported`: named captures `(?<name>…)` and `\k<name>` (XS's
+> two-pass `XS_REGEXP_N` re-parse, `fxCaptureNameParse` name validation with
+> `ID_Start`/`ID_Continue` + `\u`-escaped/astral names, `mxDuplicateCapture`,
+> and dangling-reference `mxInvalidReferenceName`), and the `u`/`v` grammar
+> (bare `{`/`]`/`}`, identity-escape and truncated `\x`/`\u{…}` rejection,
+> quantified assertions). The `ID_Start`/`ID_Continue` tables moved to the leaf
+> `endor-regexp::unicode` (single source of truth, re-exported by
+> `endor-compile`). The fix2/fix3/fix4/fix5
 > blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix

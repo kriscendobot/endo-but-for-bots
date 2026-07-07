@@ -117,6 +117,23 @@ struct Compiler {
     size: i64, // parser->size, in bytes
     nodes: Vec<Node>,
     code: Vec<i32>,
+    /// A pin feature whose SYNTAX this parser validates but whose matcher
+    /// code it does not emit yet (u/v flag, named captures, `\p`, inline
+    /// modifiers, astral). Set during the parse; when set, [`compile`]
+    /// returns it as `Unsupported` *after* the full accept/reject decision,
+    /// so a syntactically invalid such pattern is still a `Syntax` error
+    /// (the lexer needs the accept/reject verdict; the matcher does not run).
+    unsupported: Option<&'static str>,
+    /// Defined named-capture group names, in first-seen order — the
+    /// `firstCaptureName` chain. A repeat is `mxDuplicateCapture`.
+    capture_names: Vec<String>,
+    /// `\k<name>` references collected during the parse; each must resolve
+    /// to a defined name (`fxCaptureNameGet`, else `mxInvalidReferenceName`).
+    named_refs: Vec<String>,
+    /// Whether a named-capture *group* was seen — XS's `XS_REGEXP_N`, which
+    /// (in the non-`UV` path) forces the second parse where `\k` becomes a
+    /// named backreference.
+    saw_named_group: bool,
 }
 
 type PResult<T> = Result<T, CompileError>;
@@ -142,14 +159,6 @@ pub fn compile(pattern: &str, flags: &str) -> PResult<Program> {
             _ => return Err(CompileError::Syntax("invalid flags".into())),
         }
     }
-    // Honest-skip the flags whose match/compile machinery (CESU-8
-    // surrogate walk, unicode property sets, V-mode string sets) is a
-    // named later increment. The `i` flag's non-`u`/`v` case folding IS
-    // ported (crate::charcase).
-    if parser_flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
-        return Err(CompileError::Unsupported("u/v flag (unicode)"));
-    }
-
     let mut pattern_bytes = pattern.as_bytes().to_vec();
     pattern_bytes.push(0);
     let mut c = Compiler {
@@ -164,16 +173,40 @@ pub fn compile(pattern: &str, flags: &str) -> PResult<Program> {
         size: 0,
         nodes: Vec::new(),
         code: Vec::new(),
+        unsupported: None,
+        capture_names: Vec::new(),
+        named_refs: Vec::new(),
+        saw_named_group: false,
     };
+    // The `u`/`v` flags' match/compile machinery (CESU-8 surrogate walk,
+    // unicode property sets, V-mode string sets) is a named later
+    // increment, but the SYNTAX they accept/reject is validated here so the
+    // compile-time verdict matches the oracle: parse under the flag, then
+    // surface the unsupported matcher at the end.
+    if parser_flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
+        c.unsupported = Some("u/v flag (unicode)");
+    }
     c.compile_pattern()
 }
 
 impl Compiler {
     fn compile_pattern(&mut self) -> PResult<Program> {
         self.next()?;
-        let term = self.disjunction_parse(C_EOF)?;
-        // Named captures would set XS_REGEXP_N and force a re-parse; this
-        // increment honest-skips them before reaching here.
+        let mut term = self.disjunction_parse(C_EOF)?;
+        // `fxCompileRegExp`: a named-capture *group* sets XS_REGEXP_N, and
+        // in the non-`UV` path that forces a full second parse where `\k`
+        // is now read as a named backreference (it was an identity escape
+        // in the first pass). Re-run the parse with N latched so the `\k`
+        // atoms and the name/reference tables are collected under the
+        // final grammar; the accept/reject verdict comes from this pass.
+        if self.saw_named_group {
+            self.flags |= XS_REGEXP_N;
+            if self.flags & (XS_REGEXP_U | XS_REGEXP_V) == 0 {
+                self.reset_for_reparse();
+                self.next()?;
+                term = self.disjunction_parse(C_EOF)?;
+            }
+        }
         self.capture_index += 1;
         // Validate numeric backreferences now that the final capture count
         // is known — `fxCaptureReferenceMeasure` errors on an out-of-range
@@ -185,6 +218,23 @@ impl Compiler {
                     return Err(self.error("invalid reference number"));
                 }
             }
+        }
+        // `\k<name>` references resolve against the defined group names
+        // (`fxCaptureNameGet`); an unresolved name is `mxInvalidReferenceName`
+        // (a dangling groupname — a `SyntaxError`).
+        for name in &self.named_refs {
+            if !self.capture_names.iter().any(|n| n == name) {
+                return Err(self.error("invalid reference name"));
+            }
+        }
+        // A syntactically valid pattern that uses a matcher surface this
+        // stage has not ported (u/v flag, named captures, `\p`, inline
+        // modifiers, astral) is accepted by the oracle at parse time; the
+        // lexer treats this `Unsupported` as accept. Bail here, AFTER the
+        // full accept/reject decision, so an invalid such pattern is still
+        // a `Syntax` error above.
+        if let Some(msg) = self.unsupported {
+            return Err(CompileError::Unsupported(msg));
         }
         // parser->size = (5 + nameIndex) * sizeof(txInteger).
         self.size = (5 + self.name_index as i64) * 4;
@@ -232,7 +282,13 @@ impl Compiler {
         let (ch, p) = utf8_decode(&self.pattern, self.offset);
         if ch != C_EOF {
             self.offset = p;
-            if ch > 0xFFFF {
+            // XS (`fxPatternParserNext`) splits an astral code point into
+            // surrogates only outside `UV`/name context; inside `UV` or a
+            // group `<name>` it keeps the whole scalar. Endor has not ported
+            // the surrogate-split matcher path, so it stays a named
+            // Unsupported there, but a name/`UV` scalar is delivered so the
+            // group-name `ID_Start`/`ID_Continue` check can rule on it.
+            if ch > 0xFFFF && self.flags & (XS_REGEXP_U | XS_REGEXP_V | XS_REGEXP_NAME) == 0 {
                 return Err(CompileError::Unsupported("astral code point in pattern"));
             }
             self.character = ch;
@@ -255,6 +311,145 @@ impl Compiler {
 
     fn error(&self, msg: &str) -> CompileError {
         CompileError::Syntax(msg.to_string())
+    }
+
+    /// Reset the parse cursor and per-parse tables for `fxCompileRegExp`'s
+    /// second pass (the non-`UV` named-capture re-parse). `flags` (now
+    /// carrying `XS_REGEXP_N`) and `unsupported` are kept.
+    fn reset_for_reparse(&mut self) {
+        self.offset = 0;
+        self.character = 0;
+        self.capture_index = 0;
+        self.name_index = 0;
+        self.assertion_index = 0;
+        self.quantifier_index = 0;
+        self.nodes.clear();
+        self.capture_names.clear();
+        self.named_refs.clear();
+        self.saw_named_group = false;
+    }
+
+    /// `fxCaptureNameParse`: read a `<name>` up to and including `>`,
+    /// validating each code point as `ID_Start` / `ID_Continue` (with `\u`
+    /// escapes resolved by [`Self::capture_name_escape`]). Returns the
+    /// decoded name; an ill-formed name is `mxInvalidName` (a `SyntaxError`).
+    fn capture_name_parse(&mut self) -> PResult<String> {
+        let mut name = String::new();
+        if self.character == b'\\' as i64 {
+            self.capture_name_escape()?;
+        }
+        if is_ident_scalar(self.character, true) {
+            push_name_char(&mut name, self.character);
+            self.next()?;
+        } else {
+            return Err(self.error("invalid name"));
+        }
+        while self.character != b'>' as i64 {
+            if self.character == C_EOF {
+                return Err(self.error("invalid name"));
+            }
+            if self.character == b'\\' as i64 {
+                self.capture_name_escape()?;
+            }
+            if is_ident_scalar(self.character, false) {
+                push_name_char(&mut name, self.character);
+                self.next()?;
+            } else {
+                return Err(self.error("invalid name"));
+            }
+        }
+        // XS clears the transient NAME bit and consumes the '>'.
+        self.flags &= !XS_REGEXP_NAME;
+        self.next()?;
+        Ok(name)
+    }
+
+    /// `fxCaptureNameEscape`: a `\u` escape inside a group name, always in
+    /// the unicode (`braces=1, separator='\\'`) form regardless of the
+    /// pattern flags. Sets `self.character` to the decoded scalar.
+    fn capture_name_escape(&mut self) -> PResult<()> {
+        self.next()?;
+        if self.character != b'u' as i64 {
+            return Err(self.error("invalid name"));
+        }
+        match self.parse_unicode_escape_uform(self.offset) {
+            Some((ch, off)) => {
+                self.character = ch;
+                self.offset = off;
+                Ok(())
+            }
+            None => Err(self.error("invalid name")),
+        }
+    }
+
+    /// `fxParseUnicodeEscape` with `braces=1, separator='\\'`: `\u{H+}`
+    /// (`H+` ≤ 0x10FFFF) or `\uHHHH`, the latter folding a following
+    /// `\uHHHH` low surrogate into an astral scalar. `offset` points just
+    /// past the `u`; returns `(scalar, offset')` or `None` on a malformed
+    /// escape.
+    fn parse_unicode_escape_uform(&self, offset: usize) -> Option<(i64, usize)> {
+        let mut p = offset;
+        let mut c = self.read8(p);
+        p += 1;
+        let mut value: u32 = 0;
+        if c == b'{' {
+            c = self.read8(p);
+            p += 1;
+            let mut i = 0;
+            while value < 0x0011_0000 {
+                if let Some(d) = hex_digit(c) {
+                    value = value * 16 + d;
+                    c = self.read8(p);
+                    p += 1;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if c == b'}' && i > 0 && value < 0x0011_0000 {
+                return Some((value as i64, p));
+            }
+            return None;
+        }
+        // Four-hex form.
+        value = value * 16 + hex_digit(c)?;
+        c = self.read8(p);
+        p += 1;
+        value = value * 16 + hex_digit(c)?;
+        c = self.read8(p);
+        p += 1;
+        value = value * 16 + hex_digit(c)?;
+        c = self.read8(p);
+        p += 1;
+        value = value * 16 + hex_digit(c)?;
+        let mut character = value as i64;
+        let mut end = p;
+        c = self.read8(p);
+        p += 1;
+        if c != 0 && c == b'\\' && (0xD800..=0xDBFF).contains(&value) {
+            c = self.read8(p);
+            p += 1;
+            if c == b'u' {
+                let mut other: u32 = 0;
+                let mut ok = true;
+                for _ in 0..4 {
+                    c = self.read8(p);
+                    p += 1;
+                    match hex_digit(c) {
+                        Some(d) => other = other * 16 + d,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && (0xDC00..=0xDFFF).contains(&other) {
+                    character = (0x0001_0000 + ((value & 0x03FF) << 10) + (other & 0x03FF)) as i64;
+                    end = p;
+                }
+            }
+        }
+        Some((character, end))
     }
 
     fn add_node(&mut self, kind: Kind) -> NodeId {
@@ -544,11 +739,25 @@ impl Compiler {
                 if let Some((ch, off)) = self.parse_hex_escape(self.offset) {
                     self.character = ch;
                     self.offset = off;
+                } else if self.flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
+                    // UV: a truncated `\x` is a syntax error (non-UV: an
+                    // identity escape 'x').
+                    return Err(self.error("invalid escape"));
                 }
-                // Non-UV: a bad \x is an identity escape ('x'); nothing to do.
             }
             c if c == b'u' as i64 => {
-                if let Some((ch, off)) = self.parse_unicode_escape(self.offset) {
+                if self.flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
+                    // UV: the unicode form (`\u{H+}` or `\uHHHH`[+ low
+                    // surrogate]); a malformed escape is a syntax error, not
+                    // an identity escape.
+                    match self.parse_unicode_escape_uform(self.offset) {
+                        Some((ch, off)) => {
+                            self.character = ch;
+                            self.offset = off;
+                        }
+                        None => return Err(self.error("invalid escape")),
+                    }
+                } else if let Some((ch, off)) = self.parse_unicode_escape(self.offset) {
                     self.character = ch;
                     self.offset = off;
                 }
@@ -563,6 +772,10 @@ impl Compiler {
                         self.character = 0x08;
                     }
                     // The remaining class punctuators are identity escapes.
+                } else if self.flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
+                    // UV: only SyntaxCharacter / `/` identity escapes are
+                    // legal; any other `\c` is `mxInvalidEscape`.
+                    return Err(self.error("invalid escape"));
                 }
                 // Non-UV: any other escape is an identity escape.
             }
@@ -835,10 +1048,20 @@ impl Compiler {
             // unreachable because the while-guard covers `character`, but
             // the '|' case is an explicit break in C.
             Err(self.error("invalid character"))
+        } else if (ch == b']' as i64 || ch == b'}' as i64)
+            && self.flags & (XS_REGEXP_U | XS_REGEXP_V) != 0
+        {
+            // UV: a bare `]` or `}` is a syntax error (non-UV: an ordinary
+            // character, Annex B).
+            Err(self.error("invalid character"))
         } else {
             // Ordinary character (with the Annex-B `{` non-quantifier
-            // tolerance the non-`UV` path allows).
+            // tolerance the non-`UV` path allows; under UV a `{` that is not
+            // a valid quantifier is itself a syntax error).
             if ch == b'{' as i64 {
+                if self.flags & (XS_REGEXP_U | XS_REGEXP_V) != 0 {
+                    return Err(self.error("invalid character"));
+                }
                 if let Some(_) = self.quantifier_parse_brace()? {
                     return Err(self.error("invalid quantifier"));
                 }
@@ -860,7 +1083,23 @@ impl Compiler {
             self.next()?;
             Ok(self.add_node(Kind::WordContinue))
         } else if self.character == b'k' as i64 && self.flags & (XS_REGEXP_U | XS_REGEXP_V | XS_REGEXP_N) != 0 {
-            Err(CompileError::Unsupported("\\k<name> named backreference"))
+            // `\k<name>` named backreference (only when the pattern is `u`/`v`
+            // or contains a named group — `XS_REGEXP_N`). Require `<`,
+            // validate the name syntax, and record the reference for the
+            // post-parse existence check (`fxCaptureReferenceMeasure` →
+            // `mxInvalidReferenceName` on a dangling name). Matcher codegen
+            // for a named reference is unported.
+            self.next()?;
+            if self.character != b'<' as i64 {
+                return Err(self.error("invalid name"));
+            }
+            self.flags |= XS_REGEXP_NAME;
+            self.next()?;
+            let name = self.capture_name_parse()?;
+            self.named_refs.push(name);
+            self.unsupported.get_or_insert("\\k<name> named backreference");
+            let node = self.add_node(Kind::CaptureReference { capture_index: -1 });
+            self.quantifier_parse(node, current_index)
         } else if (b'1' as i64..=b'9' as i64).contains(&self.character) {
             let mut value: u32 = (self.character - b'0' as i64) as u32;
             self.next()?;
@@ -903,6 +1142,14 @@ impl Compiler {
                 self.next()?;
                 self.quantifier_parse(current, current_index)
             } else if self.character == b'<' as i64 {
+                // Peek past '<': `=`/`!` are lookbehind assertions; anything
+                // else begins a group `<name>`, so latch XS_REGEXP_NAME
+                // BEFORE reading the first name char, matching XS's astral
+                // handling during a name.
+                let peek = self.read8(self.offset);
+                if peek != b'=' && peek != b'!' {
+                    self.flags |= XS_REGEXP_NAME;
+                }
                 self.next()?;
                 if self.character == b'=' as i64 {
                     self.next()?;
@@ -919,7 +1166,26 @@ impl Compiler {
                     self.assertion_index += 1;
                     Ok(self.add_node(Kind::Assertion { term, not: true, direction: -1, assertion_index: ai }))
                 } else {
-                    Err(CompileError::Unsupported("(?<name>) named capture"))
+                    // `(?<name>…)` named capture. Validate the name
+                    // (`fxCaptureNameParse`) and register it — a repeat is
+                    // `mxDuplicateCapture` — then parse the body as a normal
+                    // capturing group. The matcher does not emit named
+                    // captures yet, so the pattern is `Unsupported`, but the
+                    // full accept/reject verdict is decided here first.
+                    self.saw_named_group = true;
+                    self.unsupported.get_or_insert("(?<name>) named capture");
+                    self.capture_index += 1;
+                    current_index += 1;
+                    let name = self.capture_name_parse()?;
+                    if self.capture_names.iter().any(|n| n == &name) {
+                        return Err(self.error("duplicate capture"));
+                    }
+                    self.capture_names.push(name);
+                    self.name_index += 1;
+                    let term = self.disjunction_parse(b')' as i64)?;
+                    self.next()?;
+                    let capture = self.add_node(Kind::Capture { term, capture_index: current_index });
+                    self.quantifier_parse(capture, current_index - 1)
                 }
             } else {
                 Err(CompileError::Unsupported("(?flags:) inline modifiers"))
@@ -1184,6 +1450,29 @@ fn hex_digit(c: u8) -> Option<u32> {
         b'a'..=b'f' => Some((c - b'a' + 10) as u32),
         b'A'..=b'F' => Some((c - b'A' + 10) as u32),
         _ => None,
+    }
+}
+
+/// Is the resolved group-name code point a valid `ID_Start` (`first`) or
+/// `ID_Continue` (`fxIsIdentifierFirst` / `fxIsIdentifierNext`)? A negative
+/// (`C_EOF`) or out-of-range value is never an identifier.
+fn is_ident_scalar(c: i64, first: bool) -> bool {
+    if !(0..=0x10_FFFF).contains(&c) {
+        return false;
+    }
+    let c = c as u32;
+    if first {
+        crate::unicode::is_identifier_first(c)
+    } else {
+        crate::unicode::is_identifier_next(c)
+    }
+}
+
+/// Append a validated group-name code point to the accumulated name. The
+/// point has already passed `is_ident_scalar`, so it is a real scalar.
+fn push_name_char(name: &mut String, c: i64) {
+    if let Some(ch) = char::from_u32(c as u32) {
+        name.push(ch);
     }
 }
 

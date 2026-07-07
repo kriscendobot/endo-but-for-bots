@@ -26,6 +26,7 @@ name = "endor-compile"
 version = "0.0.1"
 dependencies = [
  "endor-oracle",
+ "endor-regexp",
 ]
 
 [[package]]

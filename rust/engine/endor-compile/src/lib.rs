@@ -25,7 +25,11 @@ pub mod parser;
 pub mod scoper;
 pub mod token;
 pub mod token_flags;
-pub mod unicode;
+/// Unicode `ID_Start` / `ID_Continue` classification. The single source
+/// of truth lives in the leaf `endor-regexp` crate (the regexp
+/// group-name validator needs the same tables), re-exported here so the
+/// lexer's `crate::unicode` path is unchanged.
+pub use endor_regexp::unicode;
 
 pub use ast::{Item, Node};
 pub use coder::{compile, compile_module, compile_with};
