@@ -1192,12 +1192,27 @@ byte-identical vs the oracle:
   applies). Block-scoped lexicals code and unwind correctly.
 - Slice 10 — **`with`**: `fxWithNodeCode` (`TO_INSTANCE`/`WITH`, the body
   under a forced eval flag, `WITHOUT`); sloppy-only.
+- Slice 11 — **functions (first slice)**: `fxFunctionNodeCode` for plain
+  (`CONSTRUCTOR_FUNCTION`) and arrow (`FUNCTION`) function values — the
+  nested `CODE` block (`BEGIN`/`END`/`END_ARROW`), the per-function coder
+  state save/restore, `FUNCTION_ENVIRONMENT` storing, and the
+  plain-function non-enumerable `caller` own property — plus function
+  *declarations* (`fxDefineNodeCode` with `fxScopeCodeDefineNodes`
+  hoisting: defines emit at the top of their scope, the in-list occurrence
+  a no-op), `fxReturnNodeCode`, `fxBodyNodeCode`, the empty
+  `fxParamsBindingNodeCode`, and a null-symbol operand for anonymous
+  functions. Scoped to **simple bodies** (expression statements +
+  `return expr`) in non-naming contexts.
 
-**Still folded (named gaps, coder still `panic!`s):** function bodies in
-every flavor (plain/generator/async/async-generator, params with
-defaults/destructuring/rest, `arguments`, closures, arrows, home-object/
-`super`); classes (constructor/derived, methods/accessors, static members,
-private fields/methods/brands, static blocks); `for-in`/`for-of`/
-`for-await-of` and `for(let …)` refresh; generator/async `yield`/`await`;
-and module import/export linkage + the module-body wrapper. These are the
-remaining child-6/7 surface.
+**Still folded (named gaps, coder still `panic!`s — never mis-emits):**
+parameters (defaults/destructuring/rest) and the `arguments` object;
+captured closures (`fxScopeCodeRetrieve`/`Store`) and home-object/`super`;
+**named function expressions** (the `CURRENT` name binding) and anonymous
+**name inference**; **control-flow / declaring function bodies** (they need
+the non-program loop/return paths and XS's branch-threading optimizer, of
+which only branch-to-next elision is ported); generator/async functions
+and `yield`/`await`; classes (constructor/derived, methods/accessors,
+static members, private fields/methods/brands, static blocks);
+`for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
+import/export linkage + the module-body wrapper. These are the remaining
+child-6/7 surface.
