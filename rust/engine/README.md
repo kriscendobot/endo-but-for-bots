@@ -1309,11 +1309,19 @@ byte-identical vs the oracle:
   closure slot so the mapped object can alias it, completing the
   `arguments` surface (`function (a) { … arguments … }` now codes
   `NEW_CLOSURE`/`VAR_CLOSURE`/`GET_CLOSURE` for the parameters).
+- Slice 31 — **object destructuring**: `fxObjectBindingNodeCodeAssign` —
+  `TO_INSTANCE` the value into a temporary, then read each `PropertyBinding`
+  named property (`GET_PROPERTY`) and assign it into the target. Both
+  destructuring assignment (`({a,b} = x)`) and lexical/var binding
+  (`let {a,b} = x`); shorthand, renamed (`{a: p}`), `= default` elements,
+  and nested-value sources covered. Object rest (`{...r}`), computed keys,
+  nested *patterns*, and array destructuring stay deferred.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-parameter destructuring; home-object/`super` (and arrow
-capture of `this`/`super`/`target`); anonymous-class name inference and
-**direct-`eval` spread**; generator/async
+**array** destructuring (needs the iterator protocol) and object
+rest / computed-key / nested-pattern destructuring; home-object/`super`
+(and arrow capture of `this`/`super`/`target`); anonymous-class name
+inference and **direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 `for await` / `using` heads; and
