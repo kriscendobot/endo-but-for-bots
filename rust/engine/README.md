@@ -1347,11 +1347,14 @@ byte-identical vs the oracle:
   + `START_ASYNC` at entry, and `fxAwaitNodeCode` — evaluate, `AWAIT`, and
   thread the rejection/completion (`BRANCH_STATUS`) out to the return
   target until the async job resumes. Async arrows too.
+- Slice 37 — **async generators**: the `ASYNC_GENERATOR_FUNCTION` create op
+  + `START_ASYNC_GENERATOR`, and `fxYieldNodeCode`'s async branch (yield the
+  raw value, `YIELD`/`BRANCH_STATUS`, then `AWAIT` + `THROW_STATUS`).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
-inference and **direct-`eval` spread**; **async generators** and `yield*`
+inference and **direct-`eval` spread**; `yield*`
 (`Delegate`); classes (constructor/
 derived, methods/accessors, static members, private fields/methods/brands,
 static blocks); `for await` / `using` heads; and
