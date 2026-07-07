@@ -1480,7 +1480,7 @@ declarations** (the field function's frame reservation); `using` heads (a
 parser gap); and module import/export linkage + the module-body wrapper.
 These are the remaining child-6/7 surface.
 
-### Stage-5 acceptance evidence (child 7/7, re-measured by fix2-verify 6/6): the byte-identity bar
+### Stage-5 acceptance evidence (child 7/7, re-measured by fix3-verify 5/5): the byte-identity bar
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
 children** (CESU-8 strings, the four named coder rejects, the class tail,
@@ -1488,8 +1488,13 @@ and the Module goal) then closed the folds it had measured, and a **fix2**
 round (siblings 1–5: named-evaluation, private-member reads, byte
 divergences, in-function/direct-eval scope, and early errors) closed the
 byte-identity and accept-disagreement classes the first broadened sweep had
-surfaced. **fix2-verify 6/6** re-ran the whole bar from a fresh sync of the
-remote tip (`013f76aa3`). This block records the **re-measured** numbers and
+surfaced. A **fix3** round (siblings 1–4: Class α scope-classification,
+Class β private-install, Class γ eval-residue + parameter-default fold,
+Classes δ + ε) then closed the `object` / `assignment` / `function`
+divergences and every remaining `endor-rejected` fold. **fix3-verify 5/5**
+re-ran the whole bar from a fresh sync of the remote tip
+(`4a8bdf6ab9`, all four fix3 siblings present). This block records the
+**re-measured** numbers and
 the residual, fully-attributed divergence ledger.
 
 **The full-corpus byte-identity differential harness**
@@ -1531,10 +1536,10 @@ build read `identical=1691 endor-rejected=20`; the coder-reject fix child
 closed all 20 folds (→ `1711 / 0`), and the CESU-8 fix child had already
 closed the 60 string divergences (`identical=1631` → `1691` → `1711`).
 
-**Broadened real-test262 sweep (fix2-verify).** Re-running the eight
-subtrees the first broadened sweep measured and adding two the fix2 work
-touched (`expressions/async-generator`, `statements/function`), per-subtree
-since whole-`language/` OOMs the oracle:
+**Broadened real-test262 sweep (fix3-verify, 12 subtrees).** Re-running the
+ten subtrees the fix2-verify sweep measured and adding two fresh for exposure
+(`statements/switch`, `expressions/call`), per-subtree since whole-`language/`
+OOMs the oracle (`compile-diff <subtree>`, the compiler byte-identity harness):
 
 | subtree | total | identical | divergent | endor-rej | oracle-rej | accept-disagree |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1544,10 +1549,20 @@ since whole-`language/` OOMs the oracle:
 | `statements/for-of` | 712 | 641 | **0** | 0 | 71 | 0 |
 | `statements/try` | 192 | 168 | **0** | 0 | 24 | 0 |
 | `expressions/async-generator` | 585 | 507 | **0** | 0 | 78 | 0 |
-| `expressions/assignment` | 466 | 402 | **2** | 0 | 62 | 0 |
-| `statements/function` | 434 | 384 | **2** | 4 | 44 | 0 |
-| `expressions/object` | 1049 | 905 | **1** | 8 | 135 | 0 |
-| `statements/class` | 3908 | 3185 | **113** | 0 | 610 | 0 |
+| `expressions/assignment` | 466 | 404 | **0** | 0 | 62 | 0 |
+| `statements/function` | 434 | 390 | **0** | 0 | 44 | 0 |
+| `expressions/object` | 1049 | 914 | **0** | 0 | 135 | 0 |
+| `statements/class` | 3908 | 3236 | **62** | 0 | 610 | 0 |
+| `statements/switch` | 105 | 36 | **0** | 0 | 69 | 0 |
+| `expressions/call` | 96 | 94 | **0** | 1 | 1 | 0 |
+
+fix3 drove `assignment` (2 → 0), `function` (2 → 0, and its 4 endor-rejects →
+0), and `object` (1 → 0, and its 8 endor-rejects → 0) fully byte-clean, and
+`class` from 113 → 62. The two fresh subtrees are byte-clean on `divergent` /
+`accept-disagree`; `expressions/call` carries **one** `endor-rejected` on the
+single named fold `tco-call-args.js` (`coder panic: captured function name
+deferred` — a named-function-expression whose own name is captured as a
+closure slot, `coder.rs` deferral), the only `endor-rejected` in the sweep.
 
 **What fix2 closed vs the first broadened sweep.** The first sweep's Class A
 (NamedEvaluation in a destructuring default — the mis-emit flagged as
@@ -1566,11 +1581,42 @@ where their coding is not yet byte-exact; see Class β below).
 At identification (the first fix3 sweep) `divergent == 0` was **not yet MET
 everywhere**: `class` (113), `object` (1), `assignment` (2), `function` (2)
 diverged. fix3's γ + δ children have since closed `object`, `assignment`, and
-`function` entirely (live numbers in the status paragraph below); only `class`
-still diverges. Every residual is attributed to a **named, narrow** coder
-mechanism below (disassembled and identified, opcode by opcode); **none is an
-unexplained byte divergence**, so there is no new kill-criterion evidence in
-this sweep. The classes:
+`function` entirely (re-confirmed byte-clean by fix3-verify); only `class`
+still diverges, at **62** (fix3-verify re-measured). Those 62 partition into
+the named classes below, **each disassembled and identified opcode by opcode**
+(fix3-verify spot-checks: `private-field-on-nested-class` diff@4 `RESERVE`
+`0x0d` vs oracle `0x09` — Class β; `init-value-incremental` diff@150 `RESERVE`
+`0x02` vs `0x03` — Class ε; `literal-numeric-leading-decimal` diff@5, endor 16
+bytes longer on the scope-slot classification — Class α;
+`derived-cls-direct-eval-contains-superproperty-1` diff@195, endor 7 bytes
+shorter on the omitted eval prelude — Class γ):
+
+- **Class α** (closure-vs-local scope classification): **6** —
+  `accessor-name-{inst,static}/literal-numeric-{leading-decimal,non-canonical}`
+  (4), `strict-mode/arguments-callee.js` (1),
+  `elements/intercalated-static-non-static-computed-fields.js` (1). fix3's α
+  child closed the mapped-`arguments`-in-parameter-default and plain-field
+  outer-capture sub-shapes; these literal-numeric-key + captured-`arguments`
+  sub-shapes remain.
+- **Class β** (private-member install — nested-class scope count + field-init
+  brand read index): **35** — the whole `elements/private-*-on-nested-class` /
+  `private-*-shadowed-by-*-on-nested-class` / `private-static-*-usage-inside-nested-class`
+  / `privatefield{get,set}-typeerror-1` / `{get,set}-access-of-*-shadowed-private-*`
+  / `static-private-{getter,setter}-access-on-inner-class` family. fix3's β
+  child closed the accessor-pair brand double-capture; the two documented
+  scoper-structural sub-shapes remain.
+- **Class γ** (in-initializer direct-eval field-function scope): **19** — the
+  `elements/*direct-eval*`, `*-visible-to-direct-eval-on-initializer`,
+  `derived-cls-direct-eval-*`, `direct-eval-err-contains-{arguments,newtarget}`,
+  `privatename-not-valid-eval-earlyerr-3` family. fix3's γ child closed the
+  nested-function eval sub-shape and the parameter-default eval reject fold;
+  the class field-initializer eval sub-shape remains.
+- **Class ε** (field-init function scope / temporary depth): **2** —
+  `elements/init-value-incremental.js`, `elements/static-field-init-with-this.js`.
+
+6 + 35 + 19 + 2 = 62. **Every residual is attributed to a named, narrow coder
+mechanism below; none is an unexplained byte divergence**, so there is no new
+kill-criterion evidence in this sweep. The classes:
 
 1. **Class α — closure-vs-local scope classification (a MIS-EMIT).** endor
    codes a binding with `new_local` / `let_local` / `const_local` /
@@ -1687,23 +1733,33 @@ ported it: a direct `eval` in a parameter default poisons the parameter scope
 keyed on the FUNCTION node's eval flag, not the body's. `statements/function`
 endor-rejected 4 → 0 (subtree byte-clean), `expressions/object` endor-rejected
 8 → 0. With fix3's δ child the whole `object` subtree is now byte-clean
-(divergent 1 → 0). The sweep now has **no `endor-rejected` at all**.
+(divergent 1 → 0). On the twelve fix3-verify subtrees the **only** residual
+`endor-rejected` is the single named `tco-call-args.js` fold in
+`expressions/call` (`captured function name deferred`).
 
-**Stage-5 byte-identity bar — status.** On the **curated + module corpora**
-(the gated in-crate bars) the bar is **MET**: `1711/1711` and `45/45`
-byte-identical, `divergent == 0`, full accept/reject agreement. On the
-**broadened real-test262 sweep**, `accept-disagree == 0` is **MET on every
-subtree** and `endor-rejected == 0` is **MET**; `expressions/object` is now
-byte-clean too (`divergent 1 → 0`, Class δ). `divergent == 0` is **NOT yet MET**
-only on `class`: after fix3's γ + δ children the residual divergences are
-`class` 62 (the direct-eval field-initializer γ family plus the 2 Class ε
-field-init-scope files), with `object`, `assignment`, and `function` all
-byte-clean (`object` 1 → 0, `assignment` 2 → 0, `function` rejects 4 → 0).
-**Every residual is attributed** to one of the named, narrow coder mechanisms
-above (Classes γ field-init, ε) — there is **no unexplained / unattributed
-byte divergence, hence no new kill-criterion evidence**. The remaining work is
-the class field-initializer direct-eval scope + real field-init function scope
-(Classes γ, ε), not a feasibility wall.
+**Stage-5 byte-identity bar — status (fix3-verify 5/5).** On the **curated +
+module corpora** (the gated in-crate bars) the bar is **MET**: `1711/1711` and
+`45/45` byte-identical, `divergent == 0`, full accept/reject agreement. On the
+**broadened real-test262 sweep** (12 subtrees), `accept-disagree == 0` is **MET
+on every subtree**; `endor-rejected` is `0` on eleven of twelve, with the lone
+exception the named `expressions/call` fold (`tco-call-args.js` — `captured
+function name deferred`, a listed named fold). `divergent == 0` is **NOT yet
+MET** only on `class`, at **62** (`object`, `assignment`, `function`, `switch`,
+`call` all `divergent == 0`). The 62 partition as Class α (6) + Class β (35) +
+Class γ (19) + Class ε (2), **every one attributed** to a named, narrow coder
+mechanism above and confirmed opcode-by-opcode — there is **no unexplained /
+unattributed byte divergence, hence no new kill-criterion evidence**. The
+remaining work is the class private-member install (Class β), the class
+field-initializer direct-eval scope + real field-init function scope
+(Classes γ, ε), and the residual literal-numeric-key / captured-`arguments`
+scope classification (Class α) — narrow coder folds, not a feasibility wall.
+
+**FULL STAGE-5 BAR: NOT MET** (`divergent == 0` everywhere) — `statements/class`
+holds 62 fully-attributed byte divergences. The bar **IS MET** on the curated
+corpora (1711/1711), the module corpora (45/45), and eleven of the twelve
+broadened subtrees; `accept-disagree == 0` holds everywhere; the sole
+`endor-rejected` is the one named `tco-call-args.js` fold. No unattributable
+divergence anywhere ⇒ **no new kill-criterion evidence**.
 
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
