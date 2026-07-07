@@ -2572,64 +2572,72 @@ impl Coder<'_> {
         // use-closure). Dedup the brand cap by private name here; each
         // member's `valueAccess` stays a distinct per-member cap.
         let mut brand_slot: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-        for field in fields {
-            let access = self.tree.class_member_access.get(&node_key(field)).copied();
-            let is_method = field.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
-            let mut plan = FieldPlan::default();
-            // Alias slots are 0-based (the `index + 1` serialization family
-            // adds the one): the slot is the frame position *before* the
-            // push.
-            match field.token {
-                Token::PropertyAt => {
-                    plan.at = Some(caps.len() as i32);
-                    caps.push(access.and_then(|a| a.at).expect("computed field atAccess"));
-                }
-                Token::PrivateProperty => {
-                    let a = access.expect("private member access");
-                    if is_method {
-                        plan.value = Some(caps.len() as i32);
-                        caps.push(a.value.expect("valueAccess"));
+        // The **member-closure** (static / `fi`-less) path builds the capture
+        // plan by hand — class-scope declare ids in alias order and each
+        // field's 0-based alias slot. The **field-function-scope** (`fi`) path
+        // instead reads the scope's recorded member-access use-closure aliases
+        // and resolves them to frame slots *after* `RETRIEVE` assigns indices
+        // (see below), so its plans are built there.
+        if fi.is_none() {
+            for field in fields {
+                let access = self.tree.class_member_access.get(&node_key(field)).copied();
+                let is_method = field.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+                let mut plan = FieldPlan::default();
+                // Alias slots are 0-based (the `index + 1` serialization family
+                // adds the one): the slot is the frame position *before* the
+                // push.
+                match field.token {
+                    Token::PropertyAt => {
+                        plan.at = Some(caps.len() as i32);
+                        caps.push(access.and_then(|a| a.at).expect("computed field atAccess"));
                     }
-                    let sym_id = a.symbol.expect("symbolAccess");
-                    // The private name of this brand declare (a `Named` sym).
-                    let name = self.tree.scopes[class_scope]
-                        .declares
-                        .iter()
-                        .find(|d| d.id == sym_id)
-                        .and_then(|d| match &d.symbol {
-                            Some(crate::scoper::Sym::Named(n)) => Some(n.clone()),
-                            _ => None,
-                        });
-                    let slot = match name {
-                        Some(n) => *brand_slot.entry(n).or_insert_with(|| {
-                            let s = caps.len() as i32;
-                            caps.push(sym_id);
-                            s
-                        }),
-                        None => {
-                            let s = caps.len() as i32;
-                            caps.push(sym_id);
-                            s
+                    Token::PrivateProperty => {
+                        let a = access.expect("private member access");
+                        if is_method {
+                            plan.value = Some(caps.len() as i32);
+                            caps.push(a.value.expect("valueAccess"));
                         }
-                    };
-                    plan.symbol = Some(slot);
+                        let sym_id = a.symbol.expect("symbolAccess");
+                        // The private name of this brand declare (a `Named` sym).
+                        let name = self.tree.scopes[class_scope]
+                            .declares
+                            .iter()
+                            .find(|d| d.id == sym_id)
+                            .and_then(|d| match &d.symbol {
+                                Some(crate::scoper::Sym::Named(n)) => Some(n.clone()),
+                                _ => None,
+                            });
+                        let slot = match name {
+                            Some(n) => *brand_slot.entry(n).or_insert_with(|| {
+                                let s = caps.len() as i32;
+                                caps.push(sym_id);
+                                s
+                            }),
+                            None => {
+                                let s = caps.len() as i32;
+                                caps.push(sym_id);
+                                s
+                            }
+                        };
+                        plan.symbol = Some(slot);
+                    }
+                    Token::Body => {
+                        // A `static { … }` block with its own lexical
+                        // declarations needs those slots reserved in this
+                        // function's frame — the remaining class-tail fold.
+                        // (XS RESERVEs them in the constructorInit function via
+                        // its `scopeMaximum`; the inline-synthesized field-init
+                        // function here has no such precomputed count yet.)
+                        let bscope = self.tree.node_scopes.get(&node_key(field)).map(|s| s.0);
+                        assert!(
+                            bscope.map(|s| self.declare_count(s)).unwrap_or(0) == 0,
+                            "static block with lexical declarations deferred"
+                        );
+                    }
+                    _ => {}
                 }
-                Token::Body => {
-                    // A `static { … }` block with its own lexical
-                    // declarations needs those slots reserved in this
-                    // function's frame — the remaining class-tail fold.
-                    // (XS RESERVEs them in the constructorInit function via
-                    // its `scopeMaximum`; the inline-synthesized field-init
-                    // function here has no such precomputed count yet.)
-                    let bscope = self.tree.node_scopes.get(&node_key(field)).map(|s| s.0);
-                    assert!(
-                        bscope.map(|s| self.declare_count(s)).unwrap_or(0) == 0,
-                        "static block with lexical declarations deferred"
-                    );
-                }
-                _ => {}
+                plans.push(plan);
             }
-            plans.push(plan);
         }
         let k = caps.len() as i32;
 
@@ -2642,19 +2650,33 @@ impl Coder<'_> {
         self.add_symbol_opt(1, XS_CODE_CONSTRUCTOR_FUNCTION, None);
         self.add_branch(0, XS_CODE_CODE_1, target);
         self.add_index(0, XS_CODE_BEGIN_STRICT_FIELD, 0);
-        // A plain-data-field class binds its initializers inside a real
-        // `instanceInit` function scope (`fi`); its use-closure aliases —
-        // outer bindings captured by a field value — drive the frame
-        // `RESERVE`/`RETRIEVE` and the closure-slot access indices. Otherwise
-        // the member-closure-only field function reserves `k` computed-key /
-        // private-brand slots.
+        // A field-bearing class binds its initializers inside a real
+        // `instanceInit` function scope (`fi`): its use-closure aliases —
+        // computed-key / private-brand / private-value member closures AND
+        // outer bindings a field value captures — drive the frame
+        // `RESERVE`/`RETRIEVE` (`scopeCount == scopeMaximum` = closures + peak
+        // value-temporary depth) and the closure-slot access indices. The
+        // static member-closure path reserves `k` member-closure slots.
         if let Some(fi) = fi {
-            debug_assert!(caps.is_empty(), "field-init function scope with member closures");
             let reserve = *self.tree.scope_counts.get(&fi).unwrap_or(&0);
             if reserve != 0 {
                 self.add_index(0, XS_CODE_RESERVE_1, reserve);
             }
             self.scope_code_retrieve(fi);
+            // Each field's member accesses now have assigned frame slots; read
+            // them back as the field body's `GET_CLOSURE` / `NEW_PRIVATE`
+            // operands (a get/set pair shares one brand slot via the scoper's
+            // use-closure dedup).
+            for field in fields {
+                let slots =
+                    self.tree.class_member_fi.get(&node_key(field)).copied().unwrap_or_default();
+                let plan = FieldPlan {
+                    at: slots.at.map(|id| self.declare_index(fi, id)),
+                    symbol: slots.symbol.map(|id| self.declare_index(fi, id)),
+                    value: slots.value.map(|id| self.declare_index(fi, id)),
+                };
+                plans.push(plan);
+            }
         } else if k != 0 {
             self.add_index(0, XS_CODE_RESERVE_1, k);
             self.add_index(0, XS_CODE_RETRIEVE_1, k);
