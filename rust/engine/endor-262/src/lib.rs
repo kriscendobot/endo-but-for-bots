@@ -108,18 +108,77 @@ impl DualRun {
     }
 }
 
-/// Run one program on both engines and compare.
+/// Which compiler produces the bytecode `endor-vm` executes in the
+/// dual-run runner — the **pipeline seam** (stage-5 child 7). The oracle
+/// (differential C-XS) compiler is the default and stays so until the
+/// supervisor accepts stage 5; `Endor` selects the pure-Rust
+/// `endor-compile` pipeline so later stages can flip the default with a
+/// one-line change and no runner surgery (design § roadmap row 5).
 ///
-/// Returns `None` only if the oracle machine itself fails to start.
+/// In either mode the oracle is still consulted for the **reference**
+/// result/computrons the run is compared against; the selection only
+/// decides whose *bytecode* endor runs — its own, or the oracle's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compiler {
+    /// The differential C-XS oracle compiler (`endor_oracle::run`). The
+    /// stage-≤4 default; the exact XS-emitted bytecode.
+    #[default]
+    Oracle,
+    /// The pure-Rust `endor-compile` pipeline (lexer → parser → scoper →
+    /// coder). While the stage-5 byte-identity bar holds, its bytes equal
+    /// the oracle's, so the oracle's symbols atom pairs with them
+    /// unchanged; a compile fold (parser/scoper reject or a coder panic)
+    /// yields empty bytecode the runner treats as an endor abort.
+    Endor,
+}
+
+/// Compile `source` to `(bytecode, symbols)` under the selected compiler,
+/// given the oracle outcome already in hand (the reference). The endor
+/// path is total over the coder's panics (`catch_unwind`); a fold returns
+/// empty bytecode, which `endor-vm` decodes as an abort — the honest
+/// "endor could not run its own output here" signal, never a harness
+/// panic. The seam later stages flip lives entirely here.
+fn compile_for(compiler: Compiler, source: &str, oracle: &endor_oracle::OracleOutcome) -> (Vec<u8>, Vec<u8>) {
+    match compiler {
+        Compiler::Oracle => (oracle.bytecode.clone(), oracle.symbols.clone()),
+        Compiler::Endor => {
+            let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                endor_compile::compile(source)
+            }));
+            match compiled {
+                Ok(Ok(bytes)) => (bytes, oracle.symbols.clone()),
+                // A structured reject or a coder fold: empty bytecode →
+                // endor-vm aborts on decode, mirroring "endor rejected".
+                Ok(Err(_)) | Err(_) => (Vec::new(), Vec::new()),
+            }
+        }
+    }
+}
+
+/// Run one program on both engines and compare, using the default
+/// (oracle) compiler. Returns `None` only if the oracle machine fails to
+/// start.
 pub fn dual_run(source: &str) -> Option<DualRun> {
+    dual_run_with(source, Compiler::default())
+}
+
+/// Run one program on both engines and compare, choosing which compiler
+/// produces the bytecode endor executes (the pipeline seam). Returns
+/// `None` only if the oracle machine itself fails to start.
+pub fn dual_run_with(source: &str, compiler: Compiler) -> Option<DualRun> {
     let oracle = endor_oracle::run(source)?;
 
-    // Pass the oracle's symbols atom so endor relinks the program's
-    // intrinsic references (`Object`, `Boolean`, the Error hierarchy, …) to
-    // its own intrinsics by name — the C-XS compiler numbers those symbols
+    // The pipeline seam: the bytecode endor runs comes from the selected
+    // compiler. The default (oracle) path is the exact XS-emitted bytes;
+    // the endor path is `endor-compile`'s own output.
+    let (bytecode, symbols) = compile_for(compiler, source, &oracle);
+
+    // Pass the symbols atom so endor relinks the program's intrinsic
+    // references (`Object`, `Boolean`, the Error hierarchy, …) to its own
+    // intrinsics by name — the C-XS compiler numbers those symbols
     // program-locally, so the id→name table is what makes `Boolean` mean the
     // native `Boolean` and not an undefined variable (design § fundamentals).
-    let endor: RunOutcome = run_program_with_symbols(&oracle.bytecode, &oracle.symbols);
+    let endor: RunOutcome = run_program_with_symbols(&bytecode, &symbols);
 
     let agreement = match (oracle.completed, endor.completed) {
         (true, true) => Agreement::BothComplete,
@@ -162,7 +221,7 @@ pub fn dual_run(source: &str) -> Option<DualRun> {
         endor_meter_raw: endor.meter_raw,
         endor_dispatched: endor.dispatched,
         endor_halt: endor.halt,
-        bytecode: oracle.bytecode,
+        bytecode,
     })
 }
 
@@ -775,6 +834,53 @@ pub fn run_corpus(programs: &[String]) -> (Vec<DualRun>, Summary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_seam_endor_matches_oracle_on_byte_identical_programs() {
+        // The pipeline seam (stage-5 child 7): running the dual-run through
+        // the `Endor` compiler must, on programs whose endor bytecode is
+        // byte-identical to the oracle's, execute the *same* bytecode and
+        // reach the *same* agreement/result as the default `Oracle` path.
+        // This proves the seam actually flips compilers and the endor path
+        // runs endor's own output — not a no-op that always uses the oracle.
+        let programs = ["1 + 2 * 3", "if (1) { 2 } else { 3 }", "(function(a){ return a + 1 })(4)"];
+        for src in programs {
+            let oracle = dual_run_with(src, Compiler::Oracle).expect("oracle runs");
+            let endor = dual_run_with(src, Compiler::Endor).expect("oracle reference runs");
+            // The endor path compiled with endor-compile; its bytes must
+            // equal the oracle's (the byte-identity bar) for these programs.
+            assert_eq!(
+                oracle.bytecode, endor.bytecode,
+                "seam: endor-compile bytes must match the oracle's for {src:?}"
+            );
+            assert_eq!(
+                oracle.agreement, endor.agreement,
+                "seam: same agreement via either compiler for {src:?}"
+            );
+            assert_eq!(
+                oracle.endor_result, endor.endor_result,
+                "seam: same endor result via either compiler for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_seam_endor_fold_is_a_clean_abort_not_a_panic() {
+        // A construct the coder folds on (`new.target`) must, through the
+        // `Endor` seam, produce empty bytecode that endor-vm treats as an
+        // abort — never a harness panic. The seam is total over coder folds.
+        let src = "function f() { return new.target } f()";
+        let endor = dual_run_with(src, Compiler::Endor).expect("oracle reference runs");
+        assert!(
+            endor.bytecode.is_empty(),
+            "an endor coder fold must yield empty bytecode via the seam"
+        );
+        assert_ne!(
+            endor.agreement,
+            Agreement::BothComplete,
+            "an empty-bytecode endor run must not spuriously complete like the oracle"
+        );
+    }
 
     // A `DualRun` with the given agreement and endor halt. For a
     // `Halt::Throw`, the oracle is modeled as throwing the same value with
