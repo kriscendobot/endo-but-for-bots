@@ -1234,9 +1234,13 @@ byte-identical vs the oracle:
   `code_params_binding` admits `Binding` items; the defaulted param is
   excluded from the `BEGIN` count (like XS's non-simple-parameter count).
   Covers a later param defaulting from an earlier one.
+- Slice 17 — **rest parameters**: `fxParamsBindingNodeCode`'s rest branch —
+  a `...rest` param binds its target from `ARGUMENTS i` (collecting the
+  remaining arguments into an array) rather than `ARGUMENT i`; excluded
+  from the `BEGIN` count. With or without leading fixed parameters.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-parameter destructuring/rest and the `arguments` object (which forces
+parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); captured closures (`fxScopeCodeRetrieve`/`Store`)
 and home-object/`super`; **named function expressions** (the `CURRENT` name
 binding) and object-method/property **name inference**; generator/async
