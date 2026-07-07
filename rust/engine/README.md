@@ -1315,11 +1315,19 @@ byte-identical vs the oracle:
   destructuring assignment (`({a,b} = x)`) and lexical/var binding
   (`let {a,b} = x`); shorthand, renamed (`{a: p}`), `= default` elements,
   and nested-value sources covered. Object rest (`{...r}`), computed keys,
-  nested *patterns*, and array destructuring stay deferred.
+  and nested *patterns* stay deferred.
+- Slice 32 — **array destructuring**: `fxArrayBindingNodeCodeAssign` — seed
+  an iterator over the value (`FOR_OF`), pull each element from `next()`
+  into its target (skipping elision holes, collecting a `...rest` into an
+  array, applying `= default`s), and close the iterator (`.return()`) on
+  early exit, reusing the selector/alias/finalize/jump `try`/`finally`
+  machinery (only the return target crosses it). Both destructuring
+  assignment (`[a,b] = x`) and lexical/var binding (`let [a,b] = x`); holes,
+  rest, defaults, and member targets covered.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-**array** destructuring (needs the iterator protocol) and object
-rest / computed-key / nested-pattern destructuring; home-object/`super`
+object rest / computed-key / nested-pattern destructuring, and
+destructuring *parameters*; home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
 inference and **direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
