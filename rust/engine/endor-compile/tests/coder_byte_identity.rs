@@ -863,6 +863,36 @@ fn derived_classes() {
     ]);
 }
 
+// Cross-construct integration (child 6). Real-world programs that combine
+// many of the ported strata at once — functions/closures + destructuring +
+// generators/async + classes/`super` + control flow, deeply nested. These
+// stress the *interactions* between slices (slot numbering carried across a
+// closure through a destructured parameter, a `super` call inside a
+// destructuring method, a `for-await` over a defaulted rest parameter, …)
+// that per-construct tests do not, and are the strongest guard against a
+// regression in one stratum silently shifting another's bytes.
+#[test]
+fn cross_construct_integration() {
+    assert_identical(&[
+        // functions + closures + destructuring
+        "function f(a,{b,c}){return()=>a+b+c;}",
+        "(function(x){let[a,b]=x;return function(){return a+b;};});",
+        "var g=(...args)=>args.map(x=>x*2);",
+        // control flow + generators + async
+        "function*gen(a){let s=0;for(const x of a){yield s+=x;}}",
+        "async function af(x){try{return await x;}catch(e){return e;}}",
+        // classes + methods + super + destructuring params
+        "(class extends Base{m({a,b}){return super.m(a)+b;}});",
+        "(class{constructor(...a){this.a=a;}static of(...a){return new this(...a);}});",
+        // deeply nested combinations
+        "function outer(){let c=0;return{inc(){return++c;},get val(){return c;}};}",
+        "for(const{x,y}of pts){f(x,y);}",
+        "const h=async({a=1,...rest})=>{for await(let x of a){rest[x]=x;}return rest;};",
+        "function sw(n){L:for(;;){switch(n){case 1:break L;default:n--;}}return n;}",
+        "(function(){var o={a:1,m(){return this.a;},['k'+1](){return 2;}};return o;});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
