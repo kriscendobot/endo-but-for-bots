@@ -1129,3 +1129,42 @@ the suite `128/0` because its opcode set had not yet armed byte `0x25`.
 completes green — **149 passed, 0 failed** — in **~5 s** wall-clock on a warm
 build (the endor-fuzz binary's own run, including the 2000-seed decoder sweep,
 is 1.3 s). `#![forbid(unsafe_code)]` intact across the workspace.
+
+## Stage 5: the compiler port (`endor-compile` coder, child 5/7)
+
+Stage 5 replaces the differential-oracle compiler with a pure-Rust one in
+XS's own shape (lexer → parser → scoper → **coder**), held to a
+**byte-identical-bytecode** bar: `endor_compile::compile(src)` must equal
+`endor_oracle::run(src).bytecode` byte for byte. Children 1–4 landed the
+lexer/parser/scoper; **child 5** lands the coder's emission framework and
+the expression + simple-statement node surface — the first stratum that
+produces real byte-identity evidence (`endor-compile/tests/coder_byte_identity.rs`,
+with an opcode-level disassembler for triage).
+
+**Ported faithfully (the framework that shapes the bytes).** XS's exact
+`fxParserCode` three passes: pass 1 sizes every record with branches
+assumed widest and accrues the `delta` slack; pass 2 selects each
+branch's `_1`/`_2`/`_4` width from the now-known target offsets, narrowing
+`size`; pass 3 emits with back-patched displacements. Plus the
+`fxCoderAdd*` record constructors, the target/fixup arena, stack-depth
+accounting, the `INTEGER`/`STRING`/`BIGINT`/index-family operand-width
+selection, and the constant encodings (LE integers, LE-limb BigInts,
+IEEE-754 doubles, NUL-terminated strings) in XS's byte order. The program
+header is coded through `fxScopeCodingEval` — the oracle compiles the
+script goal as an eval program (`BEGIN_SLOPPY`/`STRICT`, `EVAL_ENVIRONMENT`).
+
+**Node surface covered:** literals of every scalar kind (int, number,
+string, `true`/`false`/`null`/`undefined`, BigInt), every
+unary/binary/relational/shift/bitwise operator, `&&`/`||`/`??`, the
+conditional, sequence, expression statements, `if`/`else`, and blocks.
+
+**Honest folds (the back half — child 6).** Every construct whose
+emission depends on the **atom/symbol table** — whose per-symbol id
+assignment (XS's hash-table walk order) is embedded into the *code*
+stream, so it must be reproduced exactly — or on a **nested function
+body** is deferred to child 6: identifier/property loads-and-stores,
+`var`/lexical declarations, assignment (simple/compound/destructuring),
+call/`new`/member (incl. optional chaining), object/array/template
+construction, and function/class bodies. The current coder `panic!`s (in
+tests) rather than emit a wrong byte for these — a named gap, never a
+silent divergence.
