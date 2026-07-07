@@ -2336,15 +2336,30 @@ impl Coder<'_> {
     /// parameter-binding branch emits `NEW_LOCAL` (a symbol op) and is
     /// deferred to the atom-table child; the bare `catch {}` form is here.
     fn code_catch(&mut self, node: &Node) {
-        assert!(
-            matches!(node.children[0], Item::Null),
-            "catch binding reached in control-flow coder (later child)"
-        );
-        let statement_scope = self.scope_of(node);
-        self.scope_coding_block(statement_scope);
-        self.scope_code_define_nodes(statement_scope);
-        self.code(&node.children[1]);
-        self.scope_coded(statement_scope);
+        if matches!(node.children[0], Item::Null) {
+            // No parameter: the primary scope is the body block.
+            let statement_scope = self.scope_of(node);
+            self.scope_coding_block(statement_scope);
+            self.scope_code_define_nodes(statement_scope);
+            self.code(&node.children[1]);
+            self.scope_coded(statement_scope);
+        } else {
+            // `catch (e) { … }`: the primary scope binds the parameter, the
+            // secondary is the body block. Store the caught `EXCEPTION` into
+            // the parameter slot, then code the body.
+            let param_scope = self.scope_of(node);
+            let statement_scope = self.scope_secondary(node);
+            self.scope_coding_block(param_scope);
+            self.code_reference(&node.children[0], 0);
+            self.add_byte(1, XS_CODE_EXCEPTION);
+            self.code_assign(&node.children[0], 0);
+            self.add_byte(-1, XS_CODE_POP);
+            self.scope_coding_block(statement_scope);
+            self.scope_code_define_nodes(statement_scope);
+            self.code(&node.children[1]);
+            self.scope_coded(statement_scope);
+            self.scope_coded(param_scope);
+        }
     }
 
     /// `fxTryNodeCode`. Children `[tryBlock, catch-or-null, finally-or-null]`.

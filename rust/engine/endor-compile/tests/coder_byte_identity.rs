@@ -538,6 +538,20 @@ fn function_declaring_bodies() {
     ]);
 }
 
+// `catch (e)` parameter bindings (child 6). The parameter scope allocates
+// the binding slot, the caught `EXCEPTION` is stored into it, then the body
+// block is coded and both scopes unwind. Parameterless `catch {}` (already
+// covered by `control_flow_try`) takes the single-scope path.
+#[test]
+fn catch_parameter_bindings() {
+    assert_identical(&[
+        "try{}catch(e){}", "try{1;}catch(e){e;}", "try{throw 1;}catch(e){e;}",
+        "try{}catch(e){}finally{}", "try{}catch(err){throw err;}",
+        "try{f();}catch(e){g(e);}", "try{}catch(e){let x=1;e;}",
+        "function h(){try{return 1;}catch(e){return e;}}",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
