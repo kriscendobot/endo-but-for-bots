@@ -68,7 +68,7 @@ pub mod dflags {
 
 /// `mxEvalFlag` on a scope's own `flags` word (a scope reached by direct
 /// `eval` / `with`). Same bit as [`flags::EVAL`].
-const SCOPE_EVAL: u32 = flags::EVAL;
+pub const SCOPE_EVAL: u32 = flags::EVAL;
 /// `mxStrictFlag` on a scope's `flags` word.
 const SCOPE_STRICT: u32 = flags::STRICT;
 
@@ -213,6 +213,11 @@ pub struct ScopeTree {
     /// node's address keys back to the scope XS hung off it in place
     /// (`self->scope`, `xsScope.c`). Keyed with [`node_key`].
     pub node_scopes: HashMap<usize, (usize, Option<usize>)>,
+    /// Per-node access resolution (see [`Scoper::resolutions`]): an
+    /// `Access` / declaration / `Define` node address → the `(scope,
+    /// declare id)` its symbol binds to, or `None` for the symbol path.
+    /// Keyed with [`node_key`].
+    pub resolutions: HashMap<usize, Option<(usize, u32)>>,
 }
 
 /// The stable identity the scoper/coder use to associate a scope (and,
@@ -259,6 +264,7 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
         accesses: s.accesses,
         scope_counts: s.scope_counts,
         node_scopes: s.node_scope,
+        resolutions: s.resolutions,
     })
 }
 
@@ -291,6 +297,12 @@ struct Scoper {
     scope_maximum: i32,
     scope_counts: HashMap<usize, i32>,
     accesses: Vec<AccessRecord>,
+    /// Per-node access resolution, keyed by the node's address: an
+    /// `Access` / declaration / `Define` node → the `(scope, declare id)`
+    /// its symbol binds to (XS's `access->declaration`), or `None` for a
+    /// global / sloppy-eval-var / `with` access. The coder reads this to
+    /// choose a slot op (`GET_LOCAL`/`LET_LOCAL`/…) over the symbol path.
+    resolutions: HashMap<usize, Option<(usize, u32)>>,
     /// `hoister->firstExportLink` — the exported names seen so far, for
     /// duplicate-export detection.
     export_links: Vec<Sym>,
@@ -1267,6 +1279,7 @@ impl Scoper {
             let scope = self.scope.unwrap();
             let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, false, false);
             self.record_access(&sym, node.line, resolved);
+            self.resolutions.insert(node_ptr(node), resolved);
         }
         Ok(())
     }
@@ -1278,6 +1291,7 @@ impl Scoper {
             let scope = self.scope.unwrap();
             let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, false, false);
             self.record_access(&sym, node.line, resolved);
+            self.resolutions.insert(node_ptr(node), resolved);
         }
         Ok(())
     }
@@ -1287,6 +1301,7 @@ impl Scoper {
             let scope = self.scope.unwrap();
             let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, false, false);
             self.record_access(&sym, node.line, resolved);
+            self.resolutions.insert(node_ptr(node), resolved);
         }
         if let Some(init) = child(node, 1) {
             self.bind_item(init)?;

@@ -359,6 +359,57 @@ fn control_flow_try() {
     ]);
 }
 
+// Variable declarations (child 6, declaration slice). The script goal is
+// compiled as an eval program, so a sloppy-mode `var` hoists into the
+// eval environment and its accesses stay on the symbol path
+// (`EVAL_REFERENCE` / `SET_VARIABLE`), whereas `let` / `const` bind to
+// frame slots (`NEW_LOCAL` in the scope header, `LET_LOCAL` /
+// `CONST_LOCAL` / `GET_LOCAL` / `SET_LOCAL` per access). The two paths
+// differ in every byte, so both are pinned.
+#[test]
+fn declarations_var_sloppy() {
+    assert_identical(&[
+        // bare + initialized `var`, single and multiple declarators
+        "var x;", "var x=1;", "var x=1,y=2;", "var a=1,b=2,c=3;",
+        // access, assignment, compound, delete of a hoisted var
+        "var x; x;", "var x=1; x;", "var x=1; x=2;", "var x=1; x+=2;",
+        "var x=1; x++;", "var x=1; delete x;", "var p=1; p=p+1;",
+        // interplay with expressions the earlier slices code
+        "var a=1,b=2; a+b;", "var x=1; typeof x;", "var o; o=1; o;",
+    ]);
+}
+
+#[test]
+fn declarations_let_const_lexical() {
+    assert_identical(&[
+        // program-scope lexicals bind to slots (eval program → LOCAL, not
+        // the program-scope CLOSURE marking)
+        "let x=1;", "const x=1;", "let x;", "let x=1,y=2;",
+        "const a=1,b=2;", "let x=1; x;", "const y=2; y;", "let x; x;",
+        // store / compound-store / delete into a lexical slot
+        "let x=1; x=2;", "let x=1; x+=2;", "let x=1; delete x;",
+        "let a=1,b=2,c=3; a+b+c;", "const a=1,b=2; a*b;",
+        // lexicals feeding the expression / control-flow surface
+        "let x=1; if(x)x;", "let x=1,y=2; [x,y];", "let x=1; x?x:0;",
+    ]);
+}
+
+#[test]
+fn declarations_strict_and_blocks() {
+    assert_identical(&[
+        // a `"use strict"` prologue makes the eval program strict: `var`
+        // reserves and binds a slot up front like a lexical
+        "\"use strict\"; var x=1; x;", "\"use strict\"; let x=1; x;",
+        "\"use strict\"; const y=2; y;", "\"use strict\"; var x=1; x=2; x;",
+        "\"use strict\"; let a=1,b=2; a+b;",
+        // block-scoped lexicals: the block header codes NEW_LOCAL and the
+        // block tail UNWINDs the slots
+        "{ let x=1; x; }", "{ const y=2; y; }", "{ let a=1,b=2; a+b; }",
+        "{ let x=1; } { let x=2; }", "if(1){ let x=1; x; }",
+        "while(0){ let x=1; }", "{ { let x=1; x; } }",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

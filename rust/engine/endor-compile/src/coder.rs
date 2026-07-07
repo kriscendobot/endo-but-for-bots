@@ -263,6 +263,10 @@ pub struct Coder<'a> {
     /// The atom table (`parser->symbolTable`), seeded with the built-ins.
     symbols: SymbolTable,
     tree: &'a ScopeTree,
+    /// The frame slot each declaration was assigned during scope coding
+    /// (XS writes `node->index` in `fxScopeCodingBlock`/`Eval`; a resolved
+    /// access reads it back). Keyed by `(scope index, declare id)`.
+    decl_index: HashMap<(usize, u32), i32>,
 }
 
 impl<'a> Coder<'a> {
@@ -281,7 +285,38 @@ impl<'a> Coder<'a> {
             return_target: None,
             symbols: SymbolTable::seeded(),
             tree,
+            decl_index: HashMap::new(),
         }
+    }
+
+    /// The declaration `(scope, id)` a node's symbol binds to (XS's
+    /// `access->declaration`), or `None` for the symbol path.
+    fn resolution_of(&self, node: &Node) -> Option<(usize, u32)> {
+        self.tree.resolutions.get(&node_key(node)).copied().flatten()
+    }
+
+    /// A resolved declaration's `flags` word (for the closure test).
+    fn declare_flags(&self, scope: usize, id: u32) -> u32 {
+        self.tree.scopes[scope]
+            .declares
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.flags)
+            .unwrap_or(0)
+    }
+
+    /// Whether a resolved declaration lives in a closure slot
+    /// (`mxDeclareNodeClosureFlag`).
+    fn is_closure(&self, scope: usize, id: u32) -> bool {
+        self.declare_flags(scope, id) & crate::scoper::dflags::CLOSURE != 0
+    }
+
+    /// The frame slot a resolved declaration was assigned in scope coding.
+    fn declare_index(&self, scope: usize, id: u32) -> i32 {
+        *self
+            .decl_index
+            .get(&(scope, id))
+            .expect("declaration index assigned before access")
     }
 
     /// Pre-intern every source symbol in AST pre-order, mirroring XS's
@@ -318,6 +353,16 @@ impl<'a> Coder<'a> {
     fn add_symbol(&mut self, delta: i32, id: i32, name: &str) {
         let sym = self.symbols.use_symbol(name);
         self.add(delta, Payload::Symbol { sym }, id);
+    }
+
+    /// `fxCoderAddVariable` — a `NEW_LOCAL`/`NEW_CLOSURE` record. XS stores
+    /// both the symbol and the frame `index`, but serializes only the
+    /// symbol (the index is tracked separately in [`Coder::decl_index`]),
+    /// so this is a symbol op. A slotless (`NEW_TEMPORARY`) declare never
+    /// reaches here.
+    fn add_variable(&mut self, delta: i32, id: i32, symbol: Option<&str>, _index: i32) {
+        let name = symbol.expect("NEW_LOCAL/NEW_CLOSURE needs a symbol");
+        self.add_symbol(delta, id, name);
     }
 
     // ---- fxCoderAdd* constructors -----------------------------------
@@ -442,30 +487,117 @@ impl<'a> Coder<'a> {
         self.tree.scopes[scope].declare_count
     }
 
-    // ---- scope coding (declare-free surface) ------------------------
+    // ---- scope coding -----------------------------------------------
     //
-    // The full `fxScopeCodingBlock` / `fxScopeCoded` / `fxScopeCodeRefresh`
-    // / `fxScopeCodeDefineNodes` emit `NEW_LOCAL` / `NEW_CLOSURE` /
-    // `VAR_LOCAL` clusters keyed on declaration symbols — that needs the
-    // atom table (a later child). Here they are the exact no-ops XS runs
-    // when a scope declares nothing, asserted so a declaring loop / block /
-    // `switch` / `catch` fails loudly rather than emitting wrong bytes.
+    // `fxScopeCodingBlock` / `fxScopeCoded` emit the `NEW_LOCAL` /
+    // `NEW_CLOSURE` / `VAR_LOCAL` clusters that give each declaration its
+    // frame slot (`node->index = coder->scopeLevel++`), and the matching
+    // `UNWIND` teardown. `fxScopeCodeDefineNodes` (function/host defines)
+    // stays deferred with the function slice.
 
-    /// `fxScopeCodingBlock` for a non-declaring scope (no-op).
+    /// A snapshot of a scope's declare list — `(id, token, symbol, flags)`
+    /// per declare, in XS's `firstDeclareNode`… order — taken so the
+    /// coder can assign slots (a `&mut self` walk) without borrowing the
+    /// immutable tree across the loop.
+    fn declares_of(&self, scope: usize) -> Vec<(u32, Token, Option<String>, u32)> {
+        self.tree.scopes[scope]
+            .declares
+            .iter()
+            .map(|d| {
+                let sym = match &d.symbol {
+                    Some(crate::scoper::Sym::Named(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                (d.id, d.token, sym, d.flags)
+            })
+            .collect()
+    }
+
+    /// Assign one declaration its frame slot and remember it so a resolved
+    /// access can read it back (`node->index = coder->scopeLevel++`).
+    fn set_declare_index(&mut self, scope: usize, id: u32) -> i32 {
+        let index = self.scope_level;
+        self.scope_level += 1;
+        self.decl_index.insert((scope, id), index);
+        index
+    }
+
+    /// `fxScopeCodingBlock` — give every declaration in `scope` its frame
+    /// slot and, for `var`, its `undefined` initialization; if the scope
+    /// is a direct-`eval` scope, publish the slots into a `with`
+    /// environment. Deferred: `Define`/`Private` declarations (the
+    /// function/class slices) assert.
     fn scope_coding_block(&mut self, scope: usize) {
-        assert_eq!(
-            self.declare_count(scope),
-            0,
-            "declaring scope reached in control-flow coder (later child)"
+        if self.declare_count(scope) == 0 {
+            return;
+        }
+        let is_eval = self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0;
+        for (id, token, sym, flags) in self.declares_of(scope) {
+            self.assert_declared_kind(token);
+            let is_closure = flags & crate::scoper::dflags::CLOSURE != 0;
+            if is_closure {
+                if flags & crate::scoper::dflags::USE_CLOSURE == 0 {
+                    let index = self.set_declare_index(scope, id);
+                    self.add_variable(0, XS_CODE_NEW_CLOSURE, sym.as_deref(), index);
+                    if token == Token::Var {
+                        self.add_byte(1, XS_CODE_UNDEFINED);
+                        self.add_index(0, XS_CODE_VAR_CLOSURE_1, index);
+                        self.add_byte(-1, XS_CODE_POP);
+                    }
+                }
+            } else {
+                let index = self.set_declare_index(scope, id);
+                if let Some(name) = sym.as_deref() {
+                    self.add_variable(0, XS_CODE_NEW_LOCAL, Some(name), index);
+                } else {
+                    self.add_index(0, XS_CODE_NEW_TEMPORARY, index);
+                }
+                if token == Token::Var {
+                    self.add_byte(1, XS_CODE_UNDEFINED);
+                    self.add_index(0, XS_CODE_VAR_LOCAL_1, index);
+                    self.add_byte(-1, XS_CODE_POP);
+                }
+            }
+        }
+        if is_eval {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(0, XS_CODE_WITH);
+            for (id, _, _, _) in self.declares_of(scope) {
+                let index = self.declare_index(scope, id);
+                self.add_index(0, XS_CODE_STORE_1, index);
+            }
+            self.add_byte(-1, XS_CODE_POP);
+            self.environment_level += 1;
+        }
+    }
+
+    /// `fxScopeCoded` — the block teardown: a direct-`eval` block closes
+    /// its `with` environment, then every scope unwinds its declared
+    /// slots.
+    fn scope_coded(&mut self, scope: usize) {
+        let count = self.declare_count(scope);
+        if count != 0 {
+            if self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0 {
+                self.environment_level -= 1;
+                self.add_byte(0, XS_CODE_WITHOUT);
+            }
+            self.add_index(0, XS_CODE_UNWIND_1, count);
+            self.scope_level -= count;
+        }
+    }
+
+    /// The declaration kinds the declaration slice codes. Function/host
+    /// `Define`s and class `Private`s are deferred and assert loudly.
+    fn assert_declared_kind(&self, token: Token) {
+        assert!(
+            matches!(token, Token::Var | Token::Let | Token::Const | Token::Arg | Token::NoToken),
+            "declaration kind {:?} reached (function/class slice)",
+            token
         );
     }
 
-    /// `fxScopeCoded` for a non-declaring scope (no-op).
-    fn scope_coded(&mut self, scope: usize) {
-        assert_eq!(self.declare_count(scope), 0, "declaring scope reached (later child)");
-    }
-
     /// `fxScopeCodeRefresh` for a non-declaring scope (no-op).
+    #[allow(dead_code)]
     fn scope_code_refresh(&mut self, scope: usize) {
         assert_eq!(self.declare_count(scope), 0, "declaring scope reached (later child)");
     }
@@ -474,7 +606,7 @@ impl<'a> Coder<'a> {
     fn scope_code_define_nodes(&mut self, scope: usize) {
         assert!(
             self.tree.scopes[scope].defines.is_empty(),
-            "define nodes reached in control-flow coder (later child)"
+            "define nodes reached in control-flow coder (function slice)"
         );
     }
 }
@@ -491,7 +623,15 @@ pub fn compile(source: &str) -> Result<Vec<u8>, crate::parser::ParseError> {
 /// program is strict).
 pub fn compile_with(source: &str, strict: bool) -> Result<Vec<u8>, crate::parser::ParseError> {
     let mut parser = crate::parser::Parser::new(source, strict, false)?;
-    let root = parser.parse_program(strict)?;
+    let mut root = parser.parse_program(strict)?;
+    // The oracle shim compiles the Script goal with `mxProgramFlag |
+    // mxEvalFlag`, so the program node carries `mxEvalFlag`. The scoper
+    // reads it to build an `Eval` (not `Program`) top scope — an eval
+    // program's lexicals are plain locals, whereas `fxScopeBound` marks
+    // every *program*-scope declaration `closure|useClosure`.
+    if let Item::Node(n) = &mut root {
+        n.flags |= crate::ast::flags::EVAL;
+    }
     let tree = crate::scoper::run(&root)?;
     let mut coder = Coder::new(&tree);
     // Intern the program's symbols in lex order before coding so the atom
@@ -626,6 +766,8 @@ impl Coder<'_> {
             Delete => self.code_delete(&node.children[0]),
             Object => self.code_object(node),
             Array => self.code_array(node),
+            Binding => self.code_binding(node),
+            Var | Let | Const | Using => self.code_declare(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -655,30 +797,89 @@ impl Coder<'_> {
         self.add_byte(0, XS_CODE_RETURN);
     }
 
-    /// `fxScopeCodingEval` for the program scope. Only the branch the
-    /// ported surface reaches is emitted: a sloppy eval program whose
-    /// scope declares nothing but block-locals emits `EVAL_ENVIRONMENT`
-    /// and, when `scopeCount > 0`, a `RESERVE_1`. `var`/function hoists
-    /// (which prepend `RESERVE`/`NEW_LOCAL` clusters) are child 6.
+    /// `fxScopeCodingEval` for the program scope — the eval program
+    /// header. Strict and sloppy differ sharply:
+    ///
+    /// * **strict**: reserve `scopeCount` slots up front, then
+    ///   `fxScopeCodingBlock` gives every declaration its slot (`Private`
+    ///   eval-closures are the function/class slice).
+    /// * **sloppy**: `var`/`Define` hoist first (each a `NEW_LOCAL` +
+    ///   `undefined`/`null` `VAR_LOCAL`), then `EVAL_ENVIRONMENT` resets
+    ///   the frame; the lexical (`let`/`const`) declarations then get
+    ///   their slots (and, in a direct `eval`, a `with` publish).
     fn code_scope_eval(&mut self, node: &Node) {
         let scope = self.scope_of(node);
         let strict = self.tree.scopes[scope].flags & crate::ast::flags::STRICT != 0;
+        let is_eval = self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0;
         let scope_count = *self.tree.scope_counts.get(&scope).unwrap_or(&0);
+        let declares = self.declares_of(scope);
         if strict {
             if scope_count != 0 {
-                // Strict eval reserves up front; block declares handled
-                // by `fxScopeCodingBlock` (child 6 for declaring bodies).
                 self.add_index(0, XS_CODE_RESERVE_1, scope_count);
+                self.scope_coding_block(scope);
+                for (_, token, _, _) in &declares {
+                    assert_ne!(*token, Token::Private, "eval private closure (class slice)");
+                }
             }
         } else {
-            // Sloppy: no top-level `var`/define in the ported surface, so
-            // the DEFINE/VAR prelude is empty.
+            // The `var`/`Define` hoist prelude, counted for the reserve.
+            let count = declares
+                .iter()
+                .filter(|(_, t, _, _)| matches!(t, Token::Var | Token::Define))
+                .count() as i32;
+            if count != 0 {
+                self.add_index(0, XS_CODE_RESERVE_1, count);
+                for (id, token, sym, _) in &declares {
+                    match token {
+                        Token::Define => {
+                            let index = self.set_declare_index(scope, *id);
+                            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                            self.add_byte(1, XS_CODE_NULL);
+                            self.add_index(0, XS_CODE_VAR_LOCAL_1, index);
+                            self.add_byte(-1, XS_CODE_POP);
+                        }
+                        Token::Var => {
+                            let index = self.set_declare_index(scope, *id);
+                            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                            self.add_byte(1, XS_CODE_UNDEFINED);
+                            self.add_index(0, XS_CODE_VAR_LOCAL_1, index);
+                            self.add_byte(-1, XS_CODE_POP);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             self.add_byte(0, XS_CODE_EVAL_ENVIRONMENT);
             self.scope_level = 0;
             if scope_count != 0 {
                 self.add_index(0, XS_CODE_RESERVE_1, scope_count);
-                // Declaring bodies (block lets reached at program scope)
-                // are child 6; the ported corpus keeps scopeCount == 0.
+                if self.declare_count(scope) != 0 {
+                    for (id, token, sym, flags) in &declares {
+                        if matches!(token, Token::Define | Token::Var) {
+                            continue;
+                        }
+                        self.assert_declared_kind(*token);
+                        let index = self.set_declare_index(scope, *id);
+                        if flags & crate::scoper::dflags::CLOSURE != 0 {
+                            self.add_variable(0, XS_CODE_NEW_CLOSURE, sym.as_deref(), index);
+                        } else {
+                            self.add_variable(0, XS_CODE_NEW_LOCAL, sym.as_deref(), index);
+                        }
+                    }
+                    if is_eval {
+                        self.add_byte(1, XS_CODE_UNDEFINED);
+                        self.add_byte(0, XS_CODE_WITH);
+                        for (id, token, _, _) in &declares {
+                            if matches!(token, Token::Define | Token::Var) {
+                                continue;
+                            }
+                            let index = self.declare_index(scope, *id);
+                            self.add_index(0, XS_CODE_STORE_1, index);
+                        }
+                        self.add_byte(-1, XS_CODE_POP);
+                        self.environment_level += 1;
+                    }
+                }
             }
         }
     }
@@ -706,19 +907,17 @@ impl Coder<'_> {
         }
     }
 
-    /// `fxBlockNodeCode`. In the ported surface a block declares nothing,
-    /// so `fxScopeCodingBlock`/`fxScopeCoded` are no-ops guarded on the
-    /// declare count; declaring blocks are child 6.
+    /// `fxBlockNodeCode` — a lexical block: code its scope's
+    /// declarations, dispatch the body, then unwind the block's slots.
+    /// `fxScopeCodeDefineNodes` (function/host defines) is deferred, and
+    /// `fxScopeCodeUsingStatement` with no disposables is just the
+    /// statement dispatch.
     fn code_block(&mut self, node: &Node) {
         let scope = self.scope_of(node);
-        assert_eq!(
-            self.declare_count(scope),
-            0,
-            "declaring block reached in expr/simple-statement coder (child 6)"
-        );
-        // `fxScopeCodeUsingStatement` with no disposables just dispatches
-        // the block's statement.
+        self.scope_coding_block(scope);
+        self.scope_code_define_nodes(scope);
         self.code(&node.children[0]);
+        self.scope_coded(scope);
     }
 
     /// `fxIfNodeCode` (program-flag branch: each arm sets the result to
@@ -993,6 +1192,14 @@ impl Coder<'_> {
     /// needs the scoper's per-node declaration and arrives with the
     /// declaration slices.
     fn code_access(&mut self, node: &Node) {
+        // fxAccessNodeCode: a resolved access loads its frame slot; a free
+        // reference falls back to the symbol path.
+        if let Some((scope, id)) = self.resolution_of(node) {
+            let index = self.declare_index(scope, id);
+            let op = if self.is_closure(scope, id) { XS_CODE_GET_CLOSURE_1 } else { XS_CODE_GET_LOCAL_1 };
+            self.add_index(1, op, index);
+            return;
+        }
         let name = Self::symbol_of(&node.children[0]).to_string();
         // fxAccessNodeCodeReference (unresolved, evalFlag branch)
         if self.eval_flag {
@@ -1001,6 +1208,74 @@ impl Coder<'_> {
             self.add_symbol(1, XS_CODE_PROGRAM_REFERENCE, &name);
         }
         self.add_symbol(0, XS_CODE_GET_VARIABLE, &name);
+    }
+
+    /// `fxBindingNodeCode` — `target = initializer` in a declaration
+    /// (`var`/`let`/`const` with an initializer). The target is a
+    /// declaration node (an `Access` target would be `invalid
+    /// initializer`, a syntax error the parser already rejects here).
+    fn code_binding(&mut self, node: &Node) {
+        self.code_reference(&node.children[0], 0);
+        self.code(&node.children[1]);
+        self.code_assign(&node.children[0], 0);
+        self.add_byte(-1, XS_CODE_POP);
+    }
+
+    /// `fxDeclareNodeCode` — a bare declaration with no initializer. `var`
+    /// emits nothing (its slot was set up in the scope header); `let`
+    /// initializes its slot to `undefined`; `const`/`using` without an
+    /// initializer are syntax errors the parser already rejected.
+    fn code_declare(&mut self, node: &Node) {
+        if node.token == Token::Let {
+            self.code_declare_reference(node);
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.code_declare_assign(node);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+    }
+
+    /// `fxDeclareNodeCodeReference` — a resolved declaration needs no
+    /// reference; an unresolved one (a sloppy-eval `var`) takes the symbol
+    /// path.
+    fn code_declare_reference(&mut self, node: &Node) {
+        if self.resolution_of(node).is_some() {
+            return;
+        }
+        let name = Self::symbol_of(&node.children[0]).to_string();
+        if self.eval_flag {
+            self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
+        } else {
+            self.add_symbol(1, XS_CODE_PROGRAM_REFERENCE, &name);
+        }
+    }
+
+    /// `fxDeclareNodeCodeAssign` — store the initializer into the
+    /// declaration's slot with the token's binding op (`VAR_LOCAL` /
+    /// `LET_LOCAL` / `CONST_LOCAL`, or the `*_CLOSURE` variants), or
+    /// `SET_VARIABLE` on the symbol path.
+    fn code_declare_assign(&mut self, node: &Node) {
+        match self.resolution_of(node) {
+            None => {
+                let name = Self::symbol_of(&node.children[0]).to_string();
+                self.add_symbol(-1, XS_CODE_SET_VARIABLE, &name);
+            }
+            Some((scope, id)) => {
+                let index = self.declare_index(scope, id);
+                let closure = self.is_closure(scope, id);
+                let op = match node.token {
+                    Token::Const => {
+                        if closure { XS_CODE_CONST_CLOSURE_1 } else { XS_CODE_CONST_LOCAL_1 }
+                    }
+                    Token::Let => {
+                        if closure { XS_CODE_LET_CLOSURE_1 } else { XS_CODE_LET_LOCAL_1 }
+                    }
+                    _ => {
+                        if closure { XS_CODE_VAR_CLOSURE_1 } else { XS_CODE_VAR_LOCAL_1 }
+                    }
+                };
+                self.add_index(0, op, index);
+            }
+        }
     }
 
     /// `fxMemberNodeCode`. Children `[reference, symbol]` → the reference
@@ -1150,9 +1425,14 @@ impl Coder<'_> {
         match item {
             Item::Node(n) => match n.token {
                 Token::Access => {
-                    // fxAccessNodeCodeDelete (unresolved): reference then
+                    // fxAccessNodeCodeDelete: deleting a resolved binding
+                    // yields `false`; an unresolved one references then
                     // DELETE_PROPERTY. (strict `delete ident` is a parser
                     // early error, not reached here.)
+                    if self.resolution_of(n).is_some() {
+                        self.add_byte(1, XS_CODE_FALSE);
+                        return;
+                    }
                     let name = Self::symbol_of(&n.children[0]).to_string();
                     if self.eval_flag {
                         self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
@@ -1256,12 +1536,20 @@ impl Coder<'_> {
         1
     }
 
-    /// `fxAccessNodeCodeThis` (unresolved/global path).
+    /// `fxAccessNodeCodeThis`. A resolved local pushes its slot (with no
+    /// separate receiver); a free reference pushes `undefined` as the
+    /// receiver then loads the value by symbol.
     fn code_access_this(&mut self, node: &Node, flag: i32) -> i32 {
-        let name = Self::symbol_of(&node.children[0]).to_string();
         if flag == 0 {
             self.add_byte(1, XS_CODE_UNDEFINED);
         }
+        if let Some((scope, id)) = self.resolution_of(node) {
+            let index = self.declare_index(scope, id);
+            let op = if self.is_closure(scope, id) { XS_CODE_GET_CLOSURE_1 } else { XS_CODE_GET_LOCAL_1 };
+            self.add_index(1, op, index);
+            return 0;
+        }
+        let name = Self::symbol_of(&node.children[0]).to_string();
         // unresolved: reference then GET_THIS_VARIABLE
         if self.eval_flag {
             self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
@@ -1398,7 +1686,17 @@ impl Coder<'_> {
     fn code_reference(&mut self, item: &Item, flag: i32) {
         match item {
             Item::Node(n) => match n.token {
+                // fxDeclareNodeCodeReference: a declaration target (a
+                // `var`/`let`/`const` binding) — nothing when resolved.
+                Token::Var | Token::Let | Token::Const | Token::Using => {
+                    self.code_declare_reference(n);
+                }
                 Token::Access => {
+                    // fxAccessNodeCodeReference: resolved locals need no
+                    // reference; a free reference takes the symbol path.
+                    if self.resolution_of(n).is_some() {
+                        return;
+                    }
                     let name = Self::symbol_of(&n.children[0]).to_string();
                     if self.eval_flag {
                         self.add_symbol(1, XS_CODE_EVAL_REFERENCE, &name);
@@ -1429,11 +1727,22 @@ impl Coder<'_> {
     fn code_assign(&mut self, item: &Item, flag: i32) {
         match item {
             Item::Node(n) => match n.token {
+                // fxDeclareNodeCodeAssign: a declaration target stores with
+                // its binding op (`VAR_LOCAL`/`LET_LOCAL`/`CONST_LOCAL`).
+                Token::Var | Token::Let | Token::Const | Token::Using => {
+                    self.code_declare_assign(n);
+                }
                 Token::Access => {
-                    // Unresolved (global) → SET_VARIABLE; resolved store is
-                    // the declaration slice.
-                    let name = Self::symbol_of(&n.children[0]).to_string();
-                    self.add_symbol(-1, XS_CODE_SET_VARIABLE, &name);
+                    // fxAccessNodeCodeAssign: resolved → SET_LOCAL/SET_CLOSURE
+                    // by slot; unresolved (global) → SET_VARIABLE by symbol.
+                    if let Some((scope, id)) = self.resolution_of(n) {
+                        let index = self.declare_index(scope, id);
+                        let op = if self.is_closure(scope, id) { XS_CODE_SET_CLOSURE_1 } else { XS_CODE_SET_LOCAL_1 };
+                        self.add_index(0, op, index);
+                    } else {
+                        let name = Self::symbol_of(&n.children[0]).to_string();
+                        self.add_symbol(-1, XS_CODE_SET_VARIABLE, &name);
+                    }
                 }
                 Token::Member => {
                     let is_super = self.node_is_super(&n.children[0]);
