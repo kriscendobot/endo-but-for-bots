@@ -207,6 +207,21 @@ pub struct ScopeTree {
     /// `scopeCount` per function/program/module scope, keyed by scope
     /// index (the coder's frame slot count).
     pub scope_counts: HashMap<usize, i32>,
+    /// A scope-creating node's address → its scope(s): `.0` primary
+    /// (`self->scope`), `.1` secondary (`statementScope`/`symbolScope`).
+    /// The coder walks the *same* parsed tree the scoper walked, so a
+    /// node's address keys back to the scope XS hung off it in place
+    /// (`self->scope`, `xsScope.c`). Keyed with [`node_key`].
+    pub node_scopes: HashMap<usize, (usize, Option<usize>)>,
+}
+
+/// The stable identity the scoper/coder use to associate a scope (and,
+/// later, an access resolution) with a node: the node's address in the
+/// parsed tree. Faithful to XS hanging `txScope*`/`access->declaration`
+/// off the node in place — valid only while that tree is alive, which it
+/// is for the whole compile.
+pub fn node_key(n: &Node) -> usize {
+    n as *const Node as usize
 }
 
 // ============================ entry points ============================
@@ -238,7 +253,13 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
     // fxParserBind
     s.bind_dispatch(root_node)?;
     let root_scope = *s.node_scope.get(&node_ptr(root_node)).ok_or_else(|| err(root_node.line, "no root scope"))?;
-    Ok(ScopeTree { scopes: s.scopes, root: root_scope.0, accesses: s.accesses, scope_counts: s.scope_counts })
+    Ok(ScopeTree {
+        scopes: s.scopes,
+        root: root_scope.0,
+        accesses: s.accesses,
+        scope_counts: s.scope_counts,
+        node_scopes: s.node_scope,
+    })
 }
 
 // ============================ scoper state ============================

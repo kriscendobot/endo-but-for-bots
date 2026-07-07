@@ -16,9 +16,11 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod coder;
 pub mod error;
 pub mod lexer;
 pub mod meter;
+pub mod opcodes;
 pub mod parser;
 pub mod scoper;
 pub mod token;
@@ -26,6 +28,7 @@ pub mod token_flags;
 pub mod unicode;
 
 pub use ast::{Item, Node};
+pub use coder::{compile, compile_with};
 pub use error::{LexError, LexErrorKind};
 pub use lexer::{BigIntLiteral, Lexeme, Lexer};
 pub use meter::ParseMeter;
