@@ -93,6 +93,10 @@ enum Payload {
 /// `endor_shim.c`). The symbol hash bucket count.
 const SYMBOL_MODULO: u32 = 1993;
 
+/// `XS_DONT_ENUM_FLAG` (`xsCommon.h`) — the attribute a plain function's
+/// synthetic `caller` own property carries.
+const XS_DONT_ENUM_FLAG: i32 = 4;
+
 /// The built-in symbols `fxInitializeParser` interns *before* lexing, in
 /// exact source order (`xsScript.c`). They occupy their hash buckets ahead
 /// of every program symbol, so their position is part of the ID contract
@@ -267,6 +271,11 @@ pub struct Coder<'a> {
     /// (XS writes `node->index` in `fxScopeCodingBlock`/`Eval`; a resolved
     /// access reads it back). Keyed by `(scope index, declare id)`.
     decl_index: HashMap<(usize, u32), i32>,
+    /// `Define` nodes already coded (XS's `mxDefineNodeCodedFlag`): a
+    /// function declaration is hoisted and emitted by `fxScopeCodeDefineNodes`
+    /// at the top of its scope, so its second reach — the in-list statement
+    /// — is a no-op. Keyed by node address.
+    defined: std::collections::HashSet<usize>,
 }
 
 impl<'a> Coder<'a> {
@@ -286,6 +295,7 @@ impl<'a> Coder<'a> {
             symbols: SymbolTable::seeded(),
             tree,
             decl_index: HashMap::new(),
+            defined: std::collections::HashSet::new(),
         }
     }
 
@@ -353,6 +363,22 @@ impl<'a> Coder<'a> {
     fn add_symbol(&mut self, delta: i32, id: i32, name: &str) {
         let sym = self.symbols.use_symbol(name);
         self.add(delta, Payload::Symbol { sym }, id);
+    }
+
+    /// `fxCoderAddSymbol` with a `NULL` symbol — an anonymous function's
+    /// name operand. XS serializes a null `txSymbol*` as id 0; the emitter
+    /// reads 0 for any non-`Symbol` payload, so a plain `Byte` payload on a
+    /// symbol-operand opcode emits the two zero bytes.
+    fn add_symbol_null(&mut self, delta: i32, id: i32) {
+        self.add(delta, Payload::Byte, id);
+    }
+
+    /// `fxCoderAddSymbol` for an optional name (anonymous → null symbol).
+    fn add_symbol_opt(&mut self, delta: i32, id: i32, name: Option<&str>) {
+        match name {
+            Some(n) => self.add_symbol(delta, id, n),
+            None => self.add_symbol_null(delta, id),
+        }
     }
 
     /// `fxCoderAddVariable` — a `NEW_LOCAL`/`NEW_CLOSURE` record. XS stores
@@ -769,6 +795,11 @@ impl Coder<'_> {
             Array => self.code_array(node),
             Binding => self.code_binding(node),
             Var | Let | Const | Using => self.code_declare(node),
+            Function | Generator => self.code_function(node),
+            Define => self.code_define(node),
+            Body => self.code_body(node),
+            Return => self.code_return(node),
+            ParamsBinding => self.code_params_binding(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -790,8 +821,9 @@ impl Coder<'_> {
         // missing return target skews every `try` selection by one).
         let return_target = self.create_target();
         self.return_target = Some(return_target);
-        // `fxScopeCodeDefineNodes` — no define nodes in the ported
-        // surface (function/var defines are child 6).
+        // `fxScopeCodeDefineNodes` — hoist function declarations to the top
+        // of the program before the ordinary statements.
+        self.code_define_nodes(&node.children[0]);
         self.code(&node.children[0]);
         let rt = self.return_target.take().expect("program return target");
         self.place_target(0, rt);
@@ -916,7 +948,7 @@ impl Coder<'_> {
     fn code_block(&mut self, node: &Node) {
         let scope = self.scope_of(node);
         self.scope_coding_block(scope);
-        self.scope_code_define_nodes(scope);
+        self.code_define_nodes(&node.children[0]);
         self.code(&node.children[0]);
         self.scope_coded(scope);
     }
@@ -1209,6 +1241,66 @@ impl Coder<'_> {
         }
     }
 
+    /// A name slot that may be `NULL` (an anonymous function/class).
+    fn symbol_opt(item: &Item) -> Option<String> {
+        match item {
+            Item::Symbol(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// `fxNodeCodeName` — whether coding `value` in a naming position (a
+    /// binding/assignment/property whose target supplies a name) would
+    /// infer a name for an anonymous function/class. Name inference is a
+    /// deferred slice, so callers assert a `false` here rather than emit a
+    /// wrongly-anonymous function.
+    fn infers_name(item: &Item) -> bool {
+        let node = match item {
+            Item::Node(n) => n,
+            _ => return false,
+        };
+        match node.token {
+            // a single-item parenthesized expression forwards to its item
+            Token::Expressions => {
+                if let Some(Item::List(items)) = node.children.first() {
+                    if items.len() == 1 {
+                        return Self::infers_name(&items[0]);
+                    }
+                }
+                false
+            }
+            Token::Function | Token::Generator => {
+                matches!(node.children.first(), Some(Item::Null))
+            }
+            Token::Class => matches!(node.children.first(), Some(Item::Null)),
+            _ => false,
+        }
+    }
+
+    /// Guard a naming position (a declaration/assignment/property value):
+    /// name inference for an anonymous function/class is deferred.
+    fn assert_no_name_inference(item: &Item) {
+        assert!(
+            !Self::infers_name(item),
+            "anonymous function/class name inference deferred (later slice)"
+        );
+    }
+
+    /// Guard a function body to the simple shapes this slice codes:
+    /// expression statements and `return [expr]`. Control-flow statements
+    /// (loops, `if`, `switch`, `try`, labels, nested blocks) and
+    /// declarations reach the non-program loop/return paths and XS's
+    /// branch-threading optimizer, which are later slices.
+    fn assert_simple_function_body(statement: &Item) {
+        for item in Self::statement_items(statement) {
+            let ok = match item {
+                Item::Node(n) => matches!(n.token, Token::Statement | Token::Return),
+                _ => false,
+            };
+            assert!(ok, "non-simple function body statement deferred (later slice)");
+        }
+    }
+
     /// `fxAccessNodeCode`. Child `[symbol]`. At program scope every
     /// identifier is a free (global) reference, so the coder takes the
     /// unresolved path: an `EVAL_REFERENCE` (the program is coded with the
@@ -1239,6 +1331,7 @@ impl Coder<'_> {
     /// declaration node (an `Access` target would be `invalid
     /// initializer`, a syntax error the parser already rejects here).
     fn code_binding(&mut self, node: &Node) {
+        Self::assert_no_name_inference(&node.children[1]);
         self.code_reference(&node.children[0], 0);
         self.code(&node.children[1]);
         self.code_assign(&node.children[0], 0);
@@ -1300,6 +1393,271 @@ impl Coder<'_> {
                 self.add_index(0, op, index);
             }
         }
+    }
+
+    /// `fxDefineNodeCode` — a function/host declaration statement (`(Define
+    /// #name value)`). Reference the declaration, code its initializer (a
+    /// function value), store, and pop. A define is coded once (XS's
+    /// `mxDefineNodeCodedFlag`): it is hoisted to the top of its scope by
+    /// [`Coder::code_define_nodes`], so the in-list statement is a no-op.
+    fn code_define(&mut self, node: &Node) {
+        if !self.defined.insert(node_key(node)) {
+            return;
+        }
+        self.code_declare_reference(node);
+        self.code(&node.children[1]);
+        self.code_declare_assign(node);
+        self.add_byte(-1, XS_CODE_POP);
+    }
+
+    /// `fxScopeCodeDefineNodes` — hoist and code the function-declaration
+    /// (`Define`) statements at the top of a scope's body, in source order,
+    /// before the ordinary statements. Marks each coded so its in-list
+    /// occurrence is skipped.
+    fn code_define_nodes(&mut self, body: &Item) {
+        for item in Self::statement_items(body) {
+            if let Item::Node(n) = item {
+                if n.token == Token::Define {
+                    self.code_define(n);
+                }
+            }
+        }
+    }
+
+    /// The ordered statement items of a body: a `Statements` node's list,
+    /// or the single statement itself.
+    fn statement_items(body: &Item) -> Vec<&Item> {
+        if let Item::Node(n) = body {
+            if n.token == Token::Statements {
+                if let Some(Item::List(items)) = n.children.first() {
+                    return items.iter().collect();
+                }
+            }
+        }
+        vec![body]
+    }
+
+    /// `fxCoderCountParameters` — the leading simple/pattern parameter
+    /// count (stops at the first rest binding or non-parameter slot).
+    fn count_parameters(&self, params: &Item) -> i32 {
+        let Item::Node(p) = params else { return 0 };
+        let Some(Item::List(items)) = p.children.first() else { return 0 };
+        let mut count = 0;
+        for it in items {
+            match it {
+                Item::Node(n)
+                    if matches!(n.token, Token::Arg | Token::ArrayBinding | Token::ObjectBinding) =>
+                {
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        count
+    }
+
+    /// `fxFunctionNodeCode` — emit a function value. Children `[name?,
+    /// ParamsBinding, Body]`. This slice covers plain
+    /// (`CONSTRUCTOR_FUNCTION`) and arrow (`FUNCTION`) functions; async,
+    /// generator, method, getter/setter, and class field/base/derived
+    /// constructors assert (later slices), as do parameters and captured
+    /// closures.
+    fn code_function(&mut self, node: &Node) {
+        use crate::ast::flags as f;
+        let flags = node.flags;
+        assert_eq!(
+            flags & (f::ASYNC | f::GENERATOR | f::METHOD | f::GETTER | f::SETTER | f::FIELD | f::BASE | f::DERIVED),
+            0,
+            "function flavor {flags:#x} deferred (async/generator/method/accessor/class)"
+        );
+        let scope = self.scope_of(node);
+        // Deferred: named function expressions (the scope binds the name to
+        // `CURRENT`) and parameters both add function-scope declares; a
+        // function body that declares `var`/`let`/`const` has a distinct
+        // frame/return-target interaction. Guard both as named gaps.
+        assert_eq!(
+            self.declare_count(scope),
+            0,
+            "named function expression / parameters deferred (later slice)"
+        );
+        if let Item::Node(body) = &node.children[2] {
+            let body_scope = self.scope_of(body);
+            assert_eq!(
+                self.declare_count(body_scope),
+                0,
+                "function body with declarations deferred (later slice)"
+            );
+            // A body with control flow exercises XS's branch-threading
+            // optimizer (not yet ported) and the non-program loop/return
+            // paths; defer it. A simple body is expression statements and
+            // `return expr`.
+            Self::assert_simple_function_body(&body.children[0]);
+        }
+        let is_arrow = flags & f::ARROW != 0;
+        let is_strict = flags & f::STRICT != 0;
+        let scope_count = *self.tree.scope_counts.get(&scope).unwrap_or(&0);
+        let scope_eval = self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL != 0;
+
+        // Save the coder's per-function state.
+        let saved_env = self.environment_level;
+        let saved_eval = self.eval_flag;
+        let saved_program = self.program_flag;
+        let saved_scope_level = self.scope_level;
+        let saved_break = self.first_break_target;
+        let saved_continue = self.first_continue_target;
+        let saved_return = self.return_target;
+
+        let name = Self::symbol_opt(&node.children[0]);
+        let target = self.create_target();
+
+        if flags & f::EVAL != 0 && !is_strict {
+            self.eval_flag = true;
+        }
+        self.program_flag = false;
+        self.scope_level = 0;
+        self.first_break_target = None;
+        self.first_continue_target = None;
+
+        // Function-creation op (this slice: plain or arrow only).
+        let create_op = if is_arrow { XS_CODE_FUNCTION } else { XS_CODE_CONSTRUCTOR_FUNCTION };
+        self.add_symbol_opt(1, create_op, name.as_deref());
+        self.add_branch(0, XS_CODE_CODE_1, target);
+
+        // BEGIN_* with the leading parameter count.
+        let count_params = self.count_parameters(&node.children[1]);
+        let begin = if is_strict { XS_CODE_BEGIN_STRICT } else { XS_CODE_BEGIN_SLOPPY };
+        self.add_index(0, begin, count_params);
+
+        if scope_count != 0 {
+            self.add_index(0, XS_CODE_RESERVE_1, scope_count);
+        }
+        self.scope_code_retrieve(scope);
+        self.scope_coding_params(scope);
+        self.code(&node.children[1]); // ParamsBinding
+        self.scope_code_define_nodes(scope);
+
+        self.return_target = Some(self.create_target());
+        self.code(&node.children[2]); // Body
+        let rt = self.return_target.expect("function return target");
+        self.place_target(0, rt);
+        self.add_byte(0, if is_arrow { XS_CODE_END_ARROW } else { XS_CODE_END });
+        self.place_target(0, target);
+
+        // Environment storing for captured closures / eval.
+        if scope_eval || self.eval_flag {
+            self.add_byte(1, XS_CODE_FUNCTION_ENVIRONMENT);
+            self.scope_code_store(scope);
+            self.add_byte(-1, XS_CODE_POP);
+        } else if self.tree.scopes[scope].closure_count != 0
+            || (is_arrow && self.tree.scopes[scope].arrow_default)
+        {
+            self.add_byte(1, XS_CODE_ENVIRONMENT);
+            self.scope_code_store(scope);
+            self.add_byte(-1, XS_CODE_POP);
+        }
+
+        // A plain (non-arrow/base/derived/generator/strict/method) function
+        // gets a non-enumerable `caller` own property.
+        if flags & (f::ARROW | f::BASE | f::DERIVED | f::GENERATOR | f::STRICT | f::METHOD) == 0 {
+            self.add_byte(1, XS_CODE_DUB);
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_symbol(-2, XS_CODE_NEW_PROPERTY, "caller");
+            self.add_integer(0, XS_CODE_INTEGER_1, XS_DONT_ENUM_FLAG);
+        }
+
+        // Restore the coder's per-function state.
+        self.return_target = saved_return;
+        self.first_continue_target = saved_continue;
+        self.first_break_target = saved_break;
+        self.scope_level = saved_scope_level;
+        self.program_flag = saved_program;
+        self.eval_flag = saved_eval;
+        self.environment_level = saved_env;
+    }
+
+    /// `fxScopeCodeRetrieve` — retrieve captured closures into frame slots.
+    /// This slice has no captured closures and no arrow-default, so it is a
+    /// no-op; the closure and arrow-default paths assert.
+    fn scope_code_retrieve(&mut self, scope: usize) {
+        for d in &self.tree.scopes[scope].declares {
+            assert!(
+                d.flags & crate::scoper::dflags::USE_CLOSURE == 0 || d.symbol.is_none(),
+                "closure retrieval deferred (closure slice)"
+            );
+        }
+        assert!(
+            !self.tree.scopes[scope].arrow_default,
+            "arrow-default retrieval deferred (closure slice)"
+        );
+    }
+
+    /// `fxScopeCodeStore` — store captured closures back. No-op in this
+    /// slice (no use-closure declares, no arrow-default, no eval body).
+    fn scope_code_store(&mut self, scope: usize) {
+        for d in &self.tree.scopes[scope].declares {
+            assert!(
+                d.flags & crate::scoper::dflags::USE_CLOSURE == 0,
+                "closure store deferred (closure slice)"
+            );
+        }
+    }
+
+    /// `fxScopeCodingParams` — bind parameters into frame slots. This slice
+    /// only reaches the empty-parameter / no-eval case (nothing emitted);
+    /// declaring parameters assert.
+    fn scope_coding_params(&mut self, scope: usize) {
+        for d in &self.tree.scopes[scope].declares {
+            assert!(
+                !matches!(d.token, Token::Arg | Token::Var | Token::Const),
+                "parameter binding deferred (params slice)"
+            );
+        }
+        assert!(
+            self.tree.scopes[scope].flags & crate::scoper::SCOPE_EVAL == 0,
+            "eval-scope params deferred"
+        );
+    }
+
+    /// `fxParamsBindingNodeCode` — the empty-parameter case (no
+    /// `arguments` object, no items) emits nothing. Non-empty parameter
+    /// lists and the `arguments` object are the params slice.
+    fn code_params_binding(&mut self, node: &Node) {
+        if let Some(Item::List(items)) = node.children.first() {
+            assert!(items.is_empty(), "non-empty parameter list deferred (params slice)");
+        }
+    }
+
+    /// `fxBodyNodeCode` — a function body block. This slice handles the
+    /// non-eval / non-declaring body: scope-code the block, dispatch the
+    /// statement, unwind. Child `[statement]`.
+    fn code_body(&mut self, node: &Node) {
+        let scope = self.scope_of(node);
+        self.scope_coding_block(scope);
+        self.code_define_nodes(&node.children[0]);
+        self.code(&node.children[0]);
+        self.scope_coded(scope);
+    }
+
+    /// `fxReturnNodeCode` — `return [expr];` inside a function. Code the
+    /// value (or `undefined`), set the result, unwind to the return
+    /// target, and branch to it (the branch is elided when the target is
+    /// the next instruction).
+    fn code_return(&mut self, node: &Node) {
+        assert!(!self.program_flag, "return at program scope is a syntax error");
+        let rt = self.return_target.expect("return target");
+        match node.children.first() {
+            Some(item) if !matches!(item, Item::Null) => {
+                self.code(item);
+                self.add_byte(-1, XS_CODE_SET_RESULT);
+            }
+            _ => {
+                self.add_byte(1, XS_CODE_UNDEFINED);
+                self.add_byte(-1, XS_CODE_SET_RESULT);
+            }
+        }
+        self.adjust_environment(rt);
+        self.adjust_scope(rt);
+        self.add_branch(0, XS_CODE_BRANCH_1, rt);
     }
 
     /// `fxMemberNodeCode`. Children `[reference, symbol]` → the reference
@@ -1367,6 +1725,7 @@ impl Coder<'_> {
                     Token::Property => {
                         let key = Self::symbol_of(&p.children[0]).to_string();
                         assert!(key != "__proto__", "__proto__ property reached (later child)");
+                        Self::assert_no_name_inference(&p.children[1]);
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
                         self.code(&p.children[1]);
                         self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
@@ -1639,6 +1998,7 @@ impl Coder<'_> {
     /// `fxAssignNodeCode` — plain `=`. Children `[reference, value]`:
     /// prepare the reference, evaluate the value, store.
     fn code_assign_node(&mut self, node: &Node) {
+        Self::assert_no_name_inference(&node.children[1]);
         self.code_reference(&node.children[0], 1);
         self.code(&node.children[1]);
         self.code_assign(&node.children[0], 1);

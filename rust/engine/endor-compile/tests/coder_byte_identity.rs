@@ -425,6 +425,35 @@ fn with_statement() {
     ]);
 }
 
+// Functions (child 6, first function slice). Covers plain
+// (`CONSTRUCTOR_FUNCTION`) and arrow (`FUNCTION`) function *values* with
+// simple bodies (expression statements and `return expr`), function
+// *declarations* (`Define`, hoisted to the top of the scope), and the
+// nested `CODE` block with its `BEGIN`/`END`, `FUNCTION_ENVIRONMENT`
+// storing, and the plain-function `caller` own property. Deferred (and
+// asserted, never mis-emitted): parameters, captured closures, named
+// function expressions, name inference, generators/async, methods/
+// accessors, class constructors, and control-flow / declaring bodies.
+#[test]
+fn function_expressions_and_declarations() {
+    assert_identical(&[
+        // anonymous function expressions, empty and simple bodies
+        "(function(){});", "(function(){return 1;});", "(function(){1;});",
+        "(function(){return;});", "(function(){1;2;});", "(function(){return 1+2;});",
+        "(function(){a;b;c;});", "(function(){return a+b;});",
+        // arrow functions
+        "(()=>{});", "(()=>1);", "(()=>{return 2;});", "(()=>{1;});", "(()=>x);",
+        // function declarations (hoisted) and their access order
+        "function f(){}", "f;function f(){}", "function g(){return 3;}",
+        "function f(){}function g(){}", "function k(){return \"hi\";}",
+        // function as a value in non-naming positions
+        "[function(){}];", "f(function(){});", "(function(){})();",
+        "(function(){return 1;})();",
+        // strict function expressions
+        "\"use strict\";(function(){});", "\"use strict\";(()=>{});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
