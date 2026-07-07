@@ -1616,12 +1616,24 @@ new kill-criterion evidence in this sweep. The classes:
 3. **Class γ — in-function / in-initializer direct-eval scope emission
    (divergent).** A nested function or a class-field initializer containing a
    direct `eval(...)` emits a differing function-environment prologue
-   (extra / missing scope-slot `store_1`s): `assignment/S11.13.1_A6_T1,T2`
-   (both, `eval("var x;")` in an IIFE), and the `class` direct-eval family
-   (`elements/*direct-eval*`, `derived-cls-direct-eval-*`,
-   `*-visible-to-direct-eval*`, `privatename-not-valid-eval-earlyerr-*` — 32
-   of the `class` divergences). fix2's eval-scope child landed in-function
-   direct-eval; this is its residual on nested / initializer scopes.
+   (extra / missing scope-slot `store_1`s). fix3's γ child closed the
+   **nested-function** sub-shape: an eval function now captures its whole
+   enclosing lexical frame (`fxScopeCodeStoreAll`, gated on the faithful
+   `node->declaration` bit so synthesized slots — an injected `arguments`
+   `Var`, a class's anonymous field-init closures — are not captured), so
+   `assignment/S11.13.1_A6_T1,T2` (`eval("var x;")` in an IIFE) are now
+   byte-identical (`assignment` divergent 2 → 0). The **class field-initializer**
+   sub-shape remains (the `class` direct-eval family — `elements/*direct-eval*`,
+   `derived-cls-direct-eval-*`, `*-visible-to-direct-eval*`,
+   `privatename-not-valid-eval-earlyerr-*`, `class` 62 divergences): the
+   synthesized `instanceInit`/member-closure field function still omits the
+   field-function scope's own `SCOPE_EVAL` prelude (`undefined; with; pop`) and
+   store-all capture. It must key on the field-function scope's OWN eval flag
+   (endor synthesizes that scope at bind, *after* the hoist-time poison walk,
+   so the flag has to be set there) and — for the mixed private+public
+   `caps` path — hand-roll the params publish + store-all with the exact
+   class-frame `node->declaration` gate; deferred as a larger scoper+coder
+   fold to avoid regressing the byte-clean class corpora.
 4. **Class δ — integer-index object-literal key coding (divergent).**
    `expressions/object/S11.1.5_A3.js` (`{0 : 1, "1" : "x", o : {}}`): the
    oracle codes an integer-valued key via the integer-index property path
@@ -1637,28 +1649,31 @@ new kill-criterion evidence in this sweep. The classes:
    ordering diff). 2 of the `class` divergences (the third field-init file,
    `intercalated-…`, is folded into Class α above).
 
-**Residual `endor-rejected` (all one named fold).** The only endor-rejects
-in the sweep are **8 `object` + 4 `function`**, every one the same documented
-loud fold — `coder panic: eval in a parameter default (parameter
-var-environment) deferred` — on the `scope-*-param-*-elem-var-*` /
-`scope-*-meth-param-*-var-*` tests that place an `eval(...)` in a parameter
-default (representative:
-`function/scope-param-elem-var-close.js`). A reject, never a mis-emit;
-expected until the parameter var-environment eval case is ported.
+**Residual `endor-rejected` — CLOSED.** The former loud fold (`coder panic:
+eval in a parameter default (parameter var-environment) deferred`, 8 `object`
++ 4 `function` rejects on `scope-*-param-*-var-*`) is gone. fix3's γ child
+ported it: a direct `eval` in a parameter default poisons the parameter scope
+(not the body), so `fxScopeCodingParams` publishes the parameters into a
+`with` and `fxScopeCodedBody` unwinds those frames with the two `WITHOUT` —
+keyed on the FUNCTION node's eval flag, not the body's. `statements/function`
+endor-rejected 4 → 0 (subtree byte-clean), `expressions/object` endor-rejected
+8 → 0 (its lone remaining divergence is Class δ). The sweep now has **no
+`endor-rejected` at all**.
 
 **Stage-5 byte-identity bar — status.** On the **curated + module corpora**
 (the gated in-crate bars) the bar is **MET**: `1711/1711` and `45/45`
 byte-identical, `divergent == 0`, full accept/reject agreement. On the
 **broadened real-test262 sweep**, `accept-disagree == 0` is **MET on every
-subtree** and `endor-rejected` is confined to a **single named fold**
-(eval-in-parameter-default); but `divergent == 0` is **NOT yet MET** — 118
-residual divergences remain (`class` 113, `assignment` 2, `function` 2,
-`object` 1). **Every residual is attributed** to one of the five named,
-narrow coder mechanisms above (Classes α–ε) — there is **no unexplained /
-unattributed byte divergence, hence no new kill-criterion evidence**. The
-remaining classes are follow-on coder work (closure-capture promotion,
-private-member install bytes, nested/initializer direct-eval scope,
-integer-index keys, field-initializer scope), not a feasibility wall.
+subtree** and `endor-rejected == 0` is now **MET** (the eval-in-parameter-default
+fold is closed); but `divergent == 0` is **NOT yet MET** — after fix3's γ child
+the residual divergences are `class` 62 (all the direct-eval field-initializer
+γ family) + `object` 1 (Class δ), with `assignment` and `function` now byte-clean
+(`assignment` 2 → 0, `function` rejects 4 → 0). **Every residual is attributed**
+to one of the named, narrow coder mechanisms above (Classes γ field-init, δ) —
+there is **no unexplained / unattributed byte divergence, hence no new
+kill-criterion evidence**. The remaining work is the class field-initializer
+direct-eval scope (Class γ) and integer-index keys (Class δ), not a feasibility
+wall.
 
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
