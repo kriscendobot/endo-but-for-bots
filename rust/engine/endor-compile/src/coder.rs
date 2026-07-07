@@ -797,6 +797,7 @@ impl Coder<'_> {
             While => self.code_while(node),
             Do => self.code_do(node),
             For => self.code_for(node),
+            ForIn | ForOf | ForAwaitOf => self.code_for_in_of(node),
             Break | Continue => self.code_break_continue(node),
             Throw => self.code_throw(node),
             Debugger => self.add_byte(0, XS_CODE_DEBUGGER),
@@ -1258,6 +1259,202 @@ impl Coder<'_> {
 
         self.targets[continue_target].next_target = self.first_continue_target;
         self.first_continue_target = Some(continue_target);
+    }
+
+    /// `fxForInForOfNodeCode` — the `for (ref in|of expr) body` iteration
+    /// protocol. Children `[reference, expression, statement]`. Drives the
+    /// iterator (`FOR_IN`/`FOR_OF`/`FOR_AWAIT_OF` seeds it, then a `next()`
+    /// loop) inside a `try`/`finally` that closes the iterator (`.return()`)
+    /// on break/continue/return/throw, using the same selector/alias/
+    /// finalize/jump machinery as `try`. Declaring heads (`for (let x …)`)
+    /// and `using` are deferred (the scope is asserted non-declaring).
+    fn code_for_in_of(&mut self, node: &Node) {
+        let is_async = node.token == Token::ForAwaitOf;
+        let iter_op = match node.token {
+            Token::ForOf => XS_CODE_FOR_OF,
+            Token::ForIn => XS_CODE_FOR_IN,
+            Token::ForAwaitOf => XS_CODE_FOR_AWAIT_OF,
+            _ => unreachable!(),
+        };
+        let iterator = self.use_temporary();
+        let next = self.use_temporary();
+        let done = self.use_temporary();
+        let result = self.use_temporary();
+        let exception = self.use_temporary();
+        let selector = self.use_temporary();
+
+        // Take the continue target the enclosing (anonymous) label pushed.
+        let continue_target = self.first_continue_target.expect("for-in/of needs a continue target");
+        self.first_continue_target = self.targets[continue_target].next_target;
+        self.targets[continue_target].next_target = None;
+
+        let scope = self.scope_of(node);
+        self.scope_coding_block(scope);
+        self.scope_code_define_nodes(scope);
+
+        if self.program_flag {
+            self.add_byte(1, XS_CODE_UNDEFINED);
+            self.add_byte(-1, XS_CODE_SET_RESULT);
+        }
+        self.code(&node.children[1]); // expression
+        self.add_byte(0, iter_op);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "next");
+        self.add_index(0, XS_CODE_PULL_LOCAL_1, next);
+
+        self.first_break_target = self.alias_targets(self.first_break_target);
+        self.first_continue_target = self.alias_targets(self.first_continue_target);
+        self.return_target = self.alias_targets(self.return_target);
+        let mut catch_target = self.create_target();
+        let mut normal_target = self.create_target();
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+
+        // --- loop ---
+        let next_target = self.create_target();
+        self.place_target(0, next_target);
+        self.add_byte(1, XS_CODE_TRUE);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, next);
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_integer(-2, XS_CODE_RUN_1, 0);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, result);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+        self.add_index(0, XS_CODE_SET_LOCAL_1, done);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, normal_target);
+
+        self.scope_code_reset(scope);
+        self.code_reference(&node.children[0], 0);
+        self.add_byte(1, XS_CODE_TRUE);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, result);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+        self.add_byte(1, XS_CODE_FALSE);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, done);
+        self.code_assign(&node.children[0], 0);
+        self.add_byte(-1, XS_CODE_POP);
+
+        self.targets[continue_target].environment_level = self.environment_level;
+        self.targets[continue_target].scope_level = self.scope_level;
+        self.targets[continue_target].stack_level = self.stack_level;
+        self.targets[continue_target].next_target = self.first_continue_target;
+        self.first_continue_target = Some(continue_target);
+        self.code(&node.children[2]); // statement
+        self.place_target(0, continue_target);
+        self.first_continue_target = self.targets[continue_target].next_target;
+        self.targets[continue_target].next_target = None;
+
+        self.scope_code_used_reverse(scope, exception, selector);
+
+        self.add_branch(0, XS_CODE_BRANCH_1, next_target);
+
+        // --- pre finally ---
+        let uncatch_target = self.create_target();
+        let finally_target = self.create_target();
+        self.place_target(0, catch_target);
+        self.add_byte(1, XS_CODE_EXCEPTION);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, exception);
+        self.add_integer(1, XS_CODE_INTEGER_1, 0);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, selector);
+        self.add_branch(0, XS_CODE_BRANCH_1, finally_target);
+        let mut selection = 1;
+        self.first_break_target =
+            self.finalize_targets(self.first_break_target, selector, &mut selection, uncatch_target);
+        self.first_continue_target = self.finalize_targets(
+            self.first_continue_target,
+            selector,
+            &mut selection,
+            uncatch_target,
+        );
+        self.return_target =
+            self.finalize_targets(self.return_target, selector, &mut selection, uncatch_target);
+        self.place_target(0, normal_target);
+        self.add_integer(1, XS_CODE_INTEGER_1, selection);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, selector);
+        self.place_target(0, uncatch_target);
+        self.add_byte(0, XS_CODE_UNCATCH);
+        self.place_target(0, finally_target);
+
+        // --- finally: close the iterator ---
+        catch_target = self.create_target();
+        normal_target = self.create_target();
+        self.add_branch(0, XS_CODE_CATCH_1, catch_target);
+        let done_target = self.create_target();
+        let return_target = self.create_target();
+        self.add_index(1, XS_CODE_GET_LOCAL_1, done);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "return");
+        self.add_branch(0, XS_CODE_BRANCH_CHAIN_1, return_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_byte(0, XS_CODE_SWAP);
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_integer(-2, XS_CODE_RUN_1, 0);
+        if is_async {
+            self.add_byte(0, XS_CODE_AWAIT);
+            self.add_byte(0, XS_CODE_THROW_STATUS);
+        }
+        self.add_byte(0, XS_CODE_CHECK_INSTANCE);
+        self.place_target(0, return_target);
+        self.add_byte(-1, XS_CODE_POP);
+        self.place_target(0, done_target);
+        self.add_byte(0, XS_CODE_UNCATCH);
+        self.add_branch(0, XS_CODE_BRANCH_1, normal_target);
+        self.place_target(0, catch_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, selector);
+        self.add_branch(-1, XS_CODE_BRANCH_ELSE_1, normal_target);
+        self.add_byte(1, XS_CODE_EXCEPTION);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, exception);
+        self.add_integer(1, XS_CODE_INTEGER_1, 0);
+        self.add_index(-1, XS_CODE_PULL_LOCAL_1, selector);
+        self.place_target(0, normal_target);
+
+        self.scope_code_used_reverse(scope, exception, selector);
+
+        // --- post finally ---
+        let else_target = self.create_target();
+        self.add_index(1, XS_CODE_GET_LOCAL_1, selector);
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, else_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, exception);
+        self.add_byte(-1, XS_CODE_THROW);
+        self.place_target(0, else_target);
+        let mut selection = 1;
+        let bt = self.first_break_target;
+        self.jump_targets(bt, selector, &mut selection);
+        let ct = self.first_continue_target;
+        self.jump_targets(ct, selector, &mut selection);
+        let rt = self.return_target;
+        self.jump_targets(rt, selector, &mut selection);
+
+        self.scope_coded(scope);
+        self.targets[continue_target].next_target = self.first_continue_target;
+        self.first_continue_target = Some(continue_target);
+
+        self.unuse_temporaries(6);
+    }
+
+    /// `fxScopeCodeReset` — reset per-iteration lexical bindings. No-op for
+    /// a non-declaring `for`-head (declaring heads are deferred).
+    fn scope_code_reset(&mut self, scope: usize) {
+        assert_eq!(
+            self.declare_count(scope),
+            0,
+            "declaring for-in/of head (per-iteration reset) deferred"
+        );
+    }
+
+    /// `fxScopeCodeUsedReverse` — run `using` disposers in reverse. No-op
+    /// for a non-declaring scope (declaring / `using` heads are deferred).
+    fn scope_code_used_reverse(&mut self, scope: usize, _exception: i32, _selector: i32) {
+        assert!(
+            self.tree.scopes[scope].declares.is_empty(),
+            "for-in/of with declarations / using deferred"
+        );
     }
 
     /// `fxBreakContinueNodeCode`. Child `[symbol-or-null]`.

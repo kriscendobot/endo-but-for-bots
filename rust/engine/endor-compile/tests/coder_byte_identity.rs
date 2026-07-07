@@ -597,6 +597,30 @@ fn named_function_expressions() {
     ]);
 }
 
+// `for-in` / `for-of` iteration (child 6). XS seeds the iterator
+// (`FOR_IN`/`FOR_OF`), caches `next`, and drives a `next()` loop inside a
+// `try`/`finally` that closes the iterator (`.return()`) on
+// break/continue/return/throw — reusing the same selector/alias/finalize/
+// jump target machinery as `try`. Non-declaring heads (a plain reference /
+// member target); declaring heads (`for (let x …)`), `using`, and
+// `for await` are deferred.
+#[test]
+fn for_in_of_iteration() {
+    assert_identical(&[
+        // for-of / for-in over a reference or literal, used and empty body
+        "for(x of a)x;", "for(x in a)x;", "for(x of[1,2,3])x;",
+        "for(k in o)k;", "for(x of a){}", "for(x of a);", "for(x of a)f(x);",
+        // break / continue / labeled break / throw crossing the iterator close
+        "for(x of a)break;", "for(x of a)continue;", "for(x of a){if(x)break;}",
+        "L:for(x of a)break L;", "for(x of a)throw x;",
+        // member / computed targets
+        "for(o.p of a)o.p;", "for(a[i] of b)a[i];",
+        // nesting and inside a function (return crosses the close)
+        "for(x of a)for(y of b)x;", "(function(){for(x of a)return x;});",
+        "(function(){for(x of a){if(x)continue;}});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
