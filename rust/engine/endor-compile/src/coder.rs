@@ -449,6 +449,7 @@ impl Coder<'_> {
                 }
             }
             Regexp => self.code_regexp(node),
+            Template => self.code_template(node),
             other => panic!("coder: unsupported node kind {:?}", other),
         }
     }
@@ -799,6 +800,35 @@ impl Coder<'_> {
     fn code_throw(&mut self, node: &Node) {
         self.code(&node.children[0]);
         self.add_byte(-1, XS_CODE_THROW);
+    }
+
+    /// `fxTemplateNodeCode`, untagged branch. Children `[reference,
+    /// List(items)]`; the items alternate `TemplateMiddle` (a cooked +
+    /// raw string pair) with substitution expressions. The tagged branch
+    /// builds the raw/cooked cache via `GET_PROPERTY` symbols and is
+    /// deferred to the atom-table slice.
+    fn code_template(&mut self, node: &Node) {
+        assert!(
+            matches!(node.children[0], Item::Null),
+            "tagged template reached in control-flow coder (later child)"
+        );
+        let items = match &node.children[1] {
+            Item::List(v) => v,
+            _ => panic!("template without items list"),
+        };
+        // The first item is always a `TemplateMiddle`; emit its cooked
+        // string, then fold each following part in with `+`.
+        self.code(&node_of(&items[0]).children[0]);
+        for item in &items[1..] {
+            let n = node_of(item);
+            if n.token == Token::TemplateMiddle {
+                self.code(&n.children[0]);
+            } else {
+                self.code(item);
+                self.add_byte(1, XS_CODE_TO_STRING);
+            }
+            self.add_byte(-1, XS_CODE_ADD);
+        }
     }
 
     /// `fxRegexpNodeCode`. A `new RegExp(pattern, flags)` via the

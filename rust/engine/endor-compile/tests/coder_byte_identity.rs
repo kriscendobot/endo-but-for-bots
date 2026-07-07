@@ -254,6 +254,16 @@ fn this_and_regexp() {
 }
 
 #[test]
+fn untagged_templates() {
+    assert_identical(&[
+        "``;", "`abc`;", "`a\nb`;",
+        "`${1}`;", "`a${1}`;", "`${1}b`;", "`a${1}b`;",
+        "`a${1}b${2}c`;", "`${1}${2}`;", "`x${1+2}y`;",
+        "`${true}`;", "`${\"s\"}`;", "`v=${1?2:3}`;",
+    ]);
+}
+
+#[test]
 fn control_flow_try() {
     assert_identical(&[
         "try{1;}catch{2;}", "try{1;}finally{2;}",
