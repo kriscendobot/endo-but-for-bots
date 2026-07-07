@@ -1224,12 +1224,16 @@ byte-identical vs the oracle:
   **control flow** (loops, `if`/`else`, `switch`, labeled break, try-finally,
   `return` threaded to `END`) and **declarations** (`var`/`let`/`const`,
   nested blocks) code byte-identically.
+- Slice 15 — **`catch (e)` parameter bindings**: `fxCatchNodeCode`'s
+  parameter branch — the parameter scope allocates the binding slot, the
+  caught `EXCEPTION` stores into it, then the body block codes and both
+  scopes unwind.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter defaults/destructuring/rest and the `arguments` object; captured
 closures (`fxScopeCodeRetrieve`/`Store`) and home-object/`super`; **named
 function expressions** (the `CURRENT` name binding) and object-method/
-property **name inference**; catch-parameter bindings; generator/async
+property **name inference**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 `for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
