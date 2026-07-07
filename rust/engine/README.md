@@ -1302,14 +1302,16 @@ byte-identical vs the oracle:
 - Slice 29 — **the `arguments` object**: a function that references
   `arguments` carries a synthetic `arguments` `Var`; its scope header slots
   it and a parameter prelude builds the object (`ARGUMENTS_SLOPPY` mapped /
-  else `ARGUMENTS_STRICT`, operand = the parameter count) and stores it. The
-  no-parameter (mapped) and strict cases are covered; a *mapped* `arguments`
-  with parameters — which promotes the parameters to closure slots — is
-  deferred pending the scoper marking (`fxParamsBindingNodeBind`).
+  else `ARGUMENTS_STRICT`, operand = the parameter count) and stores it.
+- Slice 30 — **mapped `arguments` closure-marks parameters**: ported
+  `fxParamsBindingNodeBind`'s rule into the scoper — a sloppy function with
+  `arguments` and a simple parameter list promotes each parameter to a
+  closure slot so the mapped object can alias it, completing the
+  `arguments` surface (`function (a) { … arguments … }` now codes
+  `NEW_CLOSURE`/`VAR_CLOSURE`/`GET_CLOSURE` for the parameters).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-parameter destructuring; a **mapped `arguments` with parameters** (needs the
-scoper to closure-mark the parameters); home-object/`super` (and arrow
+parameter destructuring; home-object/`super` (and arrow
 capture of `this`/`super`/`target`); anonymous-class name inference and
 **direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
