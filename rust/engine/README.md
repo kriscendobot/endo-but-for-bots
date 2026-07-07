@@ -1384,12 +1384,20 @@ byte-identical vs the oracle:
   `symbolScope` binding the class name as a `const` closure visible in the
   body, plus the class body scope) and enters them in the bind pass (so the
   name slot lands in `RESERVE`); the coder codes the `symbolScope`
-  (`NEW_CLOSURE`), the `NAME` op, and the class→name `CONST_CLOSURE`.
+  (`NEW_CLOSURE`), the `NAME` op, and the class→name `CONST_CLOSURE`. A
+  class body that references its own name (the `USE_CLOSURE` retrieve path)
+  is covered by the existing closure machinery.
+- Slice 44 — **computed-key class methods**: `fxClassNodeCode`'s
+  `PropertyAt` method branch — `[e](){}` evaluates the key, `AT`, then the
+  method value, `NEW_PROPERTY_AT` onto the target (constructor when static,
+  prototype otherwise). No extra scoper declares (computed method keys,
+  unlike computed fields, need no `atAccess`). Instance/static/getter/
+  generator computed methods.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 `extends` / derived constructors +
-`super(...)`, class **fields** and **private** members, static blocks,
-computed method keys, and anonymous-class name inference — these need more
-class-hoisting scoper work; `using` heads (a parser gap); and
+`super(...)`, class **fields** and **private** members, and static blocks —
+these need more class-hoisting scoper work; anonymous-class name inference;
+`using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
