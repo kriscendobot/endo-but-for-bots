@@ -1371,13 +1371,19 @@ byte-identical vs the oracle:
   already poisons the enclosing scopes. Program/block-level `eval` (with or
   without declarations, spread, as a value) is byte-identical; `a.eval()`
   is correctly a normal call.
+- Slice 42 — **base classes**: `fxClassNodeCode` for an anonymous `class`
+  with no heritage — a fresh prototype (`NULL`/`OBJECT`), the base
+  constructor (`code_function` now handles `BASE`: `BEGIN_STRICT_BASE` /
+  `END_BASE`), the `CLASS` opcode binding the prototype/constructor pair,
+  and concise method / accessor / static members (`NEW_PROPERTY` with
+  `DONT_ENUM` + method/getter/setter bits; static on the constructor,
+  instance on the prototype). The scoper's `fxClassNodeBind` reserves the
+  two class temporaries. Covers generator/async/`super`-using methods.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-anonymous-class name inference; direct-`eval` **inside a function** (the
-poisoned param scope asserts); classes
-(constructor/derived, methods/accessors, static members, private fields/
-methods/brands, static blocks, and `super` in class bodies /
-derived-constructor `super(...)`) — the scoper defers class hoisting, so
-classes need scoper work first; `using` heads (a parser gap); and
+named classes (the symbol scope), `extends` / derived constructors +
+`super(...)`, class **fields** and **private** members, static blocks,
+computed method keys, and anonymous-class name inference (these need the
+deferred class-hoisting scoper work); `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
