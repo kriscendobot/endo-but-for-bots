@@ -1343,12 +1343,16 @@ byte-identical vs the oracle:
   `{ value, done: false }` result, `YIELD`, and thread the
   `.return()`/`.throw()` completion (`BRANCH_STATUS`) out to the return
   target on non-`next` resume.
+- Slice 36 — **async functions + `await`**: the `ASYNC_FUNCTION` create op
+  + `START_ASYNC` at entry, and `fxAwaitNodeCode` — evaluate, `AWAIT`, and
+  thread the rejection/completion (`BRANCH_STATUS`) out to the return
+  target until the async job resumes. Async arrows too.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
-inference and **direct-`eval` spread**; **async** functions and `await`,
-**async generators**, and `yield*` (`Delegate`); classes (constructor/
+inference and **direct-`eval` spread**; **async generators** and `yield*`
+(`Delegate`); classes (constructor/
 derived, methods/accessors, static members, private fields/methods/brands,
 static blocks); `for await` / `using` heads; and
 module import/export linkage + the module-body wrapper. These are the
