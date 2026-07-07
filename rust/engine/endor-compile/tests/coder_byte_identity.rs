@@ -687,3 +687,12 @@ fn array_spread() {
         "[...a,...b];", "[...a,,b];", "let a=[1];[...a,2];",
     ]);
 }
+
+#[test]
+fn call_new_spread() {
+    assert_identical(&[
+        "f(...a);", "f(1,...a);", "f(...a,2);", "f(...a,...b);",
+        "f(1,...a,2);", "new X(...a);", "new X(1,...a);",
+        "a.m(...b);", "let a=[1];f(...a);",
+    ]);
+}

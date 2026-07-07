@@ -2314,20 +2314,77 @@ impl Coder<'_> {
     /// pops callee+this+args and leaves the result. Spread arguments and
     /// direct-`eval` parameter passing (the `EVAL` opcode) are deferred.
     fn code_params(&mut self, node: &Node) {
-        assert!(
-            node.flags & crate::ast::flags::SPREAD == 0,
-            "spread arguments reached (later child)"
-        );
         let items: &[Item] = match node.children.first() {
             Some(Item::List(v)) => v,
             _ => &[],
         };
-        let mut c: i32 = 0;
-        for item in items {
-            self.code(item);
-            c += 1;
+        if node.flags & crate::ast::flags::SPREAD != 0 {
+            // A `...spread` argument makes the count dynamic: a `counter`
+            // slot accumulates the argument count (bumped per fixed arg and
+            // per spread element), and the call closes with a plain `RUN`
+            // (no static count operand). Direct-`eval` spread (`EVAL`) is
+            // deferred.
+            let counter = self.use_temporary();
+            self.add_integer(1, XS_CODE_INTEGER_1, 0);
+            self.add_index(0, XS_CODE_SET_LOCAL_1, counter);
+            self.add_byte(-1, XS_CODE_POP);
+            let mut c: i32 = 0;
+            for item in items {
+                let n = node_of(item);
+                if n.token == Token::Spread {
+                    self.code_spread(&n.children[0], counter);
+                } else {
+                    c += 1;
+                    self.code(item);
+                    self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+                    self.add_integer(1, XS_CODE_INTEGER_1, 1);
+                    self.add_byte(-1, XS_CODE_ADD);
+                    self.add_index(0, XS_CODE_SET_LOCAL_1, counter);
+                    self.add_byte(-1, XS_CODE_POP);
+                }
+            }
+            self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+            self.add_byte(-3 - c, XS_CODE_RUN);
+            self.unuse_temporaries(1);
+        } else {
+            let mut c: i32 = 0;
+            for item in items {
+                self.code(item);
+                c += 1;
+            }
+            self.add_integer(-2 - c, XS_CODE_RUN_1, c);
         }
-        self.add_integer(-2 - c, XS_CODE_RUN_1, c);
+    }
+
+    /// `fxSpreadNodeCode` — iterate `...expr` with the `for-of` protocol,
+    /// pushing each `value` as a call argument and bumping `counter`.
+    fn code_spread(&mut self, expr: &Item, counter: i32) {
+        let next_target = self.create_target();
+        let done_target = self.create_target();
+        self.code(expr);
+        self.add_byte(0, XS_CODE_FOR_OF);
+        let iterator = self.use_temporary();
+        self.add_index(0, XS_CODE_SET_LOCAL_1, iterator);
+        self.add_byte(-1, XS_CODE_POP);
+        self.place_target(0, next_target);
+        self.add_index(1, XS_CODE_GET_LOCAL_1, iterator);
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "next");
+        self.add_byte(1, XS_CODE_CALL);
+        self.add_integer(-2, XS_CODE_RUN_1, 0);
+        self.add_byte(1, XS_CODE_DUB);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "done");
+        self.add_branch(-1, XS_CODE_BRANCH_IF_1, done_target);
+        self.add_symbol(0, XS_CODE_GET_PROPERTY, "value");
+        self.add_index(1, XS_CODE_GET_LOCAL_1, counter);
+        self.add_integer(1, XS_CODE_INTEGER_1, 1);
+        self.add_byte(-1, XS_CODE_ADD);
+        self.add_index(0, XS_CODE_SET_LOCAL_1, counter);
+        self.add_byte(-1, XS_CODE_POP);
+        self.add_branch(0, XS_CODE_BRANCH_1, next_target);
+        self.place_target(1, done_target);
+        self.add_byte(-1, XS_CODE_POP);
+        self.unuse_temporaries(1);
     }
 
     // ---- the `codeThis` family (callee + receiver setup) ------------
