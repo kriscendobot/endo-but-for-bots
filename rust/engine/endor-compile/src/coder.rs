@@ -2502,7 +2502,8 @@ impl Coder<'_> {
         // captures (`fxClassNodeCode`'s `instanceInit` block).
         if !instance_fields.is_empty() {
             let (iscope, iid) = instance_init.expect("instance-init declare");
-            self.code_field_init_function(&instance_fields, class_scope);
+            let fi = self.tree.class_field_init_inst.get(&node_key(node)).copied();
+            self.code_field_init_function(&instance_fields, class_scope, fi);
             self.add_index(1, XS_CODE_GET_LOCAL_1, prototype);
             self.add_byte(-1, XS_CODE_SET_HOME);
             let idx = self.declare_index(iscope, iid);
@@ -2514,7 +2515,7 @@ impl Coder<'_> {
         // function invoked with the constructor as `this`/home.
         if !static_fields.is_empty() {
             self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
-            self.code_field_init_function(&static_fields, class_scope);
+            self.code_field_init_function(&static_fields, class_scope, None);
             self.add_index(1, XS_CODE_GET_LOCAL_1, constructor);
             self.add_byte(-1, XS_CODE_SET_HOME);
             self.add_byte(1, XS_CODE_CALL);
@@ -2540,7 +2541,7 @@ impl Coder<'_> {
     /// XS's field function is a real `mxFieldFlag` function with a scope, so
     /// it `RESERVE`s the alias slots, `RETRIEVE`s the closures at entry, and
     /// `STORE`s them from the enclosing class frame after creation.
-    fn code_field_init_function(&mut self, fields: &[&Node], class_scope: usize) {
+    fn code_field_init_function(&mut self, fields: &[&Node], class_scope: usize, fi: Option<usize>) {
         use crate::ast::flags as f;
         let saved_return = self.return_target;
         let saved_scope_level = self.scope_level;
@@ -2604,7 +2605,20 @@ impl Coder<'_> {
         self.add_symbol_opt(1, XS_CODE_CONSTRUCTOR_FUNCTION, None);
         self.add_branch(0, XS_CODE_CODE_1, target);
         self.add_index(0, XS_CODE_BEGIN_STRICT_FIELD, 0);
-        if k != 0 {
+        // A plain-data-field class binds its initializers inside a real
+        // `instanceInit` function scope (`fi`); its use-closure aliases —
+        // outer bindings captured by a field value — drive the frame
+        // `RESERVE`/`RETRIEVE` and the closure-slot access indices. Otherwise
+        // the member-closure-only field function reserves `k` computed-key /
+        // private-brand slots.
+        if let Some(fi) = fi {
+            debug_assert!(caps.is_empty(), "field-init function scope with member closures");
+            let reserve = *self.tree.scope_counts.get(&fi).unwrap_or(&0);
+            if reserve != 0 {
+                self.add_index(0, XS_CODE_RESERVE_1, reserve);
+            }
+            self.scope_code_retrieve(fi);
+        } else if k != 0 {
             self.add_index(0, XS_CODE_RESERVE_1, k);
             self.add_index(0, XS_CODE_RETRIEVE_1, k);
         }
@@ -2621,7 +2635,18 @@ impl Coder<'_> {
         // running in the enclosing class frame (`fxScopeCodeStore`). At eval
         // scope the environment is a `FUNCTION_ENVIRONMENT`; otherwise a
         // captured field function needs a plain `ENVIRONMENT`.
-        if saved_eval {
+        if let Some(fi) = fi {
+            let has_captures = self.tree.scopes[fi].closure_count != 0;
+            if saved_eval {
+                self.add_byte(1, XS_CODE_FUNCTION_ENVIRONMENT);
+                self.scope_code_store(fi);
+                self.add_byte(-1, XS_CODE_POP);
+            } else if has_captures {
+                self.add_byte(1, XS_CODE_ENVIRONMENT);
+                self.scope_code_store(fi);
+                self.add_byte(-1, XS_CODE_POP);
+            }
+        } else if saved_eval {
             self.add_byte(1, XS_CODE_FUNCTION_ENVIRONMENT);
             for &cap in &caps {
                 let idx = self.declare_index(class_scope, cap);

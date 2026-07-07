@@ -276,6 +276,17 @@ pub struct ScopeTree {
     /// `CONST_CLOSURE` and the field function's `GET_CLOSURE` / `NEW_PRIVATE`.
     /// Keyed with [`node_key`].
     pub class_member_access: HashMap<usize, MemberAccess>,
+    /// A class node address → the synthesized **instance** field-init
+    /// function scope (XS's `instanceInit` function node scope) when the
+    /// class's instance data fields are all plain (literal-keyed) data
+    /// fields. The field initializers are bound inside this Function scope
+    /// so a value that captures an outer binding promotes it to a closure
+    /// (`fxClassNodeHoist`/`fxFunctionNodeBind`), and the coder reads the
+    /// scope's use-closure aliases to `RESERVE`/`RETRIEVE`/`STORE` and to
+    /// resolve each captured value access as a `GET_CLOSURE`. Absent when
+    /// the class has a computed-key or private instance field (that path
+    /// keeps the member-closure-only field function). Keyed with [`node_key`].
+    pub class_field_init_inst: HashMap<usize, usize>,
 }
 
 /// The class-scope closure declares XS synthesizes for one computed-key /
@@ -340,6 +351,7 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
         class_instance_init: s.class_instance_init,
         super_instance_init: s.super_instance_init,
         class_member_access: s.class_member_access,
+        class_field_init_inst: s.class_field_init_inst,
     })
 }
 
@@ -397,6 +409,9 @@ struct Scoper {
     /// A class member node address → its synthesized class-scope closure
     /// declares (`atAccess` / `symbolAccess` / `valueAccess`).
     class_member_access: HashMap<usize, MemberAccess>,
+    /// A class node address → its synthesized instance field-init function
+    /// scope (see [`ScopeTree::class_field_init_inst`]).
+    class_field_init_inst: HashMap<usize, usize>,
 }
 
 fn node_ptr(n: &Node) -> usize {
@@ -481,6 +496,14 @@ fn class_has_instance_field(class: &Node) -> bool {
         _ => false,
     })
 }
+/// A class member that is a **plain instance data field**: a non-static,
+/// non-method/getter/setter `Property` (literal key). These are the members
+/// whose initializers XS moves into the `instanceInit` function.
+fn is_instance_plain_data_field(m: &Node) -> bool {
+    use crate::ast::flags as f;
+    m.token == Token::Property
+        && m.flags & (f::STATIC | f::METHOD | f::GETTER | f::SETTER) == 0
+}
 #[allow(dead_code)]
 fn child_list<'a>(n: &'a Node, i: usize) -> Option<&'a [Item]> {
     match n.children.get(i) {
@@ -511,6 +534,61 @@ impl Scoper {
         self.scopes.push(sc);
         self.scope = Some(id);
         id
+    }
+
+    /// A synthetic strict `Function` scope for a class's `instanceInit`
+    /// field-init function (XS's `mxStrictFlag | mxSuperFlag | mxFieldFlag`
+    /// function node). Parented to the current scope (the class body) without
+    /// changing `self.scope`; the caller enters it explicitly.
+    fn scope_new_field_init(&mut self) -> usize {
+        let parent = self.scope;
+        // No backing AST node (the surgery is synthesized), so `node_ptr` is
+        // 0; only its own `flags` matter and it is strict.
+        let mut sc = Scope::new(parent, Token::Function, 0, SCOPE_STRICT);
+        sc.flags |= SCOPE_STRICT;
+        let id = self.scopes.len();
+        self.scopes.push(sc);
+        id
+    }
+
+    /// Whether the class has ≥1 plain instance data field and *no* computed
+    /// or private instance data field — the condition under which the
+    /// instance field initializers bind inside a synthesized `instanceInit`
+    /// function scope (`is_instance_plain_data_field`).
+    fn class_instance_fields_all_plain(&self, node: &Node) -> bool {
+        use crate::ast::flags as f;
+        let Some(Item::List(items)) = node.children.get(2) else {
+            return false;
+        };
+        let mut has_plain = false;
+        for item in items {
+            let Item::Node(m) = item else { continue };
+            let is_method = m.flags & (f::METHOD | f::GETTER | f::SETTER) != 0;
+            let is_static = m.flags & f::STATIC != 0;
+            if is_static || m.token == Token::Body {
+                continue;
+            }
+            // A non-static **private** member (data or method) contributes
+            // a `symbolAccess`/`valueAccess` member closure to the field-init
+            // function; a **computed-key** data field contributes `atAccess`.
+            // Either interleaves with outer captures — keep the old
+            // member-closure-only field function for those classes.
+            if m.token == Token::PrivateProperty || (m.token == Token::PropertyAt && !is_method) {
+                return false;
+            }
+            // A public method/getter/setter is coded inline (not in the
+            // field function) — ignore it.
+            if is_method {
+                continue;
+            }
+            // A non-static plain data field.
+            if is_instance_plain_data_field(m) {
+                has_plain = true;
+            } else {
+                return false;
+            }
+        }
+        has_plain
     }
 
     /// Build a fresh declare with a scope-stable id, without inserting it.
@@ -1573,14 +1651,58 @@ impl Scoper {
         if let Some(constructor) = child(node, 5) {
             self.bind_item(constructor)?;
         }
-        if let Some(items) = child(node, 2) {
-            self.bind_item(items)?;
+        // Decide whether to bind the instance field initializers inside a
+        // synthesized `instanceInit` function scope. XS moves every instance
+        // field's value into a real `mxFieldFlag` function, so a value that
+        // references an outer binding captures it (closure promotion). We
+        // reproduce that only when the instance data fields are all *plain*
+        // (literal-keyed) — a computed-key / private instance field keeps the
+        // member-closure-only field function (its interleaved captures are a
+        // separate fold), so we bind members the old way there.
+        let engage = self.class_instance_fields_all_plain(node);
+        // References into the AST (NOT clones): the coder walks these same
+        // nodes and looks up each access's recorded resolution by address.
+        let mut field_values: Vec<&Item> = Vec::new();
+        if let Some(Item::List(items)) = node.children.get(2) {
+            for item in items {
+                if engage {
+                    if let Item::Node(m) = item {
+                        if is_instance_plain_data_field(m) {
+                            // Its value binds inside the field-init function.
+                            if let Some(v) = m.children.get(1) {
+                                field_values.push(v);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                self.bind_item(item)?;
+            }
         }
         if let Some(constructor_init) = child(node, 3) {
             self.bind_item(constructor_init)?;
         }
         if let Some(instance_init) = child(node, 4) {
             self.bind_item(instance_init)?;
+        }
+        // Bind the instance field initializers inside the synthesized
+        // field-init function scope (XS's `instanceInit`). A captured outer
+        // binding is promoted to a closure and aliased here in field order.
+        if engage {
+            let fi = self.scope_new_field_init();
+            let saved_level = self.scope_level;
+            let saved_maximum = self.scope_maximum;
+            self.scope_level = 0;
+            self.scope_maximum = 0;
+            self.fx_scope_binding(fi);
+            for v in &field_values {
+                self.bind_item(v)?;
+            }
+            self.fx_scope_bound(fi);
+            self.scope_counts.insert(fi, self.scope_maximum);
+            self.scope_maximum = saved_maximum;
+            self.scope_level = saved_level;
+            self.class_field_init_inst.insert(node_ptr(node), fi);
         }
         self.class_node = former;
         self.fx_scope_bound(si);

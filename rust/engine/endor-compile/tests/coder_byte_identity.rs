@@ -1619,6 +1619,37 @@ fn module_exports() {
     ]);
 }
 
+// Class α — a plain (literal-keyed) instance data field whose initializer
+// captures an outer binding. XS moves the initializers into a real
+// `instanceInit` `mxFieldFlag` function, so a captured outer binding is
+// promoted to a **closure** (`NEW_CLOSURE`/`CONST_CLOSURE`) and read inside
+// the field function via a use-closure alias (`RESERVE`/`RETRIEVE`/
+// `GET_CLOSURE`); an uncaptured field stays a plain local. These fixtures pin
+// the closure-vs-local classification (opcodes 228↔230 family) the scoper's
+// field-init function scope reproduces.
+#[test]
+fn class_field_init_closure_capture() {
+    assert_identical(&[
+        // the representative: an outer `const` captured by a data field
+        "const fn = function() {}; class C { a; b = 42; c = fn }",
+        // a single captured field, no siblings
+        "const fn = function() {}; class C { c = fn }",
+        // capture interleaved with public methods (still plain data fields)
+        "const fn = function() {}; class C { a; b = 42; c = fn; m() { return 42; } }",
+        "const fn = function() {}; class C { foo = 1; m() {} a; b = 42; c = fn; n() {} bar = 2; }",
+        // a captured `var`
+        "var x = 1; class C { p = x; }",
+        // no capture: fields stay plain locals (unchanged behavior)
+        "class C { a; b = 42; }",
+        "class C { a; }",
+        // derived class: the field-init function still promotes the capture
+        "class Base {} class C extends Base { a; b = 1; }",
+        "var x = 1; class Base {} class C extends Base { a; p = x; }",
+        // two captured outer bindings, in field order
+        "const f = function() {}; const g = function() {}; class C { a = f; b = g; }",
+    ]);
+}
+
 #[test]
 fn module_default_and_reexport() {
     assert_identical_module(&[
