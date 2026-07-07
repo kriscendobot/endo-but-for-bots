@@ -476,6 +476,26 @@ fn function_parameters() {
     ]);
 }
 
+// Name inference (child 6). An anonymous function assigned to a simple
+// identifier — a `var`/`let`/`const` binding initializer or a plain
+// assignment — takes that identifier as its name, which lands directly in
+// the `CONSTRUCTOR_FUNCTION` / `FUNCTION` operand (XS sets `node->symbol`
+// before coding the value). Deferred: object-method/property naming (the
+// `NAME`-op path), member-target assignment, and anonymous classes.
+#[test]
+fn function_name_inference() {
+    assert_identical(&[
+        // binding initializers
+        "var f=function(){};", "let g=function(){};", "const c=function(){};",
+        "var f=function(){return 1;};", "var fn=function(a,b){return a+b;};",
+        "var a=function(){},b=function(){};", "var f=(function(){});",
+        // arrow bindings
+        "let h=()=>1;", "var k=()=>{};", "let m=(a)=>a;", "let id=x=>x;",
+        // assignment to an identifier
+        "x=function(){};", "x=()=>{};",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

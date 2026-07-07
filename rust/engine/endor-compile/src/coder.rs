@@ -276,6 +276,12 @@ pub struct Coder<'a> {
     /// at the top of its scope, so its second reach — the in-list statement
     /// — is a no-op. Keyed by node address.
     defined: std::collections::HashSet<usize>,
+    /// The name inferred for the next anonymous function/class value from
+    /// its binding/assignment target (XS sets `node->symbol` before the
+    /// value is coded, so the name lands in the `CONSTRUCTOR_FUNCTION` /
+    /// `FUNCTION` operand). Set by the naming site, consumed by
+    /// `code_function`.
+    pending_name: Option<String>,
 }
 
 impl<'a> Coder<'a> {
@@ -296,6 +302,7 @@ impl<'a> Coder<'a> {
             tree,
             decl_index: HashMap::new(),
             defined: std::collections::HashSet::new(),
+            pending_name: None,
         }
     }
 
@@ -1331,11 +1338,65 @@ impl Coder<'_> {
     /// declaration node (an `Access` target would be `invalid
     /// initializer`, a syntax error the parser already rejects here).
     fn code_binding(&mut self, node: &Node) {
-        Self::assert_no_name_inference(&node.children[1]);
+        // Name inference: `var/let/const f = function(){}` names the
+        // anonymous value `f` (its name lands in the function-creation
+        // operand). Only a simple identifier target supplies a name.
+        self.set_pending_name(&node.children[0], &node.children[1]);
         self.code_reference(&node.children[0], 0);
         self.code(&node.children[1]);
         self.code_assign(&node.children[0], 0);
         self.add_byte(-1, XS_CODE_POP);
+    }
+
+    /// If `value` is an anonymous function/class and `target` is a simple
+    /// identifier (a declaration or an `Access`), stage the target's name
+    /// for the function-creation operand; otherwise assert that no name
+    /// inference is needed (the class / object-method / `NAME`-op paths are
+    /// deferred).
+    fn set_pending_name(&mut self, target: &Item, value: &Item) {
+        if !Self::infers_name(value) {
+            return;
+        }
+        // Only anonymous *functions* are handled here; anonymous classes
+        // and the coder `NAME`-op fallback remain deferred.
+        assert!(
+            Self::is_anon_function_value(value),
+            "anonymous class name inference deferred (later slice)"
+        );
+        let name = match target {
+            Item::Node(n) => match n.token {
+                Token::Var | Token::Let | Token::Const | Token::Using | Token::Arg => {
+                    Self::symbol_opt(&n.children[0])
+                }
+                Token::Access => Self::symbol_opt(&n.children[0]),
+                _ => None,
+            },
+            _ => None,
+        };
+        assert!(name.is_some(), "non-identifier name-inference target deferred (later slice)");
+        self.pending_name = name;
+    }
+
+    /// Whether `value` (possibly a single-item parenthesization) is an
+    /// anonymous function/arrow value eligible for name inference here.
+    fn is_anon_function_value(value: &Item) -> bool {
+        match value {
+            Item::Node(n) => match n.token {
+                Token::Expressions => {
+                    if let Some(Item::List(items)) = n.children.first() {
+                        if items.len() == 1 {
+                            return Self::is_anon_function_value(&items[0]);
+                        }
+                    }
+                    false
+                }
+                Token::Function | Token::Generator => {
+                    matches!(n.children.first(), Some(Item::Null))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// `fxDeclareNodeCode` — a bare declaration with no initializer. `var`
@@ -1510,7 +1571,11 @@ impl Coder<'_> {
         let saved_continue = self.first_continue_target;
         let saved_return = self.return_target;
 
-        let name = Self::symbol_opt(&node.children[0]);
+        // An anonymous function takes the name inferred from its
+        // binding/assignment target (XS sets `node->symbol` before coding);
+        // always clear the pending name so it never leaks to a later value.
+        let inferred = self.pending_name.take();
+        let name = Self::symbol_opt(&node.children[0]).or(inferred);
         let target = self.create_target();
 
         if flags & f::EVAL != 0 && !is_strict {
@@ -2016,7 +2081,8 @@ impl Coder<'_> {
     /// `fxAssignNodeCode` — plain `=`. Children `[reference, value]`:
     /// prepare the reference, evaluate the value, store.
     fn code_assign_node(&mut self, node: &Node) {
-        Self::assert_no_name_inference(&node.children[1]);
+        // Name inference: `x = function(){}` names the anonymous value `x`.
+        self.set_pending_name(&node.children[0], &node.children[1]);
         self.code_reference(&node.children[0], 1);
         self.code(&node.children[1]);
         self.code_assign(&node.children[0], 1);
