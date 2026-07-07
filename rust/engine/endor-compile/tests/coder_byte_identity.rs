@@ -650,3 +650,15 @@ fn function_rest_parameters() {
         "(function(x,...ys){return ys;});",
     ]);
 }
+
+#[test]
+fn object_property_name_inference() {
+    assert_identical(&[
+        "({f:function(){}});", "({g:()=>1});", "({f:function(){},g:()=>2});",
+        "({[k]:function(){}});", "({a:1,f:function(){}});",
+        // named values keep their own name (no inference flag)
+        "({f:function named(){}});",
+        // non-function values unaffected
+        "({a:1,b:2});",
+    ]);
+}

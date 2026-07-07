@@ -97,6 +97,11 @@ const SYMBOL_MODULO: u32 = 1993;
 /// synthetic `caller` own property carries.
 const XS_DONT_ENUM_FLAG: i32 = 4;
 
+/// `XS_NAME_FLAG` (`xsCommon.h`) — the `NEW_PROPERTY` attribute bit that
+/// tells the interpreter to infer an anonymous function/class value's
+/// `.name` from the property key.
+const XS_NAME_FLAG: i32 = 1;
+
 /// The built-in symbols `fxInitializeParser` interns *before* lexing, in
 /// exact source order (`xsScript.c`). They occupy their hash buckets ahead
 /// of every program symbol, so their position is part of the ID contract
@@ -1531,16 +1536,6 @@ impl Coder<'_> {
         }
     }
 
-    /// Guard a naming position (a declaration/assignment/property value):
-    /// name inference for an anonymous function/class is deferred.
-    fn assert_no_name_inference(item: &Item) {
-        assert!(
-            !Self::infers_name(item),
-            "anonymous function/class name inference deferred (later slice)"
-        );
-    }
-
-
     /// `fxAccessNodeCode`. Child `[symbol]`. At program scope every
     /// identifier is a free (global) reference, so the coder takes the
     /// unresolved path: an `EVAL_REFERENCE` (the program is coded with the
@@ -2088,11 +2083,13 @@ impl Coder<'_> {
                     Token::Property => {
                         let key = Self::symbol_of(&p.children[0]).to_string();
                         assert!(key != "__proto__", "__proto__ property reached (later child)");
-                        Self::assert_no_name_inference(&p.children[1]);
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
                         self.code(&p.children[1]);
                         self.add_symbol(-2, XS_CODE_NEW_PROPERTY, &key);
-                        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+                        // An anonymous function/class value infers its
+                        // `.name` from the key (`XS_NAME_FLAG`).
+                        let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+                        self.add_integer(0, XS_CODE_INTEGER_1, flag);
                     }
                     Token::PropertyAt => {
                         self.add_index(1, XS_CODE_GET_LOCAL_1, object);
@@ -2100,7 +2097,8 @@ impl Coder<'_> {
                         self.add_byte(0, XS_CODE_AT);
                         self.code(&p.children[1]);
                         self.add_byte(-3, XS_CODE_NEW_PROPERTY_AT);
-                        self.add_integer(0, XS_CODE_INTEGER_1, 0);
+                        let flag = if Self::infers_name(&p.children[1]) { XS_NAME_FLAG } else { 0 };
+                        self.add_integer(0, XS_CODE_INTEGER_1, flag);
                     }
                     other => panic!("coder: unsupported object member {:?}", other),
                 }
