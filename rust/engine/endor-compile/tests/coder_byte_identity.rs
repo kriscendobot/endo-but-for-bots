@@ -521,6 +521,46 @@ fn function_name_inference() {
     ]);
 }
 
+// NamedEvaluation for a destructuring-default initializer (stage-5 fix2,
+// Class A). When an anonymous function/arrow/class/generator is the `=
+// default` of a pattern element, XS renames it after the bound identifier
+// at bind time (`fxBindingNodeBind`/`fxAssignNodeBind` →
+// `fxFunctionNodeRename`); the port stages the same name in
+// `code_assign`'s `Binding` arm. Both binding patterns (declaration, catch
+// param, function param, for-of/for-in heads) and assignment patterns must
+// name; a member / nested-pattern target must NOT (stays anonymous).
+#[test]
+fn destructuring_default_name_inference() {
+    assert_identical(&[
+        // object binding-pattern defaults, all four value kinds
+        "var {a=function(){}}=({});", "let {b=()=>{}}=({});",
+        "const {c=class{}}=({});", "var {d=function*(){}}=({});",
+        "var {e=async function(){}}=({});", "let {f=async()=>{}}=({});",
+        // array binding-pattern defaults
+        "var [g=function(){}]=[];", "let [h=()=>{}]=[];", "const [i=class{}]=[];",
+        // renamed object property with a defaulted anonymous value
+        "var {p:q=function(){}}=({});", "let {p:r=()=>{}}=({});",
+        // parenthesized initializer forwards to its inner value
+        "var {s=(function(){})}=({});",
+        // catch parameter pattern default
+        "try{throw {};}catch({arrow=()=>{}}){}",
+        "try{throw {};}catch({fn=function(){}}){}",
+        // function parameter pattern defaults
+        "(function({a=function(){}}){});", "(({b=()=>{}})=>{});",
+        "(function([c=class{}]){});",
+        // assignment-pattern (not declaration) defaults
+        "({a=function(){}}={});", "[b=()=>{}]=[];", "({c=class{}}={});",
+        "({p:q=function(){}}={});",
+        // for-of / for-in heads with a defaulted pattern binding
+        "for(var {a=()=>{}} of []){}", "for(let [b=function(){}] of []){}",
+        "for(const {c=class{}} of []){}",
+        // NOT named: a nested-pattern target leaves the value anonymous
+        "var {a:{b}={c:function(){}}}=({b:1});",
+        // NOT named: a member-target assignment default stays anonymous
+        "var o={};({x=function(){}}={});",
+    ]);
+}
+
 // Non-trivial function bodies (child 6). Once `fxCoderOptimize`'s full
 // four peephole passes are ported (branch→`END*` threading, unwind-before-
 // end removal, dead-end removal, branch-to-next), a function body with

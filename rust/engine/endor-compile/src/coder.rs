@@ -4037,6 +4037,15 @@ impl Coder<'_> {
                     self.add_byte(-1, XS_CODE_STRICT_NOT_EQUAL);
                     self.add_branch(-1, XS_CODE_BRANCH_IF_1, target);
                     self.add_byte(-1, XS_CODE_POP);
+                    // NamedEvaluation: a destructuring default `{ x = () => {} }`
+                    // names the anonymous initializer after the pattern's bound
+                    // identifier. XS applies this at bind time
+                    // (`fxBindingNodeBind` → `fxFunctionNodeRename`, keyed on the
+                    // target being an Access/Arg/Var/Let/Const/Using node); we
+                    // stage it here so the initializer's function-creation
+                    // operand consumes the name, exactly as the declaration and
+                    // plain-assignment paths already do.
+                    self.set_pending_name(&n.children[0], &n.children[1]);
                     self.code(&n.children[1]);
                     self.place_target(0, target);
                     self.code_assign(&n.children[0], flag);
