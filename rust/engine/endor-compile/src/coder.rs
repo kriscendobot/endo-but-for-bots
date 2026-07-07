@@ -1702,19 +1702,27 @@ impl Coder<'_> {
             let Item::Node(arg) = item else {
                 panic!("coder: unexpected parameter slot {item:?}");
             };
-            // A plain `Arg` (`[symbol]`) or an `= default` param (a
-            // `Binding` wrapping an `Arg` target). Destructuring
-            // (`ArrayBinding`/`ObjectBinding`) and rest (`RestBinding`) are
-            // deferred.
-            assert!(
-                matches!(arg.token, Token::Arg | Token::Binding),
-                "parameter pattern/rest {:?} deferred (params slice)",
-                arg.token
-            );
-            self.code_reference(item, 0);
-            self.add_index(1, XS_CODE_ARGUMENT, index as i32);
-            self.code_assign(item, 0);
-            self.add_byte(-1, XS_CODE_POP);
+            // A plain `Arg` (`[symbol]`), an `= default` param (a `Binding`
+            // wrapping an `Arg`), or a `...rest` param (`RestBinding`
+            // wrapping its target, bound from `ARGUMENTS i`). Destructuring
+            // (`ArrayBinding`/`ObjectBinding`) targets are deferred.
+            if arg.token == Token::RestBinding {
+                let target = &arg.children[0];
+                self.code_reference(target, 0);
+                self.add_index(1, XS_CODE_ARGUMENTS, index as i32);
+                self.code_assign(target, 0);
+                self.add_byte(-1, XS_CODE_POP);
+            } else {
+                assert!(
+                    matches!(arg.token, Token::Arg | Token::Binding),
+                    "parameter pattern {:?} deferred (params slice)",
+                    arg.token
+                );
+                self.code_reference(item, 0);
+                self.add_index(1, XS_CODE_ARGUMENT, index as i32);
+                self.code_assign(item, 0);
+                self.add_byte(-1, XS_CODE_POP);
+            }
         }
     }
 

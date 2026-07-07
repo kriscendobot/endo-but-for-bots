@@ -572,3 +572,12 @@ fn function_default_parameters() {
         "((a=1,b=a)=>a+b);", "(function(x,y=x+1){return y;});",
     ]);
 }
+
+#[test]
+fn function_rest_parameters() {
+    assert_identical(&[
+        "(function(...a){return a;});", "(function(a,...b){return b;});",
+        "((...xs)=>xs);", "((a,b,...rest)=>rest);",
+        "(function(x,...ys){return ys;});",
+    ]);
+}
