@@ -1214,14 +1214,22 @@ byte-identical vs the oracle:
   function-creation operand (a pending-name the naming site stages and
   `code_function` consumes). Object-method/property naming (the `NAME`-op
   path), member-target assignment, and anonymous classes stay deferred.
+- Slice 14 — **the branch optimizer + non-trivial function bodies**:
+  `fxCoderOptimize`'s full four peephole passes (a `BRANCH_1` reaching an
+  `END*` becomes that `END*` inline; an `UNWIND_1` before an `END*` is
+  dropped; a dead `END*` before the same `END*` is dropped; branch-to-next),
+  the `fxStatementNodeCode` store-and-pop fusion (`SET_LOCAL`/`SET_CLOSURE`
+  + `POP` → `PULL_LOCAL`/`PULL_CLOSURE`), and XS's `mxExpressionNoValue`
+  increment/compound optimization. Together these make function bodies with
+  **control flow** (loops, `if`/`else`, `switch`, labeled break, try-finally,
+  `return` threaded to `END`) and **declarations** (`var`/`let`/`const`,
+  nested blocks) code byte-identically.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter defaults/destructuring/rest and the `arguments` object; captured
 closures (`fxScopeCodeRetrieve`/`Store`) and home-object/`super`; **named
 function expressions** (the `CURRENT` name binding) and object-method/
-property **name inference**; **control-flow / declaring function bodies**
-(they need the non-program loop/return paths and XS's branch-threading
-optimizer, of which only branch-to-next elision is ported); generator/async
+property **name inference**; catch-parameter bindings; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 `for-in`/`for-of`/`for-await-of` and `for(let …)` refresh; and module
