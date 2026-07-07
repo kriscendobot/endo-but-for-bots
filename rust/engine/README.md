@@ -1355,12 +1355,21 @@ byte-identical vs the oracle:
   `YIELD_STAR` forwarding, `CHECK_INSTANCE`, and the loop/return/throw/normal
   sections with `CATCH`/`UNCATCH` + `BRANCH_CHAIN`/`COALESCE` completion
   routing), async variant awaiting each step. Completes generators/async.
+- Slice 39 — **`for await (… of …)`**: the `is_async` branch of the ported
+  `fxForInForOfNodeCode` (`AWAIT`/`THROW_STATUS` after each `next()`/
+  `return()`) became reachable once async functions landed; pinned.
+- Slice 40 — **`super` in methods + arrow `this`/`super`/`target` capture**:
+  object-method `super` (member read/call/store/delete/computed, in plain/
+  async/generator methods) already worked via the member coder's super
+  path; this implements the arrow-default capture in `fxScopeCodeRetrieve`/
+  `Store` — an arrow that transitively uses `this`/`super`/`target`
+  retrieves the receiver and target (`RETRIEVE_TARGET`/`RETRIEVE_THIS`) and
+  stores them on creation (`STORE_ARROW`).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-home-object/`super`
-(and arrow capture of `this`/`super`/`target`); anonymous-class name
-inference and **direct-`eval` spread**; classes (constructor/
-derived, methods/accessors, static members, private fields/methods/brands,
-static blocks); `for await` / `using` heads; and
+anonymous-class name inference and **direct-`eval` spread**; classes
+(constructor/derived, methods/accessors, static members, private fields/
+methods/brands, static blocks, and `super` in class bodies /
+derived-constructor `super(...)`); `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
