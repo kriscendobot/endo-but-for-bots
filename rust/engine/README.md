@@ -1761,6 +1761,39 @@ broadened subtrees; `accept-disagree == 0` holds everywhere; the sole
 `endor-rejected` is the one named `tco-call-args.js` fold. No unattributable
 divergence anywhere ⇒ **no new kill-criterion evidence**.
 
+**fix4 (the structural field-init fold) — Classes β + ε CLOSED, α interleave
+CLOSED.** The keystone deferred all through fix3 — the member-closure
+field-init function synthesized at code time — is gone. Every instance field
+initializer now binds inside a **real `instanceInit` function scope** and every
+static field value / `static { … }` block inside a real **`constructorInit`
+function scope**, both **created at hoist** (parented to the class body) so a
+field value's inner function/class chains through the field function: its outer
+captures promote to closures, a `this.#x` read resolves to the field function's
+captured retrieve slot (`GET_PRIVATE`), and `scopeCount == scopeMaximum` counts
+the member closures **plus** the peak value-temporary depth. The member
+closures (`atAccess`/`symbolAccess`/`valueAccess`) become use-closure aliases in
+field order (the get/set accessor pair sharing one brand slot via the scoper's
+`fxScopeLookup` dedup). This closed **Class β** (35 — the whole
+`private-*-on-nested-class` / `-shadowed-by-*` / `-usage-inside-nested-class` /
+`privatefield{get,set}-typeerror` / `static-private-{getter,setter}-access`
+family: the nested-class RESERVE leak and the field-initializer brand-read
+index), **Class ε**'s `init-value-incremental` (temporary depth), and **Class
+α**'s `intercalated-static-non-static-computed-fields` interleave. Result
+(re-measured on the pin): `statements/class` divergent **62 → 25**,
+`expressions/class` **50 → 19**; the curated corpora stay **1711/1711
+divergent=0**, the module gate + `cargo test --workspace` stay green, and
+**no new `endor-rejected`** (a `static { … }` block with its own lexical
+declarations remains a loud, named coder fold — its field-function frame
+reservation is the residual class-tail work). New byte-identity fixtures
+(`coder_byte_identity.rs::class_field_init_function_scope`) pin the closed
+shapes. The remaining 25 `statements/class` (19 `expressions/class`) are
+**Class γ** (the class field-initializer **direct-eval** scope prelude — the
+`*direct-eval*` / `*visible-to-direct-eval*` / `derived-cls-direct-eval-*`
+family, including `static-field-init-with-this`'s eval half) and **Class α**'s
+residual literal-numeric-key + captured-`arguments` scope classification — both
+separate, narrow scoper folds (sibling / later work), each fully attributed;
+no unexplained byte divergence, hence no new kill-criterion evidence.
+
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
 `SyntaxError: missing ;`); endor rejects it identically (`missing ;`) at
