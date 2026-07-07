@@ -1482,13 +1482,18 @@ These are the remaining child-6/7 surface.
 
 ### Stage-5 acceptance evidence (child 7/7, re-measured by fix4-verify 4/4): the byte-identity bar
 
-> **Current authoritative verdict:** see **fix4-verify 4/4** below (fresh
-> re-measure on the live tip `d93d2a4ee8`). The entire class surface is now
-> byte-clean (`statements/class` **0**, `expressions/class` **0**); all 13
-> swept subtrees + curated (1711/1711) + module (45/45) corpora are byte-clean.
-> **FULL STAGE-5 BAR: NOT MET**, held open solely by the fully-attributed
-> 6-file `expressions/arrow-function` scoper fold. The fix2/fix3/fix4-progress
-> blocks below are retained as dated round history.
+> **Current authoritative verdict:** see **fix5 1/5** below (the arrow/eval
+> scope-slot fold). The entire class surface stays byte-clean
+> (`statements/class` **0**, `expressions/class` **0**); curated (1711/1711) and
+> module (45/45) corpora stay byte-clean. **fix5 1/5 closed the dominant arrow
+> residual**: `eval-code` is now fully byte-clean (accept-disagree 4 → 0),
+> `expressions/optional-chaining` divergent 1 → 0, and `expressions/arrow-function`
+> 6 → **1** divergent. **FULL STAGE-5 BAR: NOT MET**, now held open by two
+> narrow, fully-attributed residuals: the **enclosing-function
+> closure-reification** fold (2 files: `arrow-function/arrow/binding-tests-3.js`,
+> `arguments-object/10.5-1-s.js`) and the deferred **tagged-template** feature (2
+> `endor-rejected` in `optional-chaining`). The fix2/fix3/fix4/fix5 blocks below
+> are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
 children** (CESU-8 strings, the four named coder rejects, the class tail,
