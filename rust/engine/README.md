@@ -1480,7 +1480,15 @@ declarations** (the field function's frame reservation); `using` heads (a
 parser gap); and module import/export linkage + the module-body wrapper.
 These are the remaining child-6/7 surface.
 
-### Stage-5 acceptance evidence (child 7/7, re-measured by fix3-verify 5/5): the byte-identity bar
+### Stage-5 acceptance evidence (child 7/7, re-measured by fix4-verify 4/4): the byte-identity bar
+
+> **Current authoritative verdict:** see **fix4-verify 4/4** below (fresh
+> re-measure on the live tip `d93d2a4ee8`). The entire class surface is now
+> byte-clean (`statements/class` **0**, `expressions/class` **0**); all 13
+> swept subtrees + curated (1711/1711) + module (45/45) corpora are byte-clean.
+> **FULL STAGE-5 BAR: NOT MET**, held open solely by the fully-attributed
+> 6-file `expressions/arrow-function` scoper fold. The fix2/fix3/fix4-progress
+> blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
 children** (CESU-8 strings, the four named coder rejects, the class tail,
@@ -1876,6 +1884,104 @@ byte-identity fixtures pin every closed shape
 `expressions/arrow-function` (**6** divergent, a separate pre-existing
 `scope-param-*-var-*` / `scope-body-lex-distinct` scoper fold, out of
 this slice's scope) — fully attributed, no unexplained byte divergence.
+
+**fix4-verify 4/4 (full re-measure on the live tip `d93d2a4ee8`).** A fresh
+sync of `origin/xs2rust-endor` (`d93d2a4ee8`, all three fix4 siblings present:
+the structural field-init fold, the direct-eval prelude, and the
+numeric-key/captured-`arguments`/captured-self-name slice) re-ran every stage-5
+bar from scratch against the oracle pin (`c/moddable` @ `48ee02d8`). No
+engine-code change; this block records the re-measured truth. **The entire
+class surface — the fix4 target — is now byte-clean.**
+
+**13-subtree byte-identity sweep** (`compile-diff <subtree>`, per-subtree since
+whole-`language/` OOMs the oracle) — this round adds **`expressions/class`**
+(50 divergent at the fix3-verify tip, which the fix3 sweep had missed):
+
+| subtree | total | identical | divergent | endor-rej | oracle-rej | accept-disagree |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `expressions/addition` | 48 | 48 | **0** | 0 | 0 | 0 |
+| `statements/if` | 69 | 29 | **0** | 0 | 40 | 0 |
+| `expressions/conditional` | 22 | 20 | **0** | 0 | 2 | 0 |
+| `statements/for-of` | 712 | 641 | **0** | 0 | 71 | 0 |
+| `statements/try` | 192 | 168 | **0** | 0 | 24 | 0 |
+| `expressions/async-generator` | 585 | 507 | **0** | 0 | 78 | 0 |
+| `expressions/assignment` | 466 | 404 | **0** | 0 | 62 | 0 |
+| `statements/function` | 434 | 390 | **0** | 0 | 44 | 0 |
+| `expressions/object` | 1049 | 914 | **0** | 0 | 135 | 0 |
+| `statements/class` | 3908 | 3298 | **0** | 0 | 610 | 0 |
+| `statements/switch` | 105 | 36 | **0** | 0 | 69 | 0 |
+| `expressions/call` | 96 | 95 | **0** | 0 | 1 | 0 |
+| `expressions/class` | 3663 | 3086 | **0** | 0 | 577 | 0 |
+
+**Every one of the 13 subtrees is byte-clean: `divergent == 0`,
+`endor-rejected == 0`, `accept-disagree == 0`, EXIT=0.** Since the fix3-verify
+sweep, `statements/class` closed **62 → 0** (identical 3236 → 3298),
+`expressions/class` **50 → 0** (measured for the first time this round),
+`expressions/call`'s lone `tco-call-args.js` fold closed (`endor-rejected`
+1 → 0, moved into `identical`). All `oracle-rejected` counts are
+accept-**agreements** (endor rejects the same files — `accept-disagree` is 0
+everywhere), so no `oracle-rejected` is a divergence.
+
+**Every other stage bar re-measured green:**
+
+- **Curated corpora** (`compile-diff`, gated in-crate by
+  `corpora_byte_identity_no_undocumented_divergence`): `total=1711
+  identical=1711 divergent=0 oracle-rejected=0 endor-rejected=0
+  accept-disagree=0` — **1711/1711, BAR MET**.
+- **Module corpora**: the in-crate gate
+  `module_corpora_byte_identity_no_divergence` ran **ok** (45/45, `divergent=0`)
+  in the workspace pass.
+- **Workspace** (`cargo test --workspace -- --test-threads=1` from
+  `rust/engine`): **EXIT=0**, all 20 `test result:` lines **ok** — including the
+  determinism gate (`parse_computrons_are_deterministic_per_build`) and the fuzz
+  smokes (`decoder_never_panics_on_arbitrary_bytes`,
+  `parser_is_total_over_generated_and_arbitrary_bytes`), plus the fix4
+  byte-identity fixtures (`class_field_init_function_scope`,
+  `class_field_init_direct_eval`, `class_accessor_numeric_key_canonicalization`,
+  `numeric_property_key_index_boundary`,
+  `named_class_with_heritage_names_constructor`, `captured_function_self_name`).
+- **Stage-4 dual-run spot-checks** (`test262-language <t>`, `Compiler::Oracle`):
+  `built-ins/Object total=3127 covered=176 divergent=0`, `built-ins/Function
+  total=511 covered=40 divergent=0`, `built-ins/Array total=2625 covered=437
+  divergent=0` — all EXIT=0, **no crash-aborts** (every skip a named
+  `unsupported-opcode:*`).
+- **`using` reject-agreement**: both engines still reject `using x = a` with
+  `SyntaxError: missing ;` (harness agreement `BothAbort`; the computron gap on
+  a mutually-rejected program is the advisory-only compile-metering telemetry,
+  not a result divergence).
+- **`#![forbid(unsafe_code)]`** intact at crate root in every engine crate
+  (`endor-262`, `endor-compile`, `endor-fuzz`, `endor-regexp`, `endor-vm`);
+  `endor-oracle` is the sole documented exception — the audited C-XS FFI seam,
+  `// NOT #![forbid(unsafe_code)]` by design.
+
+**Attribution partition (step 10 — every residual accounted for).** Across the
+curated + module corpora and all **13** swept subtrees there are **zero**
+byte divergences and **zero** `endor-rejected` folds — nothing to attribute; a
+clean bill. The **only** residual byte divergence anywhere in the `language/`
+tree is `expressions/arrow-function` (**6** divergent, `endor-rejected=0`,
+`accept-disagree=0`, total=326 identical=245), and it is **fully attributed**:
+all 6 are `byte-length/endor-shorter` (endor emits 5–15 fewer bytes) on the
+`scope-param-{elem,rest-elem}-var-{open,close}` / `scope-body-lex-distinct` /
+`arrow/binding-tests-3` family — a **parameter var-environment / body-lexical
+scope-slot classification** fold (endor does not yet reserve the separate
+`var`-environment scope XS creates for an arrow with a non-simple parameter
+list), the closure-vs-local opcode-pair family (spot-check first-diff opcode
+deltas of a fixed 4). This is a **known, pre-existing scoper fold outside this
+slice's scope**, not a class-path regression and **not** an unattributable
+divergence. **There is NO unexplained / unattributed byte divergence anywhere,
+hence NO new kill-criterion evidence.**
+
+**FULL STAGE-5 BAR: NOT MET** — strict `divergent == 0` **everywhere** across
+`language/` is not yet met, held open **solely** by the fully-attributed
+6-file `expressions/arrow-function` scope-param-var-environment scoper fold
+(a separate, narrow, pre-existing gap outside the class-focused fix4 scope).
+The bar **IS MET** on: the curated corpora (**1711/1711**), the module corpora
+(**45/45**), and **all 13** swept subtrees — including the entire class surface
+(`statements/class` **0**, `expressions/class` **0**), which was the fix4
+target and is now byte-clean (62 + 50 → 0). `accept-disagree == 0` and
+`endor-rejected == 0` hold on **every** measured subtree. No unattributable
+divergence anywhere ⇒ **no new kill-criterion evidence**; the residual is one
+named scoper fold, not a feasibility wall.
 
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →
