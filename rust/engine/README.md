@@ -1440,9 +1440,17 @@ byte-identical vs the oracle:
   `super(...)` constructors, fields interleaved with methods and static
   fields, and name-inferring/`this`-referencing values, on named and anonymous
   derived classes.
+- Slice 50 — **static initializer blocks**: a `static { … }` block folds
+  into the same `constructorInit` field-init function as the static data
+  fields, in source order — it runs its statements directly (no `this` /
+  `NEW_PROPERTY`) with `this` bound to the constructor. Blocks mixed with
+  static fields, multiple blocks, `super`, control flow, and interleaving
+  with methods. Deferred: a block with its own lexical declarations (needs
+  the field function's frame reservation).
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-**private** members, computed-key fields, and static blocks — these need more
-class-scope declares; `using` heads (a parser gap); and
+**private** members and computed-key fields (need the class-scope
+`atAccess` / private declares), and a static block with local declarations;
+`using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.
