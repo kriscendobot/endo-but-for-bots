@@ -2278,8 +2278,15 @@ impl Coder<'_> {
                 self.code_assign(target, 0);
                 self.add_byte(-1, XS_CODE_POP);
             } else {
+                // A plain `Arg`, an `= default` (`Binding`), or a
+                // destructuring parameter (`ArrayBinding`/`ObjectBinding`) —
+                // each pulls `ARGUMENT i` and binds it through the target's
+                // own reference/assign coder.
                 assert!(
-                    matches!(arg.token, Token::Arg | Token::Binding),
+                    matches!(
+                        arg.token,
+                        Token::Arg | Token::Binding | Token::ArrayBinding | Token::ObjectBinding
+                    ),
                     "parameter pattern {:?} deferred (params slice)",
                     arg.token
                 );

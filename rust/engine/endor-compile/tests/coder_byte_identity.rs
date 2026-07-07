@@ -742,6 +742,22 @@ fn array_destructuring() {
     ]);
 }
 
+// Destructuring parameters (child 6). A parameter that is an array/object
+// pattern pulls its `ARGUMENT i` and binds it through the same
+// `fxArrayBindingNodeCodeAssign` / `fxObjectBindingNodeCodeAssign` coders as
+// standalone destructuring. Mixed with plain parameters, rest, and
+// defaults; in both function expressions and arrows.
+#[test]
+fn destructuring_parameters() {
+    assert_identical(&[
+        "(function([a,b]){});", "(function({a,b}){});",
+        "(function([a,b]){return a+b;});", "(function({a,b}){return a;});",
+        "(function([a],b){return b;});", "(function(a,[b,c]){return b;});",
+        "(function([a,...r]){return r;});", "(function({a:p}){return p;});",
+        "(function([a=1]){return a;});", "(([a,b])=>a);",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by
