@@ -262,6 +262,27 @@ impl Lexer {
         }
     }
 
+    /// `fxSkipShebang` — at the very start of a program or module,
+    /// consume a leading `#!` hashbang comment through the end of its
+    /// line, leaving the cursor on the line terminator (or EOF) so the
+    /// next scan counts the line break as XS does. Only a `#`
+    /// immediately followed by `!` is a hashbang; a bare `#` (or `#x`)
+    /// is left untouched for the normal scanner — XS reports it as an
+    /// invalid character, and endor rejects it downstream just as
+    /// surely (a top-level private name is illegal), so ACCEPT/REJECT
+    /// agrees either way. Gating on the `#!` pair keeps this safe to
+    /// call unconditionally, including ahead of a `#x in obj`
+    /// private-in expression.
+    pub fn skip_shebang(&mut self) {
+        if self.ch == '#' as u32 && self.la == '!' as u32 {
+            self.advance(); // consume '#'
+            self.advance(); // consume '!'
+            while self.ch != EOF && !Lexer::is_line_terminator(self.ch) {
+                self.advance();
+            }
+        }
+    }
+
     /// Produce the next token, transliterating `fxGetNextTokenAux`, and
     /// charge the parse meter once for it (including EOF).
     pub fn next(&mut self) -> Result<Lexeme, LexError> {

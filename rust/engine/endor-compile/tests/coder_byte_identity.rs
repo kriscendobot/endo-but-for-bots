@@ -290,6 +290,24 @@ fn literals_and_operators() {
     ]);
 }
 
+// A leading `#!` hashbang comment (Annex B `HashbangComment`) is stripped
+// before the first token by `fxSkipShebang`, for both the program and
+// module goals; endor mirrors it in `Lexer::skip_shebang`, invoked from
+// `Parser::new`. The program after the shebang must compile byte-identically
+// to the same program without it — the hashbang contributes no bytecode and
+// does not shift the line count of the first statement (the terminator is
+// left for the scanner). Fixtures cover an empty hashbang, a non-empty one,
+// and one whose only line terminator is a bare LF.
+#[test]
+fn hashbang_comment() {
+    assert_identical(&[
+        "#!\n1 + 2",
+        "#!/usr/bin/env node\nvar x = 1; x;",
+        "#! these characters should be treated as a comment\n(function(){ return 42; })()",
+        "#!shebang\n\"use strict\"; var y = 3; y;",
+    ]);
+}
+
 // String literals are stored in the bytecode as XS's CESU-8, NOT the Rust
 // `String`'s UTF-8: an astral scalar is a 6-byte surrogate pair (each half
 // a 3-byte unit), a lone surrogate is a 3-byte unit that is not valid UTF-8

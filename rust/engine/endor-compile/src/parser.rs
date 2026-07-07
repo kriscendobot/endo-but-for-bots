@@ -115,6 +115,9 @@ impl Parser {
         lexer.set_strict(flags & flags::STRICT != 0);
         lexer.set_async(flags & flags::ASYNC != 0);
         lexer.set_generator(flags & flags::GENERATOR != 0);
+        // `fxParserTree` skips a leading `#!` hashbang before fetching
+        // the first token, for both the program and module goals.
+        lexer.skip_shebang();
         let cur = lexer.next()?;
         Ok(Parser { lexer, cur, ahead: None, flags, stack: Vec::new(), property_name_async_flag: 0 })
     }
