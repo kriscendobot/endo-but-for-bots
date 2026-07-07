@@ -893,6 +893,25 @@ fn cross_construct_integration() {
     ]);
 }
 
+// Static initializer blocks (child 6). A `static { … }` block folds into
+// the same `constructorInit` field-init function as the static data fields
+// (in source order), running its statements directly (no `this` /
+// `NEW_PROPERTY`) with `this` bound to the constructor. Covers blocks mixed
+// with static fields, multiple blocks, `super`, control flow, and
+// interleaving with methods. Deferred: a block with its own lexical
+// declarations (needs the field function's frame reservation).
+#[test]
+fn static_blocks() {
+    assert_identical(&[
+        "(class{static{}});", "(class{static{x;}});",
+        "(class{static{a;}static{b;}});", "(class{static{this.x=1;}});",
+        "(class{static x=1;static{y;}});",
+        "(class{static x=1;static y=2;static{z;}});",
+        "(class extends A{static{super.x;}});",
+        "(class{m(){}static{this.n=1;}});", "(class{static{for(;;)break;}});",
+    ]);
+}
+
 #[test]
 fn wide_operands_and_branch_widths() {
     // Force INTEGER width transitions and a long branch (BRANCH_2) by

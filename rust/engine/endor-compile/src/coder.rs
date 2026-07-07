@@ -2102,8 +2102,11 @@ impl Coder<'_> {
             );
         }
         for p in instance_fields.iter().chain(static_fields.iter()) {
+            // A data field (`Property`) or a `static { … }` block (`Body`);
+            // computed (`PropertyAt`) / private (`PrivateProperty`) fields
+            // need class-scope declares and are deferred.
             assert!(
-                p.token == Token::Property,
+                matches!(p.token, Token::Property | Token::Body),
                 "computed / private field deferred (needs class-scope declare)"
             );
         }
@@ -2203,6 +2206,13 @@ impl Coder<'_> {
     /// then `NEW_PROPERTY` with the inferred-name flag. Computed / private
     /// fields (needing `atAccess` / private declares) are deferred.
     fn code_field(&mut self, p: &Node) {
+        // A `static { … }` block folds into the same `constructorInit`
+        // field-init function as the static data fields (in source order);
+        // it runs its statements directly (no `this`/`NEW_PROPERTY`).
+        if p.token == Token::Body {
+            self.code(&p.children[0]);
+            return;
+        }
         self.add_byte(1, XS_CODE_THIS);
         let key = Self::symbol_of(&p.children[0]).to_string();
         self.code(&p.children[1]);
