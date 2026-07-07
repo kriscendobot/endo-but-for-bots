@@ -1324,10 +1324,15 @@ byte-identical vs the oracle:
   machinery (only the return target crosses it). Both destructuring
   assignment (`[a,b] = x`) and lexical/var binding (`let [a,b] = x`); holes,
   rest, defaults, and member targets covered.
+- Slice 33 — **destructuring parameters**: a parameter that is an array/
+  object pattern pulls its `ARGUMENT i` and binds it through the same
+  array/object destructuring coders (`code_params_binding` accepts
+  `ArrayBinding`/`ObjectBinding` param items). Mixed with plain parameters,
+  rest, and defaults, in both function expressions and arrows.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-object rest / computed-key / nested-pattern destructuring, and
-destructuring *parameters*; home-object/`super`
+object rest / computed-key / nested-pattern destructuring;
+home-object/`super`
 (and arrow capture of `this`/`super`/`target`); anonymous-class name
 inference and **direct-`eval` spread**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
