@@ -222,6 +222,10 @@ pub struct ScopeTree {
     /// declare `(scope, id)` when the class has instance data fields.
     /// Keyed with [`node_key`].
     pub class_instance_init: HashMap<usize, (usize, u32)>,
+    /// A `super(...)` node address → the capturing alias `(scope, id)` for
+    /// the enclosing derived class's `instanceInit` closure. Keyed with
+    /// [`node_key`].
+    pub super_instance_init: HashMap<usize, (usize, u32)>,
 }
 
 /// The stable identity the scoper/coder use to associate a scope (and,
@@ -270,6 +274,7 @@ pub fn run(root: &Item) -> Result<ScopeTree, ParseError> {
         node_scopes: s.node_scope,
         resolutions: s.resolutions,
         class_instance_init: s.class_instance_init,
+        super_instance_init: s.super_instance_init,
     })
 }
 
@@ -319,6 +324,11 @@ struct Scoper {
     /// store the field function (`CONST_CLOSURE`) and the base constructor
     /// reads its capturing alias to call it after entry.
     class_instance_init: HashMap<usize, (usize, u32)>,
+    /// A `super(...)` node address → the capturing alias `(scope, id)` for
+    /// the enclosing derived class's `instanceInit` closure (XS's
+    /// `superNode->instanceInitAccess->declaration`). The coder reads it to
+    /// call the field initializer after `super(...)` installs `this`.
+    super_instance_init: HashMap<usize, (usize, u32)>,
 }
 
 fn node_ptr(n: &Node) -> usize {
@@ -1704,9 +1714,22 @@ impl Scoper {
 
     fn bind_super(&mut self, node: &Node) -> Result<(), ParseError> {
         self.scope_arrow(self.scope);
-        // children[0]=params (class instanceInit is folded)
         if let Some(params) = child(node, 0) {
             self.bind_item(params)?;
+        }
+        // A `super(...)` in a derived class captures the class's `instanceInit`
+        // closure (`fxSuperNodeBind`) so it can call the field initializer
+        // once `this` exists. The lookup walks up from the current scope,
+        // creating the function-boundary alias XS resolves to.
+        if let Some(cnode) = self.class_node {
+            if let Some(&(rscope, rid)) = self.class_instance_init.get(&cnode) {
+                if let Some(sym) = self.declare_ref(rscope, rid).symbol.clone() {
+                    let scope = self.scope.unwrap();
+                    if let Some(resolved) = self.scope_lookup(scope, &sym, node.line, false, false) {
+                        self.super_instance_init.insert(node_ptr(node), resolved);
+                    }
+                }
+            }
         }
         Ok(())
     }

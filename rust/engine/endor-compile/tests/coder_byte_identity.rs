@@ -1056,3 +1056,18 @@ fn class_instance_fields() {
         "(class{x=1;static y=2;});",
     ]);
 }
+
+#[test]
+fn class_instance_fields_derived() {
+    assert_identical(&[
+        "(class extends Object{x=1;});", "(class C extends Object{x=1;});",
+        "(class extends Object{x=1;y=2;});",
+        "(class extends Object{constructor(){super();}x=1;});",
+        "(class extends Object{constructor(a){super(a);}x=a;});",
+        "(class extends Object{m(){}x=1;});",
+        "(class extends Object{f=function(){};});",
+        "(class extends Object{static s=1;x=2;});",
+        "(class extends Object{x=this;y=1;});",
+        "(class C extends Object{constructor(){super();this.z=3;}x=1;});",
+    ]);
+}

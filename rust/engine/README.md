@@ -1431,11 +1431,18 @@ byte-identical vs the oracle:
   (`NEW_CLOSURE` id 0). Byte-identical for single/multiple/bare fields, fields
   interleaved with methods and static fields, and name-inferring/expression/
   `this` values, on named and anonymous base classes.
+- Slice 49 — **instance class fields for derived classes**: a `super(...)`
+  node now captures the class's `instanceInit` closure (`fxSuperNodeBind`, a
+  scope-chain lookup that creates the function-boundary alias) and the coder
+  calls the field initializer right after `super(...)` installs `this`
+  (`fxSuperNodeCode`: `GET_THIS` + `GET_CLOSURE` + `CALL` + `RUN_1 0` + `POP`).
+  Byte-identical for single/multiple fields, synthesized and explicit
+  `super(...)` constructors, fields interleaved with methods and static
+  fields, and name-inferring/`this`-referencing values, on named and anonymous
+  derived classes.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
-**derived-class** instance fields (the `instanceInit` call after `super(...)`,
-`fxSuperNodeCode`), **private** members, and static blocks — the first needs
-the super-node capture, the rest more class-scope declares; `using` heads (a
-parser gap); and
+**private** members, computed-key fields, and static blocks — these need more
+class-scope declares; `using` heads (a parser gap); and
 module import/export linkage + the module-body wrapper. These are the
 remaining child-6/7 surface.

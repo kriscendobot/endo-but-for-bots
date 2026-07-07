@@ -1974,6 +1974,17 @@ impl Coder<'_> {
         self.add_byte(3, XS_CODE_SUPER);
         self.code(&node.children[0]);
         self.add_byte(0, XS_CODE_SET_THIS);
+        // A derived class with instance fields calls its `instanceInit` field
+        // initializer here, once `super(...)` has installed `this`
+        // (`fxSuperNodeCode`): `this`, the captured closure, a zero-arg run.
+        if let Some(&(ascope, aid)) = self.tree.super_instance_init.get(&node_key(node)) {
+            let idx = self.declare_index(ascope, aid);
+            self.add_byte(1, XS_CODE_GET_THIS);
+            self.add_index(1, XS_CODE_GET_CLOSURE_1, idx);
+            self.add_byte(1, XS_CODE_CALL);
+            self.add_integer(-2, XS_CODE_RUN_1, 0);
+            self.add_byte(-1, XS_CODE_POP);
+        }
     }
 
     fn code_class(&mut self, node: &Node) {
@@ -1987,10 +1998,6 @@ impl Coder<'_> {
         // The synthesized `instanceInit` closure declare, present when the
         // class has instance data fields (see `class_has_instance_field`).
         let instance_init = self.tree.class_instance_init.get(&node_key(node)).copied();
-        let ctor_is_base = match &node.children[5] {
-            Item::Node(c) => c.flags & f::BASE != 0,
-            _ => false,
-        };
 
         let prototype = self.use_temporary();
         let constructor = self.use_temporary();
@@ -2084,15 +2091,11 @@ impl Coder<'_> {
         }
 
         // Instance data fields run through the synthesized `instanceInit`
-        // field function stored in the class-body closure and called by the
-        // base constructor on entry. A *derived* class calls it after
-        // `super(...)` instead — deferred. Private / computed-key fields need
-        // class-scope declares — deferred.
+        // field function stored in the class-body closure. A base constructor
+        // calls it on entry; a derived class calls it after `super(...)`
+        // installs `this`. Private / computed-key fields need class-scope
+        // declares — deferred.
         if !instance_fields.is_empty() {
-            assert!(
-                ctor_is_base,
-                "derived-class instance-field init deferred (super-call instanceInit)"
-            );
             assert!(
                 instance_init.is_some(),
                 "instance fields present but no instanceInit declare (scoper)"
