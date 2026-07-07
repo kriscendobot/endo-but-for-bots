@@ -792,16 +792,21 @@ impl<'a> Coder<'a> {
     /// allocated in `scope_coding_params`; the reference is a no-op (the
     /// name resolves to its own slot).
     fn code_function_name(&mut self, scope: usize) {
-        let names: Vec<u32> = self.tree.scopes[scope]
+        use crate::scoper::dflags;
+        // A captured self-name (`fxDeclareNodeCodeAssign`'s `CONST` branch)
+        // binds through the closure slot (`CONST_CLOSURE_1`); an uncaptured
+        // one through the local slot (`CONST_LOCAL_1`).
+        let names: Vec<(u32, bool)> = self.tree.scopes[scope]
             .declares
             .iter()
             .filter(|d| d.token == Token::Define)
-            .map(|d| d.id)
+            .map(|d| (d.id, d.flags & dflags::CLOSURE != 0))
             .collect();
-        for id in names {
+        for (id, closure) in names {
             let index = self.declare_index(scope, id);
             self.add_byte(1, XS_CODE_CURRENT);
-            self.add_index(0, XS_CODE_CONST_LOCAL_1, index);
+            let op = if closure { XS_CODE_CONST_CLOSURE_1 } else { XS_CODE_CONST_LOCAL_1 };
+            self.add_index(0, op, index);
             self.add_byte(-1, XS_CODE_POP);
         }
     }
@@ -3149,10 +3154,20 @@ impl Coder<'_> {
             }
             // A named function expression's own name is a `Define` bound to
             // `CURRENT`; give it a slot here, initialized in the define pass.
+            // When a nested function captures the name (`function f(){ g =
+            // ()=>f; }`), `fxScopeCodingBlock` promotes the `Define` to a
+            // closure slot (`NEW_CLOSURE`); a use-closure `Define` (its own
+            // alias) gets no slot here — `fxScopeCodeRetrieve` handles it.
             if token == Token::Define {
-                let index = self.set_declare_index(scope, id);
-                assert!(flags & dflags::CLOSURE == 0, "captured function name deferred");
-                self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(&sym), index);
+                if flags & dflags::CLOSURE != 0 {
+                    if flags & dflags::USE_CLOSURE == 0 {
+                        let index = self.set_declare_index(scope, id);
+                        self.add_variable(0, XS_CODE_NEW_CLOSURE, Self::sym_name(&sym), index);
+                    }
+                } else {
+                    let index = self.set_declare_index(scope, id);
+                    self.add_variable(0, XS_CODE_NEW_LOCAL, Self::sym_name(&sym), index);
+                }
                 continue;
             }
             // `fxScopeCodingParams` slots `Arg`/`Var`/`Const` declares —

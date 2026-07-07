@@ -1788,6 +1788,27 @@ fn class_field_init_direct_eval() {
     ]);
 }
 
+// A captured named-function-expression self-name — the `tco-call-args`
+// fold (stage-5 fix4 3/4, slice 3). When a nested function captures the
+// enclosing function's own name (`function f(){ g=()=>f; }`), XS's
+// `fxScopeCodingBlock` promotes the name `Define` to a closure slot
+// (`NEW_CLOSURE`) and binds `CURRENT` through `CONST_CLOSURE_1`, so the
+// nested closure's capture resolves. Endor previously asserted-out
+// ("captured function name deferred") on this shape.
+#[test]
+fn captured_function_self_name() {
+    assert_identical(&[
+        // a nested function reads the enclosing function's own name
+        "(function f(n) { function g() { return f; } return g()(n); });",
+        // a nested arrow captures the self-name
+        "var probe; var func = function f() { probe = function() { return f; }; };",
+        // tail-call through a nested getter of the self-name (tco-call-args)
+        "'use strict'; (function f(n) { if (n === 0) return; function getF() { return f; } return getF()(n - 1); });",
+        // strict + sloppy `scope-name-var` shapes
+        "var func = function f() { var probe = function() { return f; }; return probe; };",
+    ]);
+}
+
 // Numeric accessor/property keys — `fxPropertyName`'s `fxNumberToIndex`
 // classification (stage-5 fix4 3/4). A numeric key that is a canonical
 // array index codes through the index path (`NUMBER`/`INTEGER` + `AT` +
