@@ -1273,12 +1273,17 @@ byte-identical vs the oracle:
 - Slice 23 — **object spread**: a `{...expr}` member copies `expr`'s own
   enumerable properties onto the object via the `COPY_OBJECT` intrinsic
   (invoked with the object as `this`); mixes with data properties.
+- Slice 24 — **array spread**: `fxArrayNodeCode`'s spread branch — a
+  running `counter` slot indexes appends and each `...expr` is iterated
+  with the `for-of` protocol (`FOR_OF` + a `next()`/`done` loop that
+  `SET_PROPERTY_AT`s each value); elisions bump `counter`/`length`.
 
 **Still folded (named gaps, coder still `panic!`s — never mis-emits):**
 parameter destructuring and the `arguments` object (which forces
 mapped/closure parameters); home-object/`super` (and arrow capture of
 `this`/`super`/`target`); object **methods/accessors**, written
-`__proto__:`, and anonymous-class name inference; array spread; generator/async
+`__proto__:`, anonymous-class name inference, and **call/`new` spread
+arguments**; generator/async
 functions and `yield`/`await`; classes (constructor/derived, methods/
 accessors, static members, private fields/methods/brands, static blocks);
 declaring `for-in`/`for-of` heads + `for await` + `for(let …)` refresh; and
