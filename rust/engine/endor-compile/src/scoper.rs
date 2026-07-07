@@ -399,6 +399,24 @@ fn err(line: u32, msg: &str) -> ParseError {
     ParseError { line, kind: crate::parser::ParseErrorKind::Syntax, message: msg.to_string() }
 }
 
+/// Whether a `delete` operand's reference target is a private member (so
+/// `delete` of it is an early error). Unwraps a single-item parenthesized
+/// sequence (`Expressions` with one item) recursively, mirroring the
+/// coder's `codeDelete` dispatch; a multi-item sequence is a value-delete.
+fn delete_target_is_private(item: &Item) -> bool {
+    match item {
+        Item::Node(n) => match n.token {
+            Token::PrivateMember | Token::PrivateIdentifier => true,
+            Token::Expressions => match n.children.first() {
+                Some(Item::List(items)) if items.len() == 1 => delete_target_is_private(&items[0]),
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 // --------- child-slot accessors (positional, per the struct layout) ---------
 
 fn child<'a>(n: &'a Node, i: usize) -> Option<&'a Item> {
@@ -1467,7 +1485,9 @@ impl Scoper {
             Token::Increment | Token::Decrement => self.bind_postfix(node),
             Token::Export => self.bind_export(node),
             Token::Class => self.bind_class(node),
-            // fold: Field / PrivateMember — deferred.
+            Token::PrivateMember | Token::PrivateIdentifier => self.bind_private_member(node),
+            Token::Delete => self.bind_delete(node),
+            // fold: Field — deferred.
             _ => self.bind_children(node),
         }
     }
@@ -1616,6 +1636,52 @@ impl Scoper {
             let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, false, false);
             self.record_access(&sym, node.line, resolved);
             self.resolutions.insert(node_ptr(node), resolved);
+        }
+        Ok(())
+    }
+
+    /// `delete` of a private member reference (`delete obj.#x`, including
+    /// the parenthesized/covered form `delete (this.#x)`) is an early
+    /// SyntaxError — XS reports it from `fxPrivateMemberNodeCodeDelete`.
+    /// The target is found by unwrapping a single-item parenthesized
+    /// sequence exactly as the coder's `codeDelete` dispatch does (a
+    /// multi-item `delete (a, b.#x)` is a value-`delete`, not an error).
+    fn bind_delete(&mut self, node: &Node) -> Result<(), ParseError> {
+        if let Some(target) = node.children.first() {
+            if delete_target_is_private(target) {
+                return Err(err(node.line, "delete private property"));
+            }
+        }
+        self.bind_children(node)
+    }
+
+    /// `fxPrivateMemberNodeBind` — a private member access (`obj.#x`,
+    /// `obj.#m()`) and the `#x in obj` brand check (`PrivateIdentifier`)
+    /// share this bind. The node's own `symbol` (child 0, the `#name`)
+    /// resolves through the class-scope closures the declaration slice
+    /// installed (`symbolAccess`), with the `is_private_member` flag set so a
+    /// strict `eval` scope synthesizes the brand declare (mirroring
+    /// `fxScopeLookup`'s `XS_TOKEN_PRIVATE_MEMBER` branch); an unresolved
+    /// `#name` is XS's "invalid private identifier". The reference (child 1)
+    /// binds after the lookup, matching `fxPrivateMemberNodeDistribute`.
+    fn bind_private_member(&mut self, node: &Node) -> Result<(), ParseError> {
+        // A private member accessed on `super` (`super.#x`, `super.#m()`)
+        // is invalid syntax: the reference base carries the `super` flag.
+        if let Some(Item::Node(reference)) = node.children.get(1) {
+            if reference.flags & flags::SUPER != 0 {
+                return Err(err(node.line, "invalid super private access"));
+            }
+        }
+        if let Some(sym) = child_sym(node, 0) {
+            let scope = self.scope.unwrap();
+            let resolved = self.scope_lookup(scope, &Sym::Named(sym.clone()), node.line, true, false);
+            if resolved.is_none() {
+                return Err(err(node.line, "invalid private identifier"));
+            }
+            self.resolutions.insert(node_ptr(node), resolved);
+        }
+        if let Some(reference) = child(node, 1) {
+            self.bind_item(reference)?;
         }
         Ok(())
     }

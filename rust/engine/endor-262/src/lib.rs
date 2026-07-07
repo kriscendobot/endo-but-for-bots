@@ -868,11 +868,12 @@ mod tests {
     fn compiler_seam_endor_fold_is_a_clean_abort_not_a_panic() {
         // A construct the coder folds on must, through the `Endor` seam,
         // produce empty bytecode that endor-vm treats as an abort — never a
-        // harness panic. The class-tail child ported computed-key fields and
-        // private member *declarations*, so this uses a still-deferred
-        // construct: a private *read* in a method body (`#x in o`, whose
-        // `HAS_PRIVATE` / `GET_PRIVATE` access path is the remaining fold).
-        let src = "class C { #x = 1; has(o) { return #x in o; } } new C()";
+        // harness panic. Private member *reads/writes* and the `#x in o`
+        // brand check now code byte-identically (this child), so this uses a
+        // still-deferred class-tail construct: a `static { … }` block with
+        // its own lexical declarations, whose field-function frame
+        // reservation is the remaining fold.
+        let src = "class C { static { let x = 1; } } new C()";
         let endor = dual_run_with(src, Compiler::Endor).expect("oracle reference runs");
         assert!(
             endor.bytecode.is_empty(),

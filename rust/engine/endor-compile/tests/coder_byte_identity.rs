@@ -964,7 +964,9 @@ fn cross_construct_integration() {
 // `NEW_PROPERTY`) with `this` bound to the constructor. Covers blocks mixed
 // with static fields, multiple blocks, `super`, control flow, and
 // interleaving with methods. Deferred: a block with its own lexical
-// declarations (needs the field function's frame reservation).
+// declarations — XS RESERVEs those slots in the constructorInit function
+// via its `scopeMaximum`; the inline-synthesized field-init function here
+// has no such precomputed frame count yet (loud fold, never mis-emitted).
 #[test]
 fn static_blocks() {
     assert_identical(&[
@@ -1243,6 +1245,74 @@ fn class_tail_mixed() {
         "(class{static a=1;#b=2;[c]=3;m(){}});",
         "(class extends A{#x=1;[k]=2;constructor(){super();}});",
         "(class C extends A{a=1;#b=2;[c]=3;#m(){}static #s=9;});",
+    ]);
+}
+
+// Private member READS/WRITES (`this.#x`, `obj.#m()`) + the `#x in obj`
+// brand check. A private reference resolves its `#name` through the same
+// class-scope `symbolAccess` closure the declaration slice installs (a
+// use-closure alias in the accessing method's frame); the coder emits the
+// `*_PRIVATE` family: `GET_PRIVATE` for a read (`fxPrivateMemberNodeCode`),
+// `SET_PRIVATE` for a write (`fxPrivateMemberNodeCodeAssign`), a `DUB` +
+// `GET_PRIVATE` receiver for a private method call
+// (`fxPrivateMemberNodeCodeThis`), and `HAS_PRIVATE` for `#x in obj`
+// (`fxPrivateIdentifierNodeCode`). Compound assignment / increment on a
+// private member reuse the `codeThis` + `codeAssign` pair.
+#[test]
+fn class_private_member_reads() {
+    assert_identical(&[
+        // instance field read / write through `this.#x`
+        "(class{#x=1;get(){return this.#x;}});",
+        "(class{#x=1;set(v){this.#x=v;}});",
+        "(class{#x=0;bump(){this.#x=this.#x+1;}});",
+        // private method call `this.#m()` (kept out of tail position — a
+        // tail call's `RUN_TAIL` is an orthogonal sibling fold)
+        "(class{#m(){return 1;}run(){this.#m();}});",
+        "(class{#m(a){return a;}run(){return 1+this.#m(2);}});",
+        // private getter / setter access
+        "(class{get #g(){return 7;}read(){return this.#g;}});",
+        "(class{set #s(v){}write(v){this.#s=v;}});",
+        // brand check `#x in obj`
+        "(class{#x=1;has(o){return #x in o;}});",
+        "(class{#m(){}has(o){return #m in o;}});",
+        // compound assignment and increment on a private member
+        "(class{#x=1;add(){this.#x+=2;}});",
+        "(class{#x=1;inc(){this.#x++;}});",
+        "(class{#x=1;pre(){return ++this.#x;}});",
+        "(class{#x=1;or(){this.#x||=5;}});",
+        // a private read on another instance of the same class
+        "(class{#x=1;eq(o){return this.#x===o.#x;}});",
+        // static private member accessed from a static method
+        "(class{static #s=1;static read(){return this.#s;}});",
+        "(class{static #m(){return 4;}static run(){this.#m();}});",
+        // private access nested in an inner arrow (use-closure through two frames)
+        "(class{#x=1;f(){return 1+(()=>this.#x)();}});",
+        // named/derived class shapes carrying private reads
+        "(class C{#x=1;get(){return this.#x;}});",
+        "(class extends A{#x=1;constructor(){super();}get(){return this.#x;}});",
+    ]);
+}
+
+// A class field initializer whose VALUE is a function/arrow carries
+// `mxFieldFlag` (copied from the field-parse `parser->flags`), so its
+// function value opens with `BEGIN_STRICT_FIELD` rather than a plain
+// `BEGIN_STRICT` (XS's `fxFunctionNodeCode` field branch). Instance,
+// static, and private field slots, base and derived.
+#[test]
+fn class_field_value_functions() {
+    assert_identical(&[
+        // arrow field values (the `mxFieldFlag | mxArrowFlag` flavor)
+        "(class{f=()=>1;});", "(class{f=()=>this;});", "(class{f=(a)=>a;});",
+        "(class{static f=()=>1;});", "(class{#f=()=>1;});",
+        "(class{static #f=()=>this;});",
+        // async arrow field value
+        "(class{f=async()=>1;});", "(class{f=async(a)=>await a;});",
+        // arrow field reading the instance via a captured `this`
+        "(class{x=1;f=()=>this.x;});",
+        // named/derived shapes
+        "(class C{f=()=>1;});", "(class extends A{f=()=>this;constructor(){super();}});",
+        // interleaved with a plain field and a method
+        "(class{a=1;f=()=>2;m(){}});",
     ]);
 }
 

@@ -963,6 +963,8 @@ impl Coder<'_> {
             Chain => self.code_chain(node),
             Option => self.code_option(node),
             Member => self.code_member(node),
+            PrivateMember => self.code_private_member(node),
+            PrivateIdentifier => self.code_private_identifier(node),
             MemberAt => self.code_member_at(node),
             Call => self.code_call(node),
             New => self.code_new(node),
@@ -2522,6 +2524,9 @@ impl Coder<'_> {
                     // A `static { … }` block with its own lexical
                     // declarations needs those slots reserved in this
                     // function's frame — the remaining class-tail fold.
+                    // (XS RESERVEs them in the constructorInit function via
+                    // its `scopeMaximum`; the inline-synthesized field-init
+                    // function here has no such precomputed count yet.)
                     let bscope = self.tree.node_scopes.get(&node_key(field)).map(|s| s.0);
                     assert!(
                         bscope.map(|s| self.declare_count(s)).unwrap_or(0) == 0,
@@ -2642,11 +2647,6 @@ impl Coder<'_> {
     fn code_function(&mut self, node: &Node) {
         use crate::ast::flags as f;
         let flags = node.flags;
-        assert_eq!(
-            flags & f::FIELD,
-            0,
-            "function flavor {flags:#x} deferred (field initializer)"
-        );
         let scope = self.scope_of(node);
         // The function scope may declare positional parameters (`Arg`,
         // possibly captured) and closure aliases (a `NoToken` use-closure
@@ -2725,7 +2725,13 @@ impl Coder<'_> {
         // BEGIN_* with the leading parameter count. A class constructor uses
         // `BEGIN_STRICT_BASE` / `BEGIN_STRICT_DERIVED`.
         let count_params = self.count_parameters(&node.children[1]);
-        let begin = if flags & f::BASE != 0 {
+        // XS's begin-op order: field-initializer value, then derived/base
+        // constructor, then the strict/sloppy split. A `= initializer`
+        // (or arrow) parsed in a class field context carries `mxFieldFlag`,
+        // so its function value opens with `BEGIN_STRICT_FIELD`.
+        let begin = if flags & f::FIELD != 0 {
+            XS_CODE_BEGIN_STRICT_FIELD
+        } else if flags & f::BASE != 0 {
             XS_CODE_BEGIN_STRICT_BASE
         } else if flags & f::DERIVED != 0 {
             XS_CODE_BEGIN_STRICT_DERIVED
@@ -3363,6 +3369,32 @@ impl Coder<'_> {
         self.add_symbol(0, op, &name);
     }
 
+    /// The resolved private-declaration frame index for a `PrivateMember` /
+    /// `PrivateIdentifier` node (XS's `self->declaration->index`): the
+    /// scoper resolved the `#name` through the class-scope `symbolAccess`
+    /// closure (or its use-closure alias in the accessing function).
+    fn private_index(&self, node: &Node) -> i32 {
+        let (scope, id) = self.resolution_of(node).expect("private member resolution");
+        self.declare_index(scope, id)
+    }
+
+    /// `fxPrivateMemberNodeCode` — `obj.#x` read: code the reference, then
+    /// `GET_PRIVATE` by the resolved brand index. Children `[symbol,
+    /// reference]`.
+    fn code_private_member(&mut self, node: &Node) {
+        self.code(&node.children[1]);
+        let index = self.private_index(node);
+        self.add_index(0, XS_CODE_GET_PRIVATE_1, index);
+    }
+
+    /// `fxPrivateIdentifierNodeCode` — the `#x in obj` brand check: code the
+    /// reference, then `HAS_PRIVATE` by the resolved brand index.
+    fn code_private_identifier(&mut self, node: &Node) {
+        self.code(&node.children[1]);
+        let index = self.private_index(node);
+        self.add_index(0, XS_CODE_HAS_PRIVATE_1, index);
+    }
+
     /// Whether a reference child carries `mxSuperFlag` (a `super.x` base).
     fn node_is_super(&self, item: &Item) -> bool {
         matches!(item, Item::Node(n) if n.flags & crate::ast::flags::SUPER != 0)
@@ -3783,6 +3815,7 @@ impl Coder<'_> {
             Item::Node(n) => match n.token {
                 Token::Access => self.code_access_this(n, flag),
                 Token::Member => self.code_member_this(n, flag),
+                Token::PrivateMember => self.code_private_member_this(n, flag),
                 Token::MemberAt => self.code_member_at_this(n, flag),
                 Token::Expressions => self.code_expressions_this(n, flag),
                 _ => self.code_node_this(item, flag),
@@ -3833,6 +3866,16 @@ impl Coder<'_> {
         let name = Self::symbol_of(&node.children[1]).to_string();
         self.add_byte(1, XS_CODE_DUB);
         self.add_symbol(0, if is_super { XS_CODE_GET_SUPER } else { XS_CODE_GET_PROPERTY }, &name);
+        1
+    }
+
+    /// `fxPrivateMemberNodeCodeThis` — `obj.#m(...)` callee: the object is
+    /// the receiver (`DUB`'d), then the private value is read by brand.
+    fn code_private_member_this(&mut self, node: &Node, _flag: i32) -> i32 {
+        self.code(&node.children[1]);
+        self.add_byte(1, XS_CODE_DUB);
+        let index = self.private_index(node);
+        self.add_index(0, XS_CODE_GET_PRIVATE_1, index);
         1
     }
 
@@ -3979,6 +4022,10 @@ impl Coder<'_> {
                     // fxMemberNodeCodeReference: just the object.
                     self.code(&n.children[0]);
                 }
+                Token::PrivateMember => {
+                    // fxPrivateMemberNodeCodeReference: just the object.
+                    self.code(&n.children[1]);
+                }
                 Token::MemberAt => {
                     let is_super = self.node_is_super(&n.children[0]);
                     self.code(&n.children[0]);
@@ -4019,6 +4066,11 @@ impl Coder<'_> {
                     let is_super = self.node_is_super(&n.children[0]);
                     let name = Self::symbol_of(&n.children[1]).to_string();
                     self.add_symbol(-1, if is_super { XS_CODE_SET_SUPER } else { XS_CODE_SET_PROPERTY }, &name);
+                }
+                Token::PrivateMember => {
+                    // fxPrivateMemberNodeCodeAssign: store into the brand.
+                    let index = self.private_index(n);
+                    self.add_index(-1, XS_CODE_SET_PRIVATE_1, index);
                 }
                 Token::MemberAt => {
                     let is_super = self.node_is_super(&n.children[0]);
