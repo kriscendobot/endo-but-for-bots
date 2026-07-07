@@ -17,3 +17,8 @@ path = "src/bin/test262_language.rs"
 [dependencies]
 endor-vm = { path = "../endor-vm" }
 endor-oracle = { path = "../endor-oracle" }
+endor-compile = { path = "../endor-compile" }
+
+[[bin]]
+name = "compile-diff"
+path = "src/bin/compile_diff.rs"

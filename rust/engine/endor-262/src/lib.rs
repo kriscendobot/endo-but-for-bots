@@ -21,6 +21,7 @@
 
 use endor_vm::{run_program_with_symbols, Halt, RunOutcome};
 
+pub mod compile_diff;
 pub mod test262;
 
 /// The four-valued completion agreement (design § test262 conformance).

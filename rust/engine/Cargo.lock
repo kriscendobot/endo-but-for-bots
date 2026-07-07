@@ -16,6 +16,7 @@ dependencies = [
 name = "endor-262"
 version = "0.0.1"
 dependencies = [
+ "endor-compile",
  "endor-oracle",
  "endor-vm",
 ]
