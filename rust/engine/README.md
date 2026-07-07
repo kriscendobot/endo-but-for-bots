@@ -69,6 +69,45 @@ reproducibility and the "path dependency on xsnap" phrasing):
    xsnap's audited `xsnap-platform.{c,h}` and the identical feature
    defines) rather than as a Cargo path dependency on `xsnap`.
 
+## Upstream moddable delta tracking (oracle 8.2.3 → public 8.3.1)
+
+The port is **oracle-locked**: every stage is byte-identity / four-valued
+differential against the C-XS built from the `c/moddable` pin
+`48ee02d8cfe0` = **moddable 8.2.3** (2026-06-17). That pin already
+sits *well past* the `8.0.1` gitlink (`5516726818`) endo vendors, so the
+port inherits every engine-semantics change up through 8.2.3 for free —
+implement a surface and it is measured against an oracle that already has
+those fixes.
+
+Upstream `Moddable-OpenSource/moddable` `public` is now
+**`23b4d6b0a65f` = 8.3.1** (2026-07-07; intermediate bumps 8.2.3 → 8.3 →
+8.3.1). This table projects the engine-relevant `xs/sources` / `xs/includes`
+changes across `8.0.1 → 8.3.1` onto the port and records which side of the
+**8.2.3 oracle** each falls on. The oracle pin is **deliberately NOT bumped
+here** — bumping 8.2.3 → 8.3.1 is a separate, risk-weighted act (it re-bases
+the entire byte-identity bar and carries its own API-drift friction) tracked
+as the follow-up job **`port-endor-oracle-bump-8-3-1`**. Nothing below is a
+divergence from the *current* (8.2.3) oracle; the port matches 8.2.3 today.
+
+| # | Change (XS commit) | Files | vs 8.2.3 oracle | Port surface | Verdict |
+|---|---|---|---|---|---|
+| 1 | Explicit Resource Management (`using` / `await using`, Disposable/AsyncDisposableStack) — `cf5603f0b2` (AsyncDisposableStack null/undefined await step), `a3a4761939` (compatible mode), `f3c53dc018` (module body) | `xsCode.c`, `xsScope.c`, `xsAPI.c`, `xsCommon.h`, `xsError.c` | `cf5603f0b2` **in-oracle**; `a3a4761939` + `f3c53dc018` **post-8.2.3** | parser + scoper + coder already carry the `Using` token (166), `XS_CODE_USING`/`USING_ASYNC` (240/241), the `DISPOSABLE` scope flag and `disposable_count` (`scoper.rs`), and the module coder landed at stage 5. Runtime `Symbol.dispose`/`Symbol.asyncDispose` + `DisposableStack`/`AsyncDisposableStack` + on-scope-exit/on-throw disposal ordering are a **future VM-stage surface** (not yet at runtime). | Parser/scoper folded at the pin. **Follow-up:** mirror the module-body coding refinement (`f3c53dc018`) + compatible-mode (`a3a4761939`) after the oracle bump; runtime disposal protocol lands with the VM stage that reaches it. |
+| 2 | `for await` in a module body — `c41a35d165` | `xsSyntaxical.c` | **post-8.2.3** | `for_statement` (`parser/stmt.rs:642`) parses `ForAwaitOf` but does **not** set `flags::AWAITING` (`mxAwaitingFlag`) as 8.3 now does. Matches 8.2.3 today. A latent post-oracle divergence — see the fold note added at that site. | **Follow-up (surgical):** after the oracle bump, add `self.flags \|= flags::AWAITING;` in the `await_flag` branch. |
+| 3 | Immutable ArrayBuffer proposal conformance — `0e1c47d81f` | `xsAll.h`, `xsAtomics.c`, `xsCommon.{c,h}`, `xsDataView.c`, `xsSnapshot.c` | **post-8.2.3** | `ArrayBuffer`/`DataView`/`Atomics` exist as keys; DataView runtime is partial, the immutability flag is not modeled. | **Follow-up:** buffer/typed-array layer must carry the immutable flag + conformance behavior across DataView/Atomics/snapshot; lands with the VM buffer stage, oracle at 8.3.1. |
+| 4 | `ArrayBuffer.prototype.transfer*` do not use `@@species` — `36aa1485a4`, `eff30ae5ba` | `xsDataView.c` | **in-oracle** | `transfer`/`transferToFixedLength` are a recognized-but-unimplemented named skip (`array-buffer-transfer:unsupported`, `interp.rs:11926`) — no species lookup exists to be wrong. | **No action.** Auto-inherits the no-species behavior when `transfer` is implemented against the 8.2.3 oracle. |
+| 5 | `Array.from` / `Array.fromAsync` don't throw on `undefined` mapFn (#1645) — `d8baa8cdf7` | `xsArray.c` | **post-8.2.3** | Both are honest named skips today (`Array.from:iterator-protocol-metering`, `Array.fromAsync:async-iteration`). The change: `mapFn` is used only when `mxArgc > 1 && !mxIsUndefined(argv(1))` — `undefined` ⇒ no mapper (identity). | **Follow-up:** honor the `undefined`-mapper guard when these statics are implemented, oracle at 8.3.1. |
+| 6 | Private property defined in a module namespace object — `a3da68e484` | `xsAll.h`, `xsModule.c`, `xsProperty.c` | **post-8.2.3** | Module coder + private fields both exist. The change: `fxDefine/Get/SetPrivateProperty` redirect a module `instance` to `mxModuleInstanceExports(instance)->value.reference` before walking properties. | **Follow-up:** mirror the module-instance → exports redirect in the private-property path once module-namespace + private-field interaction is exercised, oracle at 8.3.1. |
+| 7 | Native stack overflow reported natively, not as JS (#1635) + parser stack margin — `bc5a1ecfdb`, `82e80152a3`, `ebc286a46c`, `da87ebd954` | `xsMemory.c`, `xsSyntaxical.c` | **all in-oracle** | `endor-vm` already models overflow as `Halt::StackOverflow` = "an abort to the host, not a catchable `RangeError`" (`interp.rs:2431`, `:73`, `:7113`) — exactly `bc5a1ecfdb`'s semantics — and the parser carries its own stack checks. | **Already mirrored.** Oracle-covered; margin/overhead tuning is behavior-neutral. |
+| 8 | `String.prototype.trim` optimization — `f5615ff3fb` | `xsString.c` | post-8.2.3 | behavior-neutral fast path. | **Optional / no action** — no observable semantics delta. |
+
+Net: **items 4 and 7 are already handled** (4 auto-inherits, 7 already
+mirrored). **Items 1–3, 5, 6 are post-8.2.3 follow-ups** gated on the
+oracle bump; none is currently premature to *implement* only because the
+port hasn't reached those VM surfaces (ArrayBuffer/DataView runtime,
+`Array.from`, the disposal protocol). They must be mirrored **against a
+8.3.1 oracle**, not the current 8.2.3 one, or they would break the
+byte-identity bar. Oracle stays at 8.2.3 until `port-endor-oracle-bump-8-3-1`.
+
 ## Running the harness
 
 ```sh
