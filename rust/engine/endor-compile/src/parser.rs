@@ -868,6 +868,17 @@ impl Parser {
                         self.match_token(Token::RightBracket)?;
                     }
                     Token::LeftParenthesis => {
+                        // `fxPostfixExpression` (xsSyntaxical.c): a call whose
+                        // callee is a bare `Access` to `eval` sets `mxEvalFlag`
+                        // on `parser->flags`. The flag then bubbles out of any
+                        // enclosing arrow (`fxArrowExpression`) onto the nearest
+                        // non-arrow function node — the parse-time half of the
+                        // enclosing-function synthetic capture-closure fold. The
+                        // scoper's `hoist_call` sets the *scope* eval poison; this
+                        // sets the *node* flag the scoper never wired.
+                        if self.top_access_symbol().as_deref() == Some("eval") {
+                            self.flags |= flags::EVAL;
+                        }
                         self.parameters()?;
                         self.push_node_struct(2, Token::Call, line)?;
                     }

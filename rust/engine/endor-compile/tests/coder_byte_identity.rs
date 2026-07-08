@@ -2083,6 +2083,38 @@ fn arrow_receiver_capture_under_eval() {
     ]);
 }
 
+// The **enclosing-function synthetic capture-closure** fold (fix6). When an
+// arrow that contains a direct `eval` (which may reach `this`/`arguments`) is
+// created inside a non-arrow function, `fxArrowExpression` bubbles the inner
+// `mxEvalFlag` out onto the enclosing function node. That function then
+// reserves a *materialization-free* synthetic `arguments` closure
+// (`RESERVE` + `NEW_CLOSURE` + a `with`-publish `STORE_1`, plus the closing
+// two-`WITHOUT` teardown) so the arrow's `STORE_ARROW`/`RETRIEVE` capture is
+// reachable through the direct eval's scope — but *no* `ARGUMENTS_SLOPPY`
+// materialization, because the enclosing node never gains `mxArgumentsFlag`.
+// (`expressions/arrow-function/arrow/binding-tests-3.js`.)
+#[test]
+fn arrow_eval_enclosing_capture_closure() {
+    assert_identical(&[
+        // the closed shape: arrow + direct eval capturing enclosing `this`,
+        // enclosing function eval-only ⇒ materialization-free capture closure
+        "function foo(){ return ()=>eval(\"this\"); }",
+        // nested arrows: the eval flag bubbles through the whole arrow chain
+        // to the nearest non-arrow function
+        "function foo(){ return () => () => eval(\"this\"); }",
+        // variant: the enclosing function is ALSO directly eval-poisoned, so it
+        // gains `mxArgumentsFlag` (direct eval) and DOES materialize a real
+        // `arguments` object alongside the arrow capture closure
+        "function foo(){ eval(\"0\"); return ()=>eval(\"this\"); }",
+        // contrast: the arrow captures `arguments` literally (not via eval), so
+        // the enclosing function bubbles `mxArgumentsFlag` and materializes
+        "function foo(){ return () => arguments; }",
+        // an enclosing function with a parameter, so the synthetic closure
+        // slot follows the parameter in the frame
+        "function foo(a){ return ()=>eval(\"a\"); }",
+    ]);
+}
+
 // A **named function expression** whose body has a direct `eval` — the fix5
 // self-name-publish slice. XS declares the self-name `fxDefineNodeNew(…,
 // XS_TOKEN_CONST)`: a define entry whose declare token is `CONST`, so

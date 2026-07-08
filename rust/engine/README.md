@@ -1521,12 +1521,35 @@ These are the remaining child-6/7 surface.
 
 ### Stage-5 acceptance evidence (child 7/7, re-measured by fix4-verify 4/4): the byte-identity bar
 
-> **Current authoritative verdict:** **STAGE-5 BAR NOT MET** — see the
-> **fix5-verify 5/5 FULL-TREE re-measurement** section below (120 subtrees,
-> total=20602 identical=16979 divergent=1 endor-rejected=0 accept-disagree=0);
-> the bar is held open by the single named enclosing-function synthetic
-> capture-closure fold (`arrow-function/arrow/binding-tests-3.js`, first named by
-> **fix5 1/5** below, the arrow/eval scope-slot fold). The entire class surface stays byte-clean
+> **Current authoritative verdict (fix6 1/2):** the **sole open divergence is
+> CLOSED** — `expressions/arrow-function` is now **326: 251 identical,
+> divergent=0 endor-rejected=0 accept-disagree=0** (was 250 identical / 1
+> divergent). The last byte-divergent file in the whole `language/` tree,
+> `arrow-function/arrow/binding-tests-3.js`, is byte-identical. **Mechanism:**
+> `fxArrowExpression` (xsSyntaxical.c:2594) bubbles an arrow body's inner
+> `mxEvalFlag` **out** onto the nearest enclosing non-arrow function node; that
+> node then reserves a *materialization-free* synthetic `arguments` capture
+> closure (`RESERVE` + `NEW_CLOSURE` + a `with`-publish `STORE_1`, plus the
+> closing two-`WITHOUT` teardown, xsScope.c:730 / fxScopeCodedBody) with **no**
+> `ARGUMENTS_SLOPPY` materialization (the enclosing node never gains
+> `mxArgumentsFlag`). Endor's parser never set `flags::EVAL` at an `eval(...)`
+> call — the missing half of an already-wired bubble; setting it there
+> (parser.rs), gating `code_arguments_object` on the function node's actual
+> `mxArgumentsFlag` (`flags::ARGUMENTS` OR the scope's `direct_eval`, not the
+> mere presence of the injected `Var`), and keying `fxScopeCodedBody`'s teardown
+> on the function node's eval flag (`Scope::node_has_eval`, not `direct_eval`)
+> closes it. Locked in `coder_byte_identity.rs`
+> (`arrow_eval_enclosing_capture_closure`). **Full 120-subtree re-enumeration is
+> the fix6-verify 2/2 sibling's job**; this round re-measured the closed subtree
+> plus every neighbor and ~25 function/eval/scope-heavy trees (arrow-function,
+> eval-code 151/151, arguments-object 260/260, optional-chaining,
+> tagged-template, statements/expressions class, statements/expressions
+> function + async + generators, with, block-scope, function-code, global-code,
+> for/for-in/for-of, variable, try, assignment, object) all
+> **divergent=0 endor-rejected=0**, curated corpora **1711/1711**, and
+> `cargo test --workspace` **EXIT=0**. The historical fix5-verify snapshot below
+> (total=20602 identical=16979 divergent=1) is retained as a dated record; its
+> `divergent=1` is the file this round closed. The entire class surface stays byte-clean
 > (`statements/class` **0**, `expressions/class` **0**); curated (1711/1711) and
 > module (45/45) corpora stay byte-clean. **fix5 1/5 closed the dominant arrow
 > residual**: `eval-code` (accept-disagree 4 to 0) and `arguments-object`
@@ -2414,6 +2437,52 @@ non-arrow function was **rejected**: it produced a *real* `arguments` `VAR`
 (with `ARGUMENTS_SLOPPY` materialization), 2 bytes too long — the wrong
 mechanism. The correct fold is a materialization-free synthetic capture-closure
 in the enclosing function, deferred as a separate, narrower sub-fold.
+
+**fix6 1/2 — the enclosing-function synthetic capture-closure fold CLOSED (the
+LAST divergence in the whole `language/` tree).** The sub-fold above is now
+byte-identical: `expressions/arrow-function` **326: 251 identical, divergent=0
+endor-rejected=0 accept-disagree=0** (was 250/1). The measured 10-byte delta on
+`foo`'s body (oracle 71, endor 61) partitioned exactly into a `RESERVE_1 #1`
+(+2), `NEW_CLOSURE` for the synthetic `arguments` slot (+3), the eval
+`with`-publish `STORE_1` (+2), and the closing `WITHOUT WITHOUT` teardown (+3).
+The root cause was **parse-time**, not a scoper-shape gap: XS's
+`fxArrowExpression` (xsSyntaxical.c:2594) bubbles the arrow body's inner
+`mxEvalFlag` **out** onto the enclosing non-arrow function node (foo), and
+`fxFunctionNodeHoist`'s `(mxArgumentsFlag | mxEvalFlag) && !mxArrowFlag` gate
+(xsScope.c:730) then injects the synthetic `arguments` `Var` — a
+*materialization-free* capture closure, because `mxArgumentsFlag` is **not** set
+on foo (the eval string is opaque, so `arguments` is never referenced; the
+direct-eval `mxArgumentsFlag` at xsScope.c:429 lands on the arrow, not foo). The
+already-wired `flags::EVAL` bubble in endor's parser
+(`arrow_expression`/`function_expression`, stmt.rs) had no source: the parser
+never set `flags::EVAL` at an `eval(...)` call. The three-part fix:
+1. **`parser.rs`** — set `self.flags |= flags::EVAL` when a call's callee is a
+   bare `Access` to `eval` (mirrors xsSyntaxical.c:2171); the flag then bubbles
+   onto foo's node exactly as XS does, driving the first-pass
+   `inject_arguments` and the `fxScopeCodingParams` capture-closure publish.
+2. **`coder.rs` `code_arguments_object`** — gate materialization on the function
+   node's actual `mxArgumentsFlag` (`flags::ARGUMENTS` OR the scope's
+   `direct_eval`), not the mere presence of the injected `Var` (which now also
+   exists for the eval-only enclosing function). Foo has neither ⇒
+   materialization-free; a directly-eval-poisoned or `arguments`-referencing
+   function still materializes.
+3. **`coder.rs` `code_body` + `scoper.rs` `Scope::node_has_eval`** — key
+   `fxScopeCodedBody`'s two-`WITHOUT` teardown on the function **node**'s eval
+   flag (`node_base_flags & EVAL`, set by the parse bubble), not the scope's
+   `direct_eval` (which misses the enclosing-function case where the eval sits
+   in a nested arrow).
+
+The wrong fix the residual warned against (propagating `mxArgumentsFlag`, +2
+bytes from a real `ARGUMENTS_SLOPPY`) is confirmed avoided — part 2's gate is
+precisely what keeps the closure materialization-free. Locked in
+`coder_byte_identity.rs::arrow_eval_enclosing_capture_closure` (the closed
+shape, a nested-arrow chain, a directly-eval-poisoned enclosing variant that
+DOES materialize, an `arguments`-capturing contrast, and a parameterized
+enclosing function). Neighbors re-measured clean (`eval-code` 151/151,
+`arguments-object` 260/260, `optional-chaining`, `tagged-template`, both class
+trees), plus a ~25-subtree function/eval/scope sweep all `divergent=0
+endor-rejected=0`; curated corpora 1711/1711; `cargo test --workspace` EXIT=0.
+Full 120-subtree re-enumeration is the fix6-verify 2/2 sibling's bar.
 
 **`using` (explicit resource management).** Re-confirmed: the oracle at the
 pin **rejects** `using x = a` (it lexes `using` as an identifier →

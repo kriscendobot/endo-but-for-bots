@@ -3621,6 +3621,23 @@ impl Coder<'_> {
         if !has_var {
             return;
         }
+        // XS materializes the object only when the function node carries
+        // `mxArgumentsFlag` (`fxParamsBindingNodeBind` sets `self->declaration`
+        // — the object's slot — under that gate; `fxParamsBindingNodeCode`
+        // emits `ARGUMENTS_*` only when it is set). The synthetic `arguments`
+        // `Var` also exists for an `mxEvalFlag`-only function (`xsScope.c:730`),
+        // but that one is a *materialization-free* capture closure the eval
+        // `with`-publish stores into — it must NOT build the object. The flag
+        // is set two ways: `arguments` was referenced (parse ⇒ `flags::ARGUMENTS`
+        // on the node) or the function *directly* contains a direct `eval`
+        // (hoist ⇒ the scope's `direct_eval`). An enclosing function that only
+        // *encloses* an arrow's direct eval gets `mxEvalFlag` but neither, so
+        // its injected `Var` stays materialization-free.
+        let has_arguments_flag = func.flags & crate::ast::flags::ARGUMENTS != 0
+            || self.tree.scopes[scope].direct_eval;
+        if !has_arguments_flag {
+            return;
+        }
         // The `arguments` slot the object stores into: XS's
         // `fxParamsBindingNodeCode` writes to `self->declaration`, which
         // `fxParamsBindingNodeBind` set to `fxScopeGetDeclareNode(functionScope,
@@ -3732,12 +3749,16 @@ impl Coder<'_> {
         self.code_define_nodes(&node.children[0]);
         self.code(&node.children[0]);
         // `fxScopeCodedBody` keys the two-`WITHOUT` teardown on the enclosing
-        // FUNCTION node's eval flag, not the body's — so the `with` frames a
-        // direct `eval` in a **parameter default** pushed (`fxScopeCodingParams`'
-        // eval branch) unwind even though the body itself is not eval-scoped.
+        // FUNCTION node's eval flag, not the body's — so the `with` frames
+        // `fxScopeCodingParams`' eval branch pushed unwind even though the body
+        // itself is not eval-scoped. The function-node eval flag (not the
+        // scope's `direct_eval`) is the faithful key: it is set for a direct
+        // `eval` in the function AND — via `fxArrowExpression`'s bubble — for a
+        // function that merely encloses an arrow whose body holds the eval, the
+        // enclosing-function synthetic capture-closure case.
         let function_eval = self.tree.scopes[scope]
             .parent
-            .map(|p| self.tree.scopes[p].direct_eval)
+            .map(|p| self.tree.scopes[p].node_has_eval() || self.tree.scopes[p].direct_eval)
             .unwrap_or(false);
         if function_eval && !strict {
             self.scope_coded_body_eval(scope);

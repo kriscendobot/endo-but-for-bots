@@ -219,6 +219,18 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// The creating node's own `mxEvalFlag` — set at *parse* on a function
+    /// that contains a direct `eval`, and (per `fxArrowExpression`) bubbled
+    /// out of an enclosing arrow onto the nearest non-arrow function node.
+    /// `fxScopeCodedBody` keys its two-`WITHOUT` teardown on this node flag
+    /// (not the `with`-poisoned scope flag, and not `direct_eval` — which
+    /// misses the enclosing-function case where the eval sits in a nested
+    /// arrow). A `with`-poisoned scope leaves the node flag clean, so the
+    /// teardown correctly stays off there.
+    pub fn node_has_eval(&self) -> bool {
+        self.node_base_flags & flags::EVAL != 0
+    }
+
     fn new(parent: Option<usize>, token: Token, node_ptr: usize, node_base_flags: u32) -> Scope {
         Scope {
             parent,
