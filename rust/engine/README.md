@@ -1521,8 +1521,12 @@ These are the remaining child-6/7 surface.
 
 ### Stage-5 acceptance evidence (child 7/7, re-measured by fix4-verify 4/4): the byte-identity bar
 
-> **Current authoritative verdict:** see **fix5 1/5** below (the arrow/eval
-> scope-slot fold). The entire class surface stays byte-clean
+> **Current authoritative verdict:** **STAGE-5 BAR NOT MET** — see the
+> **fix5-verify 5/5 FULL-TREE re-measurement** section below (120 subtrees,
+> total=20602 identical=16979 divergent=1 endor-rejected=0 accept-disagree=0);
+> the bar is held open by the single named enclosing-function synthetic
+> capture-closure fold (`arrow-function/arrow/binding-tests-3.js`, first named by
+> **fix5 1/5** below, the arrow/eval scope-slot fold). The entire class surface stays byte-clean
 > (`statements/class` **0**, `expressions/class` **0**); curated (1711/1711) and
 > module (45/45) corpora stay byte-clean. **fix5 1/5 closed the dominant arrow
 > residual**: `eval-code` (accept-disagree 4 to 0) and `arguments-object`
@@ -1591,6 +1595,206 @@ These are the remaining child-6/7 surface.
 > error while distinct-label nestings stay byte-identical. `new.target`
 > position gating needed no change (already parity). The fix2/fix3/fix4/fix5
 > blocks below are retained as dated round history.
+
+### fix5-verify 5/5 — FULL-TREE re-measurement (the complete `language/` enumeration IS the measurement)
+
+> **Process correction (s16 finding, binding).** The fix4-verify report claimed
+> a "sole residual anywhere in `language/`" *without running the whole tree*, and
+> the s16 sweep then found 6 more residual classes. A whole-tree claim requires
+> the whole-tree run. This round therefore re-measures EVERYTHING from a fresh
+> sync of the live tip (`f9962cdff`, all four fix5 siblings present) via the
+> design-sanctioned per-subtree loop (120 single-process runs from `rust/engine`,
+> capturing every summary and DIVERGENT/ENDOR-REJECTED/ONLY-ACCEPT detail line;
+> the whole-tree single process OOMs, so the per-subtree shape is the measurement,
+> not an approximation of it).
+>
+> **Bars (all green, re-run from the remote tip):** `cargo test --workspace --
+> --test-threads=1` from `rust/engine` **EXIT=0**, all 20 `test result:` lines
+> ok (includes `corpora_byte_identity_no_undocumented_divergence`,
+> `module_corpora_byte_identity_no_divergence`,
+> `parse_computrons_are_deterministic_per_build`, and the decoder/parser fuzz
+> smokes). Curated corpora `compile-diff` (no arg): **1711/1711 identical,
+> divergent=0 endor-rejected=0 accept-disagree=0**; module corpora 45/45
+> (in-crate). Determinism spot-check: `compile-diff -- eval-code` run twice ->
+> byte-identical output. Stage-4 dual-run spot-checks (`test262-language`),
+> EXIT=0, no crash-aborts, all skips named: `built-ins/Object` **176/0 of 3127**
+> (2951 skipped by named reason -- `endor-aborted` + `unsupported-opcode:*`),
+> `built-ins/Function` **40/0 of 511**, `built-ins/Array` **437/0 of 2625**.
+> `#![forbid(unsafe_code)]` intact at every engine-crate root (`endor-oracle`
+> the sole documented FFI-seam exception); no new `unsafe`.
+
+**The full `language/` table (every subtree's summary line -- `o-rej` = both
+engines reject = agreement; `e-rej` = oracle-accepts/endor-rejects; `a-dis` =
+oracle-rejects/endor-accepts; `*` = not clean):**
+
+> subtree                              total  ident  div  o-rej  e-rej  a-dis
+> arguments-object                       260    260    0      0      0      0
+> asi                                    102     67    0     35      0      0
+> block-scope                            145     43    0    102      0      0
+> comments                                52     27    0     25      0      0
+> computed-property-names                 45     45    0      0      0      0
+> destructuring                           15     15    0      0      0      0
+> directive-prologue                      62     51    0     11      0      0
+> eval-code                              151    151    0      0      0      0
+> export                                   3      0    0      3      0      0
+> expressions/addition                    48     48    0      0      0      0
+> expressions/array                       52     52    0      0      0      0
+> expressions/arrow-function             326    250    1     75      0      0 *
+> expressions/assignment                 466    404    0     62      0      0
+> expressions/async-arrow-function        51     24    0     27      0      0
+> expressions/async-function              65     33    0     32      0      0
+> expressions/async-generator            585    507    0     78      0      0
+> expressions/await                       21     18    0      3      0      0
+> expressions/bitwise-and                 30     30    0      0      0      0
+> expressions/bitwise-not                 16     16    0      0      0      0
+> expressions/bitwise-or                  30     30    0      0      0      0
+> expressions/bitwise-xor                 30     30    0      0      0      0
+> expressions/call                        96     95    0      1      0      0
+> expressions/class                     3663   3086    0    577      0      0
+> expressions/coalesce                    24     20    0      4      0      0
+> expressions/comma                        6      6    0      0      0      0
+> expressions/compound-assignment        406    395    0     11      0      0
+> expressions/concatenation                5      5    0      0      0      0
+> expressions/conditional                 22     20    0      2      0      0
+> expressions/delete                      60     60    0      0      0      0
+> expressions/division                    45     45    0      0      0      0
+> expressions/does-not-equals             38     38    0      0      0      0
+> expressions/dynamic-import             533    438    0     95      0      0
+> expressions/equals                      47     47    0      0      0      0
+> expressions/exponentiation              44     37    0      7      0      0
+> expressions/function                   241    208    0     33      0      0
+> expressions/generators                 268    231    0     37      0      0
+> expressions/greater-than-or-equal       43     43    0      0      0      0
+> expressions/greater-than                49     49    0      0      0      0
+> expressions/grouping                     9      9    0      0      0      0
+> expressions/import.meta                 22      5    0     17      0      0
+> expressions/in                          14     14    0      0      0      0
+> expressions/instanceof                  43     43    0      0      0      0
+> expressions/left-shift                  45     45    0      0      0      0
+> expressions/less-than-or-equal          48     48    0      0      0      0
+> expressions/less-than                   46     46    0      0      0      0
+> expressions/logical-and                 18     18    0      0      0      0
+> expressions/logical-not                 19     19    0      0      0      0
+> expressions/logical-or                  18     18    0      0      0      0
+> expressions/modulus                     40     40    0      0      0      0
+> expressions/more-than-or-equal           1      1    0      0      0      0
+> expressions/more-than                    1      1    0      0      0      0
+> expressions/multiplication              40     40    0      0      0      0
+> expressions/new.target                  14     12    0      2      0      0
+> expressions/new                         55     55    0      0      0      0
+> expressions/object                    1049    914    0    135      0      0
+> expressions/optional-chaining           25     19    0      6      0      0
+> expressions/postfix-decrement           36     29    0      7      0      0
+> expressions/postfix-increment           37     30    0      7      0      0
+> expressions/prefix-decrement            33     30    0      3      0      0
+> expressions/prefix-increment            32     29    0      3      0      0
+> expressions/property-accessors          21     20    0      1      0      0
+> expressions/relational                   1      1    0      0      0      0
+> expressions/right-shift                 37     37    0      0      0      0
+> expressions/strict-does-not-equals      30     30    0      0      0      0
+> expressions/strict-equals               30     30    0      0      0      0
+> expressions/subtraction                 38     38    0      0      0      0
+> expressions/super                       85     85    0      0      0      0
+> expressions/tagged-template             27     27    0      0      0      0
+> expressions/template-literal            54     41    0     13      0      0
+> expressions/this                         6      5    0      1      0      0
+> expressions/typeof                      15     15    0      0      0      0
+> expressions/unary-minus                 14     14    0      0      0      0
+> expressions/unary-plus                  17     17    0      0      0      0
+> expressions/unsigned-right-shift        45     45    0      0      0      0
+> expressions/void                         9      9    0      0      0      0
+> expressions/yield                       61     58    0      3      0      0
+> function-code                          219    219    0      0      0      0
+> future-reserved-words                   55     47    0      8      0      0
+> global-code                             41     28    0     13      0      0
+> identifier-resolution                   12     12    0      0      0      0
+> identifiers                            145     32    0    113      0      0
+> import                                   4      0    0      4      0      0
+> keywords                                25      0    0     25      0      0
+> line-terminators                        41     24    0     17      0      0
+> literals                               430    227    0    203      0      0
+> module-code                            534     35    0    499      0      0
+> punctuators                             11      1    0     10      0      0
+> reserved-words                          27     15    0     12      0      0
+> rest-parameters                         11     10    0      1      0      0
+> source-text                              1      1    0      0      0      0
+> statementList                           80     80    0      0      0      0
+> statements/async-function               60     37    0     23      0      0
+> statements/async-generator             285    254    0     31      0      0
+> statements/block                        20      7    0     13      0      0
+> statements/break                        19      9    0     10      0      0
+> statements/class                      3908   3298    0    610      0      0
+> statements/const                       131    106    0     25      0      0
+> statements/continue                     22     12    0     10      0      0
+> statements/debugger                      2      1    0      1      0      0
+> statements/do-while                     36     19    0     17      0      0
+> statements/empty                         2      2    0      0      0      0
+> statements/expression                    3      2    0      1      0      0
+> statements/for-await-of               1226   1141    0     85      0      0
+> statements/for-in                      109     66    0     43      0      0
+> statements/for-of                      712    641    0     71      0      0
+> statements/for                         375    326    0     49      0      0
+> statements/function                    434    390    0     44      0      0
+> statements/generators                  252    222    0     30      0      0
+> statements/if                           69     29    0     40      0      0
+> statements/labeled                      23     14    0      9      0      0
+> statements/let                         140    115    0     25      0      0
+> statements/return                       16      6    0     10      0      0
+> statements/switch                      105     36    0     69      0      0
+> statements/throw                        14     14    0      0      0      0
+> statements/try                         192    168    0     24      0      0
+> statements/variable                    169    155    0     14      0      0
+> statements/while                        38     22    0     16      0      0
+> statements/with                        169    157    0     12      0      0
+> types                                  113    102    0     11      0      0
+> white-space                             42     36    0      6      0      0
+> TOTAL (120 subtrees)                 20602  16979    1   3622      0      0
+
+**Named-fold ledger (everything not `identical`, attributed -- nothing
+unclassified):**
+
+- **The sole divergence (`div=1`), the ONLY non-clean cell in the entire tree:**
+  `expressions/arrow-function/arrow/binding-tests-3.js`, class
+  `byte-length/endor-shorter`. Mechanism (fully attributed, NOT unattributable):
+  `function foo(){ return ()=>eval("this"); }` -- a direct `eval` inside an arrow
+  that captures `this` from its **enclosing** function. XS synthesizes an extra
+  enclosing-function capture closure (reserved slots for the arrow's `this`/home
+  reachable through the direct `eval`) that endor does not yet emit, so endor's
+  stream is *shorter*. This is the **enclosing-function synthetic capture-closure
+  fold** first named and ledgered by **fix5 1/5** (which drove
+  `expressions/arrow-function` 6->1 divergent); it stands unchanged and is the
+  single cell holding the bar open. **No UNATTRIBUTABLE divergence exists
+  anywhere in the tree** -- there is therefore **no kill-criterion evidence**.
+- **`e-rej` (oracle-accepts / endor-rejects) across the whole tree: 0.** Every
+  fix5 accept/reject closure holds on the full run -- `comments` (hashbang,
+  fix5 3/5), `literals` (string-escape fix5 3/5 + regexp fix5 4/5, whole dir
+  divergent=0 e-rej=0), `statements/const` (const-no-init, fix5 3/5),
+  `expressions/tagged-template` (26->0, fix5 2/5) and `expressions/template-literal`
+  (untagged illegal-escape, fix5 2/5), `expressions/import.meta` +
+  `expressions/dynamic-import` + `module-code` (script-goal gates, fix5 4/5) all
+  read divergent=0 e-rej=0 a-dis=0.
+- **`a-dis` (oracle-rejects / endor-accepts) across the whole tree: 0.** No
+  false acceptance anywhere; `eval-code` (fix5 1/5, 4->0) and every other subtree
+  read a-dis=0.
+- **`o-rej` = 3622 tree-wide** are all *agreed* rejections (both engines reject --
+  early-error / unsupported-goal files), not disagreements.
+- **Class surface invariant held:** `statements/class` (3908, div=0 e-rej=0) and
+  `expressions/class` (3663, div=0 e-rej=0) stay byte-clean.
+
+**Whole-tree totals (120 subtrees): total=20602, identical=16979, divergent=1,
+oracle-rejected=3622, endor-rejected=0, accept-disagree=0.**
+
+**VERDICT -- STAGE-5 BAR NOT MET.** The bar requires `divergent==0 AND
+accept-disagree==0` on every subtree with every remaining reject accept-agreed or
+under a named fold. accept-disagree=0 and endor-rejected=0 tree-wide, and every
+rejection is accept-agreed -- but `divergent==1`, held open by the single named
+**enclosing-function synthetic capture-closure fold**
+(`arrow-function/arrow/binding-tests-3.js`). Exact residual partition:
+**[ 1 divergence: arrow/eval enclosing-function capture-closure fold ] + [ 0
+endor-reject ] + [ 0 accept-disagree ]**. The whole-tree run CONFIRMS the
+long-claimed "sole residual" -- this time by actually enumerating all 120
+subtrees rather than extrapolating.
+
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
 children** (CESU-8 strings, the four named coder rejects, the class tail,
