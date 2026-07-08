@@ -31,7 +31,8 @@ fn main() {
         panic!(
             "Moddable XS sources not found at {}. Run \
              `git submodule update --init c/moddable` from the repo \
-             root (pin 48ee02d8cfe0, per the design's Ground Truth).",
+             root (pin 23b4d6b0a65f = moddable 8.3.1, per the design's \
+             Ground Truth; see rust/engine/README.md § Building the oracle).",
             xs_sources.display()
         );
     }

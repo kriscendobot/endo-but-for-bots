@@ -691,15 +691,15 @@ impl Parser {
             self.match_token(Token::RightParenthesis)?;
             self.statement(0)?;
             if await_flag {
-                // Fold (post-oracle, moddable 8.3 `c41a35d165` "for await in
-                // module body", xsSyntaxical.c): 8.3 additionally sets
-                // `parser->flags |= mxAwaitingFlag` here (i.e. `self.flags |=
-                // flags::AWAITING;`) so a top-level `for await` marks the
-                // module body as awaiting. The pin (8.2.3) oracle does NOT do
-                // this, so the port matches 8.2.3 by omitting it; mirror it
-                // when the oracle bumps to 8.3.1 (see rust/engine/README.md
-                // § Upstream moddable delta tracking, item 2).
                 self.push_node_struct(3, Token::ForAwaitOf, line)?;
+                // Mirror (moddable 8.3 `c41a35d165` "for await in module body",
+                // xsSyntaxical.c): after pushing the ForAwaitOf node, set
+                // `parser->flags |= mxAwaitingFlag` so a top-level `for await`
+                // marks the enclosing module body as awaiting. Landed with the
+                // oracle bump to 8.3.1 (`23b4d6b0a65f`); the pin (8.2.3) oracle
+                // did NOT do this (see rust/engine/README.md § Upstream
+                // moddable delta tracking, item 2).
+                self.flags |= flags::AWAITING;
             } else if a_token == Token::In {
                 self.push_node_struct(3, Token::ForIn, line)?;
             } else {

@@ -19,28 +19,35 @@ so it builds in-repo from the first commit (resolved question 9).
 
 `endor-oracle` compiles the C-XS engine from the `c/moddable`
 submodule. The design's Ground Truth names the pin
-**`48ee02d8cfe0`** ("the pin lineage of the `c/moddable` submodule that
-`rust/endo/xsnap/build.rs` compiles today"). Populate it with:
+**`23b4d6b0a65f`** (moddable **8.3.1**, 2026-07-07 — bumped from the
+original `48ee02d8cfe0` = 8.2.3 by the `port-endor-oracle-bump-8-3-1`
+job; see § Upstream moddable delta tracking). This pin sits *ahead* of
+what `rust/endo/xsnap/build.rs` compiles today (still 8.2.3), a
+deliberate lead so the port can be measured against the newer engine
+semantics. Populate it with:
 
 ```sh
 git -C c/moddable fetch --depth 1 --filter=blob:none \
-    origin 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
-git -C c/moddable checkout 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
+    origin 23b4d6b0a65f35209d9118c4c13c6c9b3e68784d
+git -C c/moddable checkout 23b4d6b0a65f35209d9118c4c13c6c9b3e68784d
 ```
 
-The shallow sha-fetch above only works while the pin is an advertised
-tip; GitHub now rejects it (`upload-pack: not our ref` — the `public`
-branch has moved past the pin). Two working fallbacks (verified
-2026-07-02):
+The shallow sha-fetch above works because the pin **is** the current
+`public` tip (verified 2026-07-08:
+`git ls-remote … public` → `23b4d6b0a65f…`). Should `public` later move
+past it, the sha stops being an advertised tip and GitHub rejects the
+shallow form (`upload-pack: not our ref`); two fallbacks that keep
+working regardless:
 
 ```sh
-# (a) full (non-shallow) fetch of public; the pin is an ancestor of it
+# (a) full (non-shallow) fetch of public; the pin is its tip / an ancestor
 git -C c/moddable fetch https://github.com/Moddable-OpenSource/moddable public
-git -C c/moddable checkout 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
+git -C c/moddable checkout 23b4d6b0a65f35209d9118c4c13c6c9b3e68784d
 
-# (b) fetch from any sibling checkout that already holds the pin
+# (b) seed locally from any sibling checkout, then fetch the delta from GitHub
 git -C c/moddable fetch /path/to/sibling/c/moddable 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
-git -C c/moddable checkout 48ee02d8cfe0dccb51ee2465cf6716b3468684a4
+git -C c/moddable fetch https://github.com/Moddable-OpenSource/moddable public
+git -C c/moddable checkout 23b4d6b0a65f35209d9118c4c13c6c9b3e68784d
 ```
 
 Caution: `c/moddable` in a fresh checkout is an **empty gitlink
@@ -56,10 +63,11 @@ reproducibility and the "path dependency on xsnap" phrasing):
 1. The submodule **gitlink** recorded in the superproject is
    `5516726818906190d3a042d8be90219ce9d51b45`, which is **not fetchable
    from upstream** (`upload-pack: not our ref`). The design's stated
-   pin `48ee02d8cfe0` *is* the current `public` HEAD and is what the
+   pin `23b4d6b0a65f` *is* the current `public` HEAD and is what the
    oracle builds against. Correcting the gitlink is a submodule bump
    this stage deliberately does **not** make on its own.
-2. There is an **API drift** between the two shas: at `48ee02d8cfe0`,
+2. There is an **API drift** between the two shas: at `23b4d6b0a65f`
+   (as at the former `48ee02d8cfe0`),
    `fxInitializeSharedCluster` takes a `txMachine*` argument (the
    oracle shim passes `C_NULL`, as `xst262.c` does), whereas the
    existing `xsnap` crate's `ffi.rs` declares it argument-free. Because
@@ -69,44 +77,49 @@ reproducibility and the "path dependency on xsnap" phrasing):
    xsnap's audited `xsnap-platform.{c,h}` and the identical feature
    defines) rather than as a Cargo path dependency on `xsnap`.
 
-## Upstream moddable delta tracking (oracle 8.2.3 → public 8.3.1)
+## Upstream moddable delta tracking (oracle bumped 8.2.3 → 8.3.1)
 
 The port is **oracle-locked**: every stage is byte-identity / four-valued
-differential against the C-XS built from the `c/moddable` pin
-`48ee02d8cfe0` = **moddable 8.2.3** (2026-06-17). That pin already
-sits *well past* the `8.0.1` gitlink (`5516726818`) endo vendors, so the
-port inherits every engine-semantics change up through 8.2.3 for free —
-implement a surface and it is measured against an oracle that already has
-those fixes.
+differential against the C-XS built from the `c/moddable` pin. That pin was
+**`48ee02d8cfe0` = moddable 8.2.3** (2026-06-17) and is now
+**`23b4d6b0a65f` = moddable 8.3.1** (2026-07-07; intermediate bumps 8.2.3 →
+8.3 → 8.3.1), bumped by the **`port-endor-oracle-bump-8-3-1`** job. Both pins
+sit *well past* the `8.0.1` gitlink (`5516726818`) endo vendors, so the port
+inherits every engine-semantics change up through 8.3.1 for free — implement a
+surface and it is measured against an oracle that already has those fixes.
 
-Upstream `Moddable-OpenSource/moddable` `public` is now
-**`23b4d6b0a65f` = 8.3.1** (2026-07-07; intermediate bumps 8.2.3 → 8.3 →
-8.3.1). This table projects the engine-relevant `xs/sources` / `xs/includes`
-changes across `8.0.1 → 8.3.1` onto the port and records which side of the
-**8.2.3 oracle** each falls on. The oracle pin is **deliberately NOT bumped
-here** — bumping 8.2.3 → 8.3.1 is a separate, risk-weighted act (it re-bases
-the entire byte-identity bar and carries its own API-drift friction) tracked
-as the follow-up job **`port-endor-oracle-bump-8-3-1`**. Nothing below is a
-divergence from the *current* (8.2.3) oracle; the port matches 8.2.3 today.
+This table projects the engine-relevant `xs/sources` / `xs/includes` changes
+across `8.0.1 → 8.3.1` onto the port and records which side of the original
+**8.2.3 oracle** each fell on (kept as provenance) and its status now that the
+oracle is at 8.3.1. The bump **re-based the entire byte-identity bar** onto the
+8.3.1 oracle; the whole bar was re-measured green at the bump (stage-1 harness
+86/86; corpora compile-diff 1711/1711; `language/statements/for-await-of`
+1141/1141; `language/module-code` 35/35; module corpora incl. the new
+top-level-await cover). The only already-ported construct the 8.2.3 → 8.3.1
+range touched is item 2 (`for await` in a module body), now **mirrored**;
+every other post-8.2.3 item is a future VM-stage surface the port has not yet
+reached, measured against the **8.3.1** oracle from that stage on.
 
 | # | Change (XS commit) | Files | vs 8.2.3 oracle | Port surface | Verdict |
 |---|---|---|---|---|---|
-| 1 | Explicit Resource Management (`using` / `await using`, Disposable/AsyncDisposableStack) — `cf5603f0b2` (AsyncDisposableStack null/undefined await step), `a3a4761939` (compatible mode), `f3c53dc018` (module body) | `xsCode.c`, `xsScope.c`, `xsAPI.c`, `xsCommon.h`, `xsError.c` | `cf5603f0b2` **in-oracle**; `a3a4761939` + `f3c53dc018` **post-8.2.3** | parser + scoper + coder already carry the `Using` token (166), `XS_CODE_USING`/`USING_ASYNC` (240/241), the `DISPOSABLE` scope flag and `disposable_count` (`scoper.rs`), and the module coder landed at stage 5. Runtime `Symbol.dispose`/`Symbol.asyncDispose` + `DisposableStack`/`AsyncDisposableStack` + on-scope-exit/on-throw disposal ordering are a **future VM-stage surface** (not yet at runtime). | Parser/scoper folded at the pin. **Follow-up:** mirror the module-body coding refinement (`f3c53dc018`) + compatible-mode (`a3a4761939`) after the oracle bump; runtime disposal protocol lands with the VM stage that reaches it. |
-| 2 | `for await` in a module body — `c41a35d165` | `xsSyntaxical.c` | **post-8.2.3** | `for_statement` (`parser/stmt.rs:642`) parses `ForAwaitOf` but does **not** set `flags::AWAITING` (`mxAwaitingFlag`) as 8.3 now does. Matches 8.2.3 today. A latent post-oracle divergence — see the fold note added at that site. | **Follow-up (surgical):** after the oracle bump, add `self.flags \|= flags::AWAITING;` in the `await_flag` branch. |
-| 3 | Immutable ArrayBuffer proposal conformance — `0e1c47d81f` | `xsAll.h`, `xsAtomics.c`, `xsCommon.{c,h}`, `xsDataView.c`, `xsSnapshot.c` | **post-8.2.3** | `ArrayBuffer`/`DataView`/`Atomics` exist as keys; DataView runtime is partial, the immutability flag is not modeled. | **Follow-up:** buffer/typed-array layer must carry the immutable flag + conformance behavior across DataView/Atomics/snapshot; lands with the VM buffer stage, oracle at 8.3.1. |
+| 1 | Explicit Resource Management (`using` / `await using`, Disposable/AsyncDisposableStack) — `cf5603f0b2` (AsyncDisposableStack null/undefined await step), `a3a4761939` (compatible mode), `f3c53dc018` (module body) | `xsCode.c`, `xsScope.c`, `xsAPI.c`, `xsCommon.h`, `xsError.c` | `cf5603f0b2` **in-oracle**; `a3a4761939` + `f3c53dc018` **post-8.2.3** | parser + scoper + coder already carry the `Using` token (166), `XS_CODE_USING`/`USING_ASYNC` (240/241), the `DISPOSABLE` scope flag and `disposable_count` (`scoper.rs`), and the module coder landed at stage 5. Runtime `Symbol.dispose`/`Symbol.asyncDispose` + `DisposableStack`/`AsyncDisposableStack` + on-scope-exit/on-throw disposal ordering are a **future VM-stage surface** (not yet at runtime). | Parser/scoper folded at the pin. **Follow-up (oracle now at 8.3.1):** mirror the module-body coding refinement (`f3c53dc018`) + compatible-mode (`a3a4761939`) with the coder/runtime stage; runtime disposal protocol lands with the VM stage that reaches it. |
+| 2 | `for await` in a module body — `c41a35d165` | `xsSyntaxical.c` | **post-8.2.3** | `for_statement` (`parser/stmt.rs:693`) now sets `self.flags \|= flags::AWAITING;` (mirroring `parser->flags \|= mxAwaitingFlag`) right after pushing the `ForAwaitOf` node, so a top-level `for await` marks the enclosing module body awaiting — the module node's `root_flags` carry AWAITING and it compiles async, byte-identical to the 8.3.1 oracle. | **Mirrored** (this oracle bump). Load-bearing: covered by `corpora-modules/top-level-await.js`; reverting the line diverges (`endor-shorter`, missing the async-module machinery) on that cover. |
+| 3 | Immutable ArrayBuffer proposal conformance — `0e1c47d81f` | `xsAll.h`, `xsAtomics.c`, `xsCommon.{c,h}`, `xsDataView.c`, `xsSnapshot.c` | **post-8.2.3** | `ArrayBuffer`/`DataView`/`Atomics` exist as keys; DataView runtime is partial, the immutability flag is not modeled. | **Follow-up:** buffer/typed-array layer must carry the immutable flag + conformance behavior across DataView/Atomics/snapshot; lands with the VM buffer stage, oracle now at 8.3.1. |
 | 4 | `ArrayBuffer.prototype.transfer*` do not use `@@species` — `36aa1485a4`, `eff30ae5ba` | `xsDataView.c` | **in-oracle** | `transfer`/`transferToFixedLength` are a recognized-but-unimplemented named skip (`array-buffer-transfer:unsupported`, `interp.rs:11926`) — no species lookup exists to be wrong. | **No action.** Auto-inherits the no-species behavior when `transfer` is implemented against the 8.2.3 oracle. |
-| 5 | `Array.from` / `Array.fromAsync` don't throw on `undefined` mapFn (#1645) — `d8baa8cdf7` | `xsArray.c` | **post-8.2.3** | Both are honest named skips today (`Array.from:iterator-protocol-metering`, `Array.fromAsync:async-iteration`). The change: `mapFn` is used only when `mxArgc > 1 && !mxIsUndefined(argv(1))` — `undefined` ⇒ no mapper (identity). | **Follow-up:** honor the `undefined`-mapper guard when these statics are implemented, oracle at 8.3.1. |
-| 6 | Private property defined in a module namespace object — `a3da68e484` | `xsAll.h`, `xsModule.c`, `xsProperty.c` | **post-8.2.3** | Module coder + private fields both exist. The change: `fxDefine/Get/SetPrivateProperty` redirect a module `instance` to `mxModuleInstanceExports(instance)->value.reference` before walking properties. | **Follow-up:** mirror the module-instance → exports redirect in the private-property path once module-namespace + private-field interaction is exercised, oracle at 8.3.1. |
+| 5 | `Array.from` / `Array.fromAsync` don't throw on `undefined` mapFn (#1645) — `d8baa8cdf7` | `xsArray.c` | **post-8.2.3** | Both are honest named skips today (`Array.from:iterator-protocol-metering`, `Array.fromAsync:async-iteration`). The change: `mapFn` is used only when `mxArgc > 1 && !mxIsUndefined(argv(1))` — `undefined` ⇒ no mapper (identity). | **Follow-up:** honor the `undefined`-mapper guard when these statics are implemented, oracle now at 8.3.1. |
+| 6 | Private property defined in a module namespace object — `a3da68e484` | `xsAll.h`, `xsModule.c`, `xsProperty.c` | **post-8.2.3** | Module coder + private fields both exist. The change: `fxDefine/Get/SetPrivateProperty` redirect a module `instance` to `mxModuleInstanceExports(instance)->value.reference` before walking properties. | **Follow-up:** mirror the module-instance → exports redirect in the private-property path once module-namespace + private-field interaction is exercised, oracle now at 8.3.1. |
 | 7 | Native stack overflow reported natively, not as JS (#1635) + parser stack margin — `bc5a1ecfdb`, `82e80152a3`, `ebc286a46c`, `da87ebd954` | `xsMemory.c`, `xsSyntaxical.c` | **all in-oracle** | `endor-vm` already models overflow as `Halt::StackOverflow` = "an abort to the host, not a catchable `RangeError`" (`interp.rs:2431`, `:73`, `:7113`) — exactly `bc5a1ecfdb`'s semantics — and the parser carries its own stack checks. | **Already mirrored.** Oracle-covered; margin/overhead tuning is behavior-neutral. |
 | 8 | `String.prototype.trim` optimization — `f5615ff3fb` | `xsString.c` | post-8.2.3 | behavior-neutral fast path. | **Optional / no action** — no observable semantics delta. |
 
-Net: **items 4 and 7 are already handled** (4 auto-inherits, 7 already
-mirrored). **Items 1–3, 5, 6 are post-8.2.3 follow-ups** gated on the
-oracle bump; none is currently premature to *implement* only because the
-port hasn't reached those VM surfaces (ArrayBuffer/DataView runtime,
-`Array.from`, the disposal protocol). They must be mirrored **against a
-8.3.1 oracle**, not the current 8.2.3 one, or they would break the
-byte-identity bar. Oracle stays at 8.2.3 until `port-endor-oracle-bump-8-3-1`.
+Net, after the `port-endor-oracle-bump-8-3-1` bump: **items 2, 4, and 7 are
+handled** (2 mirrored at this bump; 4 auto-inherits; 7 already mirrored) and
+item 8 is behavior-neutral / no action. **Items 1, 3, 5, 6 remain post-8.2.3
+follow-ups**, but only because the port has not yet reached those VM surfaces
+(ArrayBuffer/DataView runtime, `Array.from`, the disposal protocol), not
+because the oracle is behind — the oracle is now **8.3.1**, so each lands
+with, and is measured against, the 8.3.1 oracle at the stage that reaches it.
+No item below diverges from the *current* (8.3.1) oracle: the port matches
+8.3.1 today across every surface it has reached.
 
 ## Running the harness
 

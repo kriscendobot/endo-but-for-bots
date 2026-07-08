@@ -79,9 +79,14 @@ native Compartment support.
 
 ## Ground Truth: What Is Being Ported
 
-Measured against `Moddable-OpenSource/moddable` at `48ee02d8cfe0`
-(2026-06-17), the pin lineage of the `c/moddable` submodule that
-`rust/endo/xsnap/build.rs` compiles today.
+Measured against `Moddable-OpenSource/moddable` at `23b4d6b0a65f`
+(moddable **8.3.1**, 2026-07-07). The pin began at `48ee02d8cfe0`
+(8.2.3, 2026-06-17 — the lineage `rust/endo/xsnap/build.rs` compiles
+today) and was bumped to 8.3.1 by the `port-endor-oracle-bump-8-3-1`
+job, deliberately leading xsnap so the port is measured against the
+newer engine semantics (see `rust/engine/README.md` § Upstream
+moddable delta tracking for the per-commit deltas the bump re-bases
+onto the bar).
 
 **Interpreter.** `fxRunID` in `xs/sources/xsRun.c` is a single
 ~4,000-line dispatch loop, computed-goto under GCC/Clang and a
@@ -1098,8 +1103,10 @@ annotations inline mark exactly what changed.
    fetchable upstream) is deliberately **not** bumped by this
    program: correcting it requires the matching `xsnap` `ffi.rs`
    arity fix and belongs to a dedicated maintenance change. The
-   oracle's build pin remains `48ee02d8cfe0` per § Ground Truth,
-   with the reproduction procedure in `rust/engine/README.md`.
+   oracle's build pin is `23b4d6b0a65f` (8.3.1) per § Ground Truth —
+   bumped from the original `48ee02d8cfe0` (8.2.3) by the
+   `port-endor-oracle-bump-8-3-1` job — with the reproduction
+   procedure in `rust/engine/README.md`.
 10. **Intl is omitted (`intl402` stays out), matching the
     oracle.** Parity with C-XS is the acceptance bar and XS
     deliberately omits Intl. Adding an ICU4X-backed Intl later is
