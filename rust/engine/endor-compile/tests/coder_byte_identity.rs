@@ -2124,3 +2124,52 @@ fn optional_call_reference_is_byte_identical() {
         "var a = { b: () => ({ c: 3 }) }; a?.b?.().c;",
     ]);
 }
+
+// `import.meta` is an early Syntax Error unless the syntactic goal is Module
+// (`fxLiteralExpression`'s `mxProgramFlag` gate). The `compile` path is the
+// script/eval goal, so every `import.meta` — top level or nested in a function
+// (the flag survives `mxParserFlags` across function bodies) — must reject in
+// agreement with the oracle. (`expressions/import.meta/syntax/goal-script.js`,
+// `expressions/dynamic-import/.../import-meta.js`.)
+#[test]
+fn import_meta_in_script_goal_rejects() {
+    assert_both_reject(&[
+        "import.meta;",
+        "import.meta.url;",
+        "function f() { import.meta; }",
+        "var p = import(import.meta);",
+        "(() => import.meta)();",
+    ]);
+}
+
+// `ContainsDuplicateLabels` — a label may not re-declare one already in scope,
+// whether directly nested (`L: L: 0;`) or across an intervening statement
+// (`L: { L: 0; }`). `fxLabelNodeCode` folds the direct chain and walks the
+// enclosing break-target stack; both must reject in agreement with the oracle,
+// while distinct-label nestings stay accepted and byte-identical.
+// (`module-code/early-dup-lables.js`.)
+#[test]
+fn duplicate_labels_reject() {
+    assert_both_reject(&[
+        // across an intervening block (the early-dup-lables shape)
+        "label: { label: 0; }",
+        // directly nested
+        "a: a: 0;",
+        // re-declared two blocks deep
+        "outer: { inner: { outer: 0; } }",
+    ]);
+}
+
+#[test]
+fn distinct_nested_labels_accept() {
+    assert_identical(&[
+        // distinct labels nested through a block stay legal
+        "outer: { inner: 0; }",
+        // directly chained distinct labels
+        "a: b: 0;",
+        // same label re-used in sibling (non-nested) scopes is fine
+        "a: { 0; } a: { 1; }",
+        // label reachable by an inner break
+        "loop: while (1) { break loop; }",
+    ]);
+}

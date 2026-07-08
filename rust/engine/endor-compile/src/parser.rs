@@ -1090,6 +1090,14 @@ impl Parser {
                 && !self.cur.escaped
             {
                 self.get_next_token()?;
+                // `import.meta` is an early Syntax Error unless the goal is
+                // Module. XS gates on `mxProgramFlag` (set for the script/eval
+                // goal, preserved across nested functions via `mxParserFlags`,
+                // never set for the module goal), rejecting `import.meta` when
+                // present. Mirror that gate on `flags::PROGRAM`.
+                if self.flags & flags::PROGRAM != 0 {
+                    return Err(self.error("invalid import.meta"));
+                }
                 self.push_node_struct(0, Token::ImportMeta, line)?;
             } else {
                 return Err(self.error("invalid import."));

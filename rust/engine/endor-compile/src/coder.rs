@@ -1551,6 +1551,32 @@ impl Coder<'_> {
             }
         }
         labels.reverse();
+
+        // `fxLabelNodeCode`'s two duplicate-label checks (`ContainsDuplicateLabels`).
+        // (1) The collapse loop folds a directly-nested label chain (`L1: L2:
+        // stmt`) into one target and rejects a repeat within it. (2) It then
+        // walks the enclosing break-target stack and rejects a label that
+        // re-declares one already in scope across an intervening statement
+        // (`L: { L: 0; }`). XS compares each enclosing target's HEAD label
+        // (the innermost after collapse — our `labels[0]`) against every
+        // label of this statement.
+        for (i, outer) in labels.iter().enumerate() {
+            if let Some(o) = outer {
+                if labels[i + 1..].iter().any(|inner| inner.as_deref() == Some(o.as_str())) {
+                    self.report(node.line, &format!("duplicate label {}", o));
+                }
+            }
+        }
+        let mut bt = self.first_break_target;
+        while let Some(t) = bt {
+            if let Some(head) = self.targets[t].labels.first().and_then(|o| o.as_deref()) {
+                if labels.iter().any(|l| l.as_deref() == Some(head)) {
+                    self.report(node.line, &format!("duplicate label {}", head));
+                }
+            }
+            bt = self.targets[t].next_target;
+        }
+
         // Dispatch the wrapped statement by reference — the scoper keys
         // scopes by node address, so a clone would miss its registration.
         let statement = &cur.children[1];

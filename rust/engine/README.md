@@ -1573,7 +1573,23 @@ These are the remaining child-6/7 surface.
 > (bare `{`/`]`/`}`, identity-escape and truncated `\x`/`\u{…}` rejection,
 > quantified assertions). The `ID_Start`/`ID_Continue` tables moved to the leaf
 > `endor-regexp::unicode` (single source of truth, re-exported by
-> `endor-compile`). The fix2/fix3/fix4/fix5
+> `endor-compile`). **fix5 4/5 slice 2 closed the two remaining module-goal
+> accept-disagreements as REAL script-goal frontend gaps** (not oracle-shim
+> seam artifacts — the differential harness compiles every file as the
+> **script** goal for both engines, so a `flags: [module]` file's illegal-in-
+> script construct is a genuine script-goal disagreement): **`expressions/
+> import.meta`** (5 `accept-disagree` → **0**) and the `import(import.meta)`
+> case in **`expressions/dynamic-import`** (1 → **0**) — `import.meta` is an
+> early SyntaxError unless the goal is Module, which XS gates on `mxProgramFlag`
+> in `fxLiteralExpression`; endor now rejects it in `import_literal` when
+> `flags::PROGRAM` is set (the flag `parse_program` seeds and `PARSER_FLAGS`
+> preserves across nested functions, never set by `parse_module`).
+> **`module-code`** (1 `accept-disagree` → **0**, `early-dup-lables.js`) —
+> `ContainsDuplicateLabels` is enforced at code time by `fxLabelNodeCode`
+> (both the folded direct-chain check and the enclosing break-target-stack
+> walk); endor's `code_label` now mirrors both, reporting a `duplicate label`
+> error while distinct-label nestings stay byte-identical. `new.target`
+> position gating needed no change (already parity). The fix2/fix3/fix4/fix5
 > blocks below are retained as dated round history.
 
 Child 7 armed the acceptance harness; the first round of stage-5 **fix
