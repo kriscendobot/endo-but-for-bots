@@ -124,10 +124,11 @@ together under `test/eval/` (see "Running" below), mirroring this source layout.
 ## Running
 
 - **No credentials (anywhere):** `test/eval/*.test.js` runs the full harness
-  with a scripted faux provider standing in for the model. These are the
-  assertion-path tests; they need no network and no secrets, and each eval's
-  test co-locates with its per-eval repository fixture under `test/eval/`. They
-  run under the default `yarn test`.
+  with a scripted faux provider standing in for the model.
+  These are the assertion-path tests; they need no network and no secrets, and
+  each eval's test co-locates with its per-eval repository fixture under
+  `test/eval/`.
+  They run under the default `yarn test`.
 - **Live model (credentialed host):** `test/eval-live.test.js` runs the same
   scenarios and scorers against a real provider across the default condition
   matrix.

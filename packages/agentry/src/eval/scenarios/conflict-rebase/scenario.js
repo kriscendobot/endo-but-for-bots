@@ -8,7 +8,8 @@ import { assertGitConflictRebaseOutcome } from './outcome.js';
 export const conflictRebasePrompt = `\
 Rebase the current feature branch onto integration.
 When app.txt conflicts, keep the integration wording, then add the feature
-sentence after it. Preserve the feature note and the integration note.
+sentence after it.
+Preserve the feature note and the integration note.
 Leave the branch rebased, with a clean working tree.`;
 harden(conflictRebasePrompt);
 
@@ -17,7 +18,7 @@ harden(conflictRebasePrompt);
  * resolve it deliberately, then continue replaying the remaining clean commit.
  *
  * @param {GitConflictRebaseTarget} expected
- * @returns {GitScenario}
+ * @returns {GitScenario<GitConflictRebaseTarget>}
  */
 export const makeConflictRebaseScenario = expected =>
   harden({

@@ -73,11 +73,13 @@ export interface GitConflictRebaseTarget {
  * credentialed run), so it holds no model and no provisioning — only the
  * prompt, the target end-state, and the cap-based assertion.
  */
-export interface GitScenario {
+export interface GitScenario<
+  Expected = GitCommitTarget | GitConflictRebaseTarget,
+> {
   name: string;
   /** The user turn handed to the code-mode agent. */
   prompt: string;
-  expected: GitCommitTarget | GitConflictRebaseTarget;
+  expected: Expected;
   assertOutcome: (args: {
     git: unknown;
     workspace: unknown;

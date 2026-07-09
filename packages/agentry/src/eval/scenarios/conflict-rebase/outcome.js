@@ -8,9 +8,9 @@ import { E } from '@endo/eventual-send';
 import { branchLog, check, readTrackedFileAt } from '../../outcome-kit.js';
 
 /**
- * Score a conflict-rebase run by outcome assertion. The scorer reads the final
- * repository state through the git capability and deliberately ignores the path
- * the agent used to reach it.
+ * Score a conflict-rebase run by outcome assertion.
+ * The scorer reads the final repository state through the git capability and
+ * deliberately ignores the path the agent used to reach it.
  *
  * @param {object} args
  * @param {unknown} args.git A live `@endo/exo-git` Git capability.

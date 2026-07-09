@@ -1,9 +1,9 @@
 // @ts-check
 
-// Per-eval repository fixture for the conflict-rebase scenario. It builds a
-// real repository whose feature branch conflicts on app.txt when rebased onto
-// integration, then precomputes the exact successful replay by running that
-// rebase once with the intended resolution and resetting back.
+// Per-eval repository fixture for the conflict-rebase scenario.
+// It builds a real repository whose feature branch conflicts on app.txt when
+// rebased onto integration, then precomputes the exact successful replay by
+// running that rebase once with the intended resolution and resetting back.
 
 import fs from 'node:fs';
 import path from 'node:path';
