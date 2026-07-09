@@ -3,7 +3,7 @@
 |             |                       |
 | ----------- | --------------------- |
 | **Created** | 2026-05-02            |
-| **Updated** | 2026-07-06            |
+| **Updated** | 2026-07-09            |
 | **Author**  | Kris Kowal (prompted) |
 | **Status**  | Proposed (partially realized — see § Realization Status) |
 
@@ -30,6 +30,14 @@ Genie remains the un-migrated harness.
 The upstream `@mariozechner/pi-*` dependency the survey names has also
 been replaced repo-wide by the fork **`@earendil-works/pi-agent-core` /
 `@earendil-works/pi-ai` `^0.79.0`**.
+
+**The north star (maintainer, PR #89 review, 2026-07-09):** the intent
+is to **retire genie, lal, and fae** once all their prior art finds
+consolidated homes. Every "Share" / "Integrate-into-daemon" verdict
+below is therefore a step toward that consolidation, not toward three
+harnesses coexisting indefinitely — the shared surfaces (`@endo/agentry`
+and its siblings, the daemon capabilities) are the consolidated homes,
+and the three harnesses are the prior art being drained into them.
 
 | Survey element | Landed as | Status |
 |---|---|---|
@@ -531,6 +539,14 @@ const hits = await E(index).search('user preferences', { limit: 5 });
   This question is decision-level and the design defers to the
   maintainer; the implementation phase picks one of the two shapes
   based on the resolution.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** use an
+  **`EndoDirectory`**.
+  We do not need to realize the tree on disk, nor limit what
+  capabilities can be captured therein — an `EndoDirectory` tree can
+  contain any formula, so it is the memory substrate directly.
+  This supersedes both alternatives above: neither the pure
+  pet-store-as-typed-namespace encoding nor a `ScratchMount` over a
+  physical directory is required — memory is an `EndoDirectory`.
 - **Markdown-bag-of-files vs. blob-per-snapshot.** Whichever shape
   wins above, observation / reflection / profile entries can be
   stored either as a single file the agent edits in place (bag-of-files)
@@ -542,6 +558,12 @@ const hits = await E(index).search('user preferences', { limit: 5 });
   perform.
   Starting with bag-of-files is the pragmatic choice and forecloses
   no future move to blobs.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** an
+  `EndoDirectory` holding `ReadableBlob`s is not different from a bag of
+  files — start there.
+  The two shapes converge under the `EndoDirectory` decision above: the
+  bag-of-files mental model and the daemon-native blob storage are the
+  same thing when the bag is an `EndoDirectory` of `ReadableBlob`s.
 - **Memory-index subscription shape.** The memory-index capability
   needs a way to be notified when its watched sub-namespace changes,
   so the FTS5 index stays in sync without polling.
@@ -553,6 +575,16 @@ const hits = await E(index).search('user preferences', { limit: 5 });
   `better-sqlite3` dependency through `@endo/sqlite-store` or
   equivalent) is the granularity question the implementation phase
   resolves.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** settle this at
+  implementation time.
+  We are converging on a pattern of `@endo/foo` and `@endo/exo-foo`
+  packages for surfacing passable capabilities, and `@endo/platform` is
+  holding a lot of responsibility — possibly too much, and might need to
+  be broken down.
+  It follows that the daemon should rely on a platform abstraction for
+  an `@endo/exo-db` or `@endo/exo-fts` rather than embedding
+  `better-sqlite3` directly; the memory-index capability is the natural
+  first consumer of that seam.
 
 ## 3. Scheduling
 
@@ -767,6 +799,16 @@ Estimate: **S**, ~1 day.
   shared package now" as the bridging step.
   **I am guessing about pi's stability** — a quick survey of recent
   pi-ai releases would inform this.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** we are
+  embracing a dependency on Pi (the `@earendil-works/pi-*` fork) at this
+  time.
+  The load-bearing risk is accepted rather than mitigated by vendoring
+  or re-implementation up front.
+  To keep the concentration honest, a **weekly release-watch** runs:
+  it watches for new `@earendil-works/pi-agent-core` /
+  `@earendil-works/pi-ai` releases and proposes migrations if necessary,
+  so a breaking upstream change surfaces as a tracked task rather than a
+  surprise.
 
 - **Memory and scheduling open questions live on the sibling designs.**
   The trade-offs around memory storage shape (pet-store-as-typed-
@@ -778,6 +820,9 @@ Estimate: **S**, ~1 day.
   grantable) are owned by [`scheduler.md`](scheduler.md) § Open
   Questions.
   This document defers to those.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** the memory
+  storage-shape question is now settled — use an `EndoDirectory` tree,
+  as it can contain any formula (see § 2 Open Questions, resolved).
 
 - **The observer/reflector are thin sub-agents that read the main
   agent's `state.messages` directly.**
@@ -786,6 +831,12 @@ Estimate: **S**, ~1 day.
   service could be the LLM provider), the sub-agents need to consume
   a serialised excerpt rather than a live `messages` array reference.
   This is mostly a refactor, but it's worth flagging.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** use
+  `@endo/exo-pubsub` to provide passable topics.
+  The observer and reflector subscribe to a passable topic the main
+  agent publishes to, rather than reaching into its live `state.messages`
+  — which both serialises the excerpt naturally and makes the sub-agents
+  portable across a process boundary.
 
 - **lal's "depth prefix" in `reply` and fae's "auto-reply if no tool
   call" fallback are agent-specific quirks.**
@@ -794,6 +845,12 @@ Estimate: **S**, ~1 day.
   engine requires teaching the engine about per-tool middleware (or
   doing the post-processing in the harness loop).
   Either is fine; the choice between them is contentious.
+  **Maintainer resolution (PR #89 review, 2026-07-09):** the depth prefix
+  is a debugging instrument and should sink into the daemon's message
+  metadata, if preserved at all — it is not part of the reply payload
+  and should not need engine-level tool middleware.
+  fae's "auto-reply if no tool call" fallback remains a harness-loop
+  concern.
 
 - **`web-fetch` and `web-search` overlap with `endoclaw-network-fetch`
   (M1).**
@@ -803,6 +860,15 @@ Estimate: **S**, ~1 day.
   network-egress tools for lal and fae and `endoclaw-network-fetch`
   has to subsume them.
   Recommend coordinating with whoever picks up `endoclaw-network-fetch`.
+
+- **The endgame is retirement, not coexistence.**
+  **Maintainer resolution (PR #89 review, 2026-07-09):** the intention is
+  to retire genie, lal, and fae when all their prior art finds
+  consolidated homes (recorded at the head of § Realization Status as the
+  north star).
+  This reframes every verdict in § 4: a "Share" is a move toward a
+  consolidated home, and a "Leave-in-place" is provisional until a
+  consolidated home exists to receive it.
 
 ## Prompt
 
