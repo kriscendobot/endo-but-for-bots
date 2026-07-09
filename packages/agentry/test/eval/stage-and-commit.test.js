@@ -15,8 +15,12 @@ import {
 } from '@earendil-works/pi-ai';
 
 import {
+  defaultEvalConditions,
+  makeDefaultGitScenarioSpecs,
   makeRunMetricsRecorder,
   makeStageAndCommitScenario,
+  renderEvalMatrixMarkdownTable,
+  runEvalMatrix,
   runGitScenario,
 } from '../../src/eval/index.js';
 import { readText } from '../_eval-fixture.js';
@@ -150,6 +154,53 @@ const executeOnceModel = (t, source) =>
     fauxAssistantMessage('done'),
   ]);
 
+/**
+ * @param {import('ava').ExecutionContext} t
+ * @param {ReturnType<typeof makeStageAndCommitScenario>} scenario
+ * @returns {Model<string>}
+ */
+const matrixModel = (t, scenario) =>
+  fauxModel(t, [
+    fauxAssistantMessage(
+      fauxToolCall('execute', {
+        source: stageAndCommitSource(
+          scenario.expected.path,
+          scenario.expected.message,
+        ),
+      }),
+      { stopReason: 'toolUse' },
+    ),
+    fauxAssistantMessage('code-mode done'),
+    fauxAssistantMessage(
+      fauxToolCall('add', { paths: [scenario.expected.path] }),
+      {
+        stopReason: 'toolUse',
+      },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall('commit', { message: scenario.expected.message }),
+      {
+        stopReason: 'toolUse',
+      },
+    ),
+    fauxAssistantMessage('tool-calls done'),
+    fauxAssistantMessage(
+      fauxToolCall('exec', {
+        command: 'git',
+        args: ['add', scenario.expected.path],
+      }),
+      { stopReason: 'toolUse' },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall('exec', {
+        command: 'git',
+        args: ['commit', '-m', scenario.expected.message],
+      }),
+      { stopReason: 'toolUse' },
+    ),
+    fauxAssistantMessage('shell done'),
+  ]);
+
 test('run metrics recorder sums assistant usage and tool errors', t => {
   const recorder = makeRunMetricsRecorder();
   const first = assistantMessageWithUsage(
@@ -260,6 +311,44 @@ test('outcome assertion passes when the scripted run reaches the target end-stat
       metrics.usage.cacheWrite,
   );
   t.true(metrics.wallTimeMs >= 0);
+});
+
+test('matrix runs the stage-and-commit scenario across all conditions', async t => {
+  const scenario = makeStageAndCommitScenario();
+  const model = matrixModel(t, scenario);
+
+  const result = await runEvalMatrix({
+    scenarios: makeDefaultGitScenarioSpecs(),
+    conditions: defaultEvalConditions,
+    models: [{ model, name: 'faux-model' }],
+    repeats: 1,
+    readText,
+  });
+
+  t.deepEqual(
+    result.rows.map(row => [row.scenario, row.condition, row.model, row.pass]),
+    [
+      ['stage-and-commit', 'code-mode', 'faux-model', true],
+      ['stage-and-commit', 'tool-calls', 'faux-model', true],
+      ['stage-and-commit', 'shell', 'faux-model', true],
+    ],
+  );
+  t.deepEqual(
+    result.aggregates.map(aggregate => [
+      aggregate.condition,
+      aggregate.runs,
+      aggregate.passRate,
+    ]),
+    [
+      ['code-mode', 1, 1],
+      ['tool-calls', 1, 1],
+      ['shell', 1, 1],
+    ],
+  );
+  t.regex(
+    renderEvalMatrixMarkdownTable(result.aggregates),
+    /\| stage-and-commit \| tool-calls \| faux-model \| 1 \| 100% \|/,
+  );
 });
 
 test('outcome assertion fails the commit-message check when the wrong message is used', async t => {

@@ -1,5 +1,8 @@
 import type { StreamFn } from '@earendil-works/pi-agent-core';
+import type { Agent } from '@earendil-works/pi-agent-core';
 import type { Model, Usage } from '@earendil-works/pi-ai';
+import type { GetApiKey } from '../harness/credentials.js';
+import type { ThinkingLevel } from '../harness/model.js';
 
 /**
  * Read the UTF-8 content of an `@endo/platform/fs`-style File capability. The
@@ -59,6 +62,32 @@ export interface GitScenario {
   }) => Promise<OutcomeReport>;
 }
 
+export interface ProvisionedGitScenario {
+  /**
+   * A writable Filesystem capability over a fresh scenario repository.
+   */
+  workspace: unknown;
+  /** A writable Git capability over the same repository. */
+  git: unknown;
+  /** A confined Shell capability over the same repository. */
+  shell?: unknown;
+  /** Human-readable repository path for diagnostics. */
+  repoRoot?: string;
+  /** Release temporary resources. */
+  cleanup?: () => Promise<void> | void;
+}
+
+export interface GitScenarioSpec {
+  /** Stable scenario name. */
+  name: string;
+  /** Build the scenario for one run. */
+  makeScenario: () => GitScenario;
+  /** Provision a fresh repository for that run. */
+  provisionRepo: (args: {
+    scenario: GitScenario;
+  }) => Promise<ProvisionedGitScenario>;
+}
+
 /**
  * Summed provider usage observed during one agent run. This is based on
  * `Usage` from pi-ai, narrowed to the eval reporting surface and extended with
@@ -108,6 +137,11 @@ export interface RunGitScenarioOptions {
    * A live read/write `@endo/exo-git` Git capability over the same repository.
    */
   git: unknown;
+  /**
+   * A live shell capability over the same repository, required only by shell
+   * eval conditions.
+   */
+  shell?: unknown;
   scenario: GitScenario;
   /**
    * Read a committed File's content as UTF-8; passed through to the scenario's
@@ -115,12 +149,59 @@ export interface RunGitScenarioOptions {
    */
   readText: ReadText;
   /** Resolve the model's API key. Omit for a faux/local model. */
-  getApiKey?: import('../harness/credentials.js').GetApiKey;
-  thinkingLevel?: import('../harness/model.js').ThinkingLevel;
+  getApiKey?: GetApiKey;
+  thinkingLevel?: ThinkingLevel;
   streamFn?: StreamFn;
 }
 
 export interface RunGitScenarioResult {
   outcome: OutcomeReport;
   metrics: RunMetrics;
+}
+
+export interface EvalCondition {
+  name: string;
+  makeAgent: (
+    options: Omit<RunGitScenarioOptions, 'scenario' | 'readText'>,
+  ) => Agent;
+}
+
+export interface EvalMatrixModel {
+  model: Model<string>;
+  name?: string;
+  getApiKey?: GetApiKey;
+}
+
+export interface EvalMatrixRow {
+  scenario: string;
+  condition: string;
+  model: string;
+  repeat: number;
+  pass: boolean;
+  metrics: RunMetrics;
+  outcome: OutcomeReport;
+}
+
+export interface EvalMatrixAggregate {
+  scenario: string;
+  condition: string;
+  model: string;
+  runs: number;
+  passRate: number;
+  meanTokens: number;
+  medianTokens: number;
+  meanTurns: number;
+  medianTurns: number;
+  meanWallTimeMs: number;
+  medianWallTimeMs: number;
+}
+
+export interface EvalMatrixResult {
+  provenance: {
+    recordedAt: string;
+    providers: string[];
+    models: string[];
+  };
+  rows: EvalMatrixRow[];
+  aggregates: EvalMatrixAggregate[];
 }

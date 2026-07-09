@@ -22,4 +22,6 @@ test('agentry subpaths resolve through package exports', async t => {
   t.is(typeof evalModule.makeStageAndCommitScenario, 'function');
   t.is(typeof evalModule.assertGitCommitOutcome, 'function');
   t.is(typeof evalModule.resolveEvalModelFromEnv, 'function');
+  t.is(typeof evalModule.runEvalMatrix, 'function');
+  t.is(typeof evalModule.defaultEvalConditions, 'object');
 });
