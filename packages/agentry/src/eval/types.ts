@@ -1,5 +1,4 @@
-import type { StreamFn } from '@earendil-works/pi-agent-core';
-import type { Agent } from '@earendil-works/pi-agent-core';
+import type { Agent, StreamFn } from '@earendil-works/pi-agent-core';
 import type { Model, Usage } from '@earendil-works/pi-ai';
 import type { GetApiKey } from '../harness/credentials.js';
 import type { ThinkingLevel } from '../harness/model.js';
