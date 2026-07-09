@@ -44,7 +44,13 @@ export const readTrackedFileAt = async ({ git, readText, ref, path }) => {
   try {
     const committedFs = await E(gitRef).filesystemAt(ref);
     const committedRoot = await E(committedFs).root();
-    const file = await E(committedRoot).lookup(path);
+    const file = await path
+      .split('/')
+      .reduce(
+        (nodeP, part) =>
+          nodeP.then(node => E(/** @type {any} */ (node)).lookup(part)),
+        Promise.resolve(committedRoot),
+      );
     return await readText(file);
   } catch (err) {
     const message = /** @type {Error} */ (err)?.message ?? '';

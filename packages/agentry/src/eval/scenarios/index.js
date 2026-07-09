@@ -7,6 +7,21 @@ import {
   makeStageAndCommitScenario,
   provisionStageAndCommitRepo,
 } from './stage-and-commit/index.js';
+import {
+  makeConflictRebaseScenario,
+  provisionConflictRebaseRepo,
+} from './conflict-rebase/index.js';
+
+export {
+  conflictRebasePrompt,
+  makeConflictRebaseScenario,
+  assertGitConflictRebaseOutcome,
+} from './conflict-rebase/index.js';
+export {
+  makeStageAndCommitScenario,
+  assertGitCommitOutcome,
+  provisionStageAndCommitRepo,
+} from './stage-and-commit/index.js';
 
 /**
  * @returns {GitScenarioSpec}
@@ -17,11 +32,27 @@ export const makeStageAndCommitScenarioSpec = () =>
     makeScenario: () => makeStageAndCommitScenario(),
     provisionRepo: ({ scenario }) =>
       provisionStageAndCommitRepo({
-        path: scenario.expected.path,
-        content: scenario.expected.content,
+        path: /** @type {import('../types.js').GitCommitTarget} */ (
+          scenario.expected
+        ).path,
+        content: /** @type {import('../types.js').GitCommitTarget} */ (
+          scenario.expected
+        ).content,
       }),
   });
 harden(makeStageAndCommitScenarioSpec);
+
+/**
+ * @returns {GitScenarioSpec}
+ */
+export const makeConflictRebaseScenarioSpec = () =>
+  harden({
+    name: 'conflict-rebase',
+    makeScenario: () => makeConflictRebaseScenario(),
+    provisionRepo: ({ requirements }) =>
+      provisionConflictRebaseRepo(requirements),
+  });
+harden(makeConflictRebaseScenarioSpec);
 
 /**
  * Landed eval scenarios.
@@ -31,5 +62,5 @@ harden(makeStageAndCommitScenarioSpec);
  * @returns {GitScenarioSpec[]}
  */
 export const makeDefaultGitScenarioSpecs = () =>
-  harden([makeStageAndCommitScenarioSpec()]);
+  harden([makeStageAndCommitScenarioSpec(), makeConflictRebaseScenarioSpec()]);
 harden(makeDefaultGitScenarioSpecs);

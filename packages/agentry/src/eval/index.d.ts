@@ -20,8 +20,11 @@ export {
 } from './conditions/index.js';
 export { makeDefaultGitScenarioSpecs } from './scenarios/index.js';
 export {
+  conflictRebasePrompt,
+  makeConflictRebaseScenario,
+  assertGitConflictRebaseOutcome,
   makeStageAndCommitScenario,
   assertGitCommitOutcome,
   provisionStageAndCommitRepo,
-} from './scenarios/stage-and-commit/index.js';
+} from './scenarios/index.js';
 export type * from './types.js';

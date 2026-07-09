@@ -105,6 +105,12 @@ Shared harness (this directory's root):
 Per-eval content (one folder under `scenarios/`):
 
 - `scenarios/index.js` — the landed scenario registry used by the matrix CLI.
+- `scenarios/conflict-rebase/` - the conflict-resolution eval: `scenario.js`
+  asks the agent to rebase a feature branch onto `integration`, resolve the
+  `app.txt` conflict with the requested combined wording, and preserve both
+  notes; `outcome.js` verifies the branch topology, replayed summaries and
+  fresh oids, caller-supplied post-resolution patches, exact final tree and file
+  content, clean status, and completed rebase state.
 - `scenarios/stage-and-commit/` — the minimal-success eval: `scenario.js`
   (`makeStageAndCommitScenario(...)`, stage an untracked file and commit it with
   a given message), `provision.js` (fresh repository setup), `outcome.js`
@@ -117,13 +123,11 @@ together under `test/eval/` (see "Running" below), mirroring this source layout.
 
 ## Running
 
-- **No credentials (anywhere):** `test/eval/stage-and-commit.test.js` runs the
-  full harness with a scripted faux provider standing in for the model. This is
-  the assertion-path test; it needs no network and no secrets, and each eval's
-  test co-locates with its per-eval repository fixture
-  (`_stage-and-commit-repo.js`) under `test/eval/`.
-  It runs under the default
-  `yarn test`.
+- **No credentials (anywhere):** `test/eval/*.test.js` runs the full harness
+  with a scripted faux provider standing in for the model. These are the
+  assertion-path tests; they need no network and no secrets, and each eval's
+  test co-locates with its per-eval repository fixture under `test/eval/`. They
+  run under the default `yarn test`.
 - **Live model (credentialed host):** `test/eval-live.test.js` runs the same
   scenarios and scorers against a real provider across the default condition
   matrix.

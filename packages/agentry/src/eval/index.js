@@ -23,13 +23,17 @@ export {
   codeModeCondition,
   defaultEvalConditions,
   evalConditionsByName,
+  shellCondition,
   toolCallsCondition,
 } from './conditions/index.js';
 export { makeDefaultGitScenarioSpecs } from './scenarios/index.js';
 
 // Per-eval public symbols, re-exported from each eval's folder.
 export {
+  conflictRebasePrompt,
+  makeConflictRebaseScenario,
+  assertGitConflictRebaseOutcome,
   makeStageAndCommitScenario,
   assertGitCommitOutcome,
   provisionStageAndCommitRepo,
-} from './scenarios/stage-and-commit/index.js';
+} from './scenarios/index.js';
