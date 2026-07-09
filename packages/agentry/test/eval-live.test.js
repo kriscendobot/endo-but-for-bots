@@ -30,14 +30,17 @@ import test from '@endo/ses-ava/prepare-endo.js';
 
 import { runGitScenario, resolveEvalModelFromEnv } from '../src/eval/index.js';
 import { makeConflictRebaseScenario } from '../src/eval/scenarios/conflict-rebase/index.js';
+import { makeStackSurgeryScenario } from '../src/eval/scenarios/stack-surgery/index.js';
 import { makeStageAndCommitScenario } from '../src/eval/scenarios/stage-and-commit/index.js';
 import { readText } from './_eval-fixture.js';
 import { provisionConflictRebaseRepo } from './eval/_conflict-rebase-repo.js';
 import { provisionStageAndCommitRepo } from './eval/_stage-and-commit-repo.js';
+import { provisionStackSurgeryRepo } from './eval/_stack-surgery-repo.js';
 
 /**
  * @typedef {object} EvalRow One live-eval scenario.
  * @property {string} title The test title for this row.
+ * @property {string} [skipReason] Why this registered row is pending.
  * @property {(t: import('ava').ExecutionContext) => Promise<{ repoRoot: string, workspace: unknown, git: unknown }>} provisionRepo
  *   Provision the scenario's repository and return its powers.
  * @property {(repo: any) => import('../src/eval/types.js').GitScenario} makeScenario
@@ -66,6 +69,12 @@ const evalRows = [
     title: 'a live model resolves a conflict rebase (outcome assertion)',
     provisionRepo: t => provisionConflictRebaseRepo(t),
     makeScenario: repo => makeConflictRebaseScenario(repo),
+  },
+  {
+    title: 'a live model performs stack surgery (outcome assertion)',
+    skipReason: 'blocked on agentry-git-verb-gaps verbs',
+    provisionRepo: t => provisionStackSurgeryRepo(t),
+    makeScenario: () => makeStackSurgeryScenario(),
   },
 ];
 
@@ -254,7 +263,8 @@ const appendScenarioResult = ({ model, scenario, result, error }) => {
 };
 
 for (const row of evalRows) {
-  liveTest(row.title, async t => {
+  const rowTest = row.skipReason !== undefined ? test.skip : liveTest;
+  rowTest(row.title, async t => {
     // `live` is defined here (otherwise this test was skipped at registration).
     const { model, getApiKey } = /** @type {NonNullable<typeof live>} */ (live);
     const repo = await row.provisionRepo(t);

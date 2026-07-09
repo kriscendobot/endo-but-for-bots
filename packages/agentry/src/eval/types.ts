@@ -46,10 +46,15 @@ export interface GitScenario<Expected = unknown> {
    * It contains the `evaluate` source a competent agent should converge on.
    * This lets a downstream reporter link a scenario's transcript to the
    * solution it is scored against.
+   *
+   * Omitted by a scenario whose live agent solution is still pending (its
+   * live row is registered but skipped): it carries a fixture and outcome
+   * scorer but no reference `evaluate` source yet, so there is nothing to
+   * link to.
    */
-  referenceSourcePath: string;
+  referenceSourcePath?: string;
   /** Named export in `referenceSourcePath` holding the reference solution. */
-  referenceSourceExport: string;
+  referenceSourceExport?: string;
   assertOutcome: (args: {
     git: unknown;
     workspace: unknown;
