@@ -4,49 +4,58 @@
 /** @import { ERef } from '@endo/eventual-send' */
 /** @import { Filesystem } from '@endo/platform/fs/extended' */
 /** @import { EvalCondition } from '../types.js' */
-/** @import { GitHistoryToolCapability, GitMountToolCapability, GitToolCapability } from '@endo/agent-tools' */
+/** @import { GitHistoryToolCapability, GitMountToolCapability, GitToolCapability, ShellToolCapability } from '@endo/agent-tools' */
 
 import {
-  makeGitMountTools,
   makeGitHistoryTool,
+  makeGitMountTools,
   makeGitTool,
   makeMountFsTools,
+  makeShellTool,
 } from '@endo/agent-tools';
 import { toPiAgentTool } from '@endo/agent-tools/pi';
 
 import { makePiAgent } from '../../harness/pi-agent.js';
 
-export const makeToolCallsSystemPrompt =
-  () => `You are an Endo eval coding agent.
-Use the provided tools to inspect, edit, stage, and commit the repository.
+export const makeShellSystemPrompt = () => `You are an Endo eval coding agent.
+Use the provided repository tools to inspect, edit, stage, and commit the repository.
 
-Use repo-relative paths.
-Prefer the git tools for repository state and commits.
-Prefer the mount tools for file reads, writes, and directory listings.
+The shell is scenario-scoped and allowlisted; use it only for the listed command
+and keep all paths repository-relative.
+Prefer the Git and mount tools for repository changes and file edits.
 Do not answer in prose when a tool call can complete the task.`;
-harden(makeToolCallsSystemPrompt);
+harden(makeShellSystemPrompt);
 
 /**
- * Tool-call condition: direct pi-agent tool calls over the same live workspace
- * and git capabilities the code-mode condition receives.
+ * Shell-backed matrix condition. The shell is an additional capability with
+ * explicit timeout, output, environment, and command bounds; Git and mount
+ * tools remain available so history authority is selected from the scenario
+ * requirement rather than inferred from the condition name.
  *
  * @type {EvalCondition}
  */
-export const toolCallsCondition = harden({
-  name: 'tool-calls',
+export const shellCondition = harden({
+  name: 'shell',
   makeAgent: options => {
     const {
       model,
       workspace,
       git,
+      shell,
       scenario,
       getApiKey,
       thinkingLevel,
       streamFn,
     } = options;
+    if (shell === undefined) {
+      throw new Error(
+        'shell condition requires a provisioned Shell capability',
+      );
+    }
     const workspaceCap = /** @type {ERef<Filesystem>} */ (workspace);
     const gitCap =
       /** @type {ERef<GitToolCapability & GitMountToolCapability>} */ (git);
+    const shellCap = /** @type {ERef<ShellToolCapability>} */ (shell);
     const gitTools =
       scenario.requirements?.allowHistoryRewrite === true
         ? makeGitHistoryTool(
@@ -57,15 +66,16 @@ export const toolCallsCondition = harden({
       ...gitTools,
       ...makeGitMountTools(gitCap),
       ...makeMountFsTools(workspaceCap),
+      ...makeShellTool(shellCap),
     ]).map(tool => toPiAgentTool(tool));
     return makePiAgent({
       model,
       tools,
-      systemPrompt: makeToolCallsSystemPrompt(),
+      systemPrompt: makeShellSystemPrompt(),
       getApiKey,
       thinkingLevel,
       streamFn,
     });
   },
 });
-harden(toolCallsCondition);
+harden(shellCondition);

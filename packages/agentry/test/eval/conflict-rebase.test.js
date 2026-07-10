@@ -19,7 +19,10 @@ import {
 import fc from 'fast-check';
 
 import {
+  codeModeCondition,
   makeConflictRebaseScenario,
+  makeDefaultGitScenarioSpecs,
+  runEvalMatrix,
   runGitScenario,
 } from '../../src/eval/index.js';
 import {
@@ -182,6 +185,24 @@ test('outcome assertion passes when scripted run resolves and continues the reba
       ['worktree-clean', true],
       ['rebase-complete-on-feature-branch', true],
     ],
+  );
+});
+
+test('conflict-rebase registers in the matrix with elevated Git authority', async t => {
+  const model = executeOnceModel(
+    t,
+    conflictRebaseSource('integration', appResolvedText),
+  );
+  const result = await runEvalMatrix({
+    scenarios: [makeDefaultGitScenarioSpecs()[1]],
+    conditions: [codeModeCondition],
+    models: [{ model, name: 'faux-conflict-model' }],
+    repeats: 1,
+    readText,
+  });
+  t.deepEqual(
+    result.rows.map(row => [row.scenario, row.condition, row.pass]),
+    [['conflict-rebase', 'code-mode', true]],
   );
 });
 

@@ -1,5 +1,6 @@
 // @ts-check
 /// <reference types="ses"/>
+/* global process */
 
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -9,6 +10,8 @@ import { promisify as nodePromisify } from 'node:util';
 
 import { E } from '@endo/eventual-send';
 import { makeGit } from '@endo/exo-git';
+import { makeShell } from '@endo/exo-shell';
+import { makeHostSpawner } from '@endo/host-spawner';
 
 /** @import { EndoGit } from '@endo/exo-git' */
 import { iterateBytesReader } from '@endo/exo-stream/iterate-bytes-reader.js';
@@ -65,15 +68,40 @@ harden(readText);
  * Build the live `workspace` and `git` powers over an existing git worktree.
  *
  * @param {string} repoRoot
- * @returns {{ workspace: unknown, git: EndoGit }}
+ * @param {{ allowHistoryRewrite?: boolean }} [options]
+ * @returns {{ workspace: unknown, git: EndoGit, shell: unknown }}
  */
-export const makePowersOver = repoRoot => {
+export const makePowersOver = (repoRoot, options = {}) => {
   const workspace = makeNodeFilesystem({ rootPath: repoRoot });
   const filePowers = makeFilePowers({ fs, path });
   const mount = makeMount({ rootPath: repoRoot, readOnly: false, filePowers });
   const backend = makeNativeGitBackend({ repoRoot });
-  const git = makeGit({ mount, backend, lineageOf });
-  return harden({ workspace, git });
+  const git = makeGit(
+    { mount, backend, lineageOf },
+    { allowHistoryRewrite: options.allowHistoryRewrite === true },
+  );
+  const searchPath = process.env.PATH || '';
+  const shell = makeShell({
+    cwd: repoRoot,
+    policy: {
+      allowedCommands: ['git'],
+      timeoutMs: 30_000,
+      maxOutputBytes: 256 * 1024,
+      env: {
+        PATH: searchPath,
+        LC_ALL: 'C',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_TERMINAL_PROMPT: '0',
+      },
+    },
+    spawner: makeHostSpawner({
+      searchPath,
+      defaultEnv: { PATH: searchPath, LC_ALL: 'C' },
+      killProcessGroup: true,
+    }),
+  });
+  return harden({ workspace, git, shell });
 };
 harden(makePowersOver);
 

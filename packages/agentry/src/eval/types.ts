@@ -78,11 +78,18 @@ export interface GitScenario<Expected = unknown> {
   /** The user turn handed to the code-mode agent. */
   prompt: string;
   expected: Expected;
+  /** Capabilities the scenario needs provisioned for its run. */
+  requirements?: GitScenarioRequirements;
   assertOutcome: (args: {
     git: unknown;
     workspace: unknown;
     readText: ReadText;
   }) => Promise<OutcomeReport>;
+}
+
+export interface GitScenarioRequirements {
+  /** Permit operations that rewrite existing Git history. */
+  allowHistoryRewrite?: boolean;
 }
 
 export interface ProvisionedGitScenario {
@@ -92,6 +99,10 @@ export interface ProvisionedGitScenario {
   workspace: unknown;
   /** A writable Git capability over the same repository. */
   git: unknown;
+  /** A scenario-scoped, policy-bounded shell capability, when provisioned. */
+  shell?: unknown;
+  /** A provisioner may finalize targets that depend on the fresh repository. */
+  scenario?: GitScenario;
   /** Human-readable repository path for diagnostics. */
   repoRoot?: string;
   /** Release temporary resources. */
@@ -106,6 +117,7 @@ export interface GitScenarioSpec {
   /** Provision a fresh repository for that run. */
   provisionRepo: (args: {
     scenario: GitScenario;
+    requirements: GitScenarioRequirements;
   }) => Promise<ProvisionedGitScenario>;
 }
 
@@ -158,6 +170,7 @@ export interface RunGitScenarioOptions {
    * A live read/write `@endo/exo-git` Git capability over the same repository.
    */
   git: unknown;
+  shell?: unknown;
   scenario: GitScenario;
   /**
    * Read a committed File's content as UTF-8; passed through to the scenario's
@@ -177,9 +190,7 @@ export interface RunGitScenarioResult {
 
 export interface EvalCondition {
   name: string;
-  makeAgent: (
-    options: Omit<RunGitScenarioOptions, 'scenario' | 'readText'>,
-  ) => Agent;
+  makeAgent: (options: Omit<RunGitScenarioOptions, 'readText'>) => Agent;
 }
 
 export interface EvalMatrixModel {

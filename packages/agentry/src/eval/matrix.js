@@ -149,14 +149,20 @@ export const runEvalMatrix = async ({
       for (const modelEntry of models) {
         for (let repeat = 1; repeat <= repeats; repeat += 1) {
           const scenario = scenarioSpec.makeScenario();
-          const repo = await scenarioSpec.provisionRepo({ scenario });
+          const requirements = scenario.requirements || harden({});
+          const repo = await scenarioSpec.provisionRepo({
+            scenario,
+            requirements,
+          });
+          const runScenario = repo.scenario || scenario;
           try {
             const result = /** @type {RunGitScenarioResult} */ (
               await runGitScenarioUnder(condition, {
                 model: modelEntry.model,
                 workspace: repo.workspace,
                 git: repo.git,
-                scenario,
+                shell: repo.shell,
+                scenario: runScenario,
                 readText,
                 getApiKey: modelEntry.getApiKey,
                 thinkingLevel,
@@ -164,7 +170,7 @@ export const runEvalMatrix = async ({
             );
             rows.push(
               harden({
-                scenario: scenarioSpec.name || scenario.name,
+                scenario: scenarioSpec.name || runScenario.name,
                 condition: condition.name,
                 model: modelEntry.name || modelDisplayName(modelEntry.model),
                 repeat,

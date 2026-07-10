@@ -591,6 +591,9 @@ test('Git history rewrite authority defaults off and can be elevated', async t =
   await t.throwsAsync(E(git).reword(first.oid, 'blocked reword'), {
     message: /without history-rewrite authority/,
   });
+  await t.throwsAsync(E(git).rebase({ mode: 'start', upstream: 'main' }), {
+    message: /without history-rewrite authority/,
+  });
 
   await fs.promises.writeFile(path.join(repoRoot, 'history.txt'), 'two\n');
   await E(git).add([entry]);

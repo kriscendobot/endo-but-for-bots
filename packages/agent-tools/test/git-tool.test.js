@@ -81,6 +81,10 @@ const makeHistoryStubGit = calls =>
       calls.push(['reword', ...a]);
       return { oid: 'x', summary: a[1] };
     },
+    rebase: async (...a) => {
+      calls.push(['rebase', ...a]);
+      return 'rebase complete';
+    },
   });
 
 test('makeGitTool builds one record per non-remotable-slice method', t => {
@@ -103,6 +107,7 @@ test('makeGitTool omits cap-heavy methods', t => {
   t.false(names.has('add'));
   t.false(names.has('restore'));
   t.false(names.has('filesystemAt'));
+  t.false(names.has('rebase'));
 });
 
 test('invoke marshals named args to positional and calls the capability', async t => {
@@ -174,7 +179,11 @@ test('the schemas advertise real, declarative property names', t => {
 test('makeGitHistoryTool requires an explicit elevated capability', async t => {
   const calls = [];
   const tools = makeGitHistoryTool(makeHistoryStubGit(calls));
-  t.deepEqual(tools.map(tool => tool.name).sort(), ['commit', 'reword']);
+  t.deepEqual(tools.map(tool => tool.name).sort(), [
+    'commit',
+    'rebase',
+    'reword',
+  ]);
   const byName = name => {
     const found = tools.find(tool => tool.name === name);
     if (!found) throw new Error(`no history tool named ${name}`);
@@ -186,9 +195,11 @@ test('makeGitHistoryTool requires an explicit elevated capability', async t => {
     options: harden({ amend: true }),
   });
   await byName('reword').invoke({ ref: 'HEAD~1', message: 'new subject' });
+  await byName('rebase').invoke({ input: { mode: 'start', upstream: 'main' } });
   t.deepEqual(calls, [
     ['commit', 'amended message', { amend: true }],
     ['reword', 'HEAD~1', 'new subject'],
+    ['rebase', { mode: 'start', upstream: 'main' }],
   ]);
 });
 

@@ -45,7 +45,10 @@ export type GitToolCapability = Pick<
  * Hosts must opt into constructing these tools; the default `makeGitTool`
  * inventory does not advertise either operation.
  */
-export type GitHistoryToolCapability = Pick<EndoGit, 'commit' | 'reword'>;
+export type GitHistoryToolCapability = Pick<
+  EndoGit,
+  'commit' | 'reword' | 'rebase'
+>;
 
 /**
  * The mount-bridged slice of `EndoGit` behind `makeGitMountTools`: `status` and

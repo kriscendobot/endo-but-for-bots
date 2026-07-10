@@ -118,7 +118,7 @@ elevated tool set:
 const historyTools = makeGitHistoryTool(git);
 ```
 
-It exposes `commit` with `options.amend` and `reword`.
+It exposes `commit` with `options.amend`, `reword`, and `rebase`.
 Do not combine this set with `makeGitTool` without resolving the duplicate
 `commit` tool name in the host's catalog.
 The host controls whether a model sees the normal commit-only or elevated

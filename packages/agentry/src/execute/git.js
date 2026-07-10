@@ -15,10 +15,10 @@ export { gitCodeModeTypeDeclarations };
 
 /**
  * Build the code-mode global descriptor for an `@endo/exo-git` Git capability.
- * The read-only vs read-write split is a prompt-surface choice: `readOnly`
- * selects the `gitReadOnly` declaration (inspection verbs only) and the
- * matching one-line description. Runtime read-only enforcement stays the exo
- * guard; this only governs which verbs the prompt advertises.
+ * The three-way split is a prompt-surface choice: `readOnly` selects the
+ * inspection-only declaration, `historyRewrite` selects the elevated rewrite
+ * declaration, and the default selects the ordinary read/write declaration.
+ * Runtime authority remains enforced by the exo guard.
  *
  * @param {object} options
  * @param {string} options.name JS-identifier lexical binding name.
@@ -41,7 +41,7 @@ export const makeGitGlobal = ({
     description: readOnly
       ? 'Read-only @endo/exo-git Git capability for repository inspection.'
       : historyRewrite
-        ? 'History-rewrite @endo/exo-git Git capability for amend and reword.'
+        ? 'History-rewrite @endo/exo-git Git capability for amend, reword, and rebase.'
         : 'Read/write @endo/exo-git Git capability for repository changes.',
     declaration: readOnly
       ? gitCodeModeTypeDeclarations.gitReadOnly

@@ -5,13 +5,13 @@ import test from '@endo/ses-ava/prepare-endo.js';
 test('agentry subpaths resolve through package exports', async t => {
   const [rootModule, harnessModule, executeModule, evalModule] =
     await Promise.all([
-      // eslint-disable-next-line import/no-unresolved
+      // eslint-disable-next-line import/no-extraneous-dependencies, import/no-unresolved
       import('@endo/agentry'),
-      // eslint-disable-next-line import/no-unresolved
+      // eslint-disable-next-line import/no-extraneous-dependencies, import/no-unresolved
       import('@endo/agentry/harness'),
-      // eslint-disable-next-line import/no-unresolved
+      // eslint-disable-next-line import/no-extraneous-dependencies, import/no-unresolved
       import('@endo/agentry/execute'),
-      // eslint-disable-next-line import/no-unresolved
+      // eslint-disable-next-line import/no-extraneous-dependencies, import/no-unresolved
       import('@endo/agentry/eval'),
     ]);
   t.is(typeof rootModule.defineAgent, 'function');
@@ -24,4 +24,6 @@ test('agentry subpaths resolve through package exports', async t => {
   t.is(typeof evalModule.resolveEvalModelFromEnv, 'function');
   t.is(typeof evalModule.runEvalMatrix, 'function');
   t.is(typeof evalModule.defaultEvalConditions, 'object');
+  t.is(typeof evalModule.shellCondition, 'object');
+  t.is(typeof evalModule.makeConflictRebaseScenario, 'function');
 });

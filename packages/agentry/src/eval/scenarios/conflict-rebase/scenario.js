@@ -17,37 +17,48 @@ harden(conflictRebasePrompt);
  * A git code-mode scenario for a rebase that must stop for a content conflict,
  * resolve it deliberately, then continue replaying the remaining clean commit.
  *
- * @param {GitConflictRebaseTarget} expected
- * @returns {GitScenario<GitConflictRebaseTarget>}
+ * @param {GitConflictRebaseTarget} [expectedTarget]
+ * @returns {GitScenario<GitConflictRebaseTarget | undefined>}
  */
-export const makeConflictRebaseScenario = ({
-  featureBranch,
-  integrationBranch,
-  integrationOid,
-  replayedSummaries,
-  originalFeatureOids,
-  expectedPatches,
-  featureTreeOid,
-  appText,
-  notes,
-}) => {
-  const expected = harden({
-    featureBranch,
-    integrationBranch,
-    integrationOid,
-    replayedSummaries,
-    originalFeatureOids,
-    expectedPatches,
-    featureTreeOid,
-    appText,
-    notes,
-  });
+export const makeConflictRebaseScenario = expectedTarget => {
+  const expected =
+    expectedTarget === undefined
+      ? undefined
+      : (() => {
+          const {
+            featureBranch,
+            integrationBranch,
+            integrationOid,
+            replayedSummaries,
+            originalFeatureOids,
+            expectedPatches,
+            featureTreeOid,
+            appText,
+            notes,
+          } = expectedTarget;
+          return harden({
+            featureBranch,
+            integrationBranch,
+            integrationOid,
+            replayedSummaries,
+            originalFeatureOids,
+            expectedPatches,
+            featureTreeOid,
+            appText,
+            notes,
+          });
+        })();
   return harden({
     name: 'conflict-rebase',
+    requirements: harden({ allowHistoryRewrite: true }),
     expected,
     prompt: conflictRebasePrompt,
-    assertOutcome: ({ git, readText }) =>
-      assertGitConflictRebaseOutcome({ git, readText, expected }),
+    assertOutcome: args => {
+      if (expected === undefined) {
+        throw new Error('conflict-rebase scenario target is not provisioned');
+      }
+      return assertGitConflictRebaseOutcome({ ...args, expected });
+    },
   });
 };
 harden(makeConflictRebaseScenario);

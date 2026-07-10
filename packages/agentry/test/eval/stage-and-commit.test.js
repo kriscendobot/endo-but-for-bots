@@ -8,6 +8,7 @@
 // only on a host where the `ENDO_LLM_*` / `LAL_*` credentials are present.
 
 import test from '@endo/ses-ava/prepare-endo.js';
+import fs from 'node:fs';
 import { E } from '@endo/eventual-send';
 import {
   registerFauxProvider,
@@ -320,7 +321,7 @@ test('matrix runs the stage-and-commit scenario across all conditions', async t 
   const model = matrixModel(t, scenario);
 
   const result = await runEvalMatrix({
-    scenarios: makeDefaultGitScenarioSpecs(),
+    scenarios: makeDefaultGitScenarioSpecs().slice(0, 1),
     conditions: defaultEvalConditions,
     models: [{ model, name: 'faux-model' }],
     repeats: 1,
@@ -332,6 +333,7 @@ test('matrix runs the stage-and-commit scenario across all conditions', async t 
     [
       ['stage-and-commit', 'code-mode', 'faux-model', true],
       ['stage-and-commit', 'tool-calls', 'faux-model', true],
+      ['stage-and-commit', 'shell', 'faux-model', true],
     ],
   );
   t.deepEqual(
@@ -343,11 +345,12 @@ test('matrix runs the stage-and-commit scenario across all conditions', async t 
     [
       ['code-mode', 1, 1],
       ['tool-calls', 1, 1],
+      ['shell', 1, 1],
     ],
   );
   t.regex(
     renderEvalMatrixMarkdownTable(result.aggregates),
-    /\| stage-and-commit \| tool-calls \| faux-model \| 1 \| 100% \|/,
+    /\| stage-and-commit \| shell \| faux-model \| 1 \| 100% \|/,
   );
 });
 
@@ -381,6 +384,30 @@ test('matrix provisioner contains paths and creates parent directories', async t
     () => provisionMatrixRepo({ path: '../escaped.txt', content: 'nope\n' }),
     { message: 'stage-and-commit path must stay within the repository' },
   );
+});
+
+test('matrix provisioner gives each run a bounded shell and cleans it up', async t => {
+  const repo = await provisionMatrixRepo({
+    path: 'target.txt',
+    content: 'target\n',
+  });
+  t.teardown(repo.cleanup);
+  const shell = /** @type {any} */ (repo.shell);
+  const policy = await E(shell).inspect();
+  t.deepEqual(policy, {
+    allowedCommands: ['git'],
+    timeoutMs: 30_000,
+    maxOutputBytes: 256 * 1024,
+  });
+  const status = await E(shell).exec('git', ['status', '--short']);
+  t.is(status.exitCode, 0);
+  t.true(status.stdout.includes('target.txt'));
+  await t.throwsAsync(() => E(shell).exec('sh', []), {
+    message: /not in the allowlist/,
+  });
+  const repoRoot = repo.repoRoot;
+  await repo.cleanup?.();
+  t.false(fs.existsSync(repoRoot));
 });
 
 test('outcome assertion fails the commit-message check when the wrong message is used', async t => {

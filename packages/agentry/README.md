@@ -88,7 +88,10 @@ await agent.waitForIdle();
 `'historyRewrite'`.
 The history-rewrite mode requires a Git capability minted with explicit
 history-rewrite authority and advertises the elevated `gitHistory` surface,
-including amend and reword operations.
+including amend, reword, and rebase operations.
+Conflict-rebase scenarios request this mode through the scenario capability
+requirements; ordinary stage-and-commit scenarios receive the default Git
+capability without history-rewrite authority.
 
 The model-facing tool surface is intentionally one tool:
 `execute({ source, resultName? })`. Workspace and Git operations happen inside

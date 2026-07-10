@@ -179,6 +179,25 @@ const gitHistoryToolSchemas = harden({
       additionalProperties: false,
     },
   },
+  rebase: {
+    description: 'Rewrite the current branch by rebasing it onto an upstream.',
+    parameters: {
+      type: 'object',
+      properties: {
+        input: {
+          type: 'object',
+          properties: {
+            mode: { enum: ['start', 'continue', 'abort', 'skip'] },
+            upstream: { type: 'string' },
+          },
+          required: [],
+          additionalProperties: false,
+        },
+      },
+      required: ['input'],
+      additionalProperties: false,
+    },
+  },
 });
 
 /**

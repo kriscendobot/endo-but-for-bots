@@ -18,6 +18,7 @@ import { initRepo, makePowersOver } from '../../repo.js';
  *   repoRoot: string,
  *   workspace: unknown,
  *   git: EndoGit,
+ *   shell: unknown,
  *   cleanup: () => Promise<void>,
  * }>}
  */
@@ -43,8 +44,8 @@ export const provisionStageAndCommitRepo = async ({
     await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
     await fs.promises.writeFile(targetPath, content);
 
-    const { workspace, git } = makePowersOver(repoRoot);
-    return harden({ repoRoot, workspace, git, cleanup });
+    const { workspace, git, shell } = makePowersOver(repoRoot);
+    return harden({ repoRoot, workspace, git, shell, cleanup });
   } catch (error) {
     await cleanup();
     throw error;

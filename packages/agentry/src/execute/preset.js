@@ -263,6 +263,7 @@ harden(makeCodeModeAgent);
  * @property {GetApiKey} [getApiKey]
  * @property {ThinkingLevel} [thinkingLevel]
  * @property {boolean} [readOnlyGit]
+ * @property {boolean} [historyRewriteGit]
  */
 
 /**
@@ -275,13 +276,22 @@ harden(makeCodeModeAgent);
  * @returns {Agent}
  */
 export const makeCodeModeGitLoopAgent = options => {
-  const { workspace, git, readOnlyGit = false } = options;
+  const {
+    workspace,
+    git,
+    readOnlyGit = false,
+    historyRewriteGit = false,
+  } = options;
   const { agent } = makeCodeModeAgent({
     model: options.model,
     powers: {
       workspace,
       git,
-      gitMode: readOnlyGit ? 'readOnly' : 'readWrite',
+      gitMode: readOnlyGit
+        ? 'readOnly'
+        : historyRewriteGit
+          ? 'historyRewrite'
+          : 'readWrite',
     },
     endowments: options.endowments,
     globals: options.globals,

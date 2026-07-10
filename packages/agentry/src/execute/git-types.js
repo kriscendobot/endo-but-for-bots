@@ -7,7 +7,7 @@
  * Regenerate with: yarn workspace agentry gen:code-mode-types
  *
  * Source of truth:
- *   - git / gitReadOnly: packages/exo-git/src/types.ts (the `EndoGit`
+ *   - git / gitHistory / gitReadOnly: packages/exo-git/src/types.ts (the `EndoGit`
  *     type alias), printed by the typescript compiler API
  *     (TypeScript-canonical).
  *
@@ -43,7 +43,6 @@ export const gitCodeModeTypeDeclarations = harden({
   detach: (ref: GitRef | string) => Promise<void>;
   switch: (ref: GitRef | string) => Promise<void>;
   merge: (ref: GitRef | string, options?: GitMergeOptions) => Promise<string>;
-  rebase: (input: GitRebaseInput) => Promise<string>;
   stashPush: (options?: GitStashPushOptions) => Promise<string>;
   stashList: () => Promise<string[]>;
   stashShow: (index?: number) => Promise<string>;
@@ -121,6 +120,7 @@ type ReadableTreeView = unknown;`,
     aux: `type EndoGitHistory = {
   commit: (message: string, options?: GitCommitOptions) => Promise<GitCommit>;
   reword: (ref: GitRef | string, message: string) => Promise<GitCommit>;
+  rebase: (input: GitRebaseInput) => Promise<string>;
 };
 type GitCommit = {
     oid: string;
@@ -130,6 +130,10 @@ type GitCommit = {
 };
 type GitCommitOptions = {
     amend?: boolean;
+};
+type GitRebaseInput = {
+    mode?: 'start' | 'continue' | 'abort' | 'skip';
+    upstream?: string;
 };
 type GitRef = {
     name: string;

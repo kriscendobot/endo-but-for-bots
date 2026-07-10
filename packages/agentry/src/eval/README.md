@@ -45,6 +45,18 @@ agent:
 - `tool-calls` — direct pi-agent tool calls over the same `workspace` and `git`
   capabilities, using the mounted filesystem and mount-bridged git tool
   catalog.
+- `shell` — direct tool calls with a fresh `EndoShell` capability in addition to
+  the Git and mount tools. The shell allows only `git`, uses a 30-second
+  timeout, a 256 KiB per-stream output cap, and an explicit environment
+  passlist. Its host spawner remains an ordinary host process boundary; the
+  allowlist and sanitized environment are policy bounds, not kernel sandboxing.
+
+History-rewriting operations are selected from the scenario's
+`requirements.allowHistoryRewrite` capability declaration. The code-mode
+condition advertises the elevated `gitHistory` global only when that
+requirement is true, and the tool-call and shell conditions add the elevated
+history tool slice under the same rule. Stage-and-commit is provisioned with
+the ordinary Git capability in every condition.
 
 ## Metrics
 

@@ -14,12 +14,20 @@ import { makeCodeModeGitLoopAgent } from '../../execute/preset.js';
 export const codeModeCondition = harden({
   name: 'code-mode',
   makeAgent: options => {
-    const { model, workspace, git, getApiKey, thinkingLevel, streamFn } =
-      options;
+    const {
+      model,
+      workspace,
+      git,
+      scenario,
+      getApiKey,
+      thinkingLevel,
+      streamFn,
+    } = options;
     return makeCodeModeGitLoopAgent({
       model,
       workspace,
       git,
+      historyRewriteGit: scenario.requirements?.allowHistoryRewrite === true,
       getApiKey,
       thinkingLevel,
       streamFn,
