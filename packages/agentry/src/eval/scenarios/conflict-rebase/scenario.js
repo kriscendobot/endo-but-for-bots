@@ -18,43 +18,27 @@ harden(conflictRebasePrompt);
  * resolve it deliberately, then continue replaying the remaining clean commit.
  *
  * @param {GitConflictRebaseTarget} [expectedTarget]
- * @returns {GitScenario<GitConflictRebaseTarget | undefined>}
+ * @returns {GitScenario<GitConflictRebaseTarget>}
  */
 export const makeConflictRebaseScenario = expectedTarget => {
-  const expected =
-    expectedTarget === undefined
-      ? undefined
-      : (() => {
-          const {
-            featureBranch,
-            integrationBranch,
-            integrationOid,
-            replayedSummaries,
-            originalFeatureOids,
-            expectedPatches,
-            featureTreeOid,
-            appText,
-            notes,
-          } = expectedTarget;
-          return harden({
-            featureBranch,
-            integrationBranch,
-            integrationOid,
-            replayedSummaries,
-            originalFeatureOids,
-            expectedPatches,
-            featureTreeOid,
-            appText,
-            notes,
-          });
-        })();
+  const expected = harden({
+    featureBranch: expectedTarget?.featureBranch ?? '',
+    integrationBranch: expectedTarget?.integrationBranch ?? '',
+    integrationOid: expectedTarget?.integrationOid ?? '',
+    replayedSummaries: expectedTarget?.replayedSummaries ?? [],
+    originalFeatureOids: expectedTarget?.originalFeatureOids ?? [],
+    expectedPatches: expectedTarget?.expectedPatches ?? [],
+    featureTreeOid: expectedTarget?.featureTreeOid ?? '',
+    appText: expectedTarget?.appText ?? '',
+    notes: expectedTarget?.notes ?? [],
+  });
   return harden({
     name: 'conflict-rebase',
     requirements: harden({ allowHistoryRewrite: true }),
     expected,
     prompt: conflictRebasePrompt,
     assertOutcome: args => {
-      if (expected === undefined) {
+      if (expectedTarget === undefined) {
         throw new Error('conflict-rebase scenario target is not provisioned');
       }
       return assertGitConflictRebaseOutcome({ ...args, expected });
