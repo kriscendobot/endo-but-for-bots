@@ -9,6 +9,7 @@
 
 import { E } from '@endo/eventual-send';
 import { q } from '@endo/errors';
+import { makePromiseKit } from '@endo/promise-kit';
 import { makeExo } from '@endo/exo';
 import { encodeBase64 } from '@endo/base64';
 import { mapReader } from '@endo/stream';
@@ -403,13 +404,22 @@ harden(resolvePhysicalPath);
  * @property {string} description
  * @property {(tree: object) => Promise<object>} [snapshotTree]
  * @property {(path: string) => Promise<object>} [snapshotFile]
+ * @property {Promise<void>} [cancelled] Settles when the mount formula
+ *   is cancelled; propagated to every `followNameChanges` watcher this
+ *   mount (and its sub-mounts, via the shared context) opens, so a
+ *   cancelled mount tears its OS watcher handles down. Absent when a
+ *   mount is created outside a formula (e.g. in unit tests).
+ * @property {{ debounceMs?: number }} [watchDirectoryOptions] Advisory
+ *   tuning threaded into `FilePowers.watchDirectory`; an implementation
+ *   may honor or ignore it.
  */
 
 /**
  * Create a mount exo for a filesystem directory.
  *
  * @param {MountContext} ctx
- * @returns {object}
+ * @returns {import('./types.js').EndoMount} An `EndoMount` exo over
+ *   `ctx.currentDir`, confined to `ctx.confinementRoot`.
  */
 const makeMountExo = ctx => {
   const {
@@ -422,6 +432,8 @@ const makeMountExo = ctx => {
     description,
     snapshotTree,
     snapshotFile,
+    cancelled: mountCancelled,
+    watchDirectoryOptions,
   } = ctx;
 
   const assertWritable = () => {
@@ -446,15 +458,15 @@ const makeMountExo = ctx => {
     resolveSegments(confinementRoot, confinementRoot, segments, filePowers);
 
   /**
-   * @param {string | string[] | object} pathArg
+   * @param {string | string[] | object} path
    * @returns {string[]}
    */
-  const segmentsFromPathArg = pathArg => {
-    if (Array.isArray(pathArg)) {
-      return normalizeSegments(currentSegments, pathArg);
+  const segmentsFromPath = path => {
+    if (Array.isArray(path)) {
+      return normalizeSegments(currentSegments, path);
     }
-    if (typeof pathArg === 'object' && pathArg !== null) {
-      const record = mountEntryRecords.get(pathArg);
+    if (typeof path === 'object' && path !== null) {
+      const record = mountEntryRecords.get(path);
       if (record === undefined) {
         throw new Error('Path argument is not a daemon-minted mount entry');
       }
@@ -463,10 +475,10 @@ const makeMountExo = ctx => {
       }
       return record.segments;
     }
-    if (typeof pathArg !== 'string') {
+    if (typeof path !== 'string') {
       throw new Error(`Path must be a string, array, or mount entry`);
     }
-    return normalizeSegments(currentSegments, [pathArg]);
+    return normalizeSegments(currentSegments, [path]);
   };
 
   /**
@@ -474,17 +486,17 @@ const makeMountExo = ctx => {
    * selector rather than a single name.  Other path-bearing convenience
    * methods keep their existing single-name string compatibility.
    *
-   * @param {string | string[]} pathArg
+   * @param {string | string[]} path
    * @returns {string[]}
    */
-  const segmentsFromEntryPathArg = pathArg => {
-    if (Array.isArray(pathArg)) {
-      return normalizeSegments(currentSegments, pathArg);
+  const segmentsFromEntryPath = path => {
+    if (Array.isArray(path)) {
+      return normalizeSegments(currentSegments, path);
     }
-    if (typeof pathArg !== 'string') {
+    if (typeof path !== 'string') {
       throw new Error('entry() path must be a string or array');
     }
-    return normalizeSegments(currentSegments, pathArg.split('/'));
+    return normalizeSegments(currentSegments, path.split('/'));
   };
 
   /**
@@ -492,10 +504,10 @@ const makeMountExo = ctx => {
    * `has(...segments)`.  The dispatch layers two contracts:
    *
    * 1. A single non-null object argument is treated as an entry value;
-   *    `segmentsFromPathArg` validates the entry's mount-root
+   *    `segmentsFromPath` validates the entry's mount-root
    *    provenance (or rejects a non-entry object) and returns its
    *    segments.  The `args[0] !== null` guard here keeps `null` from
-   *    falling into this branch — `segmentsFromPathArg` would reject
+   *    falling into this branch — `segmentsFromPath` would reject
    *    `null` on its own (`typeof null === 'object'`), but the explicit
    *    guard makes the dispatch read as "string-or-entry-not-null"
    *    rather than relying on the downstream throw for shape.
@@ -510,9 +522,9 @@ const makeMountExo = ctx => {
    * @param {Array<string | object>} args
    * @returns {string[]}
    */
-  const segmentsFromHasArgs = args => {
+  const segmentsFromHasInput = args => {
     if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null) {
-      return segmentsFromPathArg(args[0]);
+      return segmentsFromPath(args[0]);
     }
     for (const arg of args) {
       if (typeof arg !== 'string') {
@@ -523,10 +535,9 @@ const makeMountExo = ctx => {
   };
 
   /**
-   * @param {string | string[] | object} pathArg
+   * @param {string | string[] | object} path
    */
-  const resolvePathArg = pathArg =>
-    resolveFromRoot(segmentsFromPathArg(pathArg));
+  const resolvePath = path => resolveFromRoot(segmentsFromPath(path));
 
   /**
    * @param {string} target
@@ -579,9 +590,19 @@ const makeMountExo = ctx => {
   const exo = makeExo('EndoMount', MountInterface, {
     help,
 
+    // `has` / `list` take a variadic **path** — each argument is a name
+    // segment, spread the same way `EndoDirectory.has(...petNamePath)` /
+    // `list(...petNamePath)` spreads a pet-name path.  The interface
+    // guards declare the same shape (`has: M.call().rest(M.any())`,
+    // `list: M.call().rest(PathSegmentsShape)`), so the spread here is
+    // the contract, not a divergence from `EndoDirectory`.  `has` is the
+    // one method that additionally accepts a single mount-entry value
+    // in place of segments (the `MountEntry` overload the platform
+    // contract widens `rest()` to `M.any()` for); `segmentsFromHasInput`
+    // disambiguates the two shapes.
     async has(...args) {
       await null;
-      const pathSegments = segmentsFromHasArgs(args);
+      const pathSegments = segmentsFromHasInput(args);
       if (pathSegments.length === 0) {
         return true;
       }
@@ -609,19 +630,19 @@ const makeMountExo = ctx => {
       return harden(confined);
     },
 
-    async lookup(pathArg) {
+    async lookup(path) {
       await null;
-      const segments = segmentsFromPathArg(pathArg);
+      const segments = segmentsFromPath(path);
       return openExisting(resolveFromRoot(segments), segments);
     },
 
-    // The `ReadableNameHub` lookup-or-undefined primitive: resolve `pathArg`
+    // The `ReadableNameHub` lookup-or-undefined primitive: resolve `path`
     // and return its handle, or `undefined` when the path is absent (or
     // escapes confinement). Mirrors `maybeReadText`'s broad catch — any
     // resolution failure yields `undefined` rather than throwing.
-    async maybeLookup(pathArg) {
+    async maybeLookup(path) {
       await null;
-      const segments = segmentsFromPathArg(pathArg);
+      const segments = segmentsFromPath(path);
       try {
         return await openExisting(resolveFromRoot(segments), segments);
       } catch {
@@ -629,9 +650,9 @@ const makeMountExo = ctx => {
       }
     },
 
-    async subView(pathArg) {
+    async subView(path) {
       await null;
-      const segments = segmentsFromPathArg(pathArg);
+      const segments = segmentsFromPath(path);
       const target = resolveFromRoot(segments);
       await assertConfined(target, confinementRoot, filePowers);
       if (!(await filePowers.isDirectory(target))) {
@@ -651,7 +672,7 @@ const makeMountExo = ctx => {
       //
       // Mint a FRESH `rootId` so the sub-view is its own identity domain:
       // a `mountEntry` minted by the parent (whose `segments` are
-      // parent-root-relative) is rejected by `segmentsFromPathArg`'s
+      // parent-root-relative) is rejected by `segmentsFromPath`'s
       // `record.rootId !== rootId` check rather than being silently
       // re-based against the sub-view root. Entries minted *by* the
       // sub-view capture this new id (via the new exo's closure) and keep
@@ -666,14 +687,14 @@ const makeMountExo = ctx => {
       });
     },
 
-    entry(pathArg) {
-      return makeEntry(segmentsFromEntryPathArg(pathArg));
+    entry(path) {
+      return makeEntry(segmentsFromEntryPath(path));
     },
 
-    async makeDirectory(pathArg) {
+    async makeDirectory(path) {
       await null;
       assertWritable();
-      const segments = segmentsFromPathArg(pathArg);
+      const segments = segmentsFromPath(path);
       const target = resolveFromRoot(segments);
       await assertConfinedOrAncestor(target, confinementRoot, filePowers);
       await filePowers.makePath(target);
@@ -684,10 +705,10 @@ const makeMountExo = ctx => {
       return openExisting(target, segments);
     },
 
-    async makeFile(pathArg, content) {
+    async makeFile(path, content) {
       await null;
       assertWritable();
-      const target = resolvePathArg(pathArg);
+      const target = resolvePath(path);
       await assertConfinedOrAncestor(target, confinementRoot, filePowers);
       const parent = filePowers.joinPath(target, '..');
       await filePowers.makePath(parent);
@@ -714,9 +735,9 @@ const makeMountExo = ctx => {
       );
     },
 
-    async stat(pathArg) {
+    async stat(path) {
       await null;
-      const target = resolvePathArg(pathArg);
+      const target = resolvePath(path);
       try {
         await assertConfined(target, confinementRoot, filePowers);
         return filePowers.statPath(target);
@@ -725,16 +746,16 @@ const makeMountExo = ctx => {
       }
     },
 
-    async readText(pathArg) {
+    async readText(path) {
       await null;
-      const target = resolvePathArg(pathArg);
+      const target = resolvePath(path);
       await assertConfined(target, confinementRoot, filePowers);
       return filePowers.readFileText(target);
     },
 
-    async maybeReadText(pathArg) {
+    async maybeReadText(path) {
       await null;
-      const target = resolvePathArg(pathArg);
+      const target = resolvePath(path);
       try {
         await assertConfined(target, confinementRoot, filePowers);
         return await filePowers.readFileText(target);
@@ -743,29 +764,29 @@ const makeMountExo = ctx => {
       }
     },
 
-    async writeText(pathArg, content) {
+    async writeText(path, content) {
       await null;
       assertWritable();
-      const target = resolvePathArg(pathArg);
+      const target = resolvePath(path);
       await assertConfinedOrAncestor(target, confinementRoot, filePowers);
       const parent = filePowers.joinPath(target, '..');
       await filePowers.makePath(parent);
       await filePowers.writeFileText(target, content);
     },
 
-    async remove(pathArg) {
+    async remove(path) {
       await null;
       assertWritable();
-      const target = resolvePathArg(pathArg);
+      const target = resolvePath(path);
       await assertConfined(target, confinementRoot, filePowers);
       await filePowers.removePath(target);
     },
 
-    async move(fromArg, toArg) {
+    async move(fromPath, toPath) {
       await null;
       assertWritable();
-      const from = resolvePathArg(fromArg);
-      const to = resolvePathArg(toArg);
+      const from = resolvePath(fromPath);
+      const to = resolvePath(toPath);
       await assertConfined(from, confinementRoot, filePowers);
       await assertConfinedOrAncestor(to, confinementRoot, filePowers);
       await filePowers.renamePath(from, to);
@@ -790,14 +811,42 @@ const makeMountExo = ctx => {
        * watcher handle when the consumer drops the iterator
        * (the standard `for await … of` cleanup path, and what
        * `makeIteratorRef` triggers when a remote subscription
-       * closes).
+       * closes).  The watcher is *also* closed if the mount
+       * formula itself is cancelled, via the mount-level
+       * `cancelled` folded into the stream's cancellation below.
        */
       const target = resolve(pathSegments);
       /** @returns {AsyncGenerator<MountNameChange, undefined, undefined>} */
       const generate = async function* generate() {
         await assertConfined(target, confinementRoot, filePowers);
 
-        const watcher = filePowers.watchDirectory(target);
+        // Cancellation follows the accept-a-`cancelled`-promise idiom:
+        // settling `cancelStream` (in the `finally`) closes the OS
+        // watcher.  The `for await` below also cancels the stream
+        // through the iterator's `return()` on the normal drop path;
+        // both surfaces resolve to the same idempotent close, and the
+        // `finally` covers an early throw before iteration begins.
+        const { promise: streamCancelled, resolve: cancelStream } =
+          /** @type {import('@endo/promise-kit').PromiseKit<void>} */ (
+            makePromiseKit()
+          );
+        // A mount formula can be cancelled while a subscription is
+        // live.  Fold the mount-level `cancelled` into this stream's
+        // own cancellation so the OS watcher closes on either signal:
+        // the consumer dropping the iterator, or the whole mount being
+        // torn down.  `watchDirectory` settles both paths to the same
+        // idempotent close, and it resolves a rejected `cancelled`
+        // (the context's cancel rejects) the same way it resolves a
+        // fulfilled one.
+        const cancelled =
+          mountCancelled === undefined
+            ? streamCancelled
+            : Promise.race([streamCancelled, mountCancelled]);
+        const events = filePowers.watchDirectory(
+          target,
+          cancelled,
+          watchDirectoryOptions,
+        );
         try {
           /** @type {Map<string, 'file' | 'directory'>} */
           const known = new Map();
@@ -814,7 +863,7 @@ const makeMountExo = ctx => {
             }
           }
 
-          for await (const event of watcher.events) {
+          for await (const event of events) {
             const childPath = filePowers.joinPath(target, event.name);
             // eslint-disable-next-line no-await-in-loop
             const present = await filePowers.exists(childPath);
@@ -838,7 +887,7 @@ const makeMountExo = ctx => {
             // the debounce window collapsed); name-set is unchanged.
           }
         } finally {
-          watcher.cancel();
+          cancelStream();
         }
       };
       return readerFromIterator(generate());
@@ -867,10 +916,10 @@ const makeMountExo = ctx => {
       return snapshotTree(this.self); // eslint-disable-line no-invalid-this
     },
 
-    async write(pathArg, value) {
+    async write(path, value) {
       await null;
       assertWritable();
-      const segments = segmentsFromPathArg(pathArg);
+      const segments = segmentsFromPath(path);
       const target = resolveFromRoot(segments);
       await assertConfinedOrAncestor(target, confinementRoot, filePowers);
       const parent = filePowers.joinPath(target, '..');
@@ -928,10 +977,10 @@ const makeMountExo = ctx => {
       );
     },
 
-    async copy(fromArg, toArg) {
+    async copy(fromPath, toPath) {
       await null;
       assertWritable();
-      const fromSegments = segmentsFromPathArg(fromArg);
+      const fromSegments = segmentsFromPath(fromPath);
       const from = resolveFromRoot(fromSegments);
       await assertConfined(from, confinementRoot, filePowers);
       // Reject copying a tree into its own descendant.  `write()`
@@ -942,7 +991,7 @@ const makeMountExo = ctx => {
       // loop until the filesystem is exhausted.  The first check is a
       // segment-prefix test on the resolved paths: `to` is a descendant
       // of `from` when `from`'s segments are a strict prefix of `to`'s.
-      const toSegments = segmentsFromPathArg(toArg);
+      const toSegments = segmentsFromPath(toPath);
       const to = resolveFromRoot(toSegments);
       const rejectDescendant = () => {
         throw new Error(
@@ -970,7 +1019,7 @@ const makeMountExo = ctx => {
         rejectDescendant();
       }
       const source = await openExisting(from, fromSegments);
-      await this.self.write(toArg, source); // eslint-disable-line no-invalid-this
+      await this.self.write(toPath, source); // eslint-disable-line no-invalid-this
     },
   });
 
@@ -978,7 +1027,12 @@ const makeMountExo = ctx => {
     exo,
     harden({ rootId, currentDir, confinementRoot, readOnly }),
   );
-  return exo;
+  // `makeExo` types the result as a `Guarded<…>` whose method returns are
+  // `PromiseLike<any>`; cast to the daemon-facing `EndoMount` shape the
+  // interface guard already enforces at runtime.
+  return /** @type {import('./types.js').EndoMount} */ (
+    /** @type {unknown} */ (exo)
+  );
 };
 harden(makeMountExo);
 
@@ -999,8 +1053,8 @@ const makeReadableTreeView = readOnlyMount => {
     async list(...pathSegments) {
       return E(readOnlyMount).list(...pathSegments);
     },
-    async lookup(pathArg) {
-      const result = await E(readOnlyMount).lookup(pathArg);
+    async lookup(path) {
+      const result = await E(readOnlyMount).lookup(path);
       // The underlying mount returns either a sub-mount (an
       // EndoMount) or a mount file.  Either way it is already
       // read-only because the parent mount is; we wrap it in the
@@ -1297,6 +1351,12 @@ harden(makeReadableBlobView);
  * @param {FilePowers} opts.filePowers
  * @param {(tree: object) => Promise<object>} [opts.snapshotTree]
  * @param {(path: string) => Promise<object>} [opts.snapshotFile]
+ * @param {Promise<void>} [opts.cancelled] The mount formula's
+ *   cancellation signal (`context.cancelled`); propagated to every
+ *   `followNameChanges` watcher so a cancelled mount closes its OS
+ *   watcher handles.
+ * @param {{ debounceMs?: number }} [opts.watchDirectoryOptions] Advisory
+ *   `watchDirectory` tuning threaded through to `followNameChanges`.
  * @returns {object}
  */
 export const makeMount = ({
@@ -1305,6 +1365,8 @@ export const makeMount = ({
   filePowers,
   snapshotTree = undefined,
   snapshotFile = undefined,
+  cancelled = undefined,
+  watchDirectoryOptions = undefined,
 }) => {
   const prefix = readOnly ? 'Read-only mount' : 'Mount';
   /** @type {MountContext} */
@@ -1318,6 +1380,8 @@ export const makeMount = ({
     description: `${prefix} at ${rootPath}`,
     snapshotTree,
     snapshotFile,
+    cancelled,
+    watchDirectoryOptions,
   };
 
   return makeMountExo(ctx);

@@ -2965,7 +2965,7 @@ const makeDaemonCore = async (
       makeEval(worker, source, names, values, context),
     'readable-blob': ({ content }) => makeReadableBlob(content),
     'readable-tree': ({ content }) => makeReadableTree(content),
-    mount: async ({ path: mountPath, readOnly }) => {
+    mount: async ({ path: mountPath, readOnly }, context) => {
       // Verify the mount path exists.
       const pathExists = await filePowers.exists(mountPath);
       if (!pathExists) {
@@ -2981,9 +2981,12 @@ const makeDaemonCore = async (
         filePowers,
         snapshotTree: snapshotMountTree,
         snapshotFile: snapshotMountFile,
+        // Cancelling the mount formula closes any live
+        // `followNameChanges` watchers it produced.
+        cancelled: context.cancelled,
       });
     },
-    'scratch-mount': async ({ readOnly }, _context, _id, formulaNumber) => {
+    'scratch-mount': async ({ readOnly }, context, _id, formulaNumber) => {
       const rootPath = filePowers.joinPath(
         persistencePowers.statePath,
         'mounts',
@@ -2996,6 +2999,9 @@ const makeDaemonCore = async (
         filePowers,
         snapshotTree: snapshotMountTree,
         snapshotFile: snapshotMountFile,
+        // Cancelling the mount formula closes any live
+        // `followNameChanges` watchers it produced.
+        cancelled: context.cancelled,
       });
     },
     git: async ({ mountId }, context) => {
