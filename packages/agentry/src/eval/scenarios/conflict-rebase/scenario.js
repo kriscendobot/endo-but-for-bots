@@ -20,12 +20,34 @@ harden(conflictRebasePrompt);
  * @param {GitConflictRebaseTarget} expected
  * @returns {GitScenario<GitConflictRebaseTarget>}
  */
-export const makeConflictRebaseScenario = expected =>
-  harden({
+export const makeConflictRebaseScenario = ({
+  featureBranch,
+  integrationBranch,
+  integrationOid,
+  replayedSummaries,
+  originalFeatureOids,
+  expectedPatches,
+  featureTreeOid,
+  appText,
+  notes,
+}) => {
+  const expected = harden({
+    featureBranch,
+    integrationBranch,
+    integrationOid,
+    replayedSummaries,
+    originalFeatureOids,
+    expectedPatches,
+    featureTreeOid,
+    appText,
+    notes,
+  });
+  return harden({
     name: 'conflict-rebase',
-    expected: harden(expected),
+    expected,
     prompt: conflictRebasePrompt,
     assertOutcome: ({ git, readText }) =>
       assertGitConflictRebaseOutcome({ git, readText, expected }),
   });
+};
 harden(makeConflictRebaseScenario);

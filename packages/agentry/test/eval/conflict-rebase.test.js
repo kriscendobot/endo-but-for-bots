@@ -65,18 +65,27 @@ const executeOnceModel = (t, source) =>
  * @param {Awaited<ReturnType<typeof provisionConflictRebaseRepo>>} repo
  * @returns {ReturnType<typeof makeConflictRebaseScenario>}
  */
-const makeScenarioFor = repo =>
-  makeConflictRebaseScenario({
-    featureBranch: repo.featureBranch,
-    integrationBranch: repo.integrationBranch,
-    integrationOid: repo.integrationOid,
-    replayedSummaries: repo.replayedSummaries,
-    originalFeatureOids: repo.originalFeatureOids,
-    expectedPatches: repo.expectedPatches,
-    featureTreeOid: repo.featureTreeOid,
-    appText: repo.appText,
-    notes: repo.notes,
-  });
+const makeScenarioFor = repo => makeConflictRebaseScenario(repo);
+
+test('scenario retains only the declared conflict-rebase target', async t => {
+  const repo = await provisionConflictRebaseRepo(t);
+  const scenario = makeScenarioFor(repo);
+
+  t.deepEqual(Object.keys(scenario.expected).sort(), [
+    'appText',
+    'expectedPatches',
+    'featureBranch',
+    'featureTreeOid',
+    'integrationBranch',
+    'integrationOid',
+    'notes',
+    'originalFeatureOids',
+    'replayedSummaries',
+  ]);
+  t.false('git' in scenario.expected);
+  t.false('workspace' in scenario.expected);
+  t.false('repoRoot' in scenario.expected);
+});
 
 /**
  * @param {string} repoRoot
