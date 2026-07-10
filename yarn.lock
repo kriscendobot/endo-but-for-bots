@@ -1236,6 +1236,7 @@ __metadata:
     "@endo/daemon": "workspace:^"
     "@endo/eventual-send": "workspace:^"
     "@endo/exo-git": "workspace:^"
+    "@endo/exo-shell": "workspace:^"
     "@endo/far": "workspace:^"
     "@endo/git": "workspace:^"
     "@endo/init": "workspace:^"
@@ -1655,6 +1656,22 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@endo/daemon-cas@workspace:^, @endo/daemon-cas@workspace:packages/daemon-cas":
+  version: 0.0.0-use.local
+  resolution: "@endo/daemon-cas@workspace:packages/daemon-cas"
+  dependencies:
+    "@endo/harden": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/platform": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
+    "@endo/stream": "workspace:^"
+    ava: "catalog:dev"
+    c8: "catalog:dev"
+    eslint: "catalog:dev"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
 "@endo/daemon@workspace:^, @endo/daemon@workspace:packages/daemon":
   version: 0.0.0-use.local
   resolution: "@endo/daemon@workspace:packages/daemon"
@@ -1665,15 +1682,18 @@ __metadata:
     "@endo/cancel": "workspace:^"
     "@endo/captp": "workspace:^"
     "@endo/compartment-mapper": "workspace:^"
+    "@endo/daemon-cas": "workspace:^"
     "@endo/errors": "workspace:^"
     "@endo/eventual-send": "workspace:^"
     "@endo/exo": "workspace:^"
     "@endo/exo-git": "workspace:^"
+    "@endo/exo-shell": "workspace:^"
     "@endo/exo-stream": "workspace:^"
     "@endo/far": "workspace:^"
     "@endo/git": "workspace:^"
     "@endo/harden": "workspace:^"
     "@endo/hex": "workspace:^"
+    "@endo/host-spawner": "workspace:^"
     "@endo/import-bundle": "workspace:^"
     "@endo/init": "workspace:^"
     "@endo/marshal": "workspace:^"
@@ -1849,9 +1869,34 @@ __metadata:
     "@endo/init": "workspace:^"
     "@endo/patterns": "workspace:^"
     "@endo/platform": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
     "@endo/stream": "workspace:^"
     ava: "catalog:dev"
     eslint: "catalog:dev"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
+"@endo/exo-http-client@workspace:packages/exo-http-client":
+  version: 0.0.0-use.local
+  resolution: "@endo/exo-http-client@workspace:packages/exo-http-client"
+  dependencies:
+    "@endo/errors": "workspace:^"
+    "@endo/eventual-send": "workspace:^"
+    "@endo/exo": "workspace:^"
+    "@endo/far": "workspace:^"
+    "@endo/harden": "workspace:^"
+    "@endo/http-confine": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/pass-style": "workspace:^"
+    "@endo/patterns": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
+    ava: "catalog:dev"
+    c8: "catalog:dev"
+    eslint: "catalog:dev"
+    prettier: "npm:^3.5.3"
+    ses: "workspace:^"
+    typescript: "catalog:dev"
   languageName: unknown
   linkType: soft
 
@@ -1873,6 +1918,22 @@ __metadata:
     eslint: "catalog:dev"
     prettier: "npm:^3.5.3"
     ses: "workspace:^"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
+"@endo/exo-shell@workspace:^, @endo/exo-shell@workspace:packages/exo-shell":
+  version: 0.0.0-use.local
+  resolution: "@endo/exo-shell@workspace:packages/exo-shell"
+  dependencies:
+    "@endo/errors": "workspace:^"
+    "@endo/exo": "workspace:^"
+    "@endo/harden": "workspace:^"
+    "@endo/host-spawner": "workspace:^"
+    "@endo/init": "workspace:^"
+    "@endo/patterns": "workspace:^"
+    ava: "catalog:dev"
+    eslint: "catalog:dev"
     typescript: "catalog:dev"
   languageName: unknown
   linkType: soft
@@ -2045,6 +2106,7 @@ __metadata:
     "@endo/exo-stream": "workspace:^"
     "@endo/far": "workspace:^"
     "@endo/harden": "workspace:^"
+    "@endo/host-spawner": "workspace:^"
     "@endo/init": "workspace:^"
     "@endo/marshal": "workspace:^"
     "@endo/pass-style": "workspace:^"
@@ -2072,9 +2134,11 @@ __metadata:
     "@endo/harden": "workspace:^"
     "@endo/init": "workspace:^"
     "@endo/platform": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
     "@endo/stream": "workspace:^"
     ava: "catalog:dev"
     eslint: "catalog:dev"
+    typescript: "catalog:dev"
   languageName: unknown
   linkType: soft
 
@@ -2172,6 +2236,34 @@ __metadata:
     "@endo/stream-node": "workspace:^"
     ava: "catalog:dev"
     eslint: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
+"@endo/host-spawner@workspace:^, @endo/host-spawner@workspace:packages/host-spawner":
+  version: 0.0.0-use.local
+  resolution: "@endo/host-spawner@workspace:packages/host-spawner"
+  dependencies:
+    "@endo/harden": "workspace:^"
+    "@endo/init": "workspace:^"
+    ava: "catalog:dev"
+    eslint: "catalog:dev"
+    typescript: "catalog:dev"
+  languageName: unknown
+  linkType: soft
+
+"@endo/http-confine@workspace:^, @endo/http-confine@workspace:packages/http-confine":
+  version: 0.0.0-use.local
+  resolution: "@endo/http-confine@workspace:packages/http-confine"
+  dependencies:
+    "@endo/errors": "workspace:^"
+    "@endo/eventual-send": "workspace:^"
+    "@endo/ses-ava": "workspace:^"
+    ava: "catalog:dev"
+    c8: "catalog:dev"
+    eslint: "catalog:dev"
+    prettier: "npm:^3.5.3"
+    ses: "workspace:^"
+    typescript: "catalog:dev"
   languageName: unknown
   linkType: soft
 

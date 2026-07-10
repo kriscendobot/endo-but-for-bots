@@ -298,6 +298,12 @@ export const HostInterface = M.interface('EndoHost', {
   provideGit: M.callWhen(M.remotable(), NameOrPathShape).returns(
     M.remotable('Git'),
   ),
+  // Derive an allowlisted command-execution Shell from a writable mount.
+  provideShell: M.callWhen(
+    M.remotable(),
+    NameOrPathShape,
+    M.recordOf(M.string(), M.any()),
+  ).returns(M.remotable('Shell')),
   // Mint a GitRemote capability that wraps a writable Git cap with a
   // policy-bound endpoint and (optional) credential.
   provideGitRemote: M.callWhen(
@@ -305,6 +311,11 @@ export const HostInterface = M.interface('EndoHost', {
     NameOrPathShape,
     M.recordOf(M.string(), M.any()),
   ).returns(M.remotable('GitRemote')),
+  // Host-only constructive clone. The endpoint is a repo-less remote
+  // authority; destMount is an empty daemon-minted destination mount.
+  provideGitClone: M.callWhen(M.recordOf(M.string(), M.any())).returns(
+    M.recordOf(M.string(), M.remotable()),
+  ),
   // Mint daemon-private Git credential capabilities.
   provideBearerCredential: M.callWhen(
     NameOrPathShape,
@@ -385,8 +396,8 @@ export const HostInterface = M.interface('EndoHost', {
   listKnownPeers: M.call().returns(M.promise()),
   // Follow changes to the known peers store
   followPeerChanges: M.call().returns(M.promise()),
-  // Locate a formula with connection hints for sharing with remote peers
-  locateForSharing: M.call().rest(NamePathShape).returns(M.promise()),
+  // Locate a formula with connection hints.
+  locateWithHints: M.call().rest(NamePathShape).returns(M.promise()),
   // Adopt a value from a locator with connection hints
   adoptFromLocator: M.call(LocatorShape, NameOrPathShape).returns(M.promise()),
   // Create an invitation

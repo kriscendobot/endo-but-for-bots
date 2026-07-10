@@ -27,7 +27,7 @@ import { GitTreeInterface } from '@endo/exo-git';
 
 // `TextDecoder` is portable across XS, browsers, and SES realms;
 // prefer it over `Buffer.from(...).toString('utf8')` per the project
-// portability preference (root CLAUDE.md § Modernisms).
+// portability preference (root AGENTS.md § Modernisms).
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
 /**
@@ -45,11 +45,15 @@ const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
  *   GitRebaseInput,
  *   GitRef,
  *   GitRestoreOptions,
- * } from '@endo/exo-git/src/types.js'
- */
-
-/**
- * @typedef {{ kind: 'bearer', material: { token: string } } | { kind: 'basic', material: { username: string, password: string } }} NativeGitCredential
+ * } from '@endo/exo-git'
+ * @import {
+ *   GitRefUpdateResult,
+ *   GitTreeEntry,
+ *   NativeGitCredential,
+ *   RawStatusEntry,
+ *   RemoteRefspec,
+ *   RepositoryIdentity,
+ * } from './native-git-backend-types.js'
  */
 
 const execFileAsync = promisify(execFile);
@@ -231,6 +235,254 @@ const withGitEnvOverrides = (envVars, overrides = /** @type {T} */ ({})) => ({
   ...overrides,
 });
 harden(withGitEnvOverrides);
+
+/**
+ * Add command-line protocol policy for explicit URL remote operations.
+ * The URL itself still comes from GitRemote policy; these flags ensure
+ * the protocol selected for that URL is the only protocol git may use
+ * after its normal URL handling.
+ *
+ * @param {string} urlText
+ * @returns {string[]}
+ */
+const remoteProtocolArgs = urlText => {
+  let protocol;
+  try {
+    protocol = new URL(urlText).protocol;
+  } catch {
+    throw new Error(`remote URL is not a valid URL: ${q(urlText)}`);
+  }
+  if (protocol === 'https:') {
+    return harden([
+      '-c',
+      'protocol.allow=never',
+      '-c',
+      'protocol.https.allow=always',
+    ]);
+  }
+  if (protocol === 'http:') {
+    return harden([
+      '-c',
+      'protocol.allow=never',
+      '-c',
+      'protocol.http.allow=always',
+    ]);
+  }
+  if (protocol === 'file:') {
+    return harden([
+      '-c',
+      'protocol.allow=never',
+      '-c',
+      'protocol.file.allow=always',
+    ]);
+  }
+  throw new Error(`remote URL protocol is not supported: ${q(protocol)}`);
+};
+harden(remoteProtocolArgs);
+
+/**
+ * Run git with GIT_ASKPASS connected to an inherited anonymous pipe.
+ *
+ * @param {object} input
+ * @param {string} input.cwd
+ * @param {string} input.envRoot
+ * @param {string[]} input.args
+ * @param {Buffer} input.credentialBytes
+ * @param {AbortSignal} [input.signal]
+ * @returns {Promise<{ stdout: string, stderr: string }>}
+ */
+const runGitWithAskpassAt = ({
+  cwd,
+  envRoot,
+  args,
+  credentialBytes,
+  signal,
+}) => {
+  if (signal?.aborted) {
+    return Promise.reject(
+      signal.reason instanceof Error
+        ? signal.reason
+        : new Error('git operation aborted'),
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    /** @type {Buffer[]} */
+    const stdoutChunks = [];
+    /** @type {Buffer[]} */
+    const stderrChunks = [];
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    let settled = false;
+    let timedOut = false;
+    let outputTooLarge = false;
+    let aborted = false;
+
+    const child = spawn('git', [...GIT_BASE_ARGS, ...args], {
+      cwd,
+      env: withGitEnvOverrides(makeGitEnv(envRoot), {
+        GIT_ASKPASS: gitAskpassHelperPath,
+        ENDO_GIT_ASKPASS_FD: String(GIT_ASKPASS_FD),
+      }),
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+    });
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+    }, GIT_TIMEOUT_MS);
+    timeout.unref();
+
+    const credentialPipe =
+      /** @type {import('node:stream').Writable | null | undefined} */ (
+        child.stdio[GIT_ASKPASS_FD]
+      );
+    if (credentialPipe === undefined || credentialPipe === null) {
+      clearTimeout(timeout);
+      child.kill('SIGTERM');
+      reject(new Error('git credential pipe was not available'));
+      return;
+    }
+    credentialPipe.on('error', () => {});
+    credentialPipe.end(credentialBytes);
+
+    const abort = () => {
+      aborted = true;
+      child.kill('SIGTERM');
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+
+    /**
+     * @param {Buffer[]} chunks
+     * @param {Buffer | string} chunk
+     * @param {'stdout' | 'stderr'} streamName
+     */
+    const appendChunk = (chunks, chunk, streamName) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+      if (streamName === 'stdout') {
+        stdoutSize += bytes.byteLength;
+      } else {
+        stderrSize += bytes.byteLength;
+      }
+      if (stdoutSize + stderrSize > GIT_MAX_BUFFER) {
+        outputTooLarge = true;
+        child.kill('SIGTERM');
+        return;
+      }
+      chunks.push(bytes);
+    };
+
+    child.stdout?.on('data', chunk =>
+      appendChunk(stdoutChunks, chunk, 'stdout'),
+    );
+    child.stderr?.on('data', chunk =>
+      appendChunk(stderrChunks, chunk, 'stderr'),
+    );
+    child.once('error', error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+      credentialPipe.destroy();
+      reject(error);
+    });
+    child.once('close', (code, closeSignal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+      credentialPipe.destroy();
+
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
+      if (code === 0 && !timedOut && !aborted && !outputTooLarge) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      const detail =
+        (outputTooLarge && 'git output exceeded max buffer') ||
+        (aborted && 'git operation aborted') ||
+        (timedOut && 'git operation timed out') ||
+        stderr ||
+        stdout ||
+        'unknown git error';
+      reject(
+        new Error(
+          `git ${gitCommandName(args)} failed (exit ${code ?? closeSignal ?? 'unknown'}):\n${truncateOutput(detail.trim())}`,
+        ),
+      );
+    });
+  });
+};
+harden(runGitWithAskpassAt);
+
+/**
+ * Host-only constructive clone helper. Unlike backend methods, clone
+ * runs before there is a repository identity to verify.
+ *
+ * @param {object} input
+ * @param {string} input.url
+ * @param {string} input.destPath
+ * @param {boolean} [input.allowLocalFileTransport]
+ * @param {unknown} [input.credential]
+ * @param {AbortSignal} [input.signal]
+ */
+export const gitClone = async ({
+  url,
+  destPath,
+  allowLocalFileTransport = false,
+  credential,
+  signal,
+}) => {
+  const remoteUrl = requireRevision(url, 'gitClone.url');
+  const destination = requireNonEmptyString(destPath, 'gitClone.destPath');
+  const parsed = new URL(remoteUrl);
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error('gitClone url must not include embedded credentials');
+  }
+  if (parsed.protocol === 'http:') {
+    throw new Error('gitClone HTTP remotes are not supported');
+  }
+  if (credential !== undefined && parsed.protocol !== 'https:') {
+    throw new Error('gitClone credentials require https remotes');
+  }
+  if (parsed.protocol === 'file:' && !allowLocalFileTransport) {
+    throw new Error('gitClone file transport requires allowLocalFileTransport');
+  }
+  await fs.promises.mkdir(destination, { recursive: true });
+  const entries = await fs.promises.readdir(destination);
+  if (entries.length > 0) {
+    throw new Error('gitClone destination mount must be empty');
+  }
+  const args = [
+    ...remoteProtocolArgs(remoteUrl),
+    'clone',
+    '--origin',
+    'origin',
+    '--end-of-options',
+    remoteUrl,
+    destination,
+  ];
+  const credentialBytes = credentialBytesFor(credential);
+  if (credentialBytes === undefined) {
+    await execFileAsync('git', [...GIT_BASE_ARGS, ...args], {
+      cwd: path.dirname(destination),
+      env: makeGitEnv(destination),
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: GIT_MAX_BUFFER,
+      signal,
+    });
+    return;
+  }
+  await runGitWithAskpassAt({
+    cwd: path.dirname(destination),
+    envRoot: destination,
+    args,
+    credentialBytes,
+    signal,
+  });
+};
+harden(gitClone);
 
 /**
  * Limits the bytes one tool call's output can balloon to, so a runaway
@@ -431,26 +683,6 @@ const normalizeTreePath = args => {
 };
 harden(normalizeTreePath);
 
-/**
- * @typedef {object} GitTreeEntry
- * @property {string} mode
- * @property {'blob' | 'tree' | 'commit'} type
- * @property {string} oid
- * @property {number | undefined} size
- * @property {string} name
- */
-
-/**
- * @typedef {'created' | 'updated' | 'up-to-date' | 'fast-forward' | 'forced' | 'pruned' | 'rejected'} GitRefUpdateResult
- */
-
-/**
- * @typedef {object} RemoteRefspec
- * @property {boolean} force
- * @property {string} src
- * @property {string} dst
- */
-
 // Repository-local configurations that can execute code on read/write
 // paths and must be refused before any mutating operation runs.  The
 // public Git exo dispatches read-only methods (status, diff, log,
@@ -603,13 +835,6 @@ const pushPorcelainFlagToResult = flag => {
 harden(pushPorcelainFlagToResult);
 
 /**
- * @typedef {object} RepositoryIdentity
- * @property {string} commonDir
- * @property {string} configHash
- * @property {string} rootCommit
- */
-
-/**
  * @param {string} configText
  */
 const hashIdentityConfig = configText => {
@@ -744,14 +969,6 @@ const worktreeCodeToStatus = (code, indexCode) => {
       return 'clean';
   }
 };
-
-/**
- * @typedef {object} RawStatusEntry
- * @property {string} path  Repository-relative path with forward slashes.
- * @property {ReturnType<typeof indexCodeToStatus>} index
- * @property {ReturnType<typeof worktreeCodeToStatus>} worktree
- * @property {string} [renamedFrom]  When the index is 'renamed' or 'copied'.
- */
 
 /**
  * Construct the native-git backend.  The backend runs the system `git`
@@ -1139,125 +1356,12 @@ export const makeNativeGitBackend = ({ repoRoot }) => {
    */
   const runGitWithAskpass = async (args, credentialBytes, signal) => {
     await verifyRepositoryIdentity();
-    if (signal?.aborted) {
-      throw signal.reason instanceof Error
-        ? signal.reason
-        : new Error('git operation aborted');
-    }
-
-    return new Promise((resolve, reject) => {
-      /** @type {Buffer[]} */
-      const stdoutChunks = [];
-      /** @type {Buffer[]} */
-      const stderrChunks = [];
-      let stdoutSize = 0;
-      let stderrSize = 0;
-      let settled = false;
-      let timedOut = false;
-      let outputTooLarge = false;
-      let aborted = false;
-
-      const child = spawn('git', [...GIT_BASE_ARGS, ...args], {
-        cwd: repoRoot,
-        env: withGitEnvOverrides(makeGitEnv(repoRoot), {
-          GIT_ASKPASS: gitAskpassHelperPath,
-          ENDO_GIT_ASKPASS_FD: String(GIT_ASKPASS_FD),
-        }),
-        stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-      });
-
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        child.kill('SIGTERM');
-      }, GIT_TIMEOUT_MS);
-      timeout.unref();
-
-      const credentialPipe =
-        /** @type {import('node:stream').Writable | null | undefined} */ (
-          child.stdio[GIT_ASKPASS_FD]
-        );
-      if (credentialPipe === undefined || credentialPipe === null) {
-        throw new Error('git credential pipe was not available');
-      }
-      credentialPipe.on('error', () => {});
-      credentialPipe.end(credentialBytes);
-
-      const abort = () => {
-        aborted = true;
-        child.kill('SIGTERM');
-      };
-      signal?.addEventListener('abort', abort, { once: true });
-
-      /**
-       * @param {Buffer[]} chunks
-       * @param {Buffer | string} chunk
-       * @param {'stdout' | 'stderr'} streamName
-       */
-      const appendChunk = (chunks, chunk, streamName) => {
-        const bytes = Buffer.isBuffer(chunk)
-          ? chunk
-          : Buffer.from(chunk, 'utf8');
-        if (streamName === 'stdout') {
-          stdoutSize += bytes.byteLength;
-        } else {
-          stderrSize += bytes.byteLength;
-        }
-        if (stdoutSize + stderrSize > GIT_MAX_BUFFER) {
-          outputTooLarge = true;
-          child.kill('SIGTERM');
-          return;
-        }
-        chunks.push(bytes);
-      };
-
-      child.stdout?.on('data', chunk =>
-        appendChunk(stdoutChunks, chunk, 'stdout'),
-      );
-      child.stderr?.on('data', chunk =>
-        appendChunk(stderrChunks, chunk, 'stderr'),
-      );
-      child.once('error', error => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        signal?.removeEventListener('abort', abort);
-        try {
-          credentialPipe.destroy();
-        } catch {
-          // ignore
-        }
-        reject(error);
-      });
-      child.once('close', (code, closeSignal) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        signal?.removeEventListener('abort', abort);
-        try {
-          credentialPipe.destroy();
-        } catch {
-          // ignore
-        }
-
-        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
-        if (code === 0 && !timedOut && !aborted && !outputTooLarge) {
-          resolve({ stdout, stderr });
-          return;
-        }
-        const detail =
-          (outputTooLarge && 'git output exceeded max buffer') ||
-          (aborted && 'git operation aborted') ||
-          (timedOut && 'git operation timed out') ||
-          stderr ||
-          stdout ||
-          'unknown git error';
-        reject(
-          new Error(
-            `git ${gitCommandName(args)} failed (exit ${code ?? closeSignal ?? 'unknown'}):\n${truncateOutput(detail.trim())}`,
-          ),
-        );
-      });
+    return runGitWithAskpassAt({
+      cwd: repoRoot,
+      envRoot: repoRoot,
+      args,
+      credentialBytes,
+      signal,
     });
   };
 
@@ -1324,50 +1428,6 @@ export const makeNativeGitBackend = ({ repoRoot }) => {
       );
     }
   };
-
-  /**
-   * Add command-line protocol policy for explicit URL remote operations.
-   * The URL itself still comes from GitRemote policy; these flags ensure
-   * the protocol selected for that URL is the only protocol git may use
-   * after its normal URL handling.
-   *
-   * @param {string} urlText
-   * @returns {string[]}
-   */
-  const remoteProtocolArgs = urlText => {
-    let protocol;
-    try {
-      protocol = new URL(urlText).protocol;
-    } catch {
-      throw new Error(`remote URL is not a valid URL: ${q(urlText)}`);
-    }
-    if (protocol === 'https:') {
-      return harden([
-        '-c',
-        'protocol.allow=never',
-        '-c',
-        'protocol.https.allow=always',
-      ]);
-    }
-    if (protocol === 'http:') {
-      return harden([
-        '-c',
-        'protocol.allow=never',
-        '-c',
-        'protocol.http.allow=always',
-      ]);
-    }
-    if (protocol === 'file:') {
-      return harden([
-        '-c',
-        'protocol.allow=never',
-        '-c',
-        'protocol.file.allow=always',
-      ]);
-    }
-    throw new Error(`remote URL protocol is not supported: ${q(protocol)}`);
-  };
-  harden(remoteProtocolArgs);
 
   /**
    * @param {string[]} selectors

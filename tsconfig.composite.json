@@ -54,6 +54,9 @@
       "path": "packages/daemon/tsconfig.composite.json"
     },
     {
+      "path": "packages/daemon-cas/tsconfig.composite.json"
+    },
+    {
       "path": "packages/env-options/tsconfig.composite.json"
     },
     {
@@ -72,7 +75,16 @@
       "path": "packages/exo/tsconfig.composite.json"
     },
     {
+      "path": "packages/exo-git/tsconfig.composite.json"
+    },
+    {
+      "path": "packages/exo-http-client/tsconfig.composite.json"
+    },
+    {
       "path": "packages/exo-playwright/tsconfig.composite.json"
+    },
+    {
+      "path": "packages/exo-shell/tsconfig.composite.json"
     },
     {
       "path": "packages/exo-stream/tsconfig.composite.json"
@@ -87,6 +99,9 @@
       "path": "packages/gateway/tsconfig.composite.json"
     },
     {
+      "path": "packages/git/tsconfig.composite.json"
+    },
+    {
       "path": "packages/goblin-chat/tsconfig.composite.json"
     },
     {
@@ -94,6 +109,12 @@
     },
     {
       "path": "packages/hex/tsconfig.composite.json"
+    },
+    {
+      "path": "packages/host-spawner/tsconfig.composite.json"
+    },
+    {
+      "path": "packages/http-confine/tsconfig.composite.json"
     },
     {
       "path": "packages/immutable-arraybuffer/tsconfig.composite.json"
@@ -145,6 +166,9 @@
     },
     {
       "path": "packages/patterns/tsconfig.composite.json"
+    },
+    {
+      "path": "packages/platform/tsconfig.composite.json"
     },
     {
       "path": "packages/promise-kit/tsconfig.composite.json"
