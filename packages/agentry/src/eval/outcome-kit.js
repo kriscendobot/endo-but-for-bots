@@ -47,8 +47,7 @@ export const readTrackedFileAt = async ({ git, readText, ref, path }) => {
     const file = await path
       .split('/')
       .reduce(
-        (nodeP, part) =>
-          nodeP.then(node => E(/** @type {any} */ (node)).lookup(part)),
+        (nodeP, part) => E(nodeP).lookup(part),
         Promise.resolve(committedRoot),
       );
     return await readText(file);
