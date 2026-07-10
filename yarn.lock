@@ -1414,6 +1414,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@endo/cbor-frame@workspace:packages/cbor-frame"
   dependencies:
+    "@endo/bytes": "workspace:^"
     "@endo/eventual-send": "workspace:^"
     "@endo/harden": "workspace:^"
     "@endo/init": "workspace:^"
@@ -15914,9 +15915,9 @@ __metadata:
     zx: "npm:^8.1.8"
   dependenciesMeta:
     "@ipshipyard/node-datachannel":
-      built: true
+      built: false
     better-sqlite3:
-      built: true
+      built: false
   languageName: unknown
   linkType: soft
 
