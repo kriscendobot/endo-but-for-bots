@@ -11,3 +11,4 @@ export {
   makeContentStoreFilePowers,
   makeContentStoreCryptoPowers,
 } from './content-store-powers.js';
+export { makeWatchDirectory } from './watch-directory.js';
