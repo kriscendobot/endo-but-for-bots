@@ -6,6 +6,8 @@ import path from 'node:path';
 
 import { initRepo, makePowersOver } from '../../repo.js';
 
+/** @import { EndoGit } from '@endo/exo-git' */
+
 /**
  * Provision a real git repository for the stage-and-commit scenario.
  *
@@ -15,7 +17,7 @@ import { initRepo, makePowersOver } from '../../repo.js';
  * @returns {Promise<{
  *   repoRoot: string,
  *   workspace: unknown,
- *   git: unknown,
+ *   git: EndoGit,
  *   cleanup: () => Promise<void>,
  * }>}
  */

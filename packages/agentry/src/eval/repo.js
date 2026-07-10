@@ -9,6 +9,8 @@ import { promisify as nodePromisify } from 'node:util';
 
 import { E } from '@endo/eventual-send';
 import { makeGit } from '@endo/exo-git';
+
+/** @import { EndoGit } from '@endo/exo-git' */
 import { iterateBytesReader } from '@endo/exo-stream/iterate-bytes-reader.js';
 import { makeNativeGitBackend } from '@endo/git';
 import { makeNodeFilesystem } from '@endo/platform/fs/extended';
@@ -63,7 +65,7 @@ harden(readText);
  * Build the live `workspace` and `git` powers over an existing git worktree.
  *
  * @param {string} repoRoot
- * @returns {{ workspace: unknown, git: unknown }}
+ * @returns {{ workspace: unknown, git: EndoGit }}
  */
 export const makePowersOver = repoRoot => {
   const workspace = makeNodeFilesystem({ rootPath: repoRoot });
