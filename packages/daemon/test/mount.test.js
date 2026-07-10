@@ -379,7 +379,7 @@ test('followNameChanges is torn down when the mount formula is cancelled', async
   // cancellation (a context's `cancelled` rejects) must close the stub.
   const rootPath = makeTempRoot(t);
   /** @type {import('../src/types.js').FilePowers['watchDirectory']} */
-  const stubWatchDirectory = (_dirPath, cancelled) => {
+  const stubWatchDirectory = (_dirPath, { cancelled } = {}) => {
     let done = false;
     /** @type {Array<(result: IteratorResult<any>) => void>} */
     const waiters = [];

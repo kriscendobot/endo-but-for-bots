@@ -9,7 +9,7 @@
 
 import { E } from '@endo/eventual-send';
 import { q } from '@endo/errors';
-import { makePromiseKit } from '@endo/promise-kit';
+import { makeCancelKit } from '@endo/cancel';
 import { makeExo } from '@endo/exo';
 import { encodeBase64 } from '@endo/base64';
 import { mapReader } from '@endo/stream';
@@ -404,11 +404,13 @@ harden(resolvePhysicalPath);
  * @property {string} description
  * @property {(tree: object) => Promise<object>} [snapshotTree]
  * @property {(path: string) => Promise<object>} [snapshotFile]
- * @property {Promise<void>} [cancelled] Settles when the mount formula
- *   is cancelled; propagated to every `followNameChanges` watcher this
- *   mount (and its sub-mounts, via the shared context) opens, so a
- *   cancelled mount tears its OS watcher handles down. Absent when a
- *   mount is created outside a formula (e.g. in unit tests).
+ * @property {import('@endo/cancel').Cancelled} [cancelled] A
+ *   cancellation token (`Promise<never>`) that rejects when the mount
+ *   formula is cancelled; folded via `makeCancelKit` into every
+ *   `followNameChanges` watcher this mount (and its sub-mounts, via the
+ *   shared context) opens, so a cancelled mount tears its OS watcher
+ *   handles down. Absent when a mount is created outside a formula (e.g.
+ *   in unit tests).
  * @property {{ debounceMs?: number }} [watchDirectoryOptions] Advisory
  *   tuning threaded into `FilePowers.watchDirectory`; an implementation
  *   may honor or ignore it.
@@ -821,32 +823,27 @@ const makeMountExo = ctx => {
         await assertConfined(target, confinementRoot, filePowers);
 
         // Cancellation follows the accept-a-`cancelled`-promise idiom:
-        // settling `cancelStream` (in the `finally`) closes the OS
+        // calling `cancelStream` (in the `finally`) closes the OS
         // watcher.  The `for await` below also cancels the stream
         // through the iterator's `return()` on the normal drop path;
         // both surfaces resolve to the same idempotent close, and the
         // `finally` covers an early throw before iteration begins.
-        const { promise: streamCancelled, resolve: cancelStream } =
-          /** @type {import('@endo/promise-kit').PromiseKit<void>} */ (
-            makePromiseKit()
-          );
-        // A mount formula can be cancelled while a subscription is
-        // live.  Fold the mount-level `cancelled` into this stream's
-        // own cancellation so the OS watcher closes on either signal:
-        // the consumer dropping the iterator, or the whole mount being
-        // torn down.  `watchDirectory` settles both paths to the same
-        // idempotent close, and it resolves a rejected `cancelled`
-        // (the context's cancel rejects) the same way it resolves a
-        // fulfilled one.
-        const cancelled =
-          mountCancelled === undefined
-            ? streamCancelled
-            : Promise.race([streamCancelled, mountCancelled]);
-        const events = filePowers.watchDirectory(
-          target,
+        //
+        // A mount formula can be cancelled while a subscription is live.
+        // `makeCancelKit(mountCancelled)` folds the mount-level
+        // `cancelled` natively — a parent cancellation propagates into
+        // this kit's token — so the OS watcher closes on either signal:
+        // the consumer dropping the iterator (our `cancelStream()`), or
+        // the whole mount being torn down (the context's `cancelled`
+        // rejecting).  `mountCancelled` is `undefined` for mounts made
+        // outside a formula (e.g. unit tests); `makeCancelKit` treats an
+        // absent parent as "no external cancellation source".
+        const { cancelled, cancel: cancelStream } =
+          makeCancelKit(mountCancelled);
+        const events = filePowers.watchDirectory(target, {
           cancelled,
-          watchDirectoryOptions,
-        );
+          ...watchDirectoryOptions,
+        });
         try {
           /** @type {Map<string, 'file' | 'directory'>} */
           const known = new Map();
@@ -1351,10 +1348,10 @@ harden(makeReadableBlobView);
  * @param {FilePowers} opts.filePowers
  * @param {(tree: object) => Promise<object>} [opts.snapshotTree]
  * @param {(path: string) => Promise<object>} [opts.snapshotFile]
- * @param {Promise<void>} [opts.cancelled] The mount formula's
- *   cancellation signal (`context.cancelled`); propagated to every
- *   `followNameChanges` watcher so a cancelled mount closes its OS
- *   watcher handles.
+ * @param {import('@endo/cancel').Cancelled} [opts.cancelled] The mount
+ *   formula's cancellation token (`context.cancelled`); folded via
+ *   `makeCancelKit` into every `followNameChanges` watcher so a
+ *   cancelled mount closes its OS watcher handles.
  * @param {{ debounceMs?: number }} [opts.watchDirectoryOptions] Advisory
  *   `watchDirectory` tuning threaded through to `followNameChanges`.
  * @returns {object}
