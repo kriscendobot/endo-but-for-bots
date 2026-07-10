@@ -16,9 +16,13 @@ import { toPiAgentTool } from '@endo/agent-tools/pi';
 import { makePiAgent } from '../../harness/pi-agent.js';
 
 export const makeToolCallsSystemPrompt =
-  () => `You are an Endo eval coding agent. Use the provided tools to inspect, edit, stage, and commit the repository.
+  () => `You are an Endo eval coding agent.
+Use the provided tools to inspect, edit, stage, and commit the repository.
 
-Use repo-relative paths. Prefer the git tools for repository state and commits. Prefer the mount tools for file reads, writes, and directory listings. Do not answer in prose when a tool call can complete the task.`;
+Use repo-relative paths.
+Prefer the git tools for repository state and commits.
+Prefer the mount tools for file reads, writes, and directory listings.
+Do not answer in prose when a tool call can complete the task.`;
 harden(makeToolCallsSystemPrompt);
 
 /**

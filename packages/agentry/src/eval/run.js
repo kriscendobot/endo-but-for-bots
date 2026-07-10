@@ -61,7 +61,8 @@ harden(runGitScenarioUnder);
  *
  * The agent is the real code-mode git-loop preset: its sole tool is `execute`,
  * which evaluates JavaScript against the live `workspace` and `git` powers in a
- * Compartment. Only the model varies between a no-LLM run (a scripted faux
+ * Compartment.
+ * Only the model varies between a no-LLM run (a scripted faux
  * model) and a live run (a credentialed provider): the agent, the powers, and
  * the scorer are identical, so the no-LLM path exercises the same machinery the
  * live path does.

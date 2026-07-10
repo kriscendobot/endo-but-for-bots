@@ -74,7 +74,8 @@ Shared harness (this directory's root):
   harness and each eval's public symbols (the per-folder barrels).
 - `run.js` — `runGitScenarioUnder(condition, { model, workspace, git, scenario, readText, ... })`
   runs one condition and scores by outcome assertion while returning diagnostic
-  run metrics. `runGitScenario(...)` remains the code-mode default for existing
+  run metrics.
+  `runGitScenario(...)` remains the code-mode default for existing
   callers.
 - `conditions/` — one module per execution condition plus the default condition
   registry.
@@ -89,14 +90,16 @@ Shared harness (this directory's root):
   metrics.
 - `env-model.js` — `resolveEvalModelsFromEnv(env)`: builds a live model list
   plus `getApiKey` hooks from `ENDO_EVAL_MODELS` / `ENDO_LLM_MODELS` /
-  `ENDO_LLM_MODEL` / `LAL_MODEL`. `resolveEvalModelFromEnv(env)` remains as the
+  `ENDO_LLM_MODEL` / `LAL_MODEL`.
+  `resolveEvalModelFromEnv(env)` remains as the
   first-model compatibility shim.
 - `types.ts` — `GitScenario`, `GitScenarioSpec`, `ReadText`: the contract every
   scenario implements.
 - `outcome-kit.js` — the shared outcome primitives: `check()`, the
   `OutcomeReport` shape, and the small shared readers (`readTrackedFileAt`
   reads a tracked file at a ref through `filesystemAt`; `branchLog` resolves a
-  branch's commit list). Per-eval scorers build on these so each stays short.
+  branch's commit list).
+  Per-eval scorers build on these so each stays short.
   Cap-based and portable; the byte reader is injected.
 
 Per-eval content (one folder under `scenarios/`):
@@ -118,16 +121,19 @@ together under `test/eval/` (see "Running" below), mirroring this source layout.
   full harness with a scripted faux provider standing in for the model. This is
   the assertion-path test; it needs no network and no secrets, and each eval's
   test co-locates with its per-eval repository fixture
-  (`_stage-and-commit-repo.js`) under `test/eval/`. It runs under the default
+  (`_stage-and-commit-repo.js`) under `test/eval/`.
+  It runs under the default
   `yarn test`.
 - **Live model (credentialed host):** `test/eval-live.test.js` runs the same
   scenarios and scorers against a real provider across the default condition
-  matrix. It is **not** part of the default `yarn test`: it runs only via its own
+  matrix.
+  It is **not** part of the default `yarn test`: it runs only via its own
   `test:live` command, under a dedicated ava config (`ava-live.config.js`), so
   that a host that happens to have the credentials in its environment does not
   reach a real provider as a side effect of a plain `yarn test` at the package or
-  workspace root. The live test additionally skips every row unless the
-  credentials are present. To run it, set `ENDO_LLM_HOST` / `ENDO_LLM_MODEL` /
+  workspace root.
+  The live test additionally skips every row unless the credentials are present.
+  To run it, set `ENDO_LLM_HOST` / `ENDO_LLM_MODEL` /
   `ENDO_LLM_AUTH_TOKEN` (or their `LAL_*` aliases) in the environment to point
   at an OpenAI-compatible endpoint, then:
 
@@ -155,7 +161,8 @@ together under `test/eval/` (see "Running" below), mirroring this source layout.
 
   - `--models` or `ENDO_EVAL_MODELS` / `ENDO_LLM_MODELS` accepts a
     comma-separated list of pi-ai model specs such as
-    `anthropic/claude-opus-4-5-20251101,openai/gpt-4o-mini`. Each model reads
+    `anthropic/claude-opus-4-5-20251101,openai/gpt-4o-mini`.
+    Each model reads
     its provider key from `<PROVIDER>_API_KEY`.
   - With `ENDO_LLM_HOST` / `LAL_HOST` set, each model spec is treated as an
     OpenAI-compatible endpoint model id and uses `ENDO_LLM_AUTH_TOKEN` /

@@ -24,7 +24,8 @@ export const makeStageAndCommitScenarioSpec = () =>
 harden(makeStageAndCommitScenarioSpec);
 
 /**
- * Landed eval scenarios. Each matrix run provisions a fresh repo from the spec
+ * Landed eval scenarios.
+ * Each matrix run provisions a fresh repo from the spec
  * so conditions and repeats do not share state.
  *
  * @returns {GitScenarioSpec[]}
