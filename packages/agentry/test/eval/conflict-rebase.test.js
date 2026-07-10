@@ -74,12 +74,16 @@ const makeScenarioFor = repo => makeConflictRebaseScenario(repo);
 
 test('summary matching is exact for arbitrary summary sequences', t => {
   fc.assert(
-    fc.property(fc.array(fc.string()), fc.array(fc.string()), (actual, expected) => {
-      const expectedMatch =
-        actual.length === expected.length &&
-        actual.every((summary, index) => summary === expected[index]);
-      t.is(summariesMatch(actual, expected), expectedMatch);
-    }),
+    fc.property(
+      fc.array(fc.string()),
+      fc.array(fc.string()),
+      (actual, expected) => {
+        const expectedMatch =
+          actual.length === expected.length &&
+          actual.every((summary, index) => summary === expected[index]);
+        t.is(summariesMatch(actual, expected), expectedMatch);
+      },
+    ),
   );
 });
 
