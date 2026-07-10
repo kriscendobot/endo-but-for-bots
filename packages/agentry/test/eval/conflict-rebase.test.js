@@ -16,12 +16,16 @@ import {
   fauxAssistantMessage,
   fauxToolCall,
 } from '@earendil-works/pi-ai';
+import fc from 'fast-check';
 
 import {
   makeConflictRebaseScenario,
   runGitScenario,
 } from '../../src/eval/index.js';
-import { assertGitConflictRebaseOutcome } from '../../src/eval/scenarios/conflict-rebase/outcome.js';
+import {
+  assertGitConflictRebaseOutcome,
+  summariesMatch,
+} from '../../src/eval/scenarios/conflict-rebase/outcome.js';
 import { readText } from '../_eval-fixture.js';
 import {
   appIntegrationText,
@@ -67,6 +71,17 @@ const executeOnceModel = (t, source) =>
  * @returns {ReturnType<typeof makeConflictRebaseScenario>}
  */
 const makeScenarioFor = repo => makeConflictRebaseScenario(repo);
+
+test('summary matching is exact for arbitrary summary sequences', t => {
+  fc.assert(
+    fc.property(fc.array(fc.string()), fc.array(fc.string()), (actual, expected) => {
+      const expectedMatch =
+        actual.length === expected.length &&
+        actual.every((summary, index) => summary === expected[index]);
+      t.is(summariesMatch(actual, expected), expectedMatch);
+    }),
+  );
+});
 
 test('scenario retains only the declared conflict-rebase target', async t => {
   const repo = await provisionConflictRebaseRepo(t);
@@ -163,6 +178,37 @@ test('outcome assertion passes when scripted run resolves and continues the reba
       ['worktree-clean', true],
       ['rebase-complete-on-feature-branch', true],
     ],
+  );
+});
+
+test('successful outcome check ordering is stable for arbitrary reruns', async t => {
+  const repo = await provisionConflictRebaseRepo(t);
+  const scenario = makeScenarioFor(repo);
+  const expectedNames = [
+    'integration-branch-tip',
+    'integration-is-ancestor',
+    'replayed-summaries',
+    'replayed-rewritten',
+    'replayed-patches',
+    'feature-tree-exact',
+    'app-text',
+    'note-present:notes/feature.md',
+    'note-present:notes/integration.md',
+    'worktree-clean',
+    'rebase-complete-on-feature-branch',
+  ];
+  await fc.assert(
+    fc.asyncProperty(fc.constant(undefined), async () => {
+      const outcome = await scenario.assertOutcome({
+        git: repo.git,
+        workspace: repo.workspace,
+        readText,
+      });
+      t.deepEqual(
+        outcome.checks.map(({ name }) => name),
+        expectedNames,
+      );
+    }),
   );
 });
 

@@ -72,6 +72,7 @@
     "@endo/ses-ava": "workspace:^",
     "ava": "catalog:dev",
     "eslint": "catalog:dev",
+    "fast-check": "^4.9.0",
     "typescript": "catalog:dev"
   },
   "files": [

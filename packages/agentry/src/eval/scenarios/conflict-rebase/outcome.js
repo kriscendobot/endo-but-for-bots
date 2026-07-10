@@ -8,6 +8,18 @@ import { E } from '@endo/eventual-send';
 import { branchLog, check, readTrackedFileAt } from '../../outcome-kit.js';
 
 /**
+ * Check whether replayed commit summaries match their target sequence exactly.
+ *
+ * @param {string[]} actual
+ * @param {string[]} expected
+ * @returns {boolean}
+ */
+export const summariesMatch = (actual, expected) =>
+  actual.length === expected.length &&
+  actual.every((summary, index) => summary === expected[index]);
+harden(summariesMatch);
+
+/**
  * Score a conflict-rebase run by outcome assertion.
  * The scorer reads the final repository state through the git capability and
  * deliberately ignores the path the agent used to reach it.
@@ -73,15 +85,14 @@ export const assertGitConflictRebaseOutcome = async ({
   const replayed = [...replayedNewestFirst].reverse();
 
   const replayedSummaries = replayed.map(entry => entry.summary);
-  const summariesMatch =
-    replayedSummaries.length === expected.replayedSummaries.length &&
-    replayedSummaries.every(
-      (summary, index) => summary === expected.replayedSummaries[index],
-    );
+  const replayedSummariesMatch = summariesMatch(
+    replayedSummaries,
+    expected.replayedSummaries,
+  );
   checks.push(
     check(
       'replayed-summaries',
-      summariesMatch,
+      replayedSummariesMatch,
       `replayed summaries ${JSON.stringify(
         replayedSummaries,
       )} (expected ${JSON.stringify(expected.replayedSummaries)})`,
