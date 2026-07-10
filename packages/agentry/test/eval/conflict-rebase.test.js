@@ -165,6 +165,46 @@ test('outcome assertion passes when scripted run resolves and continues the reba
   );
 });
 
+test('outcome assertion rejects an integration branch moved after a correct rebase', async t => {
+  const repo = await provisionConflictRebaseRepo(t);
+  const scenario = makeScenarioFor(repo);
+  const model = executeOnceModel(
+    t,
+    conflictRebaseSource(repo.integrationBranch, appResolvedText),
+  );
+
+  const completed = await runGitScenario({
+    model,
+    workspace: repo.workspace,
+    git: repo.git,
+    scenario,
+    readText,
+  });
+  t.true(completed.outcome.pass);
+
+  const run = gitRunner(repo.repoRoot);
+  await run(['switch', '-q', repo.integrationBranch]);
+  await fs.promises.writeFile(
+    path.join(repo.repoRoot, 'integration-after-rebase.txt'),
+    'Integration moved after the rebase.\n',
+  );
+  await run(['add', 'integration-after-rebase.txt']);
+  await run(['commit', '-q', '-m', 'test: move integration after rebase']);
+  await run(['switch', '-q', repo.featureBranch]);
+
+  const { outcome } = await runGitScenario({
+    model: fauxModel(t, [fauxAssistantMessage('already rebased')]),
+    workspace: repo.workspace,
+    git: repo.git,
+    scenario,
+    readText,
+  });
+
+  t.false(outcome.pass);
+  const byName = Object.fromEntries(outcome.checks.map(c => [c.name, c.ok]));
+  t.false(byName['integration-branch-tip']);
+});
+
 test('outcome assertion fails when the run never rebases', async t => {
   const repo = await provisionConflictRebaseRepo(t);
   const scenario = makeScenarioFor(repo);
