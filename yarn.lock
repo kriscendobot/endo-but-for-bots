@@ -15915,9 +15915,9 @@ __metadata:
     zx: "npm:^8.1.8"
   dependenciesMeta:
     "@ipshipyard/node-datachannel":
-      built: false
+      built: true
     better-sqlite3:
-      built: false
+      built: true
   languageName: unknown
   linkType: soft
 
