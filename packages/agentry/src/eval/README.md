@@ -111,6 +111,10 @@ Per-eval content (one folder under `scenarios/`):
   notes; `outcome.js` verifies the branch topology, replayed summaries and
   fresh oids, caller-supplied post-resolution patches, exact final tree and file
   content, clean status, and completed rebase state.
+  Its public exports are `conflictRebasePrompt`, the model-facing task text;
+  `makeConflictRebaseScenario(target)`, which binds that task to a declared
+  target end state; and `assertGitConflictRebaseOutcome(args)`, the reusable
+  scorer for that target.
 - `scenarios/stage-and-commit/` — the minimal-success eval: `scenario.js`
   (`makeStageAndCommitScenario(...)`, stage an untracked file and commit it with
   a given message), `provision.js` (fresh repository setup), `outcome.js`
