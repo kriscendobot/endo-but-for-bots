@@ -11,7 +11,7 @@ import { makeRunMetricsRecorder } from './metrics.js';
  * outcome assertion.
  *
  * The condition supplies the pi-agent-core `Agent`; the run loop and metrics
- * recorder stay uniform across code mode, tool calls, and shell capability.
+ * recorder stay uniform across code mode and tool calls.
  *
  * @param {import('./types.js').EvalCondition} condition
  * @param {RunGitScenarioOptions} options
@@ -23,7 +23,6 @@ export const runGitScenarioUnder = async (
     model,
     workspace,
     git,
-    shell,
     scenario,
     readText,
     getApiKey,
@@ -35,7 +34,6 @@ export const runGitScenarioUnder = async (
     model,
     workspace,
     git,
-    shell,
     getApiKey,
     thinkingLevel,
     streamFn,

@@ -119,9 +119,16 @@ harden(resolveEvalModelsFromEnv);
  * @returns {{ model: Model<string>, getApiKey: GetApiKey } | undefined}
  */
 export const resolveEvalModelFromEnv = env => {
-  const [first] = resolveEvalModelsFromEnv(env);
-  if (first === undefined) {
+  const host = env.ENDO_LLM_HOST || env.LAL_HOST;
+  const modelId = env.ENDO_LLM_MODEL || env.LAL_MODEL;
+  const token = env.ENDO_LLM_AUTH_TOKEN || env.LAL_AUTH_TOKEN;
+  if (!host || !modelId || !token) {
     return undefined;
+  }
+  const [first] = resolveEvalModelsFromEnv(env, { models: modelId });
+  // The preceding gate ensures this configuration always resolves one model.
+  if (first === undefined) {
+    throw new Error('configured eval model could not be resolved');
   }
   return harden({ model: first.model, getApiKey: first.getApiKey });
 };

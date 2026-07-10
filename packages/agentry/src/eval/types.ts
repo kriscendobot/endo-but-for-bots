@@ -68,8 +68,6 @@ export interface ProvisionedGitScenario {
   workspace: unknown;
   /** A writable Git capability over the same repository. */
   git: unknown;
-  /** A confined Shell capability over the same repository. */
-  shell?: unknown;
   /** Human-readable repository path for diagnostics. */
   repoRoot?: string;
   /** Release temporary resources. */
@@ -136,11 +134,6 @@ export interface RunGitScenarioOptions {
    * A live read/write `@endo/exo-git` Git capability over the same repository.
    */
   git: unknown;
-  /**
-   * A live shell capability over the same repository, required only by shell
-   * eval conditions.
-   */
-  shell?: unknown;
   scenario: GitScenario;
   /**
    * Read a committed File's content as UTF-8; passed through to the scenario's

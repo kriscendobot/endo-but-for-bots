@@ -138,6 +138,9 @@ export const runEvalMatrix = async ({
   readText,
   thinkingLevel,
 }) => {
+  if (!Number.isFinite(repeats) || !Number.isInteger(repeats) || repeats < 1) {
+    throw new Error('repeats must be a positive finite integer');
+  }
   /** @type {EvalMatrixRow[]} */
   const rows = [];
   await null; // safe-await-separator
@@ -153,7 +156,6 @@ export const runEvalMatrix = async ({
                 model: modelEntry.model,
                 workspace: repo.workspace,
                 git: repo.git,
-                shell: repo.shell,
                 scenario,
                 readText,
                 getApiKey: modelEntry.getApiKey,

@@ -8,6 +8,7 @@
 // only on a host where the `ENDO_LLM_*` / `LAL_*` credentials are present.
 
 import test from '@endo/ses-ava/prepare-endo.js';
+import { E } from '@endo/eventual-send';
 import {
   registerFauxProvider,
   fauxAssistantMessage,
@@ -23,6 +24,7 @@ import {
   runEvalMatrix,
   runGitScenario,
 } from '../../src/eval/index.js';
+import { provisionStageAndCommitRepo as provisionMatrixRepo } from '../../src/eval/scenarios/stage-and-commit/provision.js';
 import { readText } from '../_eval-fixture.js';
 import { provisionStageAndCommitRepo } from './_stage-and-commit-repo.js';
 
@@ -330,7 +332,6 @@ test('matrix runs the stage-and-commit scenario across all conditions', async t 
     [
       ['stage-and-commit', 'code-mode', 'faux-model', true],
       ['stage-and-commit', 'tool-calls', 'faux-model', true],
-      ['stage-and-commit', 'shell', 'faux-model', true],
     ],
   );
   t.deepEqual(
@@ -342,12 +343,43 @@ test('matrix runs the stage-and-commit scenario across all conditions', async t 
     [
       ['code-mode', 1, 1],
       ['tool-calls', 1, 1],
-      ['shell', 1, 1],
     ],
   );
   t.regex(
     renderEvalMatrixMarkdownTable(result.aggregates),
     /\| stage-and-commit \| tool-calls \| faux-model \| 1 \| 100% \|/,
+  );
+});
+
+for (const repeats of [0, -1, 1.5, NaN, Infinity]) {
+  test(`matrix rejects an invalid repeat count: ${repeats}`, async t => {
+    await t.throwsAsync(
+      () =>
+        runEvalMatrix({
+          scenarios: [],
+          conditions: [],
+          models: [],
+          repeats,
+          readText,
+        }),
+      { message: 'repeats must be a positive finite integer' },
+    );
+  });
+}
+
+test('matrix provisioner contains paths and creates parent directories', async t => {
+  const repo = await provisionMatrixRepo({
+    path: 'nested/target.txt',
+    content: 'nested content\n',
+  });
+  t.teardown(repo.cleanup);
+
+  const status = await E(repo.git).status();
+  t.true(status.some(row => row.path === 'nested/target.txt'));
+
+  await t.throwsAsync(
+    () => provisionMatrixRepo({ path: '../escaped.txt', content: 'nope\n' }),
+    { message: 'stage-and-commit path must stay within the repository' },
   );
 });
 

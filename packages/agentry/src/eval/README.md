@@ -37,7 +37,7 @@ failed, but it is a diagnostic, never the gate.
 
 ## Conditions
 
-The matrix compares three ways of giving the same repository authority to an
+The matrix compares two ways of giving the same repository authority to an
 agent:
 
 - `code-mode` — the existing code-mode loop over the live `workspace` and `git`
@@ -45,9 +45,6 @@ agent:
 - `tool-calls` — direct pi-agent tool calls over the same `workspace` and `git`
   capabilities, using the mounted filesystem and mount-bridged git tool
   catalog.
-- `shell` — direct pi-agent tool calls over a confined shell capability minted
-  for the scenario repository with an allowlist, timeout, output cap, and
-  sanitized environment.
 
 ## Metrics
 
@@ -85,8 +82,8 @@ Shared harness (this directory's root):
   runs `scenarios x conditions x models x repeats`, returns per-run rows plus
   aggregates, and renders the comparison markdown table.
 - `repo.js` — Node-side eval repository helpers: temp git repo bootstrap,
-  `workspace` + `git` + shell power construction, and the UTF-8 `readText`
-  scorer dependency.
+  `workspace` + `git` power construction, and the UTF-8 `readText` scorer
+  dependency.
 - `metrics.js` — `makeRunMetricsRecorder()`: subscribes to plain pi-agent-core
   events and snapshots per-run usage, turn, tool execution, and wall-time
   metrics.
@@ -163,5 +160,5 @@ together under `test/eval/` (see "Running" below), mirroring this source layout.
   - With `ENDO_LLM_HOST` / `LAL_HOST` set, each model spec is treated as an
     OpenAI-compatible endpoint model id and uses `ENDO_LLM_AUTH_TOKEN` /
     `LAL_AUTH_TOKEN`.
-  - `--conditions code-mode,tool-calls,shell` can narrow or reorder the default
+  - `--conditions code-mode,tool-calls` can narrow or reorder the default
     condition list.

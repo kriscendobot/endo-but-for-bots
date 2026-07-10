@@ -23,7 +23,6 @@ export {
   codeModeCondition,
   defaultEvalConditions,
   evalConditionsByName,
-  shellCondition,
   toolCallsCondition,
 } from './conditions/index.js';
 export { makeDefaultGitScenarioSpecs } from './scenarios/index.js';

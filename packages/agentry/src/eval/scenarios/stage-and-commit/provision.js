@@ -16,7 +16,6 @@ import { initRepo, makePowersOver } from '../../repo.js';
  *   repoRoot: string,
  *   workspace: unknown,
  *   git: unknown,
- *   shell: unknown,
  *   cleanup: () => Promise<void>,
  * }>}
  */
@@ -25,12 +24,28 @@ export const provisionStageAndCommitRepo = async ({
   content,
 }) => {
   const { repoRoot, run, cleanup } = await initRepo({ branch: 'main' });
-  await fs.promises.writeFile(path.join(repoRoot, '.keep'), '');
-  await run(['add', '.keep']);
-  await run(['commit', '-q', '-m', 'chore: initialize repository']);
-  await fs.promises.writeFile(path.join(repoRoot, filePath), content);
+  const targetPath = path.resolve(repoRoot, filePath);
+  const relativePath = path.relative(repoRoot, targetPath);
+  if (
+    relativePath === '' ||
+    relativePath.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativePath)
+  ) {
+    await cleanup();
+    throw new Error('stage-and-commit path must stay within the repository');
+  }
+  try {
+    await fs.promises.writeFile(path.join(repoRoot, '.keep'), '');
+    await run(['add', '.keep']);
+    await run(['commit', '-q', '-m', 'chore: initialize repository']);
+    await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.promises.writeFile(targetPath, content);
 
-  const { workspace, git, shell } = makePowersOver(repoRoot);
-  return harden({ repoRoot, workspace, git, shell, cleanup });
+    const { workspace, git } = makePowersOver(repoRoot);
+    return harden({ repoRoot, workspace, git, cleanup });
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 };
 harden(provisionStageAndCommitRepo);

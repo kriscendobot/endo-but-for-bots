@@ -6,6 +6,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import {
   defaultEvalConditions,
@@ -71,11 +72,10 @@ const selectConditions = names => {
   }
   return harden(
     requested.map(name => {
-      const condition = evalConditionsByName[name];
-      if (condition === undefined) {
+      if (!Object.hasOwn(evalConditionsByName, name)) {
         throw new Error(`unknown eval condition: ${name}`);
       }
-      return condition;
+      return evalConditionsByName[name];
     }),
   );
 };
@@ -111,7 +111,10 @@ export const main = async argv => {
 };
 harden(main);
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
   main(process.argv.slice(2)).catch(error => {
     console.error(error);
     process.exitCode = 1;
