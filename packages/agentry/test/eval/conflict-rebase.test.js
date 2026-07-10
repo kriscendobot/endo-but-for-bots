@@ -21,6 +21,7 @@ import {
   makeConflictRebaseScenario,
   runGitScenario,
 } from '../../src/eval/index.js';
+import { assertGitConflictRebaseOutcome } from '../../src/eval/scenarios/conflict-rebase/outcome.js';
 import { readText } from '../_eval-fixture.js';
 import {
   appIntegrationText,
@@ -104,7 +105,8 @@ const conflictRebaseSource = (upstream, resolvedText) => `\
   try {
     await E(git).rebase({ mode: 'start', upstream: ${JSON.stringify(upstream)} });
   } catch (err) {
-    if (!/conflict|could not apply|CONFLICT/i.test(String(err && err.message))) {
+    const rows = await E(git).status();
+    if (!rows.some(row => row.path === 'app.txt')) {
       throw err;
     }
   }
@@ -159,8 +161,7 @@ test('outcome assertion passes when scripted run resolves and continues the reba
       ['note-present:notes/feature.md', true],
       ['note-present:notes/integration.md', true],
       ['worktree-clean', true],
-      ['no-rebase-in-progress', true],
-      ['head-on-feature-branch', true],
+      ['rebase-complete-on-feature-branch', true],
     ],
   );
 });
@@ -205,6 +206,53 @@ test('outcome assertion rejects an integration branch moved after a correct reba
   t.false(byName['integration-branch-tip']);
 });
 
+test('outcome assertion reports a deleted integration branch as a failed check', async t => {
+  const repo = await provisionConflictRebaseRepo(t);
+  const scenario = makeScenarioFor(repo);
+  const model = executeOnceModel(
+    t,
+    conflictRebaseSource(repo.integrationBranch, appResolvedText),
+  );
+
+  await runGitScenario({
+    model,
+    workspace: repo.workspace,
+    git: repo.git,
+    scenario,
+    readText,
+  });
+  await gitRunner(repo.repoRoot)(['branch', '-D', repo.integrationBranch]);
+
+  const outcome = await scenario.assertOutcome({
+    git: repo.git,
+    workspace: repo.workspace,
+    readText,
+  });
+
+  t.false(outcome.pass);
+  const byName = Object.fromEntries(outcome.checks.map(c => [c.name, c.ok]));
+  t.false(byName['integration-branch-tip']);
+});
+
+test('empty target collections do not mask replay mismatches', async t => {
+  const repo = await provisionConflictRebaseRepo(t);
+  const outcome = await assertGitConflictRebaseOutcome({
+    git: repo.git,
+    readText,
+    expected: {
+      ...repo,
+      replayedSummaries: [],
+      originalFeatureOids: [],
+      notes: [],
+    },
+  });
+
+  t.false(outcome.pass);
+  const byName = Object.fromEntries(outcome.checks.map(c => [c.name, c.ok]));
+  t.false(byName['replayed-summaries']);
+  t.false(byName['replayed-rewritten']);
+});
+
 test('outcome assertion fails when the run never rebases', async t => {
   const repo = await provisionConflictRebaseRepo(t);
   const scenario = makeScenarioFor(repo);
@@ -225,8 +273,7 @@ test('outcome assertion fails when the run never rebases', async t => {
   t.false(byName['integration-is-ancestor']);
   t.false(byName['replayed-rewritten']);
   t.true(byName['worktree-clean']);
-  t.true(byName['no-rebase-in-progress']);
-  t.true(byName['head-on-feature-branch']);
+  t.true(byName['rebase-complete-on-feature-branch']);
 });
 
 test('outcome assertion fails when app.txt keeps the wrong resolution', async t => {
@@ -324,8 +371,8 @@ test('outcome assertion fails when conflicted worktree is left mid-rebase', asyn
   try {
     await run(['rebase', repo.integrationBranch]);
   } catch (err) {
-    const message = /** @type {Error} */ (err).message;
-    if (!/conflict|could not apply|CONFLICT/i.test(message)) {
+    const { stdout } = await run(['status', '--porcelain']);
+    if (!stdout.includes('UU app.txt')) {
       throw err;
     }
   }
@@ -342,6 +389,5 @@ test('outcome assertion fails when conflicted worktree is left mid-rebase', asyn
   t.false(outcome.pass);
   const byName = Object.fromEntries(outcome.checks.map(c => [c.name, c.ok]));
   t.false(byName['worktree-clean']);
-  t.false(byName['no-rebase-in-progress']);
-  t.false(byName['head-on-feature-branch']);
+  t.false(byName['rebase-complete-on-feature-branch']);
 });

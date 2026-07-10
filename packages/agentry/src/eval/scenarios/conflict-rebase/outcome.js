@@ -28,20 +28,33 @@ export const assertGitConflictRebaseOutcome = async ({
   const checks = [];
 
   const featureLog = await branchLog({ git, ref: expected.featureBranch });
-  const integrationTip = await E(gitRef).revParse(expected.integrationBranch);
+  let integrationTip;
+  try {
+    integrationTip = await E(gitRef).revParse(expected.integrationBranch);
+  } catch (err) {
+    checks.push(
+      check(
+        'integration-branch-tip',
+        false,
+        `${expected.integrationBranch} cannot be resolved: ${/** @type {Error} */ (err).message}`,
+      ),
+    );
+  }
   const featureOids = featureLog.map(entry => entry.oid);
 
   const integrationTipPreserved =
-    integrationTip.oid === expected.integrationOid;
-  checks.push(
-    check(
-      'integration-branch-tip',
-      integrationTipPreserved,
-      integrationTipPreserved
-        ? `${expected.integrationBranch} still points at ${expected.integrationOid}`
-        : `${expected.integrationBranch} points at ${integrationTip.oid} (expected ${expected.integrationOid})`,
-    ),
-  );
+    integrationTip?.oid === expected.integrationOid;
+  if (integrationTip !== undefined) {
+    checks.push(
+      check(
+        'integration-branch-tip',
+        integrationTipPreserved,
+        integrationTipPreserved
+          ? `${expected.integrationBranch} still points at ${expected.integrationOid}`
+          : `${expected.integrationBranch} points at ${integrationTip.oid} (expected ${expected.integrationOid})`,
+      ),
+    );
+  }
 
   const integrationIsAncestor = featureOids.includes(expected.integrationOid);
   checks.push(
@@ -182,7 +195,7 @@ export const assertGitConflictRebaseOutcome = async ({
     current !== undefined && current.name === expected.featureBranch;
   checks.push(
     check(
-      'no-rebase-in-progress',
+      'rebase-complete-on-feature-branch',
       onFeature,
       onFeature
         ? `current branch resolved to ${expected.featureBranch}`
@@ -191,16 +204,6 @@ export const assertGitConflictRebaseOutcome = async ({
           )}; a rebase in progress detaches HEAD`,
     ),
   );
-  checks.push(
-    check(
-      'head-on-feature-branch',
-      onFeature,
-      onFeature
-        ? `HEAD is on branch ${expected.featureBranch}`
-        : `current branch is ${JSON.stringify(current?.name)}`,
-    ),
-  );
-
   const pass = checks.every(entry => entry.ok);
   return harden({ pass, checks });
 };

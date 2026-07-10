@@ -105,15 +105,15 @@ Shared harness (this directory's root):
 Per-eval content (one folder under `scenarios/`):
 
 - `scenarios/index.js` — the landed scenario registry used by the matrix CLI.
-- `scenarios/conflict-rebase/` - the conflict-resolution eval: `scenario.js`
+- `scenarios/conflict-rebase/` - the conflict-rebase eval: `scenario.js`
   asks the agent to rebase a feature branch onto `integration`, resolve the
   `app.txt` conflict with the requested combined wording, and preserve both
   notes; `outcome.js` verifies the branch topology, replayed summaries and
   fresh oids, caller-supplied post-resolution patches, exact final tree and file
   content, clean status, and completed rebase state.
-  Its public exports are `conflictRebasePrompt`, the model-facing task text;
+  It exports `conflictRebasePrompt`, the model-facing task text,
   `makeConflictRebaseScenario(target)`, which binds that task to a declared
-  target end state; and `assertGitConflictRebaseOutcome(args)`, the reusable
+  target end state, and `assertGitConflictRebaseOutcome(args)`, the reusable
   scorer for that target.
 - `scenarios/stage-and-commit/` — the minimal-success eval: `scenario.js`
   (`makeStageAndCommitScenario(...)`, stage an untracked file and commit it with

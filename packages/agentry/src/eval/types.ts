@@ -74,7 +74,7 @@ export interface GitConflictRebaseTarget {
  * prompt, the target end-state, and the cap-based assertion.
  */
 export interface GitScenario<
-  Expected = GitCommitTarget | GitConflictRebaseTarget,
+  Expected = unknown,
 > {
   name: string;
   /** The user turn handed to the code-mode agent. */
