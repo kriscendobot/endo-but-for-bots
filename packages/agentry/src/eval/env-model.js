@@ -55,7 +55,8 @@ const makeEnvApiKeyGetter = (env, provider, fallbackToken) => requested => {
  * environment.
  *
  * For matrix runs, `ENDO_EVAL_MODELS` or `ENDO_LLM_MODELS` may contain a
- * comma-separated list. Without `ENDO_LLM_HOST` / `LAL_HOST`, each entry is
+ * comma-separated list.
+ * Without `ENDO_LLM_HOST` / `LAL_HOST`, each entry is
  * resolved as a pi-ai model profile such as `anthropic/claude-...`; the
  * `getApiKey` hook reads `<PROVIDER>_API_KEY` from the environment.
  * With a host
