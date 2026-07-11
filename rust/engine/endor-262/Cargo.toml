@@ -29,3 +29,10 @@ path = "src/bin/compile_diff.rs"
 [[bin]]
 name = "endor-xst"
 path = "src/bin/endor_xst.rs"
+
+# corpus-to-262: the mechanical corpus -> test262-style case converter
+# (design § Part 1). Dual-runs each corpus line against the oracle once and
+# emits one standard test262 case under `cases/`.
+[[bin]]
+name = "corpus-to-262"
+path = "src/bin/corpus_to_262.rs"

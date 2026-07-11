@@ -99,8 +99,10 @@ impl CompileReport {
             }
             CompileVerdict::OracleRejectedEndorAccepted => {
                 self.accept_disagreements += 1;
-                self.endor_only_accepts
-                    .push((id.to_string(), "endor accepted; oracle rejected".to_string()));
+                self.endor_only_accepts.push((
+                    id.to_string(),
+                    "endor accepted; oracle rejected".to_string(),
+                ));
             }
             CompileVerdict::OracleUnavailable => unreachable!(),
         }
@@ -194,7 +196,10 @@ fn classify_divergence(oracle: &[u8], endor: &[u8]) -> (String, String) {
         (class.to_string(), detail)
     } else {
         let i = first_diff(oracle, endor).unwrap_or(0);
-        let class = format!("opcode-mismatch@byte0x{:02x}", oracle.get(i).copied().unwrap_or(0));
+        let class = format!(
+            "opcode-mismatch@byte0x{:02x}",
+            oracle.get(i).copied().unwrap_or(0)
+        );
         let detail = format!(
             "same len {}; first diff @{} oracle=0x{:02x} endor=0x{:02x}",
             oracle.len(),
@@ -208,7 +213,9 @@ fn classify_divergence(oracle: &[u8], endor: &[u8]) -> (String, String) {
 
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     let n = a.len().min(b.len());
-    (0..n).find(|&i| a[i] != b[i]).or(if a.len() == b.len() { None } else { Some(n) })
+    (0..n)
+        .find(|&i| a[i] != b[i])
+        .or(if a.len() == b.len() { None } else { Some(n) })
 }
 
 /// Classify one `(id, source)` under the compile differential.
@@ -400,43 +407,51 @@ pub fn compile_diff_files(files: &[PathBuf]) -> CompileReport {
     compile_diff_programs(&programs)
 }
 
-/// The curated-corpus programs (`endor-262/corpora/*.js`, one program per
-/// non-comment line) as `(id, source)` pairs — the bounded, known-covered
-/// byte-identity slice the in-crate `cargo test` gate drives.
+/// The curated conformance-case programs as `(id, source)` pairs — the
+/// bounded, known-covered byte-identity slice the in-crate `cargo test` gate
+/// drives. The `corpora/*.js` line files these once came from retired into
+/// the `cases/` tree (design § Part 1); every converted case preserves its
+/// original one-line program verbatim in an `info: Source: <program>`
+/// frontmatter line, so the byte-identity gate reads the *same* programs from
+/// the surviving cases with no change to what it covers.
 pub fn corpora_programs() -> Vec<(String, String)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpora");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().map(|x| x == "js").unwrap_or(false))
-                .collect()
-        })
-        .unwrap_or_default();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases");
+    let mut files = crate::test262::collect_js(&dir);
     files.sort();
     let mut out = Vec::new();
     for file in &files {
-        let name = file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let contents = match std::fs::read_to_string(file) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for (lineno, line) in contents.lines().enumerate() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with("//") {
-                continue;
-            }
-            out.push((format!("{}:{}", name, lineno + 1), line.to_string()));
+        if let Some(source) = case_source_line(&contents) {
+            let id = file
+                .strip_prefix(&dir)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .into_owned();
+            out.push((id, source));
         }
     }
     out
 }
 
+/// The original corpus program a converted case preserves in its
+/// `info: Source: <program>` frontmatter line (written by the `corpus-to-262`
+/// converter). Returns `None` for a case without that line.
+fn case_source_line(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .find_map(|l| l.strip_prefix("  Source: ").map(|s| s.to_string()))
+}
+
 /// Pretty-print a report to a writer (the binary and the test share this
 /// so the honest split reads the same everywhere).
-pub fn print_report(w: &mut dyn std::io::Write, report: &CompileReport, label: &str) -> std::io::Result<()> {
+pub fn print_report(
+    w: &mut dyn std::io::Write,
+    report: &CompileReport,
+    label: &str,
+) -> std::io::Result<()> {
     writeln!(w, "{}", "=".repeat(72))?;
     writeln!(
         w,
@@ -452,7 +467,10 @@ pub fn print_report(w: &mut dyn std::io::Write, report: &CompileReport, label: &
     )?;
     if !report.divergence_classes.is_empty() {
         writeln!(w, "{}", "-".repeat(72))?;
-        writeln!(w, "NAMED divergence classes (byte mismatch on both-accept):")?;
+        writeln!(
+            w,
+            "NAMED divergence classes (byte mismatch on both-accept):"
+        )?;
         for (class, n) in &report.divergence_classes {
             writeln!(w, "  {:>5}  {}", n, class)?;
         }
@@ -513,7 +531,10 @@ mod tests {
         // build. The whole-`language/` sweep lives in the `compile-diff`
         // binary (bounded per subtree to contain oracle RSS).
         let programs = corpora_programs();
-        assert!(!programs.is_empty(), "curated corpora must contain programs");
+        assert!(
+            !programs.is_empty(),
+            "curated corpora must contain programs"
+        );
         let report = compile_diff_programs(&programs);
         let mut buf = Vec::new();
         print_report(&mut buf, &report, "corpora").unwrap();
@@ -543,7 +564,10 @@ mod tests {
             report.accept_disagreements, 0,
             "endor accepted program(s) the oracle rejected — a real bar violation"
         );
-        assert!(report.identical > 0, "expected accepted programs in the corpora");
+        assert!(
+            report.identical > 0,
+            "expected accepted programs in the corpora"
+        );
         assert!(
             report.identical * 20 > report.total,
             "byte-identity should dominate the corpus (identical={} total={})",
@@ -637,7 +661,7 @@ mod tests {
         // and endor compiles it byte-identically. `compile_one` must classify
         // these `Identical`, not `OracleRejected` — the eval-code fix5 slice.
         let cases = [
-            "let x; eval('var x;');",        // sloppy var/lex collision at runtime
+            "let x; eval('var x;');",         // sloppy var/lex collision at runtime
             "{ let x; { eval('var x;'); } }", // lower-scope collision
             "var x; (0,eval)(\"x = 1; x\\u000A++\");", // indirect eval parse failure
         ];
@@ -646,8 +670,15 @@ mod tests {
             // *runtime* SyntaxError (the case this recovery targets).
             let o = endor_oracle::run(src).expect("oracle machine");
             assert!(!o.completed, "{src:?}: expected a runtime throw");
-            assert!(o.error.contains("SyntaxError"), "{src:?}: expected SyntaxError, got {:?}", o.error);
-            assert!(!o.bytecode.is_empty(), "{src:?}: oracle must have compiled it");
+            assert!(
+                o.error.contains("SyntaxError"),
+                "{src:?}: expected SyntaxError, got {:?}",
+                o.error
+            );
+            assert!(
+                !o.bytecode.is_empty(),
+                "{src:?}: oracle must have compiled it"
+            );
             assert_eq!(
                 compile_one(src),
                 CompileVerdict::Identical,

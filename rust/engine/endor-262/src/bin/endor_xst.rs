@@ -110,14 +110,25 @@ fn main() {
 
     let mut files = Vec::new();
     for sub in &subtrees {
-        let base = if sub.starts_with("language") || sub.starts_with("built-ins") {
-            root.join(sub)
+        // A positional that already names an existing filesystem path (a case
+        // file or a directory of cases — e.g. the generated `endor-262/cases`
+        // tree) is run directly, exactly as `xst` takes case paths. Otherwise
+        // it resolves as a subtree under the located test262 root.
+        let direct = PathBuf::from(sub);
+        let found = if direct.is_file() {
+            vec![direct]
+        } else if direct.is_dir() {
+            collect_js(&direct)
         } else {
-            root.join("language").join(sub)
+            let base = if sub.starts_with("language") || sub.starts_with("built-ins") {
+                root.join(sub)
+            } else {
+                root.join("language").join(sub)
+            };
+            collect_js(&base)
         };
-        let found = collect_js(&base);
         if found.is_empty() {
-            eprintln!("warning: no test files under {}", base.display());
+            eprintln!("warning: no test files under {}", sub);
         }
         files.extend(found);
     }
