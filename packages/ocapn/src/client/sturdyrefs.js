@@ -217,6 +217,16 @@ harden(enlivenSturdyRef);
 /**
  * @typedef {object} SturdyRefTracker
  * @property {(location: OcapnLocation, secret: string | Uint8Array, type?: string) => SturdyRef} makeSturdyRef
+ * @property {(sturdyRef: SturdyRef) => SturdyRefDetails | undefined} reveal
+ *   Reveal the off-band `(location, secret[, type])` details of a
+ *   SturdyRef **this tracker** constructed — one it minted or
+ *   materialized from the wire — or `undefined` for anything else (a
+ *   forged look-alike, or a SturdyRef minted by a foreign instance).
+ *   Unlike the module-level {@link getSturdyRefDetails}, recognition is
+ *   scoped to this session manager, so `reveal` never answers for a
+ *   sibling instance's mints even when both share this realm's
+ *   `sturdyRefDetails` map. This is the closely-held reveal side; it is
+ *   the only path that yields the secret.
  * @property {(secretBytes: ArrayBufferLike) => Promise<any | undefined>} lookup
  *   Async look up a locally-held capability by the on-wire secret
  *   bytes. Calls through to the injected locator with either the
@@ -230,6 +240,14 @@ harden(enlivenSturdyRef);
  */
 export const makeSturdyRefTracker = locator => {
   const textDecoder = new TextDecoder('ascii', { fatal: true });
+  // The set of SturdyRefs THIS tracker constructed (minted locally or
+  // materialized from the wire). Scopes `reveal` to this session
+  // manager so a sibling instance's mints — which share the realm-wide
+  // `sturdyRefDetails` map — are not revealed here. Per-instance
+  // ownership, not a second copy of the details, so the wire codec's
+  // module-level `getSturdyRefDetails` write path is unaffected.
+  /** @type {WeakSet<SturdyRef>} */
+  const ownRefs = new WeakSet();
   return harden({
     makeSturdyRef: (location, secret, type = undefined) => {
       // Construct an instance satisfying the pass-style `'sturdyref'` shape
@@ -238,8 +256,11 @@ export const makeSturdyRefTracker = locator => {
       // the secret is never a property on the SturdyRef.
       const sturdyRef = makeSturdyRefInstance(location, type);
       sturdyRefDetails.set(sturdyRef, harden({ location, secret, type }));
+      ownRefs.add(sturdyRef);
       return sturdyRef;
     },
+    reveal: sturdyRef =>
+      ownRefs.has(sturdyRef) ? getSturdyRefDetails(sturdyRef) : undefined,
     lookup: async secretBytes => {
       const view =
         secretBytes instanceof Uint8Array
