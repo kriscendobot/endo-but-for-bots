@@ -1215,6 +1215,27 @@ completes green — **149 passed, 0 failed** — in **~5 s** wall-clock on a war
 build (the endor-fuzz binary's own run, including the 2000-seed decoder sweep,
 is 1.3 s). `#![forbid(unsafe_code)]` intact across the workspace.
 
+**The fix workflow this trophy is an instance of.** Every differential-fuzz
+finding lands a durable regression, and *where* depends on its shape:
+
+- A **source-level** result/completion divergence (a JS program where endor and
+  the oracle disagree at run time) is minimized, fixed, and checked in as a
+  test262 case under `endor-262/cases/regressions/` — `features:
+  [endor-dual-run, …]`, the fuzz arm named in `info:`, the fix referenced.
+  `endor-262/tests/regressions_dual_run.rs` then gates it forever (a re-opened
+  divergence fails there). This is the portable, upstream-eligible home; see
+  [`endor-262/cases/regressions/README.md`](endor-262/cases/regressions/README.md).
+- A **decoder / bytecode** trophy (target 2 — malformed bytes with no JS-source
+  preimage, like the self-loop above) has no dual-run form, so its lock stays a
+  Rust regression test in `endor-fuzz` (here, `decoder_hang_is_bounded_not_infinite`).
+- A **compiler byte-identity** divergence (`differential_compile` — different
+  bytecode on identical source that still runs to the same result) is locked by
+  the curated `endor-262/corpora/` + `corpora_byte_identity_no_undocumented_divergence`,
+  not the runtime regression tree.
+
+The `endor-fuzz` generators themselves never change to record a trophy — they
+are generative instruments; only their minimized output is captured.
+
 ## Stage 5: the compiler port (`endor-compile` coder, children 5–7)
 
 Stage 5 replaces the differential-oracle compiler with a pure-Rust one in

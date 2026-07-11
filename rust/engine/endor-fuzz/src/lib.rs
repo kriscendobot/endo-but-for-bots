@@ -15,6 +15,13 @@
 //!   drives arbitrary/truncated bytes through the decoder and
 //!   interpreter, which must degrade to a `Halt::Decode`, never panic
 //!   (XS treats bytecode as trusted; endor's loader must not).
+//!
+//! **When an arm finds a trophy** (a minimized, fixed divergence), it lands a
+//! durable regression, not a change to a generator: a source-level divergence
+//! becomes a test262 case under `endor-262/cases/regressions/` (arm named in
+//! `info:`); a bytecode/decoder trophy keeps its lock as a Rust regression test
+//! here (e.g. `decoder_hang_is_bounded_not_infinite`). See the fix workflow in
+//! `rust/engine/README.md` and `endor-262/cases/regressions/README.md`.
 
 use endor_vm::{disassemble, run_program, run_program_bounded};
 

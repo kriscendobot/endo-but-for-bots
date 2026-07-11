@@ -42,7 +42,18 @@ fn generated_cases_reproduce_corpus_coverage() {
         }
     };
 
-    let files = collect_js(&cases);
+    // The fuzz-trophies regression tree (`cases/regressions/`) is not corpus:
+    // it is gated separately by `regressions_dual_run.rs` and legitimately
+    // carries parse-negative named skips, which would break the covered==total
+    // coverage proof below. Exclude it here so this test stays a pure
+    // corpus-conversion equivalence proof.
+    let files: Vec<_> = collect_js(&cases)
+        .into_iter()
+        .filter(|p| {
+            !p.components()
+                .any(|c| c.as_os_str() == "regressions")
+        })
+        .collect();
     assert!(
         !files.is_empty(),
         "cases/ tree must contain generated cases"
