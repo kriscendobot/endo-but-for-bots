@@ -142,6 +142,21 @@ awaited promise — the exact infrastructure `Promise.prototype.finally`
   (DIRECTORY sections; whole-tree `language/` OOMs) — divergent=0, every skip
   named. `language/statements/async-generator` + `for-await-of` stay the
   **designated scope fold**: named skips `async-generator` / `for-await-of`.
+
+**Harness wiring — LANDED** (convergence child 3/5, PR #600). The `endor-xst`
+runner now graduates `flags: [async]` cases from the `structural:async-or-can-
+block` pre-skip to real dual-run verdicts (`endor_262::xst::run_async_case`):
+a pure-JS async prelude defines `$DONE`/`print` once (byte-identical on both
+engines — no host-function calibration), both engines drain the promise job
+queue per case, and the runner reads the `$DONE` completion sentinel plus the
+unhandled-rejection latch off endor after the drain
+(`Interp::{global_string, has_unhandled_rejection}`, the latter mirroring
+`the->rejection`). The base dual-run verdict is refined by the latch: only a
+clean `Test262:AsyncTestComplete` on a `Covered` base counts as covered;
+every other signal (reported failure, did-not-run, unhandled rejection) is an
+honest `async:*` named skip, never a `Fail`. Graduated `endor-xst` covered
+(divergent=0): await 10, async-function 22, `built-ins/AsyncFunction` 1,
+`built-ins/Promise` 68. Bars in `endor-262/src/xst.rs`.
 - Grow `built-ins/Promise` further only once native reaction handlers land
   `finally` + the combinators (they share the infra above).
 

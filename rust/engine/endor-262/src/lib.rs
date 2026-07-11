@@ -192,6 +192,20 @@ pub fn dual_run_with(source: &str, compiler: Compiler) -> Option<DualRun> {
     // native `Boolean` and not an undefined variable (design § fundamentals).
     let endor: RunOutcome = run_program_with_symbols(&bytecode, &symbols);
 
+    Some(build_dual_run(source, oracle, endor, bytecode))
+}
+
+/// Assemble a [`DualRun`] record from an oracle outcome and endor's run of
+/// (the compiler-selected) `bytecode`, computing the four-valued agreement plus
+/// the result/computron/error comparisons. Shared by [`dual_run_with`] and
+/// [`dual_run_async`], which differ only in whether they retain endor's
+/// interpreter afterward to read the async completion latch.
+fn build_dual_run(
+    source: &str,
+    oracle: endor_oracle::OracleOutcome,
+    endor: RunOutcome,
+    bytecode: Vec<u8>,
+) -> DualRun {
     let agreement = match (oracle.completed, endor.completed) {
         (true, true) => Agreement::BothComplete,
         (false, false) => Agreement::BothAbort,
@@ -217,7 +231,7 @@ pub fn dual_run_with(source: &str, compiler: Compiler) -> Option<DualRun> {
         && matches!(endor.halt, Halt::Throw(_))
         && oracle.error == endor_error;
 
-    Some(DualRun {
+    DualRun {
         source: source.to_string(),
         agreement,
         result_agrees,
@@ -234,6 +248,53 @@ pub fn dual_run_with(source: &str, compiler: Compiler) -> Option<DualRun> {
         endor_dispatched: endor.dispatched,
         endor_halt: endor.halt,
         bytecode,
+    }
+}
+
+/// A dual-run that also retains the endor-side async observations an
+/// `async`-flagged test262 case needs (design § Part 2, the async row): the
+/// `$DONE` completion sentinel a pure-JS async prelude records into a global,
+/// and the unhandled-rejection latch mirroring XS's `the->rejection`. The
+/// oracle shim already drains the promise job queue with metering accumulating
+/// (`fxRunPromiseJobs`), and endor's [`endor_vm::Interp::run`] drains its own
+/// (the stage-3b promise pump), so a computron agreement in `run` certifies
+/// endor reproduced the oracle's whole execution *including* the microtask
+/// drain — the gate the async verdict layers on top of.
+#[derive(Debug, Clone)]
+pub struct AsyncDualRun {
+    pub run: DualRun,
+    /// The endor async completion sentinel (`$DONE`'s outcome as the async
+    /// prelude records it), rendered `String()`; `None` if the program never
+    /// signaled (the did-not-run latch — `$DONE` was never called).
+    pub endor_signal: Option<String>,
+    /// endor saw a promise settle rejected that nothing ever observed
+    /// (`the->rejection`-equivalent).
+    pub endor_unhandled_rejection: bool,
+}
+
+/// Run one async-harness `source` on both engines and, keeping endor's
+/// interpreter past the run, read the `$DONE` completion sentinel out of the
+/// global named `signal_name` plus the unhandled-rejection latch. Uses the
+/// default (oracle) compiler like [`dual_run`]; returns `None` only if the
+/// oracle machine itself fails to start.
+pub fn dual_run_async(source: &str, signal_name: &str) -> Option<AsyncDualRun> {
+    let oracle = endor_oracle::run(source)?;
+    let (bytecode, symbols) = compile_for(Compiler::default(), source, &oracle);
+
+    // Mirror `run_program_with_symbols`, but retain the interpreter so the
+    // async completion latch can be read after the job drain.
+    let names = endor_vm::parse_symbols(&symbols);
+    let mut interp = endor_vm::Interp::new();
+    interp.link_intrinsics(&names);
+    let endor: RunOutcome = interp.run(&bytecode);
+
+    let endor_signal = interp.global_string(signal_name);
+    let endor_unhandled_rejection = interp.has_unhandled_rejection();
+
+    Some(AsyncDualRun {
+        run: build_dual_run(source, oracle, endor, bytecode),
+        endor_signal,
+        endor_unhandled_rejection,
     })
 }
 

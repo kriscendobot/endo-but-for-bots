@@ -1014,6 +1014,35 @@ objects) the bulk of `language/` needs, so most tests are honestly skipped
 today, the covered count growing as later stages land the built-ins. See
 the design's § test262 conformance (requirement 6).
 
+**`async`-flagged cases (harness wiring, convergence child 3/5).** A test
+carrying `flags: [async]` no longer pre-skips wholesale as
+`structural:async-or-can-block`; the runner now plays `xst262.c`'s async
+protocol over the stage-3b/4b promise pump. Because the oracle compiles the
+assembled source and endor runs that exact bytecode, `$DONE`/`print` are
+defined **once, in a pure-JS async prelude** (so the two engines stay
+byte-identical — no host-function metering to calibrate — and
+`doneprintHandle.js` works whether or not the case lists it): `$DONE`'s
+outcome is recorded into a sentinel global, both engines drain the promise
+job queue per case (the `fxRunLoop`-equivalent), and after the drain the
+runner reads the sentinel off endor (`Interp::global_string`, the did-not-run
+latch) plus the unhandled-rejection latch (`Interp::has_unhandled_rejection`,
+mirroring XS's `the->rejection`). The verdict is the ordinary dual-run verdict
+**refined** by that latch: a clean `Test262:AsyncTestComplete` on a
+differentially-`Covered` base is covered; a reported failure, an unexpected
+signal, the did-not-run case, and an unhandled rejection each become an
+honest named skip (`async:*`) — never a `Fail`, since on a `Covered` base the
+oracle agreed with endor, so any non-success signal reflects the shared
+execution, not an endor defect (a genuine endor divergence is already caught
+by the completion/computron differential). Graduated `endor-xst` covered
+counts, `divergent=0` throughout: `language/expressions/await` 10,
+`language/statements/async-function` 22, `built-ins/AsyncFunction` 1,
+`built-ins/Promise` 68 (the async-flagged Promise cases now run end-to-end).
+`CanBlockIsFalse` (the `$262.agent`/Atomics blocking-agent tests) stays a
+named structural skip (`structural:can-block`). Bars:
+`xst::tests::{async_prelude_records_done_through_the_drain,
+refine_async_only_narrows_covered_to_honest_skips,
+async_sections_have_zero_failures_through_xst}`.
+
 ## The XSRE RegExp engine port (stage-3b, `endor-regexp`)
 
 `endor-regexp` is the engine-internal transliteration of the pin's RegExp

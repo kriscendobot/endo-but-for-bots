@@ -2093,6 +2093,14 @@ struct PromiseData {
     state: PromiseState,
     result: Slot,
     reactions: Vec<PromiseReaction>,
+    /// Whether a reaction (`.then`/`.catch`/`await`) was ever registered on
+    /// this promise — endor's coarse mirror of XS's per-rejection "handled"
+    /// bookkeeping behind `the->rejection`. Set the first time a reaction is
+    /// attached ([`Interp::promise_then_with`]/[`Interp::promise_then_native`]),
+    /// so a promise that settles **rejected** with `ever_handled == false` is
+    /// the unhandled rejection [`Interp::has_unhandled_rejection`] reports. Pure
+    /// post-run bookkeeping — never metered, so it cannot perturb computrons.
+    ever_handled: bool,
 }
 
 /// Per-instance RegExp state (XS's `XS_REGEXP_KIND` internal slot plus the
@@ -3215,6 +3223,40 @@ impl Interp {
     #[cfg(feature = "cost-calibration")]
     pub fn cost_recorder(&self) -> &crate::cost::CostRecorder {
         &self.cost
+    }
+
+    /// Read the top-level binding named `name`, rendered with ECMAScript
+    /// `String()` semantics — the post-run inspection the async test262
+    /// harness uses to read the `$DONE` completion sentinel a pure-JS async
+    /// prelude records into a global (design § Part 2, the async row). Resolves
+    /// through the same read path the interpreter uses (a declared frame local
+    /// first, then the global object's property) and the program-local symbol
+    /// table [`Self::link_intrinsics`] built, so it must be called after
+    /// [`Self::run`], when the top-level frame's scope is restored. Returns
+    /// `None` when the program never assigned that name (its slot is absent or
+    /// still the hoisted `undefined`): the did-not-run latch — `$DONE`/`print`
+    /// was never called.
+    pub fn global_string(&self, name: &str) -> Option<String> {
+        let id = *self.symbol_ids.get(name)?;
+        let slot = self.resolve_get(id)?;
+        if slot.kind == Kind::Undefined {
+            return None;
+        }
+        Some(self.render(&slot))
+    }
+
+    /// Whether any promise settled **rejected** with no reaction ever
+    /// registered on it — endor's mirror of XS's `the->rejection` unhandled-
+    /// rejection latch (design § Part 2, the async row). A `.then`/`.catch`/
+    /// `await` on the promise sets `ever_handled`
+    /// ([`Self::promise_then_with`]/[`Self::promise_then_native`]), so this is
+    /// true only for a rejection nothing ever observed — the shape an async
+    /// test that throws without settling `$DONE` leaves behind. Read after
+    /// [`Self::run`], once the job drain has settled every promise it can.
+    pub fn has_unhandled_rejection(&self) -> bool {
+        self.promises
+            .values()
+            .any(|p| p.state == PromiseState::Rejected && !p.ever_handled)
     }
 
     /// The raw bytecode-dispatch count (`n_dispatched`), exposed for the C1
@@ -8191,6 +8233,7 @@ impl Interp {
                 state: PromiseState::Pending,
                 result: Slot::undefined(),
                 reactions: Vec::new(),
+                ever_handled: false,
             },
         );
         inst
@@ -9031,6 +9074,10 @@ impl Interp {
             reject,
             kind: ReactionKind::User,
         };
+        // A `.then`/`.catch` observes the promise: mark it handled for the
+        // unhandled-rejection latch (XS clears `the->rejection` when a reaction
+        // is registered). Unmetered bookkeeping.
+        self.promises.get_mut(&promise).unwrap().ever_handled = true;
         let state = self.promises[&promise].state;
         match state {
             PromiseState::Pending => {
@@ -9077,6 +9124,9 @@ impl Interp {
             reject: Slot::undefined(),
             kind,
         };
+        // A native reaction (`await`, `finally`, the combinators) observes the
+        // promise too — mark it handled for the unhandled-rejection latch.
+        self.promises.get_mut(&promise).unwrap().ever_handled = true;
         let state = self.promises[&promise].state;
         match state {
             PromiseState::Pending => {

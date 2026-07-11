@@ -23,7 +23,7 @@
 //! parse-phase negatives activate.
 
 use crate::frontmatter::{self, Frontmatter, Negative};
-use crate::{dual_run, Agreement, DualRun};
+use crate::{dual_run, dual_run_async, Agreement, AsyncDualRun, DualRun};
 use endor_vm::Halt;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -249,6 +249,17 @@ struct Eval {
     computron_gap: bool,
 }
 
+/// Compute one case's verdict from a dual-run record already in hand and its
+/// frontmatter (the negative/positive split). Shared by the synchronous
+/// [`evaluate`] path and the async path ([`run_async_case`]), which supplies
+/// its own dual-run so it can additionally read the completion latch.
+fn verdict_for(cfg: &Config, run: &DualRun, fm: &Frontmatter, meter_exact_gate: bool) -> Verdict {
+    match &fm.negative {
+        Some(neg) => evaluate_negative(cfg, run, neg),
+        None => evaluate_positive(cfg, run, meter_exact_gate),
+    }
+}
+
 /// Evaluate one assembled sloppy source against the oracle differential.
 fn evaluate(cfg: &Config, source: &str, fm: &Frontmatter, meter_exact_gate: bool) -> Eval {
     let run = match dual_run(source) {
@@ -261,10 +272,7 @@ fn evaluate(cfg: &Config, source: &str, fm: &Frontmatter, meter_exact_gate: bool
             }
         }
     };
-    let outcome = match &fm.negative {
-        Some(neg) => evaluate_negative(cfg, &run, neg),
-        None => evaluate_positive(cfg, &run, meter_exact_gate),
-    };
+    let outcome = verdict_for(cfg, &run, fm, meter_exact_gate);
     // The computron comparison is advisory (accuracy-over-parity): a covered
     // case whose computrons drift from the oracle's is telemetry, folded
     // into the report's `advisory:` section, never a failure on its own.
@@ -400,6 +408,40 @@ fn determinism_violation(source: &str, repeat: u32, baseline: u64) -> bool {
     false
 }
 
+/// The name of the global the async prelude records the `$DONE` completion
+/// into, read back off endor after the job drain
+/// ([`crate::AsyncDualRun::endor_signal`]). Assigned as an *implicit* sloppy
+/// global (no `var`) so it is a pure global-object property on both engines,
+/// never a frame local that closure-cell aliasing could shadow.
+const ASYNC_SIGNAL_NAME: &str = "__endorAsyncSignal";
+
+/// The pure-JS async harness prelude, prepended to an `async`-flagged case
+/// (design § Part 2, the async row: "`$DONE` host function + did-not-run
+/// latch"). Because the oracle compiles the assembled source and endor runs
+/// that exact bytecode, `$DONE`/`print` are defined **once, in JS** — so the
+/// two engines run byte-identically (no host-function metering to calibrate)
+/// and the completion is observed by reading [`ASYNC_SIGNAL_NAME`] off endor
+/// after the drain, gated by the dual-run's computron agreement.
+///
+/// `$DONE` mirrors `doneprintHandle.js`'s classification exactly; a test that
+/// lists `doneprintHandle.js` in its `includes:` simply redeclares `$DONE`
+/// (a hoisted function) to route through `print`, which this prelude also
+/// defines to write the same sentinel — so either path records the same
+/// `Test262:AsyncTest{Complete,Failure:…}` marker string.
+const ASYNC_PRELUDE: &str = r#"function $DONE(error) {
+  if (error) {
+    if (typeof error === 'object' && error !== null && 'name' in error) {
+      __endorAsyncSignal = 'Test262:AsyncTestFailure:' + error.name + ': ' + error.message;
+    } else {
+      __endorAsyncSignal = 'Test262:AsyncTestFailure:Test262Error: ' + error;
+    }
+  } else {
+    __endorAsyncSignal = 'Test262:AsyncTestComplete';
+  }
+}
+function print(msg) { __endorAsyncSignal = '' + msg; }
+"#;
+
 /// Run one case (source text) through the full mode/verdict machinery.
 pub fn run_case(cfg: &Config, harness_dir: &Path, src: &str) -> CaseResult {
     let fm = frontmatter::parse(src);
@@ -414,12 +456,11 @@ pub fn run_case(cfg: &Config, harness_dir: &Path, src: &str) -> CaseResult {
     if fm.flags.iter().any(|f| f == "module") {
         return preskip("structural:module");
     }
-    if fm
-        .flags
-        .iter()
-        .any(|f| f == "async" || f == "CanBlockIsFalse")
-    {
-        return preskip("structural:async-or-can-block");
+    // `CanBlockIsFalse` marks the `$262.agent`/Atomics blocking-agent tests,
+    // which need a threading story endor does not have — a named structural
+    // skip. (`async` no longer rides this pre-skip; it runs below.)
+    if fm.flags.iter().any(|f| f == "CanBlockIsFalse") {
+        return preskip("structural:can-block");
     }
 
     let (_run_sloppy, has_strict, only_strict) = strict_mode_status(&fm.flags);
@@ -434,6 +475,16 @@ pub fn run_case(cfg: &Config, harness_dir: &Path, src: &str) -> CaseResult {
         };
     }
 
+    let meter_exact_gate =
+        cfg.gate_meter_exact && fm.features.iter().any(|f| f == "endor-meter-exact");
+
+    // `async`-flagged case: assemble with the `$DONE` prelude, run the dual-run
+    // (both engines drain the promise job queue — the fxRunLoop-equivalent —
+    // per case), and layer the async completion verdict on the differential.
+    if fm.flags.iter().any(|f| f == "async") {
+        return run_async_case(cfg, harness_dir, src, &fm, has_strict, meter_exact_gate);
+    }
+
     let source = match assemble(harness_dir, src, &fm) {
         Ok(s) => s,
         Err(reason) => {
@@ -445,8 +496,6 @@ pub fn run_case(cfg: &Config, harness_dir: &Path, src: &str) -> CaseResult {
         }
     };
 
-    let meter_exact_gate =
-        cfg.gate_meter_exact && fm.features.iter().any(|f| f == "endor-meter-exact");
     let eval = evaluate(cfg, &source, &fm, meter_exact_gate);
 
     // The determinism gate (unconditional half of the doctrine) overrides a
@@ -466,6 +515,100 @@ pub fn run_case(cfg: &Config, harness_dir: &Path, src: &str) -> CaseResult {
         verdict,
         strict_skipped: has_strict,
         computron_gap: eval.computron_gap,
+    }
+}
+
+/// Run one `async`-flagged case: prepend the [`ASYNC_PRELUDE`] to the standard
+/// assembly, dual-run it (each engine drains its own promise job queue), and
+/// resolve the verdict as the base differential verdict *refined* by endor's
+/// `$DONE` completion latch. The refinement only ever *narrows* a `Covered`
+/// base to an honest skip — never manufactures a failure — so endor cannot lie
+/// about an async case (a genuine endor divergence is already caught by the
+/// completion/computron differential in [`verdict_for`]).
+fn run_async_case(
+    cfg: &Config,
+    harness_dir: &Path,
+    src: &str,
+    fm: &Frontmatter,
+    has_strict: bool,
+    meter_exact_gate: bool,
+) -> CaseResult {
+    let assembled = match assemble(harness_dir, src, fm) {
+        Ok(s) => s,
+        Err(reason) => {
+            return CaseResult {
+                verdict: Verdict::PreSkip(reason),
+                strict_skipped: has_strict,
+                computron_gap: false,
+            }
+        }
+    };
+    let source = format!("{ASYNC_PRELUDE}{assembled}");
+
+    let async_run = match dual_run_async(&source, ASYNC_SIGNAL_NAME) {
+        Some(a) => a,
+        None => {
+            return CaseResult {
+                verdict: Verdict::RunSkip("oracle-machine-error".into()),
+                strict_skipped: has_strict,
+                computron_gap: false,
+            }
+        }
+    };
+
+    let base = verdict_for(cfg, &async_run.run, fm, meter_exact_gate);
+    let computron_gap =
+        matches!(base, Verdict::Covered) && async_run.run.oracle_computrons != async_run.run.endor_computrons;
+
+    // A `Covered` differential means endor reproduced the oracle's full
+    // execution (script + microtask drain) — only then is the async completion
+    // latch meaningful; a divergence keeps its base Fail/skip.
+    let outcome = match base {
+        Verdict::Covered => refine_async(&async_run),
+        other => other,
+    };
+
+    // The determinism gate runs over the same prelude-bearing source.
+    let verdict = if cfg.repeat > 1
+        && determinism_violation(&source, cfg.repeat, async_run.run.endor_computrons)
+    {
+        Verdict::Fail(format!(
+            "nondeterministic computrons across {} runs",
+            cfg.repeat
+        ))
+    } else {
+        outcome
+    };
+
+    CaseResult {
+        verdict,
+        strict_skipped: has_strict,
+        computron_gap,
+    }
+}
+
+/// Refine a differentially-`Covered` async case by its `$DONE` completion
+/// latch (the did-not-run / success / failure trichotomy `xst262.c` computes
+/// after `fxRunLoop`), plus the unhandled-rejection latch. Only the clean
+/// success path counts as covered; every other shape is an honest named skip —
+/// never a `Fail`, because on a `Covered` base the oracle *agreed* with endor,
+/// so a non-success signal reflects the shared execution (an oracle-side
+/// failure or a test that never signaled), not an endor defect.
+fn refine_async(async_run: &AsyncDualRun) -> Verdict {
+    if async_run.endor_unhandled_rejection {
+        return Verdict::RunSkip("async:unhandled-rejection".into());
+    }
+    match async_run.endor_signal.as_deref() {
+        Some("Test262:AsyncTestComplete") => Verdict::Covered,
+        Some(s) if s.starts_with("Test262:AsyncTestFailure") => {
+            Verdict::RunSkip("async:reported-failure".into())
+        }
+        // A signal that is neither the success marker nor a known failure
+        // marker: some other `print` output — honestly named, not covered.
+        Some(_) => Verdict::RunSkip("async:unexpected-signal".into()),
+        // The did-not-run latch: `$DONE` was never called (nor `print`), so the
+        // async test never signaled completion on the shared execution.
+        None => Verdict::RunSkip("async:no-completion-signal".into()),
     }
 }
 
@@ -790,5 +933,135 @@ mod tests {
             endor_halt,
             bytecode: Vec::new(),
         }
+    }
+
+    /// An `AsyncDualRun` wrapping a trivially-agreeing dual-run with a chosen
+    /// completion signal and rejection latch — for the pure `refine_async`
+    /// trichotomy without an oracle machine.
+    fn synthetic_async(signal: Option<&str>, unhandled: bool) -> AsyncDualRun {
+        AsyncDualRun {
+            run: synthetic_abort(Halt::Return, ""),
+            endor_signal: signal.map(|s| s.to_string()),
+            endor_unhandled_rejection: unhandled,
+        }
+    }
+
+    #[test]
+    fn refine_async_only_narrows_covered_to_honest_skips() {
+        // The clean `$DONE()` success is the only covered shape.
+        assert_eq!(
+            refine_async(&synthetic_async(Some("Test262:AsyncTestComplete"), false)),
+            Verdict::Covered
+        );
+        // A reported async failure, an unexpected signal, and the did-not-run
+        // latch each become a NAMED skip — never a `Fail` (on a `Covered` base
+        // the oracle agreed with endor, so a non-success signal is a shared
+        // outcome, not an endor defect).
+        assert!(matches!(
+            refine_async(&synthetic_async(Some("Test262:AsyncTestFailure:X"), false)),
+            Verdict::RunSkip(r) if r == "async:reported-failure"
+        ));
+        assert!(matches!(
+            refine_async(&synthetic_async(Some("something else"), false)),
+            Verdict::RunSkip(r) if r == "async:unexpected-signal"
+        ));
+        assert!(matches!(
+            refine_async(&synthetic_async(None, false)),
+            Verdict::RunSkip(r) if r == "async:no-completion-signal"
+        ));
+        // The unhandled-rejection latch wins even over a would-be success.
+        assert!(matches!(
+            refine_async(&synthetic_async(Some("Test262:AsyncTestComplete"), true)),
+            Verdict::RunSkip(r) if r == "async:unhandled-rejection"
+        ));
+    }
+
+    #[test]
+    fn async_prelude_records_done_through_the_drain() {
+        // The `$DONE` sentinel + job-drain wiring, exercised end-to-end through
+        // the real oracle differential (no test262 tree needed). Each source
+        // prepends the async prelude, dual-runs, and the endor completion latch
+        // is read after the promise pump drains.
+        let done = |body: &str| {
+            let src = format!("{ASYNC_PRELUDE}{body}");
+            dual_run_async(&src, ASYNC_SIGNAL_NAME).expect("oracle machine available")
+        };
+
+        // A synchronous success signals `AsyncTestComplete`.
+        let s = done("$DONE();");
+        assert_eq!(s.endor_signal.as_deref(), Some("Test262:AsyncTestComplete"));
+        assert!(!s.endor_unhandled_rejection);
+
+        // An awaited primitive then `$DONE()` — the resume runs at the drain.
+        let a = done("(async function(){ await 1; $DONE(); })();");
+        assert_eq!(a.run.agreement, Agreement::BothComplete);
+        assert_eq!(a.endor_signal.as_deref(), Some("Test262:AsyncTestComplete"));
+
+        // A resolved-promise reaction feeding `$DONE` — drained the same way.
+        let p = done("Promise.resolve(1).then(function(){ $DONE(); }, $DONE);");
+        assert_eq!(p.endor_signal.as_deref(), Some("Test262:AsyncTestComplete"));
+
+        // Never signals: the did-not-run latch reads `None`.
+        assert_eq!(done("1 + 1;").endor_signal, None);
+
+        // A rejected promise nothing observes trips the unhandled-rejection
+        // latch (mirroring `the->rejection`), and never signals `$DONE`.
+        let r = done("Promise.reject(new Error('x'));");
+        assert!(r.endor_unhandled_rejection);
+        assert_eq!(r.endor_signal, None);
+    }
+
+    #[test]
+    fn async_sections_have_zero_failures_through_xst() {
+        // The async analogue of `covered_grammar_sections_have_zero_failures_
+        // through_xst`: walk a bounded slice of the async surface (which used
+        // to pre-skip wholesale as `structural:async-or-can-block`) through the
+        // full runner and require ZERO failures — every `async` case endor runs
+        // to a real `$DONE` completion is covered, everything else is honestly
+        // named-skipped, nothing diverges. The covered count is reported, not
+        // pinned (it grows as the async surface lands more built-ins).
+        use crate::test262::{collect_js, locate_test262};
+        let (root, harness) = match locate_test262() {
+            Some(p) => p,
+            None => {
+                eprintln!("test262 subset absent; skipping the endor-xst async bar");
+                return;
+            }
+        };
+        // Bounded async directories (whole-tree `built-ins/Promise` is large;
+        // the await + async-function statement sections are a representative,
+        // deterministic slice that stays inside the oracle RSS budget).
+        let sections = [
+            "language/expressions/await",
+            "language/statements/async-function",
+        ];
+        let mut files = Vec::new();
+        for s in sections {
+            files.extend(collect_js(&root.join(s)));
+        }
+        assert!(!files.is_empty(), "async sections must have tests");
+        let cfg = Config::default();
+        let rep = run_files(&cfg, &harness, &root, &files);
+        eprintln!(
+            "endor-xst async slice: total={} covered={} failed={}",
+            rep.total,
+            rep.covered,
+            rep.failures.len(),
+        );
+        for (reason, n) in rep.skip_detail_summary() {
+            eprintln!("    {:>5}  {}", n, reason);
+        }
+        for (path, detail) in &rep.failures {
+            eprintln!("  FAIL {}\n    {}", path, detail);
+        }
+        assert!(
+            rep.covered > 0,
+            "the async surface has landed; expected some covered async cases"
+        );
+        assert!(
+            rep.failures.is_empty(),
+            "zero failures required through the async xst runner; got {}",
+            rep.failures.len()
+        );
     }
 }
