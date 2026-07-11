@@ -8,6 +8,14 @@ import { cborCodec } from '@endo/ocapn/cbor';
 import { makeCryptography } from '@endo/ocapn/cryptography';
 import { makeOcapnNoiseNetwork } from '@endo/ocapn-noise';
 import { makeTcpTransport } from '@endo/ocapn-noise/transport/tcp';
+import { makeWebSocketTransport } from '@endo/ocapn-noise/transport/ws';
+// The OCapN network module is loaded unconfined (`makeUnconfined` in
+// `setup-ocapn.js`), so — exactly like `ws-relay.js` and the TCP
+// transport's `import net from 'node:net'` — it obtains its Node
+// WebSocket powers by importing them here at the module top, then
+// threads them into the transport rather than letting confined code
+// reach for `ws` ambiently.
+import { WebSocket, WebSocketServer } from 'ws';
 import { fromHex, toHex } from '../hex.js';
 
 /**
@@ -44,9 +52,20 @@ const BOOTSTRAP_SWISSNUM = 'endo-bootstrap';
 // Address protocol for OCapN-Noise-over-TCP connection hints.
 const protocol = 'ocapn+noise+tcp';
 
+// Address protocol for OCapN-Noise-over-WebSocket connection hints. The
+// WS variant is what the target deployment host (minion.town) can serve,
+// since it exposes only 443/WS; TCP and WS share the same Noise session
+// layer and differ only in the byte-stream transport underneath.
+const wsProtocol = 'ocapn+noise+ws';
+
 // Optional pet name under which a stored `host:port` listen address
 // is read, mirroring `tcp-netstring.js`'s `tcp-listen-addr`.
 const LISTEN_ADDR_NAME = 'ocapn-listen-addr';
+
+// Optional pet name for the WebSocket listen address, parallel to
+// `ocapn-listen-addr`. Its presence is what enables the WS transport;
+// see the transport-gating logic in `make`.
+const WS_LISTEN_ADDR_NAME = 'ws-listen-addr';
 
 // Domain-separation prefix for the agent-binding signature. Mixed into
 // the signed material so a signature produced for this binding cannot
@@ -91,22 +110,43 @@ export const make = async (powers, context) => {
   const localGreeter = await E(powers).greeter();
   const localGateway = await E(powers).gateway();
 
-  // Determine the TCP listen address. Port 0 lets the OS assign an
-  // ephemeral port.
-  let host = '127.0.0.1';
-  let port = 0;
-  /** @type {string | undefined} */
-  let configuredHostPort;
-  try {
-    configuredHostPort = /** @type {string} */ (
-      await E(powers).lookup(LISTEN_ADDR_NAME)
-    );
-    const listenUrl = new URL(`tcp://${configuredHostPort}`);
-    host = listenUrl.hostname;
-    port = listenUrl.port !== '' ? Number(listenUrl.port) : 0;
-  } catch {
-    // No stored listen address; fall back to an ephemeral local port.
-  }
+  // Read an optional stored `host:port` listen address by pet name.
+  // Returns `undefined` when the name is unset. Port 0 (or an absent
+  // port) lets the OS assign an ephemeral port. The `scheme` is only a
+  // URL-parsing vehicle for the `host:port` authority; it never leaves
+  // this function.
+  /**
+   * @param {string} name
+   * @param {'tcp' | 'ws'} scheme
+   * @returns {Promise<{ configured: string, host: string, port: number } | undefined>}
+   */
+  const readListenAddr = async (name, scheme) => {
+    /** @type {string} */
+    let configured;
+    try {
+      configured = /** @type {string} */ (await E(powers).lookup(name));
+    } catch {
+      return undefined;
+    }
+    const listenUrl = new URL(`${scheme}://${configured}`);
+    return {
+      configured,
+      host: listenUrl.hostname,
+      port: listenUrl.port !== '' ? Number(listenUrl.port) : 0,
+    };
+  };
+
+  // Transport gating. TCP is enabled by `ocapn-listen-addr`, WS by
+  // `ws-listen-addr`; a daemon may enable either or both. When neither
+  // is configured we default to an ephemeral TCP listener so an
+  // unconfigured daemon keeps its historical TCP-only behavior.
+  const tcpConfig = await readListenAddr(LISTEN_ADDR_NAME, 'tcp');
+  const wsConfig = await readListenAddr(WS_LISTEN_ADDR_NAME, 'ws');
+  const enableTcp = tcpConfig !== undefined || wsConfig === undefined;
+  const enableWs = wsConfig !== undefined;
+
+  const tcpHost = tcpConfig?.host ?? '127.0.0.1';
+  const tcpPort = tcpConfig?.port ?? 0;
 
   const codec = cborCodec;
   const network = makeOcapnNoiseNetwork({ codec });
@@ -162,8 +202,27 @@ export const make = async (powers, context) => {
   const locator = new Map();
   locator.set(BOOTSTRAP_SWISSNUM, bootstrap);
 
-  const tcpTransport = makeTcpTransport({ host, port });
-  await network.addTransport(tcpTransport);
+  if (enableTcp) {
+    const tcpTransport = makeTcpTransport({ host: tcpHost, port: tcpPort });
+    await network.addTransport(tcpTransport);
+  }
+  if (enableWs) {
+    // The WS transport needs both a `WebSocket` client constructor (to
+    // dial) and a `WebSocketServer` constructor (to listen); both are
+    // supplied from the module-top `ws` import so confined code never
+    // reaches for `ws` itself.
+    const wsTransport = makeWebSocketTransport({
+      // The `ws` package's `WebSocket` constructor is structurally a
+      // browser `WebSocket` for the transport's purposes but does not
+      // unify with the DOM `WebSocket` lib type; cast at this boundary.
+      // eslint-disable-next-line object-shorthand
+      WebSocket: /** @type {any} */ (WebSocket),
+      WebSocketServer,
+      host: /** @type {{ host: string }} */ (wsConfig).host,
+      port: /** @type {{ port: number }} */ (wsConfig).port,
+    });
+    await network.addTransport(wsTransport);
+  }
 
   const client = await makeOcapn({
     codec,
@@ -177,20 +236,12 @@ export const make = async (powers, context) => {
   });
 
   // Our advertised OCapN location, including the transport hints
-  // (bound host and port) a peer needs in order to dial us.
+  // (bound host and port for TCP; a `ws://host:port` url for WS) a peer
+  // needs in order to dial us. The location carries the hints for every
+  // enabled transport, so each per-protocol address below embeds the
+  // same `loc` and differs only in scheme and informational authority.
   const localLocation = network.locationFor(keyId);
   const localHints = localLocation.hints || {};
-  const boundPort = String(localHints['tcp:port'] || port);
-
-  // Persist the resolved listen address so an OS-assigned ephemeral
-  // port stays stable across daemon restarts; otherwise every restart
-  // would advertise a different port and invalidate stored locators.
-  // Mirrors `tcp-netstring.js`. IPv6 literals are bracketed so the
-  // stored value parses through `new URL('tcp://...')` on restart.
-  const resolvedHostPort = formatHostPort(host, boundPort);
-  if (resolvedHostPort !== configuredHostPort) {
-    await E(powers).storeValue(resolvedHostPort, LISTEN_ADDR_NAME);
-  }
 
   // The connection-hint address embeds both the daemon node id and
   // the full OCapN location, so a dialing peer can reconstruct the
@@ -200,15 +251,61 @@ export const make = async (powers, context) => {
   // informational — it keeps the address a well-formed URL so the
   // daemon's `new URL(address)` and `.protocol` checks in `makePeer`
   // continue to work.
-  const hintHost = localHints['tcp:host'] || host;
   const encodedNode = encodeURIComponent(String(localNodeId));
   const encodedLocation = encodeURIComponent(JSON.stringify(localLocation));
-  const address = `${protocol}://${formatHostPort(hintHost, boundPort)}/?node=${encodedNode}&loc=${encodedLocation}`;
+
+  /** @type {string[]} */
+  const addresses = [];
+
+  if (enableTcp) {
+    const boundPort = String(localHints['tcp:port'] || tcpPort);
+
+    // Persist the resolved listen address so an OS-assigned ephemeral
+    // port stays stable across daemon restarts; otherwise every restart
+    // would advertise a different port and invalidate stored locators.
+    // Mirrors `tcp-netstring.js`. IPv6 literals are bracketed so the
+    // stored value parses through `new URL('tcp://...')` on restart.
+    const resolvedHostPort = formatHostPort(tcpHost, boundPort);
+    if (resolvedHostPort !== tcpConfig?.configured) {
+      await E(powers).storeValue(resolvedHostPort, LISTEN_ADDR_NAME);
+    }
+
+    const hintHost = localHints['tcp:host'] || tcpHost;
+    addresses.push(
+      `${protocol}://${formatHostPort(hintHost, boundPort)}/?node=${encodedNode}&loc=${encodedLocation}`,
+    );
+  }
+
+  if (enableWs) {
+    // The WS listener advertises a single aggregated `ws:url` hint
+    // (`ws://host:port`) rather than the separate host/port pair TCP
+    // uses; parse it back out to form the informational authority and
+    // the persisted `host:port` listen address. The bound host in the
+    // hint already substitutes a routable address for a wildcard bind.
+    const wsUrlHint = /** @type {string} */ (localHints['ws:url']);
+    const wsUrl = new URL(wsUrlHint);
+    const wsBoundPort = wsUrl.port;
+
+    // Persist the resolved WS listen address (bind host + resolved
+    // port) so an ephemeral port survives restart, mirroring the TCP
+    // branch above.
+    const resolvedWsHostPort = formatHostPort(
+      /** @type {{ host: string }} */ (wsConfig).host,
+      wsBoundPort,
+    );
+    if (resolvedWsHostPort !== wsConfig?.configured) {
+      await E(powers).storeValue(resolvedWsHostPort, WS_LISTEN_ADDR_NAME);
+    }
+
+    addresses.push(
+      `${wsProtocol}://${formatHostPort(wsUrl.hostname, wsBoundPort)}/?node=${encodedNode}&loc=${encodedLocation}`,
+    );
+  }
 
   // `client.shutdown()` tears down the OCapN sessions and the
-  // network's transports (closing the TCP listener); shutting the
-  // network down again separately would destroy sockets out from
-  // under the in-flight session close.
+  // network's transports (closing the TCP and/or WebSocket listeners);
+  // shutting the network down again separately would destroy sockets
+  // out from under the in-flight session close.
   E.sendOnly(context).addDisposalHook(() => client.shutdown());
   cancelled.catch(() => client.shutdown());
 
@@ -317,16 +414,28 @@ export const make = async (powers, context) => {
   };
 
   return Far('OcapnNoiseService', {
-    addresses: () => harden([address]),
+    addresses: () => harden(addresses),
     /** @param {string} addressOrProtocol */
     supports: addressOrProtocol => {
+      // Normalize to a bare `scheme:` regardless of whether we were
+      // handed a full address URL or just a protocol token. Only the
+      // enabled transports are reported as supported, so the daemon's
+      // address router never hands this network a scheme it cannot dial.
+      let scheme;
       try {
-        return new URL(addressOrProtocol).protocol === `${protocol}:`;
+        scheme = new URL(addressOrProtocol).protocol;
       } catch {
-        return (
-          addressOrProtocol === `${protocol}:` || addressOrProtocol === protocol
-        );
+        scheme = addressOrProtocol.endsWith(':')
+          ? addressOrProtocol
+          : `${addressOrProtocol}:`;
       }
+      if (scheme === `${protocol}:`) {
+        return enableTcp;
+      }
+      if (scheme === `${wsProtocol}:`) {
+        return enableWs;
+      }
+      return false;
     },
     connect,
   });
