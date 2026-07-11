@@ -9,24 +9,13 @@
 //! scope shapes against an oracle (C-XS exposes no scope dump); the
 //! shape/numbering contract is pinned by the unit fixtures in
 //! `src/scoper/tests.rs`.
+//!
+//! The corpus programs are the curated corpus lines, now carried verbatim
+//! in the `info: Source:` frontmatter of the `endor-262/cases/` tree (the
+//! `corpora/*.js` line files retired in PR #600 convergence 2/5).
 
-use std::path::PathBuf;
-
-fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../endor-262/corpora")
-}
-
-/// A program line worth scoping: non-blank and not a whole-line comment.
-fn code_lines(contents: &str) -> Vec<&str> {
-    contents
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| {
-            let t = l.trim_start();
-            !t.is_empty() && !t.starts_with("//")
-        })
-        .collect()
-}
+mod corpus_cases;
+use corpus_cases::{corpus_programs, CORPUS_PROGRAM_COUNT};
 
 /// True if the parser accepts `src` as a Script (the scoper only runs on
 /// parser-accepted programs).
@@ -39,30 +28,27 @@ fn parses(src: &str) -> bool {
 
 #[test]
 fn corpus_scope_smoke() {
-    let dir = corpus_dir();
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read corpus dir {}: {e}", dir.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "js").unwrap_or(false))
-        .collect();
-    files.sort();
-    assert!(!files.is_empty(), "no corpus files under {}", dir.display());
+    let programs = corpus_programs();
+    assert_eq!(
+        programs.len(),
+        CORPUS_PROGRAM_COUNT,
+        "expected {CORPUS_PROGRAM_COUNT} corpus programs in endor-262/cases, found {}",
+        programs.len()
+    );
 
     let mut scoped = 0usize;
     let mut early_errors = 0usize;
-    for file in &files {
-        let contents = std::fs::read_to_string(file).unwrap();
-        for line in code_lines(&contents) {
-            if !parses(line) {
-                continue;
-            }
-            // A panic here fails the test (the point of the smoke).
-            match endor_compile::scope_program(line, false) {
-                Ok(_) => scoped += 1,
-                Err(_) => early_errors += 1,
-            }
+    for (_id, program) in &programs {
+        let line = program.as_str();
+        if !parses(line) {
+            continue;
+        }
+        // A panic here fails the test (the point of the smoke).
+        match endor_compile::scope_program(line, false) {
+            Ok(_) => scoped += 1,
+            Err(_) => early_errors += 1,
         }
     }
-    eprintln!("corpus scope smoke: {} files, {scoped} scoped, {early_errors} early errors", files.len());
+    eprintln!("corpus scope smoke: {} programs, {scoped} scoped, {early_errors} early errors", programs.len());
     assert!(scoped > 0, "expected to scope at least one corpus program");
 }
