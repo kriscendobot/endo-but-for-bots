@@ -10,15 +10,22 @@ publish.workspace = true
 name = "endor_262"
 path = "src/lib.rs"
 
-[[bin]]
-name = "test262-language"
-path = "src/bin/test262_language.rs"
-
 [dependencies]
 endor-vm = { path = "../endor-vm" }
 endor-oracle = { path = "../endor-oracle" }
 endor-compile = { path = "../endor-compile" }
+# Full test262 YAML frontmatter parse (design § Part 2: a real YAML
+# dependency replaces test262.rs's three-field hand parser). yaml-rust2 is
+# pure Rust, so the crate's #![forbid(unsafe_code)] holds; default features
+# (encoding_rs BOM detection) are off — test262 files are UTF-8.
+yaml-rust2 = { version = "0.11", default-features = false }
 
 [[bin]]
 name = "compile-diff"
 path = "src/bin/compile_diff.rs"
+
+# endor-xst: the xst-analogue test262 runner (design § Part 2). Subsumes the
+# dual-run harness and the `test262-language` subtree walker.
+[[bin]]
+name = "endor-xst"
+path = "src/bin/endor_xst.rs"

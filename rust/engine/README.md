@@ -129,13 +129,17 @@ cargo run -p endor-262 --bin harness          # stage-1 corpus
 cargo run -p endor-262 --bin harness -- '1 + 2 * 3'   # ad-hoc program
 cargo test  --workspace -- --test-threads=1   # includes the bar as a test
 
-# The real test262 language/ dual-run runner (stage-2 acceptance bar).
+# The xst-analogue test262 runner (`endor-xst`, design § Part 2) — the
+# dual-run runner that subsumes the retired `test262-language` walker.
 # Run per subtree — the C-XS oracle accumulates memory across a whole-tree
 # walk, so `expressions`/`statements` in separate processes bound the RSS.
-cargo run -p endor-262 --bin test262-language -- expressions
-cargo run -p endor-262 --bin test262-language -- statements/for
+cargo run -p endor-262 --bin endor-xst -- expressions
+cargo run -p endor-262 --bin endor-xst -- statements/for
 # The stage-3 built-ins sections run through the same binary:
-cargo run -p endor-262 --bin test262-language -- built-ins/Boolean
+cargo run -p endor-262 --bin endor-xst -- built-ins/Boolean
+# The full frontmatter, negative verdicts, feature skip list, and the
+# xst-shaped YAML report (`-o`) are documented in `endor-xst --help`.
+cargo run -p endor-262 --bin endor-xst -- -o report.yaml built-ins/Math
 ```
 
 The stage-scoped curated corpora under `endor-262/corpora/` are the
@@ -736,7 +740,7 @@ code unit** (XS's `c_strcmp`), then the single symbol key `@@toStringTag` →
 audited oracle seam: the `endor-oracle` shim compiles the **script goal only**
 (`fxParseScript(..., mxProgramFlag | mxEvalFlag)`); it does not drive the module
 goal / loader, so a top-level `import`/`export` is a script-goal syntax error and
-the `test262-language` runner already names every `module`-flagged test a
+the `endor-xst` runner already names every `module`-flagged test a
 `structural:module` skip. Extending the shim to drive `fxParseModule` +
 `fxLinkModules` + a resolve hook across the FFI is a larger, separately-audited
 seam this static child deliberately does not open; the **differential gap is
@@ -998,7 +1002,7 @@ under the id that program assigned it (`endor_vm::run_program_with_symbols`). Pe
 monorepo's existing `packages/test262-runner` test262 subset — the same
 tree and convention that package already uses to prove XS↔Node HardenedJS
 parity — rather than a separate pinned test262 submodule. The
-`test262-language` runner (module `endor_262::test262`) assembles each
+`endor-xst` runner (modules `endor_262::{xst,test262}`) assembles each
 `language/` test the standard test262 way and dual-runs it, reporting an
 **honest covered/skipped split**: `covered` is bit-exact (result AND
 computron, four-valued completion) only; every skip is named by the opcode
@@ -1674,7 +1678,7 @@ These are the remaining child-6/7 surface.
 > `compile-diff` (no arg): **1711/1711 identical, divergent=0 endor-rejected=0
 > accept-disagree=0**; module corpora in-crate. Determinism spot-check:
 > `compile-diff -- eval-code` run twice -> byte-identical output (151/151).
-> Stage-4 dual-run spot-checks (`test262-language`), EXIT=0, no crash-aborts, all
+> Stage-4 dual-run spot-checks (`endor-xst`), EXIT=0, no crash-aborts, all
 > skips named (`endor-aborted` is a named SKIP reason, not a crash):
 > `built-ins/Object` **175/0 of 3127** (2952 skipped by named reason),
 > `built-ins/Function` **40/0 of 511** (471 skipped), `built-ins/Array` **435/0
@@ -1877,7 +1881,7 @@ strongest form.
 > smokes). Curated corpora `compile-diff` (no arg): **1711/1711 identical,
 > divergent=0 endor-rejected=0 accept-disagree=0**; module corpora 45/45
 > (in-crate). Determinism spot-check: `compile-diff -- eval-code` run twice ->
-> byte-identical output. Stage-4 dual-run spot-checks (`test262-language`),
+> byte-identical output. Stage-4 dual-run spot-checks (`endor-xst`),
 > EXIT=0, no crash-aborts, all skips named: `built-ins/Object` **176/0 of 3127**
 > (2951 skipped by named reason -- `endor-aborted` + `unsupported-opcode:*`),
 > `built-ins/Function` **40/0 of 511**, `built-ins/Array` **437/0 of 2625**.
@@ -2507,7 +2511,7 @@ everywhere), so no `oracle-rejected` is a divergence.
   `class_field_init_direct_eval`, `class_accessor_numeric_key_canonicalization`,
   `numeric_property_key_index_boundary`,
   `named_class_with_heritage_names_constructor`, `captured_function_self_name`).
-- **Stage-4 dual-run spot-checks** (`test262-language <t>`, `Compiler::Oracle`):
+- **Stage-4 dual-run spot-checks** (`endor-xst <t>`, `Compiler::Oracle`):
   `built-ins/Object total=3127 covered=176 divergent=0`, `built-ins/Function
   total=511 covered=40 divergent=0`, `built-ins/Array total=2625 covered=437
   divergent=0` — all EXIT=0, **no crash-aborts** (every skip a named

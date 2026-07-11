@@ -11,7 +11,7 @@
 //!   cargo run -p endor-262 --bin compile-diff -- language/expressions/addition
 //!   cargo run -p endor-262 --bin compile-diff -- built-ins/Boolean
 //!
-//! Memory note (same as `test262-language`): the C-XS oracle accumulates
+//! Memory note (same as `endor-xst`): the C-XS oracle accumulates
 //! process RSS across the machine create/destroy cycles a whole-tree run
 //! makes, so walking all of `language/` in one process can exhaust RAM.
 //! Run it **per subtree**; each subprocess frees everything on exit.

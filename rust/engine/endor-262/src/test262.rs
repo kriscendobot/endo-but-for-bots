@@ -55,35 +55,18 @@ pub struct Frontmatter {
 }
 
 /// Extract the front-matter block and parse `flags`, `includes`, and the
-/// presence of a `negative:` section. Deliberately small: a full YAML
-/// parser is not needed for these three fields.
+/// presence of a `negative:` section. Delegates to the full YAML parser
+/// ([`crate::frontmatter`]) — the three-field hand parser is retired
+/// (design § Part 2, "test262.rs's three-field frontmatter parser is
+/// replaced by the full YAML parse"), so a block-sequence `flags:` or a
+/// multi-line `negative:` reads the same here as it does under `endor-xst`.
 pub fn parse_frontmatter(src: &str) -> Frontmatter {
-    let mut fm = Frontmatter::default();
-    let (start, end) = match (src.find("/*---"), src.find("---*/")) {
-        (Some(s), Some(e)) if e > s => (s + 5, e),
-        _ => return fm,
-    };
-    let block = &src[start..end];
-    // `flags: [a, b]` and `includes: [x.js, y.js]` are single-line arrays.
-    let bracket_list = |key: &str| -> Vec<String> {
-        for line in block.lines() {
-            let t = line.trim();
-            if let Some(rest) = t.strip_prefix(key) {
-                if let (Some(a), Some(b)) = (rest.find('['), rest.find(']')) {
-                    return rest[a + 1..b]
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-        }
-        Vec::new()
-    };
-    fm.flags = bracket_list("flags:");
-    fm.includes = bracket_list("includes:");
-    fm.negative = block.lines().any(|l| l.trim_start().starts_with("negative:"));
-    fm
+    let full = crate::frontmatter::parse(src);
+    Frontmatter {
+        flags: full.flags,
+        includes: full.includes,
+        negative: full.negative.is_some(),
+    }
 }
 
 /// Assemble a test into the single source string both engines run, the
@@ -333,26 +316,11 @@ pub fn ses_xs_parity_files(test_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Parse the front-matter `features: [...]` list (single-line array), the
-/// axis the `ses-xs-parity` opt-in set is selected by.
+/// Parse the front-matter `features:` list — the axis the `ses-xs-parity`
+/// opt-in set is selected by. Delegates to the full YAML parser, so both the
+/// flow (`[a, b]`) and block (`- a`) sequence forms read.
 fn parse_features(src: &str) -> Vec<String> {
-    let (start, end) = match (src.find("/*---"), src.find("---*/")) {
-        (Some(s), Some(e)) if e > s => (s + 5, e),
-        _ => return Vec::new(),
-    };
-    for line in src[start..end].lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("features:") {
-            if let (Some(a), Some(b)) = (rest.find('['), rest.find(']')) {
-                return rest[a + 1..b]
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-        }
-    }
-    Vec::new()
+    crate::frontmatter::parse(src).features
 }
 
 #[cfg(test)]
@@ -383,7 +351,7 @@ mod tests {
         // agrees but whose computrons shift under the recalibration is a NAMED
         // `builtin-coercion-computron-gap` skip (classify()), NOT a divergence —
         // exactly the accuracy-over-parity split the swap adopted. Whole-tree
-        // `built-ins/String` (1111 files) is the `test262-language` binary; this
+        // `built-ins/String` (1111 files) is the `endor-xst` binary; this
         // in-`cargo test` slice stays bounded so the oracle RSS is contained.
         let (root, harness) = match locate_test262() {
             Some(p) => p,
@@ -445,7 +413,7 @@ mod tests {
         };
         // A bounded, deterministic slice of the covered-grammar sections so
         // the in-`cargo test` run stays fast; the full-tree walk is the
-        // `test262-language` binary. These sections are where the covered
+        // `endor-xst` binary. These sections are where the covered
         // grammar (arithmetic/logic/comparison/conditional expressions,
         // block/if/while/for/var/throw/try statements) actually lives.
         let sections = [

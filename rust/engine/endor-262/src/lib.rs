@@ -22,7 +22,9 @@
 use endor_vm::{run_program_with_symbols, Halt, RunOutcome};
 
 pub mod compile_diff;
+pub mod frontmatter;
 pub mod test262;
+pub mod xst;
 
 /// The four-valued completion agreement (design § test262 conformance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
