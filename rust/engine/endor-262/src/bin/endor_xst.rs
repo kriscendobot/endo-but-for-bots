@@ -19,6 +19,15 @@
 //!   endor-xst --repeat 3 --gate-meter-exact language/expressions/addition
 //!   endor-xst -o report.yaml language/statements
 //!   endor-xst --test262-dir /path/to/test262 --no-oracle built-ins/Math
+//!   endor-xst -l --feature-filter ses-xs-parity --features-include ses-xs-parity built-ins
+//!
+//! The last line is the third-host `ses-xs-parity` invocation: endor joins
+//! `xst -l` and node-with-SES-prelude as the third `packages/test262-runner`
+//! host on that parity axis (design § Staging step 4). The guest
+//! `lockdown()`/`Compartment` surface the mode needs is a named scope fold
+//! endor does not yet expose, so today every such case is an honest named
+//! skip (`feature:Compartment` / `ses-mode:lockdown-unimplemented`); coverage
+//! lights up automatically when that guest surface lands.
 //!
 //! Positional paths are subtrees under the located test262 root; a bare path
 //! defaults under `language/` for back-compat with `test262-language`. Exit
@@ -32,7 +41,7 @@
 //! exit.
 
 use endor_262::test262::{collect_js, locate_test262};
-use endor_262::xst::{run_files, Config};
+use endor_262::xst::{run_files, Config, SesMode};
 use std::path::PathBuf;
 
 fn main() {
@@ -64,6 +73,28 @@ fn main() {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
                 );
+            }
+            "--feature-filter" => {
+                let v = args
+                    .next()
+                    .unwrap_or_else(|| fail("--feature-filter needs a feature"));
+                cfg.feature_filter.extend(
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+            // SES lockdown/compartment modes — the `xst262.c` `-l`/`-lc`/`-c`
+            // analogues; `--ses-mode <l|lc|c>` is the long form.
+            "-l" => cfg.ses_mode = SesMode::Lockdown,
+            "-lc" | "-cl" => cfg.ses_mode = SesMode::LockdownCompartment,
+            "-c" => cfg.ses_mode = SesMode::Compartment,
+            "--ses-mode" => {
+                let v = args
+                    .next()
+                    .unwrap_or_else(|| fail("--ses-mode needs one of l|lc|c"));
+                cfg.ses_mode =
+                    SesMode::parse(&v).unwrap_or_else(|| fail("--ses-mode must be l, lc, or c"));
             }
             "--test262-dir" => {
                 test262_dir = Some(PathBuf::from(
@@ -139,11 +170,12 @@ fn main() {
     }
 
     eprintln!(
-        "endor-xst: running {} test262 files (oracle={}, repeat={}, gate-meter-exact={})",
+        "endor-xst: running {} test262 files (oracle={}, repeat={}, gate-meter-exact={}, ses-mode={})",
         files.len(),
         cfg.oracle,
         cfg.repeat,
         cfg.gate_meter_exact,
+        cfg.ses_mode.short(),
     );
     let rep = run_files(&cfg, &harness, &root, &files);
 
@@ -156,8 +188,10 @@ fn main() {
         rep.total - rep.covered - rep.failures.len(),
     );
     println!(
-        "  mode: sloppy-run={} strict-skipped-unimplemented={}",
-        rep.sloppy_run, rep.strict_skipped
+        "  mode: sloppy-run={} strict-skipped-unimplemented={} ses-mode={}",
+        rep.sloppy_run,
+        rep.strict_skipped,
+        rep.ses_mode.short()
     );
     println!("  advisory: computron-gap={}", rep.computron_advisories);
     println!("{}", "-".repeat(72));
@@ -222,8 +256,16 @@ OPTIONS:
     --no-oracle              do not gate on oracle agreement
     --gate-meter-exact       fail endor-meter-exact cases on a computron drift
     --repeat N               re-run endor N times; require identical computrons
-    --features-include F[,F] opt features back into the run (e.g. ses-xs-parity)
+    --features-include F[,F] opt features OUT of the skip set (e.g. ses-xs-parity)
+    --feature-filter F[,F]   run ONLY cases carrying a feature (test262-harness
+                             --features-include semantics; e.g. ses-xs-parity)
+    -l | -lc | -c            SES lockdown / lockdown+compartment / compartment
+    --ses-mode l|lc|c        mode (xst262.c -l/-lc/-c analogues); guest surface
+                             not yet landed, so each is a named whole-case skip
     --test262-dir DIR        use DIR as the test262 root (has harness/, test/)
     -o, --report FILE        write the xst-shaped YAML report to FILE
     -h, --help               print this help
+
+THIRD-HOST (ses-xs-parity axis, alongside `xst -l` and node+SES prelude):
+    endor-xst -l --feature-filter ses-xs-parity --features-include ses-xs-parity built-ins
 ";

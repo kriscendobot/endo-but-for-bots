@@ -51,11 +51,115 @@ pub const DEFAULT_ENDOR_SKIP_FEATURES: &[&str] = &[
     "SharedArrayBuffer",
     "tail-call-optimization",
     "IsHTMLDDA",
+    // The guest Hardened-JavaScript surface endor does not yet expose as a
+    // guest-callable intrinsic: `lockdown()` (a named scope fold in
+    // `endor-vm::interp::create_hardened_globals`) and the `Compartment`
+    // constructor (a named scope fold in `endor-vm::compartment`, modeled as
+    // a host-side Rust realm API, not a guest intrinsic). endor DOES land the
+    // guest `harden`/`petrify` globals, so those are never skipped. This is
+    // the direct `xst262.c` `gxFeatures` analogue — a feature the *engine*
+    // does not implement — and is trimmed as the guest surface lands. A
+    // `ses-xs-parity` test that needs either self-names `feature:Compartment`
+    // / `feature:lockdown` here rather than a generic run-time abort.
+    "lockdown",
+    "Compartment",
     // Hardened-JavaScript / SES parity opt-in set: needs the stage-4
     // lockdown/Compartment surface, not yet landed. Opt in explicitly with
     // `--features-include ses-xs-parity` once it does.
     "ses-xs-parity",
 ];
+
+/// The SES lockdown/compartment mode — endor-xst's analogue of `xst262.c`'s
+/// `-l` / `-lc` / `-c` (design § Part 2, the lockdown/compartment row). It
+/// selects the Hardened-JavaScript setup applied to every case before it
+/// runs, exactly as `xst` calls `lockdown()` and/or evaluates the body in a
+/// `Compartment`. This is the engine-side entry point of the "endor as a
+/// third `packages/test262-runner` host alongside `xst` and `node`" the
+/// engine design promises: the `ses-xs-parity` axis runs `xst -l`, `node`
+/// with the SES prelude, and `endor-xst -l`.
+///
+/// Because the guest surface these modes need (`lockdown()`, the
+/// `Compartment` intrinsic) is a named scope fold endor does not yet expose
+/// (only the host-side realm API + the guest `harden`/`petrify` globals are
+/// landed), a case run under a mode other than [`SesMode::None`] is a
+/// whole-case *named* pre-skip ([`SesMode::unimplemented_skip`]) rather than
+/// a generic abort or a false failure — the honest split, parallel to the
+/// `onlyStrict` strict-mode skip. When the guest `lockdown`/`Compartment`
+/// surface lands, `unimplemented_skip` returns `None` and the mode's prelude
+/// ([`SesMode::prelude`]) is applied to the assembled source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SesMode {
+    /// No lockdown/compartment setup (the default; `xst` with no `-l`/`-c`).
+    #[default]
+    None,
+    /// `-l`: `lockdown()` before the case (freeze the shared intrinsics).
+    Lockdown,
+    /// `-c`: evaluate the case body in a fresh `Compartment`.
+    Compartment,
+    /// `-lc`: `lockdown()`, then evaluate the body in a `Compartment`.
+    LockdownCompartment,
+}
+
+impl SesMode {
+    /// Parse the `xst`-shaped mode token (`l` / `lc` / `c`), as it appears
+    /// after the `-` on the CLI or as the `--ses-mode` value.
+    pub fn parse(token: &str) -> Option<SesMode> {
+        match token {
+            "l" => Some(SesMode::Lockdown),
+            "c" => Some(SesMode::Compartment),
+            "lc" | "cl" => Some(SesMode::LockdownCompartment),
+            _ => None,
+        }
+    }
+
+    /// The short `xst` name of the mode (`l` / `lc` / `c`), for the report's
+    /// `mode:` section; `none` for [`SesMode::None`].
+    pub fn short(self) -> &'static str {
+        match self {
+            SesMode::None => "none",
+            SesMode::Lockdown => "l",
+            SesMode::Compartment => "c",
+            SesMode::LockdownCompartment => "lc",
+        }
+    }
+
+    /// The Hardened-JavaScript prelude/wrap the mode applies to the assembled
+    /// case — `xst`'s `lockdown()` call and/or `Compartment` evaluation. This
+    /// is the shape that runs *once the guest surface lands*; today
+    /// [`Self::unimplemented_skip`] short-circuits before it is reached, so it
+    /// is the documented target, exercised by a unit test but not yet on the
+    /// live run path. `{body}` is where the assembled source is spliced.
+    pub fn prelude(self) -> &'static str {
+        match self {
+            SesMode::None => "{body}",
+            SesMode::Lockdown => "lockdown();\n{body}",
+            // The compartment wrap evaluates the assembled body in a fresh
+            // compartment over the (optionally locked-down) shared intrinsics
+            // — `new Compartment().evaluate(<body>)` in `xst`. endor splices
+            // the body directly (not as a string) since the guest evaluator
+            // is what lands; until then this is unreached.
+            SesMode::Compartment => "new Compartment().evaluate(function(){\n{body}\n});",
+            SesMode::LockdownCompartment => {
+                "lockdown();\nnew Compartment().evaluate(function(){\n{body}\n});"
+            }
+        }
+    }
+
+    /// The honest named skip a mode incurs while its guest surface is a scope
+    /// fold, or `None` once endor exposes the guest `lockdown`/`Compartment`
+    /// surface. This is the single seam that flips these modes from
+    /// whole-case named skips to real runs when the surface lands — remove a
+    /// match arm (and the matching entry in [`DEFAULT_ENDOR_SKIP_FEATURES`])
+    /// as each guest builtin is implemented.
+    pub fn unimplemented_skip(self) -> Option<&'static str> {
+        match self {
+            SesMode::None => None,
+            SesMode::Lockdown => Some("ses-mode:lockdown-unimplemented"),
+            SesMode::Compartment => Some("ses-mode:compartment-unimplemented"),
+            SesMode::LockdownCompartment => Some("ses-mode:lockdown-compartment-unimplemented"),
+        }
+    }
+}
 
 /// Runner configuration, derived from the CLI (design § Part 2, "dual-run
 /// oracle wiring").
@@ -77,6 +181,16 @@ pub struct Config {
     /// `--features-include <feature>`: features to remove from the skip set
     /// (opt them into the run).
     pub features_include: Vec<String>,
+    /// `-l` / `-lc` / `-c` / `--ses-mode <l|lc|c>`: the SES lockdown/
+    /// compartment mode applied to every case (the third-host `ses-xs-parity`
+    /// axis runs `-l`). Default [`SesMode::None`].
+    pub ses_mode: SesMode,
+    /// `--feature-filter <feature>`: run **only** cases whose frontmatter
+    /// `features:` lists this (the `test262-harness --features-include`
+    /// semantics the repo drives `xst`/`node` with — distinct from
+    /// endor-xst's skip-list `--features-include`). Empty = no filter. Used
+    /// to restrict a whole-tree walk to the `ses-xs-parity` axis.
+    pub feature_filter: Vec<String>,
 }
 
 impl Default for Config {
@@ -86,6 +200,8 @@ impl Default for Config {
             gate_meter_exact: false,
             repeat: 1,
             features_include: Vec::new(),
+            ses_mode: SesMode::None,
+            feature_filter: Vec::new(),
         }
     }
 }
@@ -475,6 +591,21 @@ pub fn run_case(cfg: &Config, harness_dir: &Path, src: &str) -> CaseResult {
         };
     }
 
+    // SES lockdown/compartment mode (`-l`/`-lc`/`-c`): the mode's guest
+    // surface (`lockdown()`, the `Compartment` intrinsic) is a named scope
+    // fold endor does not yet expose, so a case run under any mode is a
+    // whole-case named pre-skip — the honest split, parallel to the
+    // `onlyStrict` strict skip. When the guest surface lands, this seam
+    // ([`SesMode::unimplemented_skip`]) returns `None` and the mode's
+    // [`SesMode::prelude`] is applied to the assembled source instead.
+    if let Some(reason) = cfg.ses_mode.unimplemented_skip() {
+        return CaseResult {
+            verdict: Verdict::PreSkip(reason.into()),
+            strict_skipped: has_strict,
+            computron_gap: false,
+        };
+    }
+
     let meter_exact_gate =
         cfg.gate_meter_exact && fm.features.iter().any(|f| f == "endor-meter-exact");
 
@@ -632,6 +763,10 @@ pub struct XstReport {
     pub run_skips: BTreeMap<String, usize>,
     /// `advisory:` — covered cases whose computrons drifted from the oracle.
     pub computron_advisories: usize,
+    /// The SES lockdown/compartment mode this run applied (`-l`/`-lc`/`-c`),
+    /// surfaced in the report's `mode:` section so a reader sees which
+    /// Hardened-JavaScript axis produced it. [`SesMode::None`] for a plain run.
+    pub ses_mode: SesMode,
 }
 
 impl XstReport {
@@ -701,6 +836,7 @@ impl XstReport {
             "  strict-skipped-unimplemented: {}\n",
             self.strict_skipped
         ));
+        s.push_str(&format!("  ses-mode: {}\n", self.ses_mode.short()));
         s.push_str("fail:\n");
         for (path, detail) in &self.failures {
             s.push_str(&format!("  - path: {}\n", yaml_quote(path)));
@@ -742,6 +878,7 @@ fn yaml_quote(s: &str) -> String {
 /// each path for readable failure labels.
 pub fn run_files(cfg: &Config, harness_dir: &Path, root: &Path, files: &[PathBuf]) -> XstReport {
     let mut rep = XstReport::default();
+    rep.ses_mode = cfg.ses_mode;
     for path in files {
         let rel = path
             .strip_prefix(root)
@@ -755,6 +892,19 @@ pub fn run_files(cfg: &Config, harness_dir: &Path, root: &Path, files: &[PathBuf
                 continue;
             }
         };
+        // `--feature-filter` (the `test262-harness --features-include`
+        // semantics): a case that does not carry a required feature is out of
+        // scope for this run — not recorded, so it never enters `total`.
+        if !cfg.feature_filter.is_empty() {
+            let fm = frontmatter::parse(&src);
+            let carries = cfg
+                .feature_filter
+                .iter()
+                .any(|want| fm.features.iter().any(|f| f == want));
+            if !carries {
+                continue;
+            }
+        }
         let r = run_case(cfg, harness_dir, &src);
         rep.record(&rel, r);
     }
@@ -787,6 +937,81 @@ mod tests {
             constructor_name("Test262Error: Expected a TypeError"),
             "Test262Error"
         );
+    }
+
+    #[test]
+    fn ses_mode_parses_the_xst_tokens() {
+        assert_eq!(SesMode::parse("l"), Some(SesMode::Lockdown));
+        assert_eq!(SesMode::parse("c"), Some(SesMode::Compartment));
+        assert_eq!(SesMode::parse("lc"), Some(SesMode::LockdownCompartment));
+        assert_eq!(SesMode::parse("cl"), Some(SesMode::LockdownCompartment));
+        assert_eq!(SesMode::parse("x"), None);
+        assert_eq!(SesMode::None.short(), "none");
+        assert_eq!(SesMode::Lockdown.short(), "l");
+        assert_eq!(SesMode::LockdownCompartment.short(), "lc");
+    }
+
+    #[test]
+    fn ses_mode_prelude_and_skip_seam() {
+        // The default runs the body verbatim and needs no guest surface.
+        assert_eq!(SesMode::None.prelude(), "{body}");
+        assert_eq!(SesMode::None.unimplemented_skip(), None);
+        // A lockdown mode's prelude calls the guest `lockdown()` — the shape
+        // that runs once the guest surface lands.
+        assert!(SesMode::Lockdown.prelude().starts_with("lockdown();"));
+        assert!(SesMode::Compartment.prelude().contains("Compartment"));
+        // Until it lands, every non-None mode is a distinct named skip.
+        assert_eq!(
+            SesMode::Lockdown.unimplemented_skip(),
+            Some("ses-mode:lockdown-unimplemented")
+        );
+        assert_eq!(
+            SesMode::Compartment.unimplemented_skip(),
+            Some("ses-mode:compartment-unimplemented")
+        );
+        assert_eq!(
+            SesMode::LockdownCompartment.unimplemented_skip(),
+            Some("ses-mode:lockdown-compartment-unimplemented")
+        );
+    }
+
+    #[test]
+    fn ses_mode_makes_a_case_a_named_preskip() {
+        // With a lockdown mode armed, a plain covered-grammar case is a whole-
+        // case named pre-skip (the guest `lockdown()` surface is a scope
+        // fold), never a failure — even though the case itself runs fine with
+        // no mode. The harness dir is irrelevant: the mode short-circuits
+        // before assembly.
+        let mut cfg = Config::default();
+        cfg.ses_mode = SesMode::Lockdown;
+        let r = run_case(&cfg, Path::new("/nonexistent"), "1 + 1;");
+        assert_eq!(
+            r.verdict,
+            Verdict::PreSkip("ses-mode:lockdown-unimplemented".into())
+        );
+    }
+
+    #[test]
+    fn guest_lockdown_and_compartment_are_skip_features() {
+        // The two real `ses-xs-parity` tests in the subset declare
+        // `Compartment` / `lockdown` features; endor lacks the guest surface,
+        // so they are named `feature:*` skips (the `gxFeatures` analogue) even
+        // when `ses-xs-parity` itself is opted in.
+        let mut cfg = Config::default();
+        cfg.features_include = vec!["ses-xs-parity".into()];
+        let skip = effective_skip_features(&cfg);
+        assert!(skip.contains("Compartment"));
+        assert!(skip.contains("lockdown"));
+        assert!(!skip.contains("ses-xs-parity"));
+    }
+
+    #[test]
+    fn report_yaml_carries_the_ses_mode() {
+        let mut rep = XstReport::default();
+        rep.ses_mode = SesMode::Lockdown;
+        assert!(rep.to_yaml().contains("ses-mode: l"));
+        let plain = XstReport::default();
+        assert!(plain.to_yaml().contains("ses-mode: none"));
     }
 
     #[test]
