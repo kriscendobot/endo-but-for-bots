@@ -974,7 +974,7 @@ ecosystem.
 | endoclaw-browser | Not Started | Playwright-backed `Browser` exo with origin allowlist |
 | endoclaw-channel-bridges | Not Started | `chat` SDK (Vercel) adapters for Slack, Telegram, Discord, etc. |
 | endoclaw-skill-registry | Not Started | Skills directory — capability-aware plugin index |
-| [inspect-package](inspect-package.md) | Not Started | `@endo/inspect` + `@endo/inspect/shim.js`; condition-parameterized (node VT-100-iff-TTY / browser rich-console / xs plain); faithful safety contract **blocked on** the SES Proxy brand check ([endojs/endo#1756](https://github.com/endojs/endo/issues/1756), [#819](https://github.com/endojs/endo/issues/819)). PR [#715](https://github.com/endojs/endo-but-for-bots/pull/715) |
+| [inspect-package](inspect-package.md) | Not Started | `@endo/inspect` + `@endo/inspect/shim.js`; condition-parameterized (node VT-100-iff-TTY / browser rich-console / xs plain); faithful safety contract **blocked on** a portable Proxy brand check: the stamping power ([endojs/endo#1756](https://github.com/endojs/endo/issues/1756), twin [Agoric/agoric-sdk#3905](https://github.com/Agoric/agoric-sdk/issues/3905)) or the non-trapping integrity trait ([tc39/proposal-stabilize](https://github.com/tc39/proposal-stabilize) via [endojs/endo#2673](https://github.com/endojs/endo/pull/2673) / [#2675](https://github.com/endojs/endo/pull/2675)), with [endojs/endo#819](https://github.com/endojs/endo/issues/819) as the soundness precondition. PR [#715](https://github.com/endojs/endo-but-for-bots/pull/715) |
 
 **Exit criterion:** AI coding agent runs with principle of least
 authority enforced — sandboxed processes, confined filesystem, auditable
@@ -1305,6 +1305,7 @@ have been remapped: 0 → 1, ½ → 2, 1 → 3, 2 → 4, 3 → 7, 4 → 9,
 | endoclaw-browser | M-L | 1.5 weeks | 10 | Playwright-backed, origin-confined; smallest cut in PR #106 |
 | endoclaw-channel-bridges | M | 4-5 days | 10 | Vercel `chat` SDK adapters |
 | endoclaw-skill-registry | S-M | 3 days | 10 | Skills directory with capability declarations; PR #105 open |
+| inspect-package | M | 2-3 days | 10 | `@endo/inspect` portable core + node/browser/xs condition entries + the SES `setInspector` seam and shim; the deferred faithful-Proxy phase is excluded (blocked on endojs/endo#1756 or the non-trapping trait, endojs/endo#2673 / #2675) |
 | endor-tui | XL | 5-8 weeks | 11 | Rust TUI: ratatui/crossterm, concept-map of every Chat component, XS `mxDebug` debugger integration (XL bumped 1.3x) |
 | endor-bus-tui | XL | 4-7 weeks | 11 | Bus-verb spec, XS handle API, Exo/CapTP wrapper; cross-worker layout composition (XL bumped 1.3x) |
 | endopi | Reference | — | — | Comparative analysis of the pi agent harness against endo; spins out the endopi-* gap-closing designs below |
