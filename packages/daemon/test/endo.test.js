@@ -3022,8 +3022,17 @@ test('the ocapn capability and netlayer handles never cross a facet boundary', a
   await t.throwsAsync(() => E(guest).sturdyRefs(), {
     message: /target has no method "sturdyRefs"/u,
   });
+  // The guest's view of its host must not reveal the identity either way the
+  // facet resolves: a bare mail handle (open/receive) has no `identify` at
+  // all — the stronger posture — and a namespace-shaped facet must miss.
   const guestsHost = E(guest).lookup(['@host']);
-  t.is(await E(guestsHost).identify('ocapn'), undefined);
+  const probed = await E(guestsHost)
+    .identify('ocapn')
+    .catch(error => {
+      t.regex(String(error), /target has no method "identify"/u);
+      return undefined;
+    });
+  t.is(probed, undefined);
 
   // Even the host, which CAN mint, never receives the raw OCapN capability or
   // a netlayer: minting hands back only an opaque grant handle, and the
