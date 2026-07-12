@@ -27,6 +27,7 @@ const formulaTypes = new Set([
   'marshal',
   'message',
   'mount',
+  'ocapn',
   'peer',
   'pet-inspector',
   'pet-store',
