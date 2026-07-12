@@ -214,6 +214,8 @@ export const makeDaemonicPersistencePowers = (
     deleteFormula: async formulaNumber => deleteFormula(formulaNumber),
     listFormulas: async () => listFormulas(),
     listFormulaNumbersByNode,
+    getState,
+    setState,
     writeAgentKey,
     getAgentKey,
     hasAgentKey,

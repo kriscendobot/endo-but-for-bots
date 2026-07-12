@@ -3,7 +3,8 @@
 
 /** @import { ERef } from '@endo/eventual-send' */
 /** @import { PassableBytesReader } from '@endo/exo-stream' */
-/** @import { AgentDeferredTaskParams, ChannelDeferredTaskParams, Context, DaemonCore, DeferredTasks, EndoGit, EndoGuest, EndoHost, EnvRecord, EvalDeferredTaskParams, FormulaIdentifier, FormulaNumber, GitCredentialDeferredTaskParams, GitDeferredTaskParams, GitRemoteDeferredTaskParams, InvitationDeferredTaskParams, MakeCapletDeferredTaskParams, MakeCapletOptions, MakeDirectoryNode, MakeHostOrGuestOptions, MakeMailbox, MountDeferredTaskParams, Name, NameOrPath, NamePath, NodeNumber, PeerInfo, PetName, ReadableBlobDeferredTaskParams, ReadableTreeDeferredTaskParams, MarshalDeferredTaskParams, ScratchMountDeferredTaskParams, WorkerDeferredTaskParams } from './types.js' */
+/** @import { SturdyRef } from '@endo/pass-style' */
+/** @import { AgentDeferredTaskParams, ChannelDeferredTaskParams, Context, DaemonCore, DeferredTasks, EndoGit, EndoGuest, EndoHost, EnvRecord, EvalDeferredTaskParams, FormulaIdentifier, FormulaNumber, GitCredentialDeferredTaskParams, GitDeferredTaskParams, GitRemoteDeferredTaskParams, InvitationDeferredTaskParams, MakeCapletDeferredTaskParams, MakeCapletOptions, MakeDirectoryNode, MakeHostOrGuestOptions, MakeMailbox, MountDeferredTaskParams, Name, NameOrPath, NamePath, NodeNumber, PeerInfo, PetName, ReadableBlobDeferredTaskParams, ReadableTreeDeferredTaskParams, MarshalDeferredTaskParams, ScratchMountDeferredTaskParams, SturdyRefGrant, EndoSturdyRefs, WorkerDeferredTaskParams } from './types.js' */
 
 import { E } from '@endo/far';
 import { makeExo } from '@endo/exo';
@@ -33,7 +34,7 @@ import { isSturdyRef, resolveSturdyRefToId } from './sturdyref-resolution.js';
 
 import { makeDeferredTasks } from './deferred-tasks.js';
 
-import { HostInterface } from './interfaces.js';
+import { HostInterface, SturdyRefsInterface } from './interfaces.js';
 import { hostHelp, makeHelp } from './help-text.js';
 import { assertValidTreeEntryName } from './mount.js';
 
@@ -79,6 +80,9 @@ const normalizeHostOrGuestOptions = opts => {
  * @param {object} args
  * @param {DaemonCore['provide']} args.provide
  * @param {DaemonCore['provideStoreController']} args.provideStoreController
+ * @param {(formulaIdentifier: FormulaIdentifier, type?: string) => Promise<{ sturdyRef: SturdyRef, grantHandle: string }>} args.mintSturdyRefGrant
+ * @param {() => Promise<SturdyRefGrant[]>} args.getSturdyRefGrants
+ * @param {(grantHandle: string) => Promise<boolean>} args.deleteSturdyRefGrant
  * @param {DaemonCore['cancelValue']} args.cancelValue
  * @param {DaemonCore['formulateWorker']} args.formulateWorker
  * @param {DaemonCore['formulateHost']} args.formulateHost
@@ -119,6 +123,9 @@ const normalizeHostOrGuestOptions = opts => {
 export const makeHostMaker = ({
   provide,
   provideStoreController,
+  mintSturdyRefGrant,
+  getSturdyRefGrants,
+  deleteSturdyRefGrant,
   cancelValue,
   formulateWorker,
   formulateHost,
@@ -1490,6 +1497,41 @@ export const makeHostMaker = ({
       return E(endoBootstrap).followPeerChanges();
     };
 
+    // The SturdyRef EXPORT facet (design cut 3, "daemon as C"), vended
+    // host-only. Its methods delegate to the daemon-core exporter: minting is
+    // a host-tier act, and because the guest facet has no `sturdyRefs` method
+    // a confined guest never reaches the daemon-private swiss-num store. The
+    // returned grant handle is the marshalable management reference; the raw
+    // wire-tier SturdyRef stays daemon-side for the OCapN wire codec (cut 4+).
+    // Memoized so repeated `sturdyRefs()` calls return one stable facet.
+    let sturdyRefsExo;
+    /** @type {EndoHost['sturdyRefs']} */
+    const sturdyRefs = async () => {
+      if (sturdyRefsExo === undefined) {
+        sturdyRefsExo = makeExo('EndoSturdyRefs', SturdyRefsInterface, {
+          /** @type {EndoSturdyRefs['provideSturdyRef']} */
+          provideSturdyRef: async (petNameOrPath, type) => {
+            const namePath = namePathFrom(petNameOrPath);
+            const id = await E(directory).identify(...namePath);
+            if (id === undefined) {
+              throw new TypeError(`Unknown pet name: ${q(petNameOrPath)}`);
+            }
+            const { grantHandle } = await mintSturdyRefGrant(
+              /** @type {FormulaIdentifier} */ (id),
+              type,
+            );
+            return grantHandle;
+          },
+          /** @type {EndoSturdyRefs['listSturdyRefGrants']} */
+          listSturdyRefGrants: async () => getSturdyRefGrants(),
+          /** @type {EndoSturdyRefs['revokeSturdyRefGrant']} */
+          revokeSturdyRefGrant: async grantHandle =>
+            deleteSturdyRefGrant(grantHandle),
+        });
+      }
+      return sturdyRefsExo;
+    };
+
     /** @type {EndoHost['getPeerInfo']} */
     const getPeerInfo = async () => {
       const addresses = await getAllNetworkAddresses(networksDirectoryId);
@@ -1740,6 +1782,7 @@ export const makeHostMaker = ({
       addPeerInfo,
       listKnownPeers,
       followPeerChanges,
+      sturdyRefs,
       locateForSharing,
       adoptFromLocator,
       deliver,
