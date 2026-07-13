@@ -3,7 +3,14 @@
 import test from '@endo/ses-ava/prepare-endo.js';
 
 test('agentry subpaths resolve through package exports', async t => {
-  const [rootModule, harnessModule, executeModule, evalModule, editTextModule] =
+  const [
+    rootModule,
+    harnessModule,
+    executeModule,
+    evalModule,
+    editTextModule,
+    rpcModule,
+  ] =
     await Promise.all([
       // eslint-disable-next-line import/no-unresolved
       import('@endo/agentry'),
@@ -15,6 +22,8 @@ test('agentry subpaths resolve through package exports', async t => {
       import('@endo/agentry/eval'),
       // eslint-disable-next-line import/no-unresolved
       import('@endo/agentry/edit-text'),
+      // eslint-disable-next-line import/no-unresolved
+      import('@endo/agentry/rpc'),
     ]);
   t.is(typeof rootModule.defineAgent, 'function');
   t.is(typeof harnessModule.makePiAgent, 'function');
@@ -30,4 +39,10 @@ test('agentry subpaths resolve through package exports', async t => {
   t.false('assertGitConflictRebaseOutcome' in evalModule);
   t.false('makeStageAndCommitScenario' in evalModule);
   t.false('assertGitCommitOutcome' in evalModule);
+  t.is(typeof rpcModule.makeJsonlDecoder, 'function');
+  t.is(typeof rpcModule.encodeRecord, 'function');
+  t.is(typeof rpcModule.translateAgentEvent, 'function');
+  t.is(typeof rpcModule.makeRpcSession, 'function');
+  t.is(typeof rpcModule.makeRpcBridge, 'function');
+  t.is(typeof rpcModule.serveRpc, 'function');
 });
