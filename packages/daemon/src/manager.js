@@ -1,5 +1,6 @@
 // @ts-check
 /** @import { EndoGit, WritableGitWorktree } from '@endo/exo-git' */
+/** @import { RegistryFormula } from './types.js' */
 /* eslint-disable no-await-in-loop */
 /* global clearTimeout, globalThis, process, setTimeout */
 
@@ -4489,7 +4490,7 @@ const makeDaemonCore = async (
     nodeNumber = localNodeNumber,
     registryUrl = registryDefaultUrl,
   ) => {
-    /** @type {import('./types.js').RegistryFormula} */
+    /** @type {RegistryFormula} */
     const formula = {
       type: 'registry',
       registryUrl,
