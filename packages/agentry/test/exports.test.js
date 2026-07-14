@@ -10,21 +10,20 @@ test('agentry subpaths resolve through package exports', async t => {
     evalModule,
     editTextModule,
     rpcModule,
-  ] =
-    await Promise.all([
-      // eslint-disable-next-line import/no-unresolved
-      import('@endo/agentry'),
-      // eslint-disable-next-line import/no-unresolved
-      import('@endo/agentry/harness'),
-      // eslint-disable-next-line import/no-unresolved
-      import('@endo/agentry/execute'),
-      // eslint-disable-next-line import/no-unresolved
-      import('@endo/agentry/eval'),
-      // eslint-disable-next-line import/no-unresolved
-      import('@endo/agentry/edit-text'),
-      // eslint-disable-next-line import/no-unresolved
-      import('@endo/agentry/rpc'),
-    ]);
+  ] = await Promise.all([
+    // eslint-disable-next-line import/no-unresolved
+    import('@endo/agentry'),
+    // eslint-disable-next-line import/no-unresolved
+    import('@endo/agentry/harness'),
+    // eslint-disable-next-line import/no-unresolved
+    import('@endo/agentry/execute'),
+    // eslint-disable-next-line import/no-unresolved
+    import('@endo/agentry/eval'),
+    // eslint-disable-next-line import/no-unresolved
+    import('@endo/agentry/edit-text'),
+    // eslint-disable-next-line import/no-unresolved
+    import('@endo/agentry/rpc'),
+  ]);
   t.is(typeof rootModule.defineAgent, 'function');
   t.is(typeof harnessModule.makePiAgent, 'function');
   t.is(typeof executeModule.makeCodeModeAgent, 'function');
