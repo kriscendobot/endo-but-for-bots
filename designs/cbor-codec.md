@@ -3,8 +3,17 @@
 | | |
 |---|---|
 | **Created** | 2026-07-12 |
+| **Updated** | 2026-07-15 |
 | **Author** | Kris Kowal (prompted) |
-| **Status** | Proposed |
+| **Status** | Accepted |
+
+> **2026-07-15 — open questions resolved.** The maintainer review on
+> [PR #710](https://github.com/endojs/endo-but-for-bots/pull/710) settled all
+> four open questions and directed the build: the framing sibling is
+> `@endo/cbor-frame` and the trailing-`s` name is retired for good; readers are
+> **strict**; text-string well-formedness rides a shared ponyfill rather than the
+> engine-native method; and phase 1 lands on `llm`. The resolutions are folded
+> into the sections below and recorded under [Open Questions](#open-questions).
 
 ## What is the Problem Being Solved?
 
@@ -77,13 +86,18 @@ returns no existing `cbor` package. "CBOR" is the canonical acronym
 for Concise Binary Object Representation and is permitted under the
 namer's rule on canonical acronyms. `@endo/cbor` names the codec
 primitives for one CBOR item; the framing sibling landed as
-`@endo/cbor-frame` — proposed as `@endo/cbors` in
-[cbors.md](cbors.md), implemented under the explicit `-frame` suffix in
-[PR #288](https://github.com/endojs/endo-but-for-bots/pull/288) — and
-names a *stream* of length-prefixed byte strings on the wire. The two
-packages are complements, not competitors: `@endo/cbor-frame` frames
-opaque payload bytes, `@endo/cbor` encodes and decodes the bytes inside
-a frame. The `-frame` suffix keeps the two names from colliding.
+`@endo/cbor-frame` in
+[PR #288](https://github.com/endojs/endo-but-for-bots/pull/288)
+([cbor-frame.md](cbor-frame.md)) and names a *stream* of
+length-prefixed byte strings on the wire. The two packages are
+complements, not competitors: `@endo/cbor-frame` frames opaque payload
+bytes, `@endo/cbor` encodes and decodes the bytes inside a frame. The
+`-frame` suffix keeps the two names from colliding. `@endo/cbor-frame`
+is deliberately minimal; it would be reasonable for it to import the
+specific head primitives it needs (`writeHead` / `readHead`) from
+`@endo/cbor` through narrowly scoped module imports so it entrains no
+unused code, rather than carry its own head-parsing scaffolding
+(§ [Migration Path](#migration-path) phase 4).
 
 **Identifier style follows the slots file**: `writeUint`,
 `writeByteString`, `writeArrayHeader`, `readUint`, `readByteString`,
@@ -135,7 +149,7 @@ export const writeFloat64 = (writer, x) => { ... };     // canonical NaN
 export const writeBignum = (writer, bigint) => { ... }; // tags 2/3
 
 // Reader state over a Uint8Array.
-export const makeCborReader = (bytes, opts = {}) => { ... }; // { name?, strict? }
+export const makeCborReader = (bytes, opts = {}) => { ... }; // { name?, lenient? } — strict by default
 export const readHead = reader => { ... };              // -> { major, value }
 export const peekHead = reader => { ... };              // no advance
 export const readUint = reader => { ... };
@@ -179,16 +193,17 @@ are bigints.
   a non-minimal head. This preserves the slot-machine's byte-identity
   contract with `rust/endo/slots/src/wire/codec.rs` and ocapn's
   signature-stability requirement.
-- **Readers are tolerant by default, strict by option.** Today
-  neither implementation rejects a non-minimal head on read (the
-  ocapn decoder validates canonical NaN but accepts, say, a length 5
-  encoded in two bytes). `makeCborReader(bytes, { strict: true })`
-  additionally rejects non-minimal heads and non-minimal bignum
-  payloads. The canonical-NaN check in `readFloat64` stays
-  unconditional, matching current ocapn behavior. Whether ocapn
-  should enable `strict` for its signature-verification paths is an
-  Open Question; the shared module makes it a one-line decision
-  instead of a rewrite.
+- **Readers are strict.** Per the maintainer's review directive ("be
+  strict"), a reader rejects non-minimal heads and non-minimal bignum
+  payloads by default, so two byte-different encodings of the same
+  value can never both decode. This is stricter than today's ocapn
+  decoder, which validates canonical NaN but accepts, say, a length 5
+  encoded in two bytes. The canonical-NaN check in `readFloat64` stays
+  unconditional. A `makeCborReader(bytes, { lenient: true })` escape
+  hatch preserves the old tolerant behavior for interop with a peer
+  that emits non-canonical heads, but it is off by default and no
+  ocapn path — signature verification least of all — is expected to
+  need it. Non-canonical NaN is rejected in every mode.
 
 ### Buffer state
 
@@ -203,7 +218,8 @@ and peek. A later extraction of generic byte cursors into
 filed) and would not change this package's API.
 
 The reader state is a plain record over the input `Uint8Array` with
-an index, a `name`, and the `strict` flag. `readByteString` returns a
+an index, a `name`, and the `lenient` flag (strict by default).
+`readByteString` returns a
 fresh `Uint8Array` copy (the slots behavior); immutability conversion
 (`bytesToImmutable` from `@endo/bytes`) remains ocapn policy at its
 class layer.
@@ -220,10 +236,18 @@ class layer.
 ```
 
 Text-string well-formedness (today checked in ocapn via
-`isWellFormedString` from `@endo/pass-style`) uses the engine-native
-`String.prototype.isWellFormed` so the package does not entrain
-`@endo/pass-style`; engine availability is an Open Question with a
-small local fallback as the escape hatch.
+`isWellFormedString` from `@endo/pass-style`) does **not** rely on the
+engine-native `String.prototype.isWellFormed`: per the maintainer's
+review directive it is probably not universally supported (XS in
+particular) and must ride a **ponyfill**. The repository likely already
+carries such a check, so the design **factors it out of `@endo/ocapn`
+or `@endo/pass-style` into a shared home rather than duplicating it** —
+either a new `@endo/is-well-formed-string` leaf package or a new module
+in `@endo/utf8` — and `@endo/cbor` takes a dependency on that shared
+home. This keeps `@endo/cbor` off a `@endo/pass-style` dependency while
+guaranteeing a correct, engine-independent check. Proposing and landing
+the shared ponyfill is a phase-0 prerequisite of the build (see
+[Migration Path](#migration-path)); the exact home is settled there.
 
 ### What moves, what stays
 
@@ -239,13 +263,20 @@ small local fallback as the escape hatch.
 
 Phased so each step is independently landable and verifiable:
 
+0. **Land the shared well-formed-string ponyfill** the codec depends
+   on (see [Dependencies](#dependencies)): factor the existing check
+   out of `@endo/ocapn` / `@endo/pass-style` into `@endo/is-well-formed-string`
+   or a new `@endo/utf8` module. Small and independently landable;
+   `@endo/cbor` depends on its result.
 1. **Create `packages/cbor`** with the API above and the merged test
    suite: the vector tests from `packages/slots/test/cbor.test.js`
    (PR #124) and the primitive-level cases from
    `packages/ocapn/test/cbor/{encode,decode}.test.js`, plus a golden
-   hex-vector fixture (see Test Plan). Base per the repository's
-   base-branch inference rule: `master`, merged forward to `llm` and
-   `endor` in the ordinary course.
+   hex-vector fixture (see Test Plan). **Base: `llm`** (maintainer's
+   review directive — "put it on `llm` and hope to port to
+   origin/master when stable"), forward-ported to `origin/master` and
+   `endor` once the package is stable rather than base-inferred to
+   `master` first.
 2. **Migrate ocapn.** Replace the module-level helpers in
    `encode.js` / `decode.js` with imports; the `CborWriter` /
    `CborReader` classes and the `OcapnCodec` surface are unchanged.
@@ -260,13 +291,16 @@ Phased so each step is independently landable and verifiable:
    adversarial and end-to-end suites plus the Rust parity CI lane
    (`.github/workflows/rust-endor.yml`) stay green, proving the
    byte-identity contract with `rust/endo/slots` held.
-4. **Optional: migrate the daemon envelope codec** and revisit the
-   `@endo/cbor-frame` framing design, which may import `writeHead` /
-   `readHead` for its byte-string heads. Its recorded decision to
-   duplicate head-parsing scaffolding for independent auditability
-   ([cbors.md](cbors.md) section Dependencies) predates a shared
-   primitive package existing; whether to supersede that decision is
-   left to the maintainer at implementation time.
+4. **Optional: migrate the daemon envelope codec** and refactor
+   `@endo/cbor-frame` to import `writeHead` / `readHead` from
+   `@endo/cbor` for its byte-string heads. Per the maintainer's review
+   directive, `@endo/cbor-frame` stays deliberately minimal and should
+   import the specific head primitives it needs through narrowly scoped
+   module imports so it entrains no unused code; its recorded decision
+   to duplicate head-parsing scaffolding for independent auditability
+   ([cbor-frame.md](cbor-frame.md) section Dependencies) predated a
+   shared primitive package existing and is superseded by that
+   directive.
 
 Sequencing note: phase 1 and 2 do not depend on PR #124 merging;
 phase 3 does. If PR #124 instead rebases onto a landed phase 1, the
@@ -278,7 +312,7 @@ slots package can adopt `@endo/cbor` before merge and shed its
 | Package | Role |
 |---|---|
 | `@endo/cbor` (this design) | Encodes and decodes single CBOR items; the primitive layer |
-| [`@endo/cbor-frame`](cbors.md) (impl PR #288; proposed as `@endo/cbors`) | Frames a stream of length-prefixed CBOR byte strings; payload bytes are opaque |
+| [`@endo/cbor-frame`](cbor-frame.md) (impl PR #288) | Frames a stream of length-prefixed CBOR byte strings; payload bytes are opaque |
 | [`@endo/syrup-frame`](ocapn-tcp-syrups-framing.md) (landed on `llm`; proposed as `@endo/syrups`) | The Syrup-grammar framing sibling |
 | `@endo/netstring` | The netstring-grammar framing sibling |
 | `packages/ocapn` | OCapN protocol codec; becomes a consumer |
@@ -298,10 +332,11 @@ slots package can adopt `@endo/cbor` before merge and shed its
 - **Ported suites.** All cases from `packages/slots/test/cbor.test.js`
   and the primitive-level cases from
   `packages/ocapn/test/cbor/{encode,decode}.test.js`.
-- **Strict-mode cases.** Non-minimal heads accepted by default,
-  rejected under `strict`; non-canonical NaN rejected always;
-  indefinite-length and reserved additional-info bytes rejected
-  always; truncated head, truncated payload, trailing bytes.
+- **Strict-mode cases.** Non-minimal heads and non-minimal bignum
+  payloads rejected by default, accepted only under `{ lenient: true }`;
+  non-canonical NaN rejected always; indefinite-length and reserved
+  additional-info bytes rejected always; truncated head, truncated
+  payload, trailing bytes.
 - **Migration acceptance.** Phases 2 and 3 rerun the consumers'
   existing suites unchanged (ocapn interop tests, slots end-to-end
   and adversarial tests, Rust parity CI) as the proof that outputs
@@ -317,7 +352,7 @@ slots package can adopt `@endo/cbor` before merge and shed its
    only shape that keeps both consumers honest.
 2. **Not an extension of `@endo/cbor-frame`.** That design scopes itself
    to framing only and explicitly excludes codec duties
-   ([cbors.md](cbors.md) section Scope); grafting a codec onto it
+   ([cbor-frame.md](cbor-frame.md) section Scope); grafting a codec onto it
    would break its recorded contract. Considered and rejected:
    one combined CBOR package. Reason: framing and item codecs have
    different consumers and different audit surfaces.
@@ -330,10 +365,12 @@ slots package can adopt `@endo/cbor` before merge and shed its
 4. **Number-domain heads, bigint bignums.** Safe-integer heads match
    slots and every real ocapn argument; bigints appear exactly where
    CBOR itself goes arbitrary-precision (tags 2/3).
-5. **Canonical writers, optionally-strict readers.** Byte identity
-   with Rust and signature stability demand canonical writes;
-   tolerant reads preserve today's observable behavior, with `strict`
-   available where verification wants it.
+5. **Canonical writers, strict readers.** Byte identity with Rust and
+   signature stability demand canonical writes; strict reads (the
+   maintainer's directive) reject non-canonical encodings so no two
+   byte-different encodings of a value both decode, with an opt-in
+   `lenient` escape hatch retained only for a concrete tolerant-peer
+   need.
 6. **Own buffer state rather than extracting syrup's
    `BufferWriter` / `BufferReader`.** Keeps the package
    dependency-light and the migration surface small; a generic
@@ -342,27 +379,36 @@ slots package can adopt `@endo/cbor` before merge and shed its
 
 ## Open Questions
 
+All four are **resolved** by the maintainer's 2026-07-15 review on
+[PR #710](https://github.com/endojs/endo-but-for-bots/pull/710); the
+resolutions are folded into the sections above and restated here.
+
 1. **Is `@endo/cbor` acceptable alongside the framing package?**
-   Resolved by the implementation: the framing sibling landed as
-   `@endo/cbor-frame` (PR #288), not the near-collision `@endo/cbors`
-   this section originally weighed, so the codec/framing distinction is
-   now carried by an explicit `-frame` suffix rather than a single
-   trailing letter. `@endo/cbor` stays as the primitive-codec name.
-2. **Should ocapn's signature-verification paths construct readers
-   with `strict: true`?** Today non-minimal heads pass its decoder,
-   so two byte-different encodings of the same value can both
-   verify. Enabling strict tightens this; it may also reject traffic
-   from tolerant peers. Maintainer call at phase 2.
+   **Resolved: yes, they are separate packages.** The framing sibling
+   is `@endo/cbor-frame` (PR #288) and the earlier trailing-`s` name is
+   retired permanently — "there will never be" that name; the
+   codec/framing distinction is carried by the explicit `-frame`
+   suffix. `@endo/cbor` stays as the primitive-codec name.
+   `@endo/cbor-frame` remains deliberately minimal and may later import
+   the head primitives it needs from `@endo/cbor` through narrowly
+   scoped module imports (phase 4).
+2. **Should readers be strict?** **Resolved: be strict.** Readers
+   reject non-minimal heads and non-minimal bignum payloads by default;
+   ocapn's signature-verification paths (and every other path) get the
+   strict behavior for free. A `{ lenient: true }` opt-out is retained
+   only for a concrete tolerant-peer need, off by default.
 3. **Is `String.prototype.isWellFormed` available on every supported
-   engine, XS included?** Slots runs under the XS worker
-   (`packages/daemon/src/bus-worker-xs.js`). If XS lacks it, the
-   package carries a small local well-formedness check instead of a
-   `@endo/pass-style` dependency.
-4. **Where does phase 1 land relative to PR #124?** The design
-   assumes `master` first with forward-merges to `llm` and `endor`,
-   and slots adopting post-merge (phase 3). If the maintainer prefers
-   the package to exist before #124 merges so the PR never ships its
-   private copy, phase 1 can target the `endor` line first.
+   engine, XS included?** **Resolved: do not rely on it — use a
+   ponyfill.** It is probably not universally supported (XS runs the
+   slots worker, `packages/daemon/src/bus-worker-xs.js`). Factor the
+   existing well-formedness check out of `@endo/ocapn` / `@endo/pass-style`
+   into a shared home — an `@endo/is-well-formed-string` leaf package or
+   a new `@endo/utf8` module — rather than duplicate it, and depend on
+   that (phase 0). See [Dependencies](#dependencies).
+4. **Where does phase 1 land relative to PR #124?** **Resolved: land
+   on `llm`.** Phase 1 targets `llm` and is ported to `origin/master`
+   when the package is stable, rather than base-inferred to `master`
+   first.
 
 ## Prompt
 

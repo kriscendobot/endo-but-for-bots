@@ -1018,8 +1018,8 @@ direct-to-this-gateway sessions.
 The path name encodes the codec/transport pair:
 
 - `ocapn`: protocol family.
-- `cbor`: payload codec ([`cbors`](cbors.md), peer of
-  `@endo/syrups`).
+- `cbor`: payload codec ([`cbor-frame`](cbor-frame.md), peer of
+  `@endo/syrup-frame`).
 - `np`: Noise Protocol network identifier (per
   [`ocapn-noise-network`](ocapn-noise-network.md) § Network
   Identifier).
