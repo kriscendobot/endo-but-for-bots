@@ -14,6 +14,8 @@ so it builds in-repo from the first commit (resolved question 9).
 | `endor-262` | `#![forbid(unsafe_code)]` | Dual-run harness: runs the same bytecode on `endor-vm` and the oracle, recording four-valued + computron agreement. |
 | `endor-fuzz` | `#![forbid(unsafe_code)]` | cargo-fuzz targets 1 (differential source) and 2 (bytecode decoder), authored so the logic is a plain testable lib. |
 | `endor-regexp` | `#![forbid(unsafe_code)]` | Engine-internal port of the XS RegExp engine (`xsre.c`): the pattern compiler (parse → measure → code) and the backtracking match VM, metering-exact against the pin. The JavaScript `RegExp` surface is child 9, linked from `endor-vm` (§ The JavaScript RegExp surface). |
+| `endor-compile` | `#![forbid(unsafe_code)]` | The pure-Rust compiler port (lexer → parser → scoper → coder) whose bytecode AND `SYMB` atom equal the C-XS oracle's byte for byte (stage 5, § Stage 5). Now the dual-run default (`Compiler::Endor`). |
+| `endor-snapshot` | `#![forbid(unsafe_code)]` | The `XS_M`-atom machine-image writer/reader and arena serializer: content-addressed suspend/resume of a metered `endor-vm` machine, byte-exact round-trip with meter state preserved across suspend (stage 6, § Stage 6). |
 
 ## Building the oracle: the `c/moddable` pin
 
@@ -2817,4 +2819,71 @@ dual-run runner takes an explicit `Compiler` selection `{Oracle, Endor}`:
 reference result). The default stays `Oracle` until the supervisor accepts
 stage 5 — later stages flip it with a one-line change and no runner
 surgery. The `Endor` path is total over coder folds (`catch_unwind` → empty
-bytecode → a clean endor-vm abort, never a harness panic).
+bytecode → a clean endor-vm abort, never a harness panic). **Flipped in
+stage 6 child 1** — see § Stage 6.
+
+## Stage 6: the snapshot surface (`endor-snapshot`, children 1–6)
+
+The metered `endor-vm` machine becomes **suspendable**: an `XS_M`-atom
+machine image (`endor-snapshot`) content-addresses a running machine to a
+CAS blob and resumes it byte-exact, meter state included, so a supervisor
+can park a worker and revive it as if it had never stopped. The six landed
+children:
+
+1. **Seam flip** (`be53dd526`) — `Compiler::default()` is now
+   `Compiler::Endor` (the `#[default]` variant): the dual-run default runs
+   `endor-compile`'s own bytecode, the oracle stays the reference. Every
+   `endor_oracle::` call site is a differential-harness / reference path
+   only (`dual_run_with`, `compile-diff`, `corpus_to_262`), never the
+   default execution path.
+2. **`XS_M` atom container** (`edf0ebbe8`) — the atom writer/reader and
+   arena serializer; every payload arm round-trips byte-exact
+   (`atom.rs`, `image.rs`, `slot_codec.rs`, `format.rs` fixtures).
+3. **`Machine` snapshot surface + meter across suspend** (`c24cf4aa1`) —
+   `suspend_to_cas` / `resume_from_cas`; `suspend_resume_equals_uninterrupted`
+   and `armed_meter_state_survives_suspend` prove a resumed machine's result
+   and meter equal an uninterrupted run's.
+4. **Round-trip / malformed-atom fuzz** (`e26375cbb`) — round-trip-invariance
+   targets plus the malformed-atom / over-allocation gates
+   (`malformed_*_does_not_over_allocate`, `mutation_corpus_reaches_the_atom_decoders`).
+5. **Supervisor integration** (`ed547e721`) — landed (not a probe): a
+   supervisor suspends/resumes real workers, preserving result + meter and
+   writing a content-addressed blob
+   (`supervisor_suspend_resume_preserves_result_and_meter`,
+   `supervisor_suspend_writes_content_addressed_blob`,
+   `supervisor_suspends_multiple_workers_independently`).
+6. **Whole-stage verify** (this ledger row) — every bar reproduced from a
+   fresh checkout at the tip below.
+
+### Stage-6 whole-stage verify — bars reproduced at the tip (`ed547e721`)
+
+> **Binding process rule (s16/s18).** A whole-tree claim requires the
+> whole-tree enumeration AT THE CLAIMED TIP; a workspace-green claim requires
+> running the workspace at that tip. Every number below is measured from a
+> fresh `xs2rust-endor` sync at `ed547e721`, oracle pinned to moddable
+> **8.3.1** (`23b4d6b0a65f`), each run captured to a file with `$?` checked
+> directly.
+>
+> - **Workspace** — `cargo test --workspace -- --test-threads=1` from
+>   `rust/engine`: **EXIT=0**, every `test result:` line `0 failed` (the
+>   snapshot round-trip, suspend/resume-equals-uninterrupted incl. meter,
+>   malformed-atom, and supervisor-integration tests all green in the run).
+> - **`#![forbid(unsafe_code)]`** intact at every engine-crate root —
+>   `endor-vm`, `endor-262`, `endor-fuzz`, `endor-regexp`, `endor-compile`,
+>   **and `endor-snapshot`**; `endor-oracle` the sole audited FFI exception.
+> - **Curated `compile-diff`** (no arg): **1711/1711 identical, divergent=0,
+>   endor-rejected=0, accept-disagree=0** (SYMB atom byte-identity also MET).
+> - **The complete 121-run `language/` enumeration** (120 subtrees + the loose
+>   `expressions/tco-pos.js` via a temp subtree; whole-`language/` OOMs the
+>   oracle, so per-subtree IS the measurement): every run **EXIT=0**, summed
+>   **total=20603 identical=16981 divergent=0 oracle-rejected=3622
+>   endor-rejected=0 accept-disagree=0** — exactly the s19 anchor at
+>   `69ec87becb`, all rejections agreed.
+> - **Stage-4 dual-run spot-checks** (`endor-xst`), EXIT=0, all skips named:
+>   `built-ins/Object` **182 covered / 0 failed** (of 3127; 2945 named skips),
+>   `built-ins/Function` **43 / 0** (of 511; 468 skips), `built-ins/Array`
+>   **487 / 0** (of 2625; 2138 skips) — the covered-counts recovered above the
+>   fix6-verify 8.3.1 figures (175/40/435) as the tip advanced.
+>
+> **STAGE-6 BARS MET.** No divergence, no unsafe outside the audited seam, the
+> stage-5 byte-identity bar holds unmoved at the tip.
