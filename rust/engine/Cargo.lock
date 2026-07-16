@@ -43,6 +43,7 @@ dependencies = [
  "endor-compile",
  "endor-oracle",
  "endor-regexp",
+ "endor-snapshot",
  "endor-vm",
 ]
 

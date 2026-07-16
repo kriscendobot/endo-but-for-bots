@@ -30,6 +30,15 @@ use endor_vm::{disassemble, run_program, run_program_bounded};
 pub mod regexp;
 pub use regexp::{differential_check_regexp, gen_regexp, RegExpCase};
 
+/// Stage-6 child 4: the snapshot round-trip-invariance and malformed-atom
+/// decoder fuzz arms over `endor-snapshot`'s `XS_M` writer/reader.
+pub mod snapshot;
+pub use snapshot::{
+    decoder_is_error_free, gen_machine_image, roundtrip_generated_is_invariant,
+    roundtrip_image_is_invariant, roundtrip_program_is_invariant, suspend_resume_is_transparent,
+    RoundtripDivergence,
+};
+
 /// A cursor over fuzzer-provided bytes, used to drive the grammar
 /// deterministically (a minimal `arbitrary::Unstructured`).
 struct Bytes<'a> {

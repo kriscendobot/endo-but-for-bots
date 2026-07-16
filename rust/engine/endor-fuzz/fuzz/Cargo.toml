@@ -58,5 +58,17 @@ path = "fuzz_targets/differential_compile.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "snapshot_roundtrip"
+path = "fuzz_targets/snapshot_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snapshot_decoder"
+path = "fuzz_targets/snapshot_decoder.rs"
+test = false
+doc = false
+
 [workspace]
 # Own workspace: cargo-fuzz builds this tree in isolation.

@@ -15,3 +15,8 @@ endor-vm = { path = "../endor-vm" }
 endor-oracle = { path = "../endor-oracle" }
 endor-regexp = { path = "../endor-regexp" }
 endor-compile = { path = "../endor-compile" }
+# Stage-6 child 4: the snapshot round-trip-invariance and malformed-atom
+# decoder fuzz arms drive the XS_M writer/reader (design § Snapshots,
+# Fuzzability). The substance stays here in the forbid(unsafe_code) lib so it
+# builds and unit-tests without a libFuzzer toolchain.
+endor-snapshot = { path = "../endor-snapshot" }

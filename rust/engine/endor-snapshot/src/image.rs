@@ -221,7 +221,13 @@ fn decode_strings(p: &[u8]) -> Result<Vec<String>, SnapshotError> {
         return Err(SnapshotError::Corrupt("string list header"));
     }
     let count = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    // Reserve no more than the payload could possibly hold: every entry
+    // carries at least a 4-byte length header, so a valid `count` never
+    // exceeds `p.len() / 4`. Clamping the pre-reservation keeps a malformed
+    // `count` (up to `u32::MAX`) from reserving gigabytes before the
+    // per-entry bounds check below rejects the truncation (fuzz trophy
+    // `malformed_string_count_does_not_over_allocate`).
+    let mut out = Vec::with_capacity(count.min(p.len() / 4));
     let mut i = 4;
     for _ in 0..count {
         if i + 4 > p.len() {
@@ -254,7 +260,11 @@ fn decode_u32s(p: &[u8]) -> Result<Vec<u32>, SnapshotError> {
         return Err(SnapshotError::Corrupt("u32 list header"));
     }
     let count = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
-    let mut out = Vec::with_capacity(count);
+    // Clamp the pre-reservation to what the payload can hold (4 bytes per
+    // entry); a malformed `count` must not reserve gigabytes before the
+    // per-entry bounds check below rejects it (fuzz trophy
+    // `malformed_u32_count_does_not_over_allocate`).
+    let mut out = Vec::with_capacity(count.min(p.len() / 4));
     let mut i = 4;
     for _ in 0..count {
         if i + 4 > p.len() {
@@ -287,7 +297,11 @@ fn decode_heap(p: &[u8]) -> Result<(Vec<Slot>, Vec<u32>, u32), SnapshotError> {
     let free_count = u32::from_be_bytes([p[4], p[5], p[6], p[7]]) as usize;
     let live = u32::from_be_bytes([p[8], p[9], p[10], p[11]]);
     let mut i = 12;
-    let mut free = Vec::with_capacity(free_count);
+    // Clamp the free-list pre-reservation to what the payload can hold (4
+    // bytes per entry); a malformed `free_count` must not reserve gigabytes
+    // before the per-entry bounds check below rejects it (fuzz trophy
+    // `malformed_heap_free_count_does_not_over_allocate`).
+    let mut free = Vec::with_capacity(free_count.min(p.len() / 4));
     for _ in 0..free_count {
         if i + 4 > p.len() {
             return Err(SnapshotError::Corrupt("HEAP free list"));
@@ -609,5 +623,122 @@ mod tests {
         } else {
             panic!("bigint payload");
         }
+    }
+
+    // --- malformed-atom decoder trophies (stage-6 child 4) ---
+    //
+    // A container whose list-count field is enormous but whose payload is
+    // short must fail closed **promptly** — the reader must not pre-reserve a
+    // `Vec` sized by the untrusted count (up to `u32::MAX`), which reserves
+    // gigabytes and aborts under a memory limit before the per-entry bounds
+    // check ever runs. These locks build a minimal valid VERS+SIGN+HEAP
+    // prefix, then a single list atom whose count claims `u32::MAX` with no
+    // entry bytes behind it, and assert a structured `Corrupt` error. The
+    // clamp in `decode_strings`/`decode_u32s`/`decode_heap` is what makes them
+    // return in microseconds; before it, each hung on a 16–100 GB allocation.
+    // (The daemon restore path must fail closed on a corrupt snapshot, never
+    // crash the worker — job spec item 2.)
+
+    use crate::atom::AtomWriter;
+
+    /// A valid container prefix (VERS + SIGN + empty HEAP) that
+    /// `read_machine` accepts up to the list atoms, so a malformed list atom
+    /// appended after it is reached by the decoder.
+    fn valid_prefix() -> AtomWriter {
+        let mut w = AtomWriter::new();
+        w.atom(VERS, &Version::current().encode());
+        w.atom(SIGN, &sig().encode());
+        // Empty HEAP payload: slot_count=0, free_count=0, live=0.
+        w.atom(HEAP, &[0u8; 12]);
+        w
+    }
+
+    /// A `u32::MAX` count with no entry bytes: `[count=0xFFFFFFFF]`.
+    fn huge_count_payload() -> Vec<u8> {
+        u32::MAX.to_be_bytes().to_vec()
+    }
+
+    #[test]
+    fn malformed_string_count_does_not_over_allocate() {
+        // KEYS claims u32::MAX strings but carries none.
+        let mut w = valid_prefix();
+        w.atom(KEYS, &huge_count_payload());
+        let bytes = w.finish();
+        assert_eq!(
+            read_machine(&bytes, &sig()),
+            Err(SnapshotError::Corrupt("string list entry header"))
+        );
+        // NAME is decoded by the same path — lock it too.
+        let mut w = valid_prefix();
+        w.atom(NAME, &huge_count_payload());
+        let bytes = w.finish();
+        assert_eq!(
+            read_machine(&bytes, &sig()),
+            Err(SnapshotError::Corrupt("string list entry header"))
+        );
+    }
+
+    #[test]
+    fn malformed_u32_count_does_not_over_allocate() {
+        // SYMB claims u32::MAX ids but carries none.
+        let mut w = valid_prefix();
+        w.atom(SYMB, &huge_count_payload());
+        let bytes = w.finish();
+        assert_eq!(
+            read_machine(&bytes, &sig()),
+            Err(SnapshotError::Corrupt("u32 list entry"))
+        );
+    }
+
+    #[test]
+    fn malformed_heap_free_count_does_not_over_allocate() {
+        // A HEAP header whose free_count claims u32::MAX with no free bytes.
+        let mut heap = Vec::new();
+        heap.extend_from_slice(&0u32.to_be_bytes()); // slot_count = 0
+        heap.extend_from_slice(&u32::MAX.to_be_bytes()); // free_count = u32::MAX
+        heap.extend_from_slice(&0u32.to_be_bytes()); // live = 0
+        let mut w = AtomWriter::new();
+        w.atom(VERS, &Version::current().encode());
+        w.atom(SIGN, &sig().encode());
+        w.atom(HEAP, &heap);
+        let bytes = w.finish();
+        assert_eq!(
+            read_machine(&bytes, &sig()),
+            Err(SnapshotError::Corrupt("HEAP free list"))
+        );
+    }
+
+    #[test]
+    fn malformed_heap_slot_count_does_not_over_allocate() {
+        // A HEAP header whose slot_count claims u32::MAX records with none
+        // present: the `want > remaining` check must reject it before
+        // `decode_slots` reserves the record array.
+        let mut heap = Vec::new();
+        heap.extend_from_slice(&u32::MAX.to_be_bytes()); // slot_count = u32::MAX
+        heap.extend_from_slice(&0u32.to_be_bytes()); // free_count = 0
+        heap.extend_from_slice(&0u32.to_be_bytes()); // live = 0
+        let mut w = AtomWriter::new();
+        w.atom(VERS, &Version::current().encode());
+        w.atom(SIGN, &sig().encode());
+        w.atom(HEAP, &heap);
+        let bytes = w.finish();
+        assert_eq!(
+            read_machine(&bytes, &sig()),
+            Err(SnapshotError::Corrupt("HEAP records truncated"))
+        );
+    }
+
+    #[test]
+    fn malformed_stack_count_does_not_over_allocate() {
+        // STAC claims u32::MAX slots but carries none.
+        let mut stac = Vec::new();
+        stac.extend_from_slice(&u32::MAX.to_be_bytes()); // count = u32::MAX
+        let mut w = valid_prefix();
+        w.atom(STAC, &stac);
+        let bytes = w.finish();
+        assert_eq!(
+            read_machine(&bytes, &sig()),
+            Err(SnapshotError::Corrupt("STAC records truncated"))
+        );
     }
 }
