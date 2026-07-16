@@ -62,16 +62,21 @@ sub-path exports:
 string, lenient), with a third strict variant `strictDecodeUtf8` (bytes
 to string, fatal on malformed sequences).
 
-`@endo/ascii` is a new package providing ASCII encoding and decoding
-using plain charCode arithmetic, without relying on `TextEncoder` or
-`TextDecoder` (which do not support the `"ascii"` encoding label).
-It provides two sub-path exports:
+`@endo/ascii` is a new package providing ASCII encoding and decoding.
+Where the platform provides `TextEncoder` and `TextDecoder`, each
+function runs a single native UTF-8 pass and verifies the result is
+ASCII by its length (one byte per code unit if and only if all code
+units are at most 127); otherwise, and on non-ASCII input, it falls
+back to plain charCode arithmetic, which also serves platforms without
+those globals (whose decoders in any case do not support the `"ascii"`
+encoding label). It provides two sub-path exports:
 `encodeAscii` (string to `Uint8Array`, throws on values outside ASCII
 range 0-127) and `decodeAscii` (bytes to string, passes non-ASCII bytes
 through without error).
 
 `@endo/pass-style` gains three additional sub-path exports for UTF-8
 encoding and decoding that are aware of the byteArray passable form:
+
 - `@endo/pass-style/encode-utf8.js` exports `encodeUtf8(s)`: encodes a
   string as a passable `byteArray` (frozen `Uint8Array` over immutable
   `ArrayBuffer`).
