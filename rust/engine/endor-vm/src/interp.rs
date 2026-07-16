@@ -4070,14 +4070,22 @@ impl Interp {
         }
     }
 
-    /// Bind the intrinsic constructors this program references into the
-    /// global object, keyed by the program-local symbol id the C-XS compiler
-    /// assigned each name (`names[k]` is the name of id `k + 1`; see
-    /// [`crate::symbols`]). Only names that match a known intrinsic are
-    /// bound; everything else is left to resolve as an ordinary global (a
-    /// `var`/sloppy-global) or to miss. Unmetered: these globals pre-exist
-    /// the guest run exactly as XS's do, so no allocation is charged.
-    pub fn link_intrinsics(&mut self, names: &[String]) {
+    /// Derive the program-symbol tables and every name-keyed lookup-id cache
+    /// from `names` (the decoded `SYMB` atom, `names[k]` = the name of id
+    /// `k + 1`): the forward `symbol_names`, the inverse `symbol_ids`, the
+    /// `next_intern_id` runtime-key counter (past the program symbols so a
+    /// novel key never collides), and the cached ids
+    /// (`length_id`/`name_id`/… and the RegExp getter/result clusters).
+    ///
+    /// This is a **pure function of `names`** — it touches no arena and reads
+    /// no other state — which is exactly why it is factored out of
+    /// [`Self::link_intrinsics`]: [`Self::restore_snapshot_state`] calls it
+    /// on the restored `symbol_names` to rebuild these tables identically to
+    /// boot, without re-running the intrinsic *global-property* installation
+    /// (those properties already round-trip inside the restored arena). It is
+    /// the derivation that makes the SymbolTables ledger row's "rebuilt at
+    /// restore" claim true, and it keeps the two callers from drifting.
+    fn bind_program_symbols(&mut self, names: &[String]) {
         self.symbol_names = names.to_vec();
         // Runtime-interned keys number past the compiler's program symbols
         // (ids `1..=names.len()`), so a novel runtime key can never collide
@@ -4121,12 +4129,33 @@ impl Interp {
             input: id_of("input"),
             groups: id_of("groups"),
         };
+        // Record the program-local id for every name (first occurrence wins,
+        // matching the compiler's numbering), so a native built-in can relink
+        // a well-known property name (`message`, `name`, …) to the id the
+        // compiler assigned it in this program.
         for (k, name) in names.iter().enumerate() {
             let id = (k + 1) as u16;
-            // Record the program-local id for every name, so a native
-            // built-in can relink a well-known property name (`message`,
-            // `name`, …) to the id the compiler assigned it in this program.
             self.symbol_ids.entry(name.clone()).or_insert(id);
+        }
+    }
+
+    /// Bind the intrinsic constructors this program references into the
+    /// global object, keyed by the program-local symbol id the C-XS compiler
+    /// assigned each name (`names[k]` is the name of id `k + 1`; see
+    /// [`crate::symbols`]). Only names that match a known intrinsic are
+    /// bound; everything else is left to resolve as an ordinary global (a
+    /// `var`/sloppy-global) or to miss. Unmetered: these globals pre-exist
+    /// the guest run exactly as XS's do, so no allocation is charged.
+    pub fn link_intrinsics(&mut self, names: &[String]) {
+        // The program-symbol name↔id tables and every name-keyed lookup-id
+        // cache (`length_id`/`name_id`/… and the RegExp id clusters). Split
+        // out because it is derived *purely* from `names` — so
+        // [`Self::restore_snapshot_state`] re-derives it identically from the
+        // restored `symbol_names` without re-linking intrinsics (the
+        // SymbolTables ledger row's restore-time rebuild).
+        self.bind_program_symbols(names);
+        for (k, name) in names.iter().enumerate() {
+            let id = (k + 1) as u16;
             if self.global_props.contains_key(&id) {
                 continue;
             }
@@ -4290,8 +4319,60 @@ impl Interp {
         self.slots = slots;
         self.chunks = chunks;
         self.stack = stack;
-        self.symbol_names = symbol_names;
         self.meter.restore(meter);
+        // SymbolTables ledger row: only `symbol_names` is serialized; the
+        // inverse `symbol_ids`, the `next_intern_id` counter, and the
+        // name-keyed lookup-id caches are *derived* from it — `link_intrinsics`
+        // computes them at boot and never persists them, so restore re-derives
+        // them here by the identical pure derivation. Without this a resumed
+        // machine's `symbol_ids` stays empty and `next_intern_id` stays at the
+        // fresh-boot `1`, colliding a novel runtime-interned key with a program
+        // symbol id. (Consumes `symbol_names`, so this both sets the forward
+        // table and rebuilds the rest.)
+        self.bind_program_symbols(&symbol_names);
+        // GlobalProps ledger row: the global object's own-property slots
+        // (intrinsic bindings and runtime-materialized `var`/sloppy globals
+        // alike) round-trip *inside* the restored slot arena — they are linked
+        // into `global_obj`'s property chain — but the `global_props` fast-index
+        // that `resolve_get`/`resolve_set` consult is a HashMap, not arena
+        // state, and boot leaves it empty. Rebuild it by walking the restored
+        // chain, so a global created in an earlier crank resolves after resume.
+        self.rebuild_global_props();
+    }
+
+    /// Rebuild the [`Self::global_props`] id→slot fast index by walking the
+    /// restored global object's own-property list. `create_global_property`
+    /// is the *only* writer of `global_props`, and it links every entry into
+    /// `global_obj`'s property chain as it inserts into the map, so the chain
+    /// and the map are one-to-one — walking the chain reconstructs the map
+    /// exactly. Used at restore, where the arena round-trips the chain but the
+    /// map (plain side-table state, not arena-resident) must be re-derived.
+    ///
+    /// Because this runs on the *restored* arena — which on the malformed-atom
+    /// fuzz path may hold arbitrary bytes — every index is bounds-checked
+    /// against the arena capacity and the walk is capped at the slot count, so
+    /// a garbage or cyclic `next` pointer stops the walk (yielding a partial /
+    /// empty index) instead of panicking or hanging. On a well-formed snapshot
+    /// the caps are never reached and the reconstruction is exact.
+    fn rebuild_global_props(&mut self) {
+        self.global_props.clear();
+        let cap = self.slots.capacity();
+        // A valid chain visits each of the global object's own properties
+        // once; capping at the slot count makes a fuzzer-induced cycle
+        // terminate rather than spin.
+        let in_bounds = |idx: crate::value::SlotIndex| !idx.is_null() && idx.0 < cap;
+        if !in_bounds(self.global_obj) {
+            return;
+        }
+        let mut cur = self.slots.get(self.global_obj).next;
+        let mut budget = cap as usize;
+        while in_bounds(cur) && budget > 0 {
+            let s = self.slots.get(cur);
+            let (id, next) = (s.id, s.next);
+            self.global_props.insert(id, cur);
+            cur = next;
+            budget -= 1;
+        }
     }
 
     /// Allocate a property slot for global key `id`, link it into the

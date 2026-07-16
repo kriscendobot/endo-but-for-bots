@@ -66,6 +66,7 @@ dependencies = [
 name = "endor-snapshot"
 version = "0.0.1"
 dependencies = [
+ "endor-compile",
  "endor-vm",
 ]
 

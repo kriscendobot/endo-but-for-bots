@@ -22,3 +22,8 @@ endor-vm = { path = "../endor-vm" }
 # an integration test compiles as a separate crate, so the engine must be
 # declared here even though it is a regular dependency above.
 endor-vm = { path = "../endor-vm" }
+# The cross-crank restore regression tests (`tests/restore_side_tables.rs`)
+# compile real guest source to bytecode + a SYMB atom so the restored
+# machine reads genuine runtime-materialized globals across a snapshot —
+# the pure-Rust compiler pipeline (no oracle needed) that `dual_run` rides.
+endor-compile = { path = "../endor-compile" }
