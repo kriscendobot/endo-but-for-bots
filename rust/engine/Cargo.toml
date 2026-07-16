@@ -13,6 +13,7 @@ members = [
     "endor-fuzz",
     "endor-regexp",
     "endor-compile",
+    "endor-snapshot",
 ]
 
 [workspace.package]

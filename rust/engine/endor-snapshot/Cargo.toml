@@ -1,0 +1,17 @@
+[package]
+name = "endor-snapshot"
+description = "The endor XS_M atom container writer/reader and index-arena heap serializer (design: designs/xs2rust-endor-engine.md § Snapshots). Writes/reads the length-prefixed big-endian FourCC atom grammar with an endor VERS discriminator. #![forbid(unsafe_code)]."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "endor_snapshot"
+path = "src/lib.rs"
+
+[dependencies]
+# The value/heap model this crate serializes. Only public arena/slot
+# surfaces are used (design § Snapshots: the writer is a serializer over
+# the index arenas, not a relocator).
+endor-vm = { path = "../endor-vm" }

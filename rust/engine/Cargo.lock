@@ -62,6 +62,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "endor-snapshot"
+version = "0.0.1"
+dependencies = [
+ "endor-vm",
+]
+
+[[package]]
 name = "endor-vm"
 version = "0.0.1"
 dependencies = [

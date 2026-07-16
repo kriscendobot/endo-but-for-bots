@@ -127,6 +127,32 @@ pub enum Kind {
     BigInt = 14,
 }
 
+impl Kind {
+    /// Decode a kind byte (the `#[repr(u8)]` discriminant), for the snapshot
+    /// reader deserializing a `HEAP` slot image. Returns `None` for a byte
+    /// that names no kind — a corrupt/foreign snapshot record.
+    pub fn from_u8(b: u8) -> Option<Kind> {
+        Some(match b {
+            0 => Kind::Undefined,
+            1 => Kind::Null,
+            2 => Kind::Boolean,
+            3 => Kind::Integer,
+            4 => Kind::Number,
+            5 => Kind::String,
+            6 => Kind::Instance,
+            7 => Kind::Property,
+            8 => Kind::Symbol,
+            9 => Kind::Closure,
+            10 => Kind::Reference,
+            11 => Kind::Uninitialized,
+            12 => Kind::EnvReference,
+            13 => Kind::At,
+            14 => Kind::BigInt,
+            _ => return None,
+        })
+    }
+}
+
 /// The 16-byte value payload (XS's value union arm subset for stage 1).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Payload {
@@ -399,6 +425,45 @@ impl SlotArena {
     pub fn byte_size(&self) -> usize {
         self.slots.len() * 32
     }
+
+    // --- snapshot support (see `endor-snapshot`) ---
+    //
+    // The snapshot writer is a *serializer*, not a relocator (design §
+    // Snapshots): because slots never move and are addressed by index, the
+    // HEAP atom is just the flat record array plus the free list, and a
+    // read reconstructs an identical arena. These accessors expose exactly
+    // the state a faithful `HEAP` round-trip needs and nothing more.
+
+    /// Every slot record ever allocated (live and freed alike), in index
+    /// order — the flat image the `HEAP` atom serializes. Freed records are
+    /// serialized as-is so slot indices are preserved across a round-trip
+    /// (an index-arena snapshot never renumbers).
+    #[inline]
+    pub fn records(&self) -> &[Slot] {
+        &self.slots
+    }
+
+    /// The free list (indices returned to the arena, LIFO reuse order), so a
+    /// restored arena reuses the same records in the same order as the
+    /// original would have — keeping post-restore allocation deterministic.
+    #[inline]
+    pub fn free_list(&self) -> &[u32] {
+        &self.free
+    }
+
+    /// Rebuild an arena from a serialized image: the flat record array, the
+    /// free list, and the live count. Marks are reset (a snapshot is taken
+    /// on a quiescent machine, outside any collection — design § Snapshots
+    /// constraint 1), so no mark state needs to survive.
+    pub fn from_image(slots: Vec<Slot>, free: Vec<u32>, live: u32) -> SlotArena {
+        let marks = vec![false; slots.len()];
+        SlotArena {
+            slots,
+            free,
+            marks,
+            live,
+        }
+    }
 }
 
 /// The size of a chunk's length header, in bytes. Each block in the
@@ -509,6 +574,23 @@ impl ChunkArena {
     #[inline]
     pub fn byte_size(&self) -> usize {
         self.bytes.len()
+    }
+
+    // --- snapshot support (see `endor-snapshot`) ---
+
+    /// The whole backing byte vector, header discipline included — the
+    /// `BLOC` atom payload. Because `ChunkOffset`s are byte offsets into
+    /// exactly these bytes, serializing them verbatim keeps every offset
+    /// valid across a round-trip with no relocation (design § Snapshots:
+    /// the writer is a serializer, not a relocator).
+    #[inline]
+    pub fn raw(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Rebuild a chunk arena from a serialized `BLOC` image.
+    pub fn from_image(bytes: Vec<u8>) -> ChunkArena {
+        ChunkArena { bytes }
     }
 }
 
