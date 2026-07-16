@@ -38,6 +38,12 @@ pub const KEYS: FourCc = FourCc(*b"KEYS");
 pub const NAME: FourCc = FourCc(*b"NAME");
 /// `SYMB` — the symbol table (well-known / registered symbol identities).
 pub const SYMB: FourCc = FourCc(*b"SYMB");
+/// `METR` — the metering state (design row 6): the frozen 16.16
+/// fixed-point counters plus the cost-table version that produced them,
+/// so a resumed machine continues its meter exactly. Endor-specific (C-XS
+/// carries meter state differently), which the endor `VERS` discriminator
+/// already fences off.
+pub const METR: FourCc = FourCc(*b"METR");
 
 /// The endor discriminator embedded at the head of the `VERS` atom. An
 /// endor snapshot is never mistaken for a C-XS one and vice versa
@@ -194,6 +200,11 @@ pub enum SnapshotError {
     /// The host's current signature does not match the snapshot's — the
     /// callback table changed layout since the snapshot was written.
     SignatureMismatch { expected: Signature, found: Signature },
+    /// The snapshot's cost-table version does not match this engine's
+    /// frozen table ([`endor_vm::COST_TABLE_VERSION`]) — resuming would
+    /// continue a meter under changed weights. Fails closed, the metering
+    /// analogue of [`SnapshotError::SignatureMismatch`] (design row 6).
+    CostTableMismatch { expected: String, found: String },
     /// A required atom (`VERS`, `SIGN`, `HEAP`, …) was absent.
     MissingAtom(FourCc),
     /// A structural payload was malformed (wrong length, bad slot record).

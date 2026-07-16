@@ -25,10 +25,16 @@
 //!   and the host callback-table [`format::Signature`] scheme.
 //! - [`slot_codec`] — [`endor_vm::Slot`] ↔ fixed-width record.
 //! - [`image`] — [`image::MachineImage`] plus [`image::write_machine`] /
-//!   [`image::read_machine`], the narrow API the `Machine`-level
-//!   `write_snapshot_to_file`/`from_snapshot_file`/`suspend_to_cas`
-//!   (child 3) call. This crate deliberately does **not** wire that
-//!   `Machine` surface.
+//!   [`image::read_machine`], the narrow API the `Machine`-level surface
+//!   calls, now including the [`image::MeterImage`] `METR` atom (meter
+//!   state across suspend, design row 6).
+//! - [`machine`] — the xsnap-shaped `Machine` surface (stage-6 child 3):
+//!   the [`machine::MachineSnapshot`] extension trait on `endor_vm::Interp`
+//!   (`write_snapshot_to_file`/`suspend_to_cas`) plus
+//!   [`machine::from_snapshot_file`]/[`machine::resume_from_cas`]. Its
+//!   suspend-point contract (between-crank quiescence) is documented there.
+//! - [`sha256`] — the dependency-free, `unsafe`-free SHA-256 the CAS
+//!   content addressing uses.
 //!
 //! # Side-table completeness (the bug class this crate designs against)
 //!
@@ -46,14 +52,20 @@
 pub mod atom;
 pub mod format;
 pub mod image;
+pub mod machine;
+pub mod sha256;
 pub mod sidetable;
 pub mod slot_codec;
 
 pub use atom::{Atom, AtomError, AtomReader, AtomWriter};
 pub use format::{
     FourCc, Signature, SignatureError, SnapshotError, Version, VersionError, BLOC, CREA, HEAP,
-    KEYS, NAME, SIGN, STAC, SYMB, VERS, XS_M,
+    KEYS, METR, NAME, SIGN, STAC, SYMB, VERS, XS_M,
 };
-pub use image::{read_machine, write_machine, CreationParams, MachineImage};
+pub use image::{read_machine, write_machine, CreationParams, MachineImage, MeterImage};
+pub use machine::{
+    from_snapshot_bytes, from_snapshot_file, image_to_interp, resume_from_cas, MachineSnapshot,
+    MachineSnapshotError,
+};
 pub use sidetable::{Coverage, Descriptor, SideTable};
 pub use slot_codec::{decode_slot, decode_slots, encode_slot, encode_slots, SLOT_RECORD_BYTES};

@@ -117,6 +117,11 @@ pub enum SideTable {
     /// `harden`/`petrify`, requirement 5): which intrinsics and object
     /// graphs are frozen. A resumed hardened graph must stay hardened.
     HardenState,
+    /// `meter` — the machine's metering state (design row 6): accumulated
+    /// computrons, the check interval/threshold, and the frozen cost-table
+    /// version. **Carried by the `METR` atom** (stage-6 child 3), so a
+    /// resumed machine continues its meter exactly.
+    Meter,
 }
 
 impl SideTable {
@@ -152,6 +157,7 @@ impl SideTable {
         SideTable::SymbolTables,
         SideTable::Modules,
         SideTable::HardenState,
+        SideTable::Meter,
     ];
 
     /// The table's `Interp` field name and its current snapshot coverage.
@@ -196,6 +202,8 @@ impl SideTable {
             SideTable::RegExps => ("regexps", Pending),
             SideTable::Modules => ("module::ModuleGraph", Pending),
             SideTable::HardenState => ("lockdown/harden state", Pending),
+            // The metering state — carried by the METR atom (child 3).
+            SideTable::Meter => ("meter", Serialized),
         };
         Descriptor {
             table: self,
@@ -237,7 +245,7 @@ mod tests {
     fn all_is_exhaustive() {
         // Count of variants, kept beside the enum. Bump when a variant is
         // added — the assertion below then forces the ALL entry too.
-        const VARIANT_COUNT: usize = 27;
+        const VARIANT_COUNT: usize = 28;
         assert_eq!(SideTable::ALL.len(), VARIANT_COUNT);
 
         // No duplicates: each field name appears once.

@@ -19,10 +19,86 @@
 
 use crate::atom::{AtomReader, AtomWriter};
 use crate::format::{
-    Signature, SnapshotError, Version, BLOC, CREA, HEAP, KEYS, NAME, SIGN, STAC, SYMB, VERS,
+    Signature, SnapshotError, Version, BLOC, CREA, HEAP, KEYS, METR, NAME, SIGN, STAC, SYMB, VERS,
 };
 use crate::slot_codec::{decode_slots, encode_slots, SLOT_RECORD_BYTES};
-use endor_vm::{ChunkArena, Slot, SlotArena};
+use endor_vm::{ChunkArena, MeterState, Slot, SlotArena, COST_TABLE_VERSION};
+
+/// The metering state carried in the `METR` atom (design row 6: "meter
+/// state across suspend"). The frozen 16.16 fixed-point counters plus the
+/// **cost-table version** that produced them; a resume whose cost-table
+/// version differs from this engine's [`endor_vm::COST_TABLE_VERSION`]
+/// fails closed ([`SnapshotError::CostTableMismatch`]) rather than
+/// silently continuing a meter whose weights changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeterImage {
+    pub cost_table_version: String,
+    pub index: u64,
+    pub interval: u64,
+    pub count: u64,
+}
+
+impl MeterImage {
+    /// The image of a live meter state under this engine's current frozen
+    /// cost table.
+    pub fn of(state: MeterState) -> MeterImage {
+        MeterImage {
+            cost_table_version: COST_TABLE_VERSION.to_string(),
+            index: state.index,
+            interval: state.interval,
+            count: state.count,
+        }
+    }
+
+    /// A zeroed, un-armed meter under the current cost table (the meter of
+    /// a machine that has run nothing).
+    pub fn current() -> MeterImage {
+        MeterImage::of(MeterState::default())
+    }
+
+    /// The carried metering state as the engine's [`MeterState`] (drops the
+    /// cost-table version, which the reader has already validated).
+    pub fn to_state(&self) -> MeterState {
+        MeterState {
+            index: self.index,
+            interval: self.interval,
+            count: self.count,
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&self.index.to_be_bytes());
+        v.extend_from_slice(&self.interval.to_be_bytes());
+        v.extend_from_slice(&self.count.to_be_bytes());
+        let vb = self.cost_table_version.as_bytes();
+        v.extend_from_slice(&(vb.len() as u32).to_be_bytes());
+        v.extend_from_slice(vb);
+        v
+    }
+
+    fn decode(p: &[u8]) -> Result<MeterImage, SnapshotError> {
+        if p.len() < 28 {
+            return Err(SnapshotError::Corrupt("METR header"));
+        }
+        let index = u64::from_be_bytes(p[0..8].try_into().unwrap());
+        let interval = u64::from_be_bytes(p[8..16].try_into().unwrap());
+        let count = u64::from_be_bytes(p[16..24].try_into().unwrap());
+        let vlen = u32::from_be_bytes([p[24], p[25], p[26], p[27]]) as usize;
+        if 28 + vlen > p.len() {
+            return Err(SnapshotError::Corrupt("METR version string"));
+        }
+        let cost_table_version = std::str::from_utf8(&p[28..28 + vlen])
+            .map_err(|_| SnapshotError::Corrupt("METR version not utf8"))?
+            .to_string();
+        Ok(MeterImage {
+            cost_table_version,
+            index,
+            interval,
+            count,
+        })
+    }
+}
 
 /// Machine creation parameters (`CREA`). The heap-sizing hints XS records
 /// so a restore can pre-size the arenas; endor's arenas grow on demand, so
@@ -73,6 +149,9 @@ pub struct MachineImage {
     pub names: Vec<String>,
     /// `SYMB`: well-known / registered symbol identity slot indices.
     pub symbols: Vec<u32>,
+    /// `METR`: the metering state (design row 6). A resumed machine
+    /// continues its meter from exactly this point.
+    pub meter: MeterImage,
 }
 
 impl MachineImage {
@@ -103,7 +182,16 @@ impl MachineImage {
             keys,
             names,
             symbols,
+            meter: MeterImage::current(),
         }
+    }
+
+    /// Attach a metering state to this image (design row 6). The snapshot
+    /// surface calls this with the live machine's [`MeterState`] so a
+    /// resume continues the meter exactly.
+    pub fn with_meter(mut self, meter: MeterState) -> MachineImage {
+        self.meter = MeterImage::of(meter);
+        self
     }
 
     /// Rebuild the slot and chunk arenas from this image. Round-trips the
@@ -237,8 +325,9 @@ fn decode_stack(p: &[u8]) -> Result<Vec<Slot>, SnapshotError> {
 
 /// Serialize a machine image into an `XS_M` atom container. Atoms are
 /// written in the canonical order `VERS SIGN CREA BLOC HEAP STAC KEYS NAME
-/// SYMB` (the order `xsSnapshot.c` emits), so two writes of the same image
-/// are byte-identical.
+/// SYMB METR` (the order `xsSnapshot.c` emits, with the endor-specific
+/// `METR` meter atom last), so two writes of the same image are
+/// byte-identical.
 pub fn write_machine(image: &MachineImage) -> Vec<u8> {
     let mut w = AtomWriter::new();
     w.atom(VERS, &image.version.encode());
@@ -250,6 +339,7 @@ pub fn write_machine(image: &MachineImage) -> Vec<u8> {
     w.atom(KEYS, &encode_strings(&image.keys));
     w.atom(NAME, &encode_strings(&image.names));
     w.atom(SYMB, &encode_u32s(&image.symbols));
+    w.atom(METR, &image.meter.encode());
     w.finish()
 }
 
@@ -299,6 +389,21 @@ pub fn read_machine(buf: &[u8], expected_sig: &Signature) -> Result<MachineImage
         None => Vec::new(),
     };
 
+    // METR (design row 6): decode the metering state and fail closed on a
+    // cost-table version this engine did not produce — the metering
+    // analogue of the SIGN check above. An absent METR (a pre-row-6
+    // container) reads as a zeroed meter under the current table.
+    let meter = match r.find(METR) {
+        Some(a) => MeterImage::decode(a.payload)?,
+        None => MeterImage::current(),
+    };
+    if meter.cost_table_version != COST_TABLE_VERSION {
+        return Err(SnapshotError::CostTableMismatch {
+            expected: COST_TABLE_VERSION.to_string(),
+            found: meter.cost_table_version,
+        });
+    }
+
     Ok(MachineImage {
         version,
         signature,
@@ -311,6 +416,7 @@ pub fn read_machine(buf: &[u8], expected_sig: &Signature) -> Result<MachineImage
         keys,
         names,
         symbols,
+        meter,
     })
 }
 
@@ -337,6 +443,7 @@ mod tests {
             keys: Vec::new(),
             names: Vec::new(),
             symbols: Vec::new(),
+            meter: MeterImage::current(),
         };
         let bytes = write_machine(&img);
         let back = read_machine(&bytes, &sig()).unwrap();
@@ -359,6 +466,7 @@ mod tests {
             keys: Vec::new(),
             names: Vec::new(),
             symbols: Vec::new(),
+            meter: MeterImage::current(),
         };
         let bytes = write_machine(&img);
         match read_machine(&bytes, &Signature::new("host-is-now-v2")) {
@@ -454,6 +562,7 @@ mod tests {
             keys: vec!["k1".to_string(), "k2".to_string(), "".to_string()],
             names: vec!["Object".to_string(), "length".to_string()],
             symbols: vec![7, 8, 9],
+            meter: MeterImage::current(),
         };
         let bytes = write_machine(&img);
         let back = read_machine(&bytes, &sig()).unwrap();

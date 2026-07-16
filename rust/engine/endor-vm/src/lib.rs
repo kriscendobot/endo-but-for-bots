@@ -36,7 +36,7 @@ pub use compartment::{
 };
 pub use gc::{GcStats, Heap};
 pub use interp::{Halt, Interp, Native, RunOutcome, PROGRAM_INVOCATION_COMPUTRONS};
-pub use meter::{Meter, MeterCheck};
+pub use meter::{Meter, MeterCheck, MeterState, COST_TABLE_VERSION};
 pub use module::{
     BodyOp, ExportEntry, ImportEntry, ImportName, ModuleError, ModuleGraph, ModuleId,
     ModuleRecord, ModuleSource, ModuleValue, Namespace,

@@ -14,6 +14,17 @@
 //! `meterIndex > meterCount`, at backward branches, calls, returns, and
 //! catches; a false return aborts the crank.
 
+/// The frozen, release-versioned id of the meter's cost table (design
+/// `designs/xs2rust-endor-engine.md` § roadmap row 6: "meter state across
+/// suspend"). Endor's meter is its **own** frozen cost table, not a
+/// back-fit of the oracle's; a snapshot records which table produced its
+/// computrons ([`crate::meter::MeterState`] carried in the `METR` atom),
+/// and a resume under a **different** cost-table version fails closed
+/// rather than silently continuing a meter whose weights changed — the
+/// metering analogue of the callback-table `SIGN` signature. Bump the
+/// trailing number whenever any metering weight or check point changes.
+pub const COST_TABLE_VERSION: &str = "endor-meter-1";
+
 /// `XS_CODE_METERING`: one bytecode dispatch.
 pub const CODE_METERING: u64 = 1 << 16;
 /// `XS_BUILTIN_METERING`: one built-in operation step (`mxMeterOne` /
@@ -50,6 +61,21 @@ pub enum MeterCheck {
     /// The host refused more computation: abort the crank with
     /// `XS_TOO_MUCH_COMPUTATION_EXIT` semantics.
     Abort,
+}
+
+/// The serializable projection of a [`Meter`] carried across a suspend
+/// (design row 6). The three fixed-point counters that make a resumed
+/// machine continue its meter **exactly** — `index` (`the->meterIndex`),
+/// `interval` (`the->meterInterval`, scaled raw units), and `count`
+/// (`the->meterCount`, the next check threshold). `last_reported` is
+/// diagnostic only (it re-derives from `index` on the next check), so it
+/// is deliberately not part of the carried state. The cost-table version
+/// travels alongside in the snapshot's `METR` atom, not here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct MeterState {
+    pub index: u64,
+    pub interval: u64,
+    pub count: u64,
 }
 
 /// The 16.16 fixed-point meter.
@@ -200,6 +226,32 @@ impl Meter {
     #[inline]
     pub fn raw(&self) -> u64 {
         self.index
+    }
+
+    /// The serializable metering state (design row 6, snapshot support):
+    /// the counters a suspend must carry so a resume continues the meter
+    /// exactly. See [`MeterState`].
+    #[inline]
+    pub fn state(&self) -> MeterState {
+        MeterState {
+            index: self.index,
+            interval: self.interval,
+            count: self.count,
+        }
+    }
+
+    /// Reinstate a metering state read from a snapshot ([`Self::state`]'s
+    /// inverse). The armed/un-armed distinction rides in `interval` (zero
+    /// ⇒ the un-armed differential-harness meter, which accumulates but
+    /// never checks), so a resumed machine re-arms exactly as it was.
+    /// `last_reported` is re-seeded from `index` for diagnostics; it feeds
+    /// no computation.
+    #[inline]
+    pub fn restore(&mut self, s: MeterState) {
+        self.index = s.index;
+        self.interval = s.interval;
+        self.count = s.count;
+        self.last_reported = s.index >> 16;
     }
 
     /// Computrons (`meterIndex >> 16`), what the host callback sees.

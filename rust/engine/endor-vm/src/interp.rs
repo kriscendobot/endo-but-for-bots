@@ -4234,6 +4234,66 @@ impl Interp {
         self.create_global_property(id, (value.kind, value.value));
     }
 
+    // --- Snapshot surface (stage-6 child 3) -------------------------------
+    //
+    // The narrow, engine-side conversion primitives the `endor-snapshot`
+    // `Machine`-level `write_snapshot_to_file`/`from_snapshot_file`/
+    // `suspend_to_cas` surface builds on: read the serializable projection
+    // of a live machine (the index arenas plus the value stack, program
+    // symbol names, and metering state), and reinstate one on restore.
+    // The atom *format* stays in `endor-snapshot` (which owns the `XS_M`
+    // grammar); the `Interp`↔image conversion stays here in the engine
+    // (design § Snapshots — image.rs's contract). The rich per-instance
+    // side tables enumerated `Pending` in `endor_snapshot::sidetable` are
+    // the honest remainder: this surface round-trips a machine whose
+    // reachable state is confined to the carried atoms — the between-crank
+    // quiescent contract documented on the snapshot crate.
+
+    /// The interpreter's live value stack (the `STAC` atom source). At
+    /// machine quiescence — between top-level `run` cranks, the only point
+    /// a snapshot is taken — this is empty; it is carried for completeness
+    /// and so a mid-drain image is not silently lossy.
+    pub fn stack_slots(&self) -> &[Slot] {
+        &self.stack
+    }
+
+    /// The program symbol name table (the `NAME` atom source), id-ordered
+    /// (`symbol_names[id - 1]`), as decoded from the program's C-XS symbols
+    /// atom at [`Self::link_intrinsics`].
+    pub fn program_symbol_names(&self) -> &[String] {
+        &self.symbol_names
+    }
+
+    /// The machine's serializable metering state (design row 6): the
+    /// counters a suspend carries so a resume continues the meter exactly.
+    pub fn meter_state(&self) -> crate::meter::MeterState {
+        self.meter.state()
+    }
+
+    /// Reinstate the serializable state decoded from a snapshot image:
+    /// the index arenas, the value stack, the program symbol names, and
+    /// the metering state. The boot-derived intrinsics and prototype
+    /// tables remain those a fresh [`Interp::new`] built — their slot
+    /// indices are deterministic, so they still address the restored
+    /// arena's identical boot region — and the un-metered/armed distinction
+    /// rides in the restored [`crate::meter::MeterState`]. A machine
+    /// restored this way continues a following crank identically to one
+    /// that never suspended, for the covered (arena + meter) surface.
+    pub fn restore_snapshot_state(
+        &mut self,
+        slots: SlotArena,
+        chunks: ChunkArena,
+        stack: Vec<Slot>,
+        symbol_names: Vec<String>,
+        meter: crate::meter::MeterState,
+    ) {
+        self.slots = slots;
+        self.chunks = chunks;
+        self.stack = stack;
+        self.symbol_names = symbol_names;
+        self.meter.restore(meter);
+    }
+
     /// Allocate a property slot for global key `id`, link it into the
     /// global object's property list, and record it in [`Self::global_props`].
     /// Does **not** meter — callers add the allocation metering at the
