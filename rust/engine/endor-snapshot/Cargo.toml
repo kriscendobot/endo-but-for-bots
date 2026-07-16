@@ -15,3 +15,10 @@ path = "src/lib.rs"
 # surfaces are used (design § Snapshots: the writer is a serializer over
 # the index arenas, not a relocator).
 endor-vm = { path = "../endor-vm" }
+
+[dev-dependencies]
+# The integration test crate (`tests/supervisor_suspend_resume.rs`) drives
+# a live `Interp` through the supervisor-shaped suspend/resume lifecycle;
+# an integration test compiles as a separate crate, so the engine must be
+# declared here even though it is a regular dependency above.
+endor-vm = { path = "../endor-vm" }
