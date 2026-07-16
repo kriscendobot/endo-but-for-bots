@@ -3,9 +3,12 @@
 //! requirement 6).
 //!
 //! For each program it executes the source on the C-XS oracle
-//! (`endor-oracle`) to obtain `(bytecode, result, run-only computrons)`
-//! and runs that exact bytecode on `endor-vm`, then records four-valued
-//! agreement plus computron agreement. Matching the oracle's *fail*
+//! (`endor-oracle`) to obtain the reference `(result, run-only computrons)`
+//! and, post stage-6 seam flip, runs endor's **own** bytecode (compiled by
+//! the default `endor-compile` pipeline; the oracle's exact bytes remain a
+//! selectable differential reference via [`Compiler::Oracle`]) on
+//! `endor-vm`, then records four-valued agreement plus computron
+//! agreement. Matching the oracle's *fail*
 //! vector matters as much as its pass vector: a program endor completes
 //! that C-XS throws on (or vice versa) is a divergence, never a silent
 //! improvement.
@@ -117,26 +120,30 @@ impl DualRun {
 }
 
 /// Which compiler produces the bytecode `endor-vm` executes in the
-/// dual-run runner — the **pipeline seam** (stage-5 child 7). The oracle
-/// (differential C-XS) compiler is the default and stays so until the
-/// supervisor accepts stage 5; `Endor` selects the pure-Rust
-/// `endor-compile` pipeline so later stages can flip the default with a
-/// one-line change and no runner surgery (design § roadmap row 5).
+/// dual-run runner — the **pipeline seam** (stage-5 child 7). Stage 5's
+/// byte-identity bar (`endor-compile` == the C-XS oracle over the whole
+/// conformance corpus) is accepted, so `Endor` is now the **default**: the
+/// default runner runs endor's *own* bytecode and *own* symbols atom
+/// (stage-6 child 1, design § roadmap row 5). `Oracle` survives only as a
+/// selectable differential REFERENCE — the byte-identity/dual-run harnesses
+/// that compare endor against the exact XS-emitted bytes.
 ///
-/// In either mode the oracle is still consulted for the **reference**
+/// In either mode the oracle is still *consulted* for the **reference**
 /// result/computrons the run is compared against; the selection only
 /// decides whose *bytecode* endor runs — its own, or the oracle's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compiler {
-    /// The differential C-XS oracle compiler (`endor_oracle::run`). The
-    /// stage-≤4 default; the exact XS-emitted bytecode.
-    #[default]
+    /// The differential C-XS oracle compiler (`endor_oracle::run`): the
+    /// exact XS-emitted bytecode. No longer a default execution path — a
+    /// selectable reference for the byte-identity/dual-run differentials
+    /// only.
     Oracle,
     /// The pure-Rust `endor-compile` pipeline (lexer → parser → scoper →
-    /// coder). While the stage-5 byte-identity bar holds, its bytes equal
-    /// the oracle's, so the oracle's symbols atom pairs with them
-    /// unchanged; a compile fold (parser/scoper reject or a coder panic)
+    /// coder), now the **default**. Post stage 5 its bytes AND its symbols
+    /// atom equal the oracle's, so the seam no longer borrows the oracle's
+    /// SYMB payload; a compile fold (parser/scoper reject or a coder panic)
     /// yields empty bytecode the runner treats as an endor abort.
+    #[default]
     Endor,
 }
 
@@ -145,7 +152,7 @@ pub enum Compiler {
 /// path is total over the coder's panics (`catch_unwind`); a fold returns
 /// empty bytecode, which `endor-vm` decodes as an abort — the honest
 /// "endor could not run its own output here" signal, never a harness
-/// panic. The seam later stages flip lives entirely here.
+/// panic. The seam the default now rides lives entirely here.
 fn compile_for(
     compiler: Compiler,
     source: &str,
@@ -154,11 +161,17 @@ fn compile_for(
     match compiler {
         Compiler::Oracle => (oracle.bytecode.clone(), oracle.symbols.clone()),
         Compiler::Endor => {
+            // Endor emits BOTH halves now — its own bytecode and its own
+            // SYMB atom (`compile_atoms`) — so the flipped default no longer
+            // borrows the oracle's `symbols`. Byte-identity of that atom
+            // against the oracle is a committed gate
+            // (`compile_diff::symbols_diff_programs`, exercised by
+            // `corpora_symbols_atom_byte_identity`).
             let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                endor_compile::compile(source)
+                endor_compile::compile_atoms(source)
             }));
             match compiled {
-                Ok(Ok(bytes)) => (bytes, oracle.symbols.clone()),
+                Ok(Ok((bytes, symbols))) => (bytes, symbols),
                 // A structured reject or a coder fold: empty bytecode →
                 // endor-vm aborts on decode, mirroring "endor rejected".
                 Ok(Err(_)) | Err(_) => (Vec::new(), Vec::new()),
@@ -168,8 +181,9 @@ fn compile_for(
 }
 
 /// Run one program on both engines and compare, using the default
-/// (oracle) compiler. Returns `None` only if the oracle machine fails to
-/// start.
+/// compiler (now [`Compiler::Endor`] — endor runs its own bytecode, the
+/// oracle stays the reference). Returns `None` only if the oracle machine
+/// fails to start.
 pub fn dual_run(source: &str) -> Option<DualRun> {
     dual_run_with(source, Compiler::default())
 }
@@ -275,8 +289,8 @@ pub struct AsyncDualRun {
 /// Run one async-harness `source` on both engines and, keeping endor's
 /// interpreter past the run, read the `$DONE` completion sentinel out of the
 /// global named `signal_name` plus the unhandled-rejection latch. Uses the
-/// default (oracle) compiler like [`dual_run`]; returns `None` only if the
-/// oracle machine itself fails to start.
+/// default compiler ([`Compiler::Endor`]) like [`dual_run`]; returns
+/// `None` only if the oracle machine itself fails to start.
 pub fn dual_run_async(source: &str, signal_name: &str) -> Option<AsyncDualRun> {
     let oracle = endor_oracle::run(source)?;
     let (bytecode, symbols) = compile_for(Compiler::default(), source, &oracle);
@@ -466,20 +480,29 @@ impl CompartmentDualRun {
     }
 }
 
-/// Compile `source` on the oracle, then evaluate its exact bytecode in
-/// two compartments over one machine's shared intrinsics. Returns `None`
+/// Evaluate `source` in two compartments over one machine's shared
+/// intrinsics and compare against the oracle reference. Post stage-6 flip
+/// the bytecode/symbols the compartments evaluate come from the **default
+/// (endor) compiler** — this was the review ledger's standing residual
+/// ("the endor-vm compartment evaluate path still oracle-compiles"), a
+/// default execution path that must run endor's own output, not the
+/// oracle's. The oracle is still *run* to supply the reference
+/// result/computrons the compartments are checked against. Returns `None`
 /// only if the oracle machine itself fails to start.
 pub fn compartment_dual_run(source: &str) -> Option<CompartmentDualRun> {
     use endor_vm::Machine;
 
     let oracle = endor_oracle::run(source)?;
+    // The compartments run endor's OWN bytecode + symbols (the flipped
+    // default), never the oracle's; the oracle stays the reference.
+    let (bytecode, symbols) = compile_for(Compiler::default(), source, &oracle);
     let machine = Machine::new();
     let a = machine.new_compartment();
     let b = machine.new_compartment();
     let shared_intrinsics = std::rc::Rc::ptr_eq(a.intrinsics(), b.intrinsics());
 
-    let ra = a.evaluate_with_symbols(&oracle.bytecode, &oracle.symbols);
-    let rb = b.evaluate_with_symbols(&oracle.bytecode, &oracle.symbols);
+    let ra = a.evaluate_with_symbols(&bytecode, &symbols);
+    let rb = b.evaluate_with_symbols(&bytecode, &symbols);
 
     Some(CompartmentDualRun {
         source: source.to_string(),

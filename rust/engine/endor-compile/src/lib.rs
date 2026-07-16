@@ -32,7 +32,9 @@ pub mod token_flags;
 pub use endor_regexp::unicode;
 
 pub use ast::{Item, Node};
-pub use coder::{compile, compile_module, compile_with};
+pub use coder::{
+    compile, compile_atoms, compile_atoms_with, compile_module, compile_module_atoms, compile_with,
+};
 pub use error::{LexError, LexErrorKind};
 pub use lexer::{BigIntLiteral, Lexeme, Lexer};
 pub use meter::ParseMeter;

@@ -266,6 +266,50 @@ impl SymbolTable {
     fn id_table(&self) -> Vec<i32> {
         self.entries.iter().map(|e| e.id).collect()
     }
+
+    /// Serialize the used symbols into the C-XS **symbols atom** wire
+    /// format — `fxParserCode`'s `script->symbolsBuffer` (`xsCode.c`),
+    /// exactly what `endor_oracle::run(source).symbols` returns and what
+    /// `endor_vm::parse_symbols` decodes.
+    ///
+    /// Layout: a 2-byte little-endian count = `used + 1` (`mxEncodeID` with
+    /// `sizeof(txID) == 2`; the `+1` reserves id 0 = `XS_NO_ID`), then, for
+    /// every used symbol in **id order**, its bytes *including the trailing
+    /// NUL* (XS's `symbol->length` counts the terminator, and `c_memcpy`
+    /// copies it). The id-order walk is `fxParserCode`'s: buckets in index
+    /// order, and within a bucket most-recent-first (the prepend order),
+    /// numbering only `usage` symbols — the identical walk
+    /// [`assign_ids`] uses, so the strings land in ascending id order.
+    ///
+    /// Even a symbol-free program yields a 2-byte `01 00` atom (`total`
+    /// starts at `sizeof(txID)`), matching XS, which always allocates the
+    /// count. Call after [`assign_ids`].
+    fn symbols_atom(&self) -> Vec<u8> {
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); SYMBOL_MODULO as usize];
+        for i in 0..self.entries.len() {
+            buckets[self.entries[i].bucket as usize].push(i);
+        }
+        let mut used: u16 = 0;
+        let mut body: Vec<u8> = Vec::new();
+        for bucket in &buckets {
+            for &i in bucket.iter().rev() {
+                let e = &self.entries[i];
+                if e.usage {
+                    used = used.wrapping_add(1);
+                    // The interned spelling verbatim, then the NUL XS's
+                    // `symbol->length` includes.
+                    body.extend_from_slice(e.string.as_bytes());
+                    body.push(0);
+                }
+            }
+        }
+        // count = final `id` in `fxParserCode` = used + 1 (id starts at 1).
+        let count = used.wrapping_add(1);
+        let mut atom = Vec::with_capacity(2 + body.len());
+        atom.extend_from_slice(&count.to_le_bytes());
+        atom.append(&mut body);
+        atom
+    }
 }
 
 /// One code record — XS's `txByteCode` with its subtype fields. `id` is
@@ -860,9 +904,27 @@ pub fn compile(source: &str) -> Result<Vec<u8>, crate::parser::ParseError> {
     compile_with(source, false)
 }
 
+/// [`compile`], additionally returning the C-XS **symbols atom**
+/// (`(bytecode, symbols)`) endor emits for the program — byte-identical to
+/// `endor_oracle::run(source).symbols` whenever the bytecode is (the
+/// stage-5 id contract). This is the entry the dual-run seam's `Endor` arm
+/// calls so it no longer has to borrow the oracle's SYMB payload.
+pub fn compile_atoms(source: &str) -> Result<(Vec<u8>, Vec<u8>), crate::parser::ParseError> {
+    compile_atoms_with(source, false)
+}
+
 /// `compile`, choosing the Script strictness (a bare `"use strict"`
 /// program is strict).
 pub fn compile_with(source: &str, strict: bool) -> Result<Vec<u8>, crate::parser::ParseError> {
+    Ok(compile_atoms_with(source, strict)?.0)
+}
+
+/// [`compile_with`], additionally returning the symbols atom (the
+/// atom-bearing counterpart of [`compile_atoms`]).
+pub fn compile_atoms_with(
+    source: &str,
+    strict: bool,
+) -> Result<(Vec<u8>, Vec<u8>), crate::parser::ParseError> {
     let mut parser = crate::parser::Parser::new(source, strict, false)?;
     let mut root = parser.parse_program(strict)?;
     // The oracle shim compiles the Script goal with `mxProgramFlag |
@@ -886,7 +948,7 @@ pub fn compile_with(source: &str, strict: bool) -> Result<Vec<u8>, crate::parser
     if let Some(e) = coder.error.take() {
         return Err(e);
     }
-    Ok(coder.serialize())
+    Ok(coder.serialize_atoms())
 }
 
 fn node_of(item: &Item) -> &Node {
@@ -902,6 +964,16 @@ fn node_of(item: &Item) -> &Node {
 /// `endor_oracle::compile_module(source).bytecode` returns (the module
 /// counterpart of [`compile`]).
 pub fn compile_module(source: &str) -> Result<Vec<u8>, crate::parser::ParseError> {
+    Ok(compile_module_atoms(source)?.0)
+}
+
+/// [`compile_module`], additionally returning the module symbols atom
+/// (`(bytecode, symbols)`) — the module-goal counterpart of
+/// [`compile_atoms`], byte-identical to
+/// `endor_oracle::compile_module(source).symbols` whenever the bytecode is.
+pub fn compile_module_atoms(
+    source: &str,
+) -> Result<(Vec<u8>, Vec<u8>), crate::parser::ParseError> {
     // The module goal is strict and allows top-level await (the parser's
     // `module` flag), mirroring the oracle shim's fxParserTree module branch
     // (`mxStrictFlag | mxAsyncFlag`).
@@ -914,7 +986,7 @@ pub fn compile_module(source: &str) -> Result<Vec<u8>, crate::parser::ParseError
     if let Some(e) = coder.error.take() {
         return Err(e);
     }
-    Ok(coder.serialize())
+    Ok(coder.serialize_atoms())
 }
 
 // ============================ node dispatch ============================
@@ -5190,9 +5262,15 @@ impl Coder<'_> {
             .position(|c| matches!(c.payload, Payload::Target { tid: t } if t == tid))
     }
 
-    /// `fxParserCode`'s three passes over the record list, producing the
-    /// `codeBuffer` bytes.
-    fn serialize(&mut self) -> Vec<u8> {
+    /// `fxParserCode`'s three passes, producing **both** the `codeBuffer`
+    /// bytes and the `symbolsBuffer` atom (`(bytecode, symbols)`) — the two
+    /// halves of XS's `txScript` the oracle shim hands back. The symbols
+    /// atom is emitted from the same [`assign_ids`] walk the bytecode's
+    /// symbol operands were numbered by, so endor's SYMB payload is
+    /// byte-identical to the oracle's whenever the operands are (the
+    /// stage-5 id contract), letting the `Endor` seam stop borrowing the
+    /// oracle's atom.
+    fn serialize_atoms(&mut self) -> (Vec<u8>, Vec<u8>) {
         self.optimize();
 
         // ---- pass 1: size with branches assumed widest, accrue delta --
@@ -5221,13 +5299,16 @@ impl Coder<'_> {
         // bucket walk here, between sizing and emission).
         self.symbols.assign_ids();
         let sym_ids = self.symbols.id_table();
+        // The SYMB atom is dumped from the same walk, so its strings are in
+        // the ids' order (`fxParserCode` emits `symbolsBuffer` right here).
+        let symbols = self.symbols.symbols_atom();
 
         // ---- pass 3: emit ---------------------------------------------
         let mut out: Vec<u8> = Vec::with_capacity(size.max(0) as usize);
         for c in &self.codes {
             emit_step(c, &mut out, &self.targets, &sym_ids);
         }
-        out
+        (out, symbols)
     }
 }
 

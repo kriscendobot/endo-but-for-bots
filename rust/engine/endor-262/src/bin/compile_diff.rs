@@ -20,16 +20,22 @@
 //! accept/reject disagreement), so CI/nightly can gate on it.
 
 use endor_262::compile_diff::{
-    collect_js, compile_diff_files, corpora_programs, compile_diff_programs, print_report,
+    collect_js, compile_diff_files, compile_diff_programs, corpora_programs, print_report,
+    print_symbols_report, symbols_diff_programs,
 };
 use endor_262::test262::locate_test262;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // The curated no-arg run also proves the SYMB-atom identity the flipped
+    // default relies on (endor emits its own symbols, not the oracle's).
+    let mut symbols_report = None;
+
     let (report, label) = if args.is_empty() {
         // Default: the bounded curated corpora (no test262 subset needed).
         let programs = corpora_programs();
+        symbols_report = Some(symbols_diff_programs(&programs));
         (compile_diff_programs(&programs), "corpora".to_string())
     } else {
         let (root, _harness) = match locate_test262() {
@@ -58,7 +64,15 @@ fn main() {
     let mut lock = stdout.lock();
     print_report(&mut lock, &report, &label).unwrap();
 
-    if !report.met_bar() {
+    let symbols_ok = match &symbols_report {
+        Some(sr) => {
+            print_symbols_report(&mut lock, sr, &label).unwrap();
+            sr.met_bar()
+        }
+        None => true,
+    };
+
+    if !report.met_bar() || !symbols_ok {
         std::process::exit(1);
     }
 }

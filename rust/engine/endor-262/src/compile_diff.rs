@@ -445,6 +445,155 @@ fn case_source_line(contents: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix("  Source: ").map(|s| s.to_string()))
 }
 
+// ==================== symbols-atom byte identity ======================
+//
+// Stage-6 child 1 flips the dual-run default to `endor-compile`, which now
+// emits its OWN symbols atom instead of borrowing the oracle's. That atom
+// must be byte-identical to the oracle's `SYMB` payload — the same
+// guarantee the bytecode has, extended to the second half of the script.
+// This is the committed, repeatable gate proving it, over the same curated
+// corpus the bytecode gate uses.
+
+/// The symbols-atom differential tally: how many both-accept programs had a
+/// byte-identical SYMB atom, and every divergence with its triage detail.
+#[derive(Debug, Default, Clone)]
+pub struct SymbolsReport {
+    /// Programs where both engines accepted and the atoms were compared.
+    pub checked: usize,
+    /// Of those, how many atoms were byte-identical.
+    pub identical: usize,
+    /// Byte-divergent atoms: `(id, detail)`.
+    pub divergent: Vec<(String, String)>,
+    /// Programs skipped from the atom comparison (oracle rejected, or endor
+    /// folded — the bytecode gate already owns those axes).
+    pub skipped: usize,
+}
+
+impl SymbolsReport {
+    /// The bar: zero symbols-atom divergence over every both-accept program.
+    pub fn met_bar(&self) -> bool {
+        self.divergent.is_empty()
+    }
+}
+
+/// The oracle's `(parsed, symbols)` for `source` — the SYMB atom XS emits
+/// alongside the bytecode. `None` = machine startup failure. Mirrors
+/// [`oracle_compile`]'s accept test (a runtime throw still parsed).
+fn oracle_symbols(source: &str) -> Option<(bool, Vec<u8>)> {
+    let o = endor_oracle::run(source)?;
+    if o.completed {
+        return Some((true, o.symbols));
+    }
+    let parsed = !o.error.contains("SyntaxError");
+    Some((parsed, o.symbols))
+}
+
+/// Compare endor's emitted symbols atom to the oracle's, byte for byte, on
+/// every program in `programs` where both engines accept. The bytecode gate
+/// ([`compile_diff_programs`]) owns accept/reject and byte-of-code identity;
+/// this layers the SYMB-atom identity the flipped default depends on.
+/// Silences the panic hook for the batch so a coder fold is a skip, not a
+/// stderr spew.
+pub fn symbols_diff_programs(programs: &[(String, String)]) -> SymbolsReport {
+    let prev_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let mut report = SymbolsReport::default();
+    for (id, source) in programs {
+        let (oracle_parsed, oracle_syms) = match oracle_symbols(source) {
+            Some(v) => v,
+            None => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let endor = panic::catch_unwind(AssertUnwindSafe(|| endor_compile::compile_atoms(source)));
+        let endor_syms = match endor {
+            Ok(Ok((_, syms))) => syms,
+            // endor folded or rejected: the bytecode gate covers accept/reject
+            // disagreement; nothing to compare here.
+            _ => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        // Recover the runtime-SyntaxError case exactly as `compile_one` does:
+        // if the oracle "rejected" only because a compiled program threw at
+        // runtime, its emitted SYMB is still the reference. We compare when
+        // the oracle produced any atom (it always emits at least the 2-byte
+        // count) and endor accepted; a genuine parse reject yields no endor
+        // acceptance, so it was skipped above.
+        if !oracle_parsed && oracle_syms.is_empty() {
+            report.skipped += 1;
+            continue;
+        }
+        report.checked += 1;
+        if endor_syms == oracle_syms {
+            report.identical += 1;
+        } else {
+            let detail = symbols_divergence_detail(&oracle_syms, &endor_syms);
+            report.divergent.push((id.clone(), detail));
+        }
+    }
+    panic::set_hook(prev_hook);
+    report
+}
+
+/// A triage line for a SYMB-atom mismatch: lengths and the first differing
+/// byte.
+fn symbols_divergence_detail(oracle: &[u8], endor: &[u8]) -> String {
+    match first_diff(oracle, endor) {
+        Some(i) => format!(
+            "len oracle={} endor={}; first diff @{} oracle=0x{:02x} endor=0x{:02x}",
+            oracle.len(),
+            endor.len(),
+            i,
+            oracle.get(i).copied().unwrap_or(0),
+            endor.get(i).copied().unwrap_or(0),
+        ),
+        None => format!(
+            "len oracle={} endor={}; common prefix identical",
+            oracle.len(),
+            endor.len()
+        ),
+    }
+}
+
+/// Pretty-print a [`SymbolsReport`] to a writer (the binary and the test
+/// share this).
+pub fn print_symbols_report(
+    w: &mut dyn std::io::Write,
+    report: &SymbolsReport,
+    label: &str,
+) -> std::io::Result<()> {
+    writeln!(w, "{}", "-".repeat(72))?;
+    writeln!(
+        w,
+        "symbols-atom byte identity [{}]: checked={} identical={} divergent={} (skipped={})",
+        label,
+        report.checked,
+        report.identical,
+        report.divergent.len(),
+        report.skipped,
+    )?;
+    for (id, detail) in &report.divergent {
+        writeln!(w, "  SYMB-DIVERGENT [{}]\n    {}", id, detail)?;
+    }
+    if report.met_bar() {
+        writeln!(
+            w,
+            "SYMB BAR MET: {} identical, 0 divergent (of {} both-accept)",
+            report.identical, report.checked
+        )?;
+    } else {
+        writeln!(
+            w,
+            "SYMB BAR NOT MET: {} symbols-atom divergence(s)",
+            report.divergent.len()
+        )?;
+    }
+    Ok(())
+}
+
 /// Pretty-print a report to a writer (the binary and the test share this
 /// so the honest split reads the same everywhere).
 pub fn print_report(
@@ -573,6 +722,42 @@ mod tests {
             "byte-identity should dominate the corpus (identical={} total={})",
             report.identical,
             report.total
+        );
+    }
+
+    #[test]
+    fn corpora_symbols_atom_byte_identity() {
+        // Stage-6 child 1 gate: the SYMB atom `endor-compile` now emits
+        // (`compile_atoms`) must be byte-identical to the C-XS oracle's over
+        // the whole curated corpus — the second half of the script, held to
+        // the same bar as the bytecode. This is what lets the flipped
+        // dual-run default stop borrowing `oracle.symbols`: endor pairs its
+        // own bytecode with its own symbols. Any byte divergence here would
+        // mean the flipped default links intrinsics against a different
+        // id→name table than the oracle, so it fails the build.
+        let programs = corpora_programs();
+        assert!(!programs.is_empty(), "curated corpora must contain programs");
+        let report = symbols_diff_programs(&programs);
+        let mut buf = Vec::new();
+        print_symbols_report(&mut buf, &report, "corpora").unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&buf));
+
+        assert!(
+            report.divergent.is_empty(),
+            "symbols-atom divergence(s) — the flipped default would mislink \
+             intrinsics: {:#?}",
+            report.divergent
+        );
+        assert!(
+            report.checked > 0,
+            "expected both-accept programs to compare symbols atoms on"
+        );
+        // The atom identity must dominate (it is total on this corpus).
+        assert_eq!(
+            report.identical, report.checked,
+            "every both-accept program must have a byte-identical symbols atom \
+             (identical={} checked={})",
+            report.identical, report.checked
         );
     }
 
