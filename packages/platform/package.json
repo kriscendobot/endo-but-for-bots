@@ -26,18 +26,18 @@
     },
     "./fs/lite": "./src/fs/index.js",
     "./fs/lite/types": {
-      "types": "./src/fs/types.d.ts"
+      "types": "./src/fs/types-index.d.ts"
     },
     "./fs/lite/types.js": {
-      "types": "./src/fs/types.d.ts"
+      "types": "./src/fs/types-index.d.ts"
     },
     "./fs/node": "./src/fs-node/index.js",
     "./fs/search": "./src/fs/search.js",
     "./fs/search.types": {
-      "types": "./src/fs/search.types.d.ts"
+      "types": "./src/fs/search-types-index.d.ts"
     },
     "./fs/search.types.js": {
-      "types": "./src/fs/search.types.d.ts"
+      "types": "./src/fs/search-types-index.d.ts"
     },
     "./fs/node/search": "./src/fs-node/search-powers.js",
     "./fs/extended": {
