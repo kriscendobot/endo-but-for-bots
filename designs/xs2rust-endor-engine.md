@@ -1081,7 +1081,33 @@ annotations inline mark exactly what changed.
    `endor-compile`, `endor-ses`, `endor-snapshot`, `endor-debug`),
    engine flag value `endor-rs`.** No collision with the existing
    `endo` and `xsnap` crates, and `-e xs` / `-e endor-rs`
-   distinguishes the engines permanently.
+   distinguishes the engines through the parity campaign.
+   *Amended 2026-07-17 by maintainer directive
+   ([issuecomment-4997629312](https://github.com/endojs/endo-but-for-bots/pull/600#issuecomment-4997629312))
+   — the naming north-star for the whole port:* the `-rs` suffix
+   reads as "the **R**ust port of X**S**", so the two
+   engine-selecting variants are named symmetrically —
+   **`endor-xs`** (endor backed by the C-XS engine, the `-e xs`
+   flag) and **`endor-rs`** (endor backed by the Rust port, the
+   `-e endor-rs` flag). The port converges on **`endor`** with no
+   suffix as the name of the fully-Rust Endo — the Rust port of
+   both the Endo tool and the novel JavaScript engine — once that
+   port is the default and the C-XS variant is no longer built by
+   default. The combined build that links both engines,
+   **`endocr`** (Endo with C and Rust), is retained only for
+   parity testing: the differential oracle harness (`endor-oracle`,
+   dev- and CI-only) is its home and the sole surviving place C is
+   compiled in. This refines — it does not reopen — the
+   crate-naming and flag-value decisions above; the flag values
+   stay `-e xs` / `-e endor-rs`, and `endor-xs` / `endor-rs` /
+   `endocr` name the resulting build variants. **Open — routed to
+   the maintainer, not resolved here:** the user-facing CLI binary
+   was renamed `endor` → `endot`
+   ([issuecomment-4900059356](https://github.com/endojs/endo-but-for-bots/pull/600#issuecomment-4900059356)),
+   which this north-star reads against — if `endor` is to name the
+   Rust Endo tool, the `endot` binary rename likely wants reverting
+   or re-scoping. That decision is the maintainer's; this note only
+   records the tension.
 8. **Machines stay `!Send`.** Preserving thread-pinned parity
    with today's runner model keeps the port's behavior envelope
    identical; cross-thread machine migration is a separate
