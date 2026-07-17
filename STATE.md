@@ -10,15 +10,14 @@ the outgoing PR diff.
 
 ## Work completed
 
-- Branch: detached worktree at PR head `1ed75df5973cc68226b81585df97ed5867343598`.
+- Branch: detached worktree based on PR head `1ed75df5973cc68226b81585df97ed5867343598`.
 - Base: `origin/llm` at `e8edeb2b232dae9a019112c70809e4b91176b3ca`.
 - Commit map: existing PR commits are now autosquashed as `654255f86`,
   `5053a07ff`, and `d2bd9957f`; `8db191ba2` reconciles the default history
   tool surface, release notes, README, canonical rebase guard, and authority
-  regression test; `98ffe7f7a` preflights conflict side checkout, reports
+  regression test; `1ec373be1` preflights conflict side checkout, reports
   clear tool errors, and covers clean, mixed, duplicate, and modify/delete
-  paths; `a5ac1011c` and `6cd798d80` are test/lint fixups for that commit and
-  must be autosquashed before push.
+  paths, with all test and lint fixups autosquashed.
 - Confirmed PR #646 is draft and its head matches the requested SHA.
 
 ## Decisions
@@ -32,9 +31,10 @@ the outgoing PR diff.
 
 ## Pending work
 
-Step 1: Run focused tests, lint, type checks, docs/checklist, and pre-push gates.
-Step 2: Autosquash `a5ac1011c` and `6cd798d80`, remove `STATE.md`, push, verify draft
-   state, and request the next code-panel run.
+Step 1: Focused tests, full package tests, lint, types, build, docs, changeset
+   status, and pre-push gates are green.
+Step 2: Remove `STATE.md`, verify the outgoing diff, push, verify draft state,
+   and request the next code-panel run.
 
 ## Hazards and verification
 
