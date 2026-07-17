@@ -782,6 +782,17 @@ pub const ARRAY_BUFFER_BYTE_LENGTH_GET_METERING: u64 = 0;
 /// the inner `new ArrayBuffer` construct frame; the length-dependent chunk
 /// is metered by `alloc_array_buffer`, independent of this constant).
 pub const TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING: u64 = 280320;
+/// `new <TypedArray>(source)` from a dense Array / source TypedArray
+/// (`fx_TypedArray` → `fxConstructTypedArray` → the element copy):
+/// per-element **advisory** step over the [`TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING`]
+/// frame + `alloc_array_buffer` chunk. XS reaches this either through the
+/// iterator protocol (a spread source with `Symbol.iterator`) or the
+/// array-like fast path, whose per-element metering differs; per the
+/// accuracy-over-parity doctrine the from-source corpus is **result-gated**
+/// (the oracle certifies the element bytes; computrons are advisory), so this
+/// is the directional per-element setter step (`mxMeterOne` = one builtin
+/// step), not an isolated-raw-gap calibration.
+pub const TYPED_ARRAY_FROM_SOURCE_ELEMENT_METERING: u64 = 1 << 14;
 /// The constant raw 16.16 cost of a `new <TypedArray>(buffer[, offset[,
 /// length]])` construct over an existing ArrayBuffer: the native host frame
 /// and `fxConstructTypedArray` (the instance + three internal slots). No
@@ -8310,8 +8321,58 @@ impl Interp {
                         );
                         Slot::of(Kind::Reference, Payload::Reference(inst))
                     }
-                    // A source TypedArray or an array-like/iterable object → the
-                    // element-copy / from-object path; honest skip.
+                    // `new TA(source)` from a **dense Array** (`new Uint8Array([
+                    // 1,2,3])`, the common boot-bundle form) or a **source
+                    // TypedArray** (`new Int16Array(u8)`): allocate a fresh
+                    // backing store of `length << shift` and copy each element,
+                    // coercing per the destination element type. A plain array
+                    // literal carries the default `Symbol.iterator`, so its
+                    // direct dense element sequence IS the iterator result the
+                    // spec-mandated protocol would yield — result-faithful. An
+                    // element needing `ToPrimitive`/`valueOf` (an object member),
+                    // or a BigInt-element view, self-names (the coercion
+                    // metering is a later increment).
+                    Payload::Reference(r)
+                        if self.arrays.contains_key(&r) || self.typed_arrays.contains_key(&r) =>
+                    {
+                        // The source element sequence, read directly (a dense
+                        // array's items / a source TypedArray's decoded
+                        // elements); a hole reads `undefined` (→ NaN → 0 for an
+                        // integer view), matching the default-iterator result.
+                        let elements: Vec<Slot> = if let Some(src) = self.arrays.get(&r) {
+                            let len = src.length;
+                            (0..len)
+                                .map(|i| src.items.get(&i).copied().unwrap_or_else(Slot::undefined))
+                                .collect()
+                        } else {
+                            let src = self.typed_arrays[&r];
+                            (0..src.length)
+                                .map(|i| {
+                                    self.typed_array_element_get(src, i)
+                                        .unwrap_or_else(Slot::undefined)
+                                })
+                                .collect()
+                        };
+                        let length = elements.len() as u32;
+                        if length > (0x7FFF_FFFFu32 >> shift) {
+                            return Err(Halt::Unsupported("native-call:TypedArray:bad-length"));
+                        }
+                        let byte_length = length << shift;
+                        self.meter.tick_raw(TYPED_ARRAY_LENGTH_CTOR_FRAME_METERING);
+                        let buffer = self.alloc_array_buffer(byte_length);
+                        let inst = self.slots.alloc(Slot::instance(proto));
+                        let ta = TypedArrayData { kind: idx, buffer, offset: 0, length };
+                        self.typed_arrays.insert(inst, ta);
+                        for (i, v) in elements.into_iter().enumerate() {
+                            self.typed_array_element_set(ta, i as u32, v)?;
+                            self.meter
+                                .tick_raw(TYPED_ARRAY_FROM_SOURCE_ELEMENT_METERING);
+                        }
+                        Slot::of(Kind::Reference, Payload::Reference(inst))
+                    }
+                    // Any other object source (an array-like without dense
+                    // storage, a bare iterable, a Map/Set) → the general
+                    // from-object protocol; honest skip.
                     Payload::Reference(_) => {
                         return Err(Halt::Unsupported("native-call:TypedArray:from-object"))
                     }
