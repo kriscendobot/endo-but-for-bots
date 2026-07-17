@@ -11,6 +11,15 @@
   ],
   "author": "Endo contributors",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/endojs/endo/tree/master/packages/cbor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/endojs/endo.git",
+    "directory": "packages/cbor"
+  },
+  "bugs": {
+    "url": "https://github.com/endojs/endo/issues"
+  },
   "type": "module",
   "main": "./index.js",
   "exports": {
@@ -35,6 +44,9 @@
     "eslint": "catalog:dev",
     "ses": "workspace:^",
     "typescript": "catalog:dev"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "eslintConfig": {
     "extends": [
