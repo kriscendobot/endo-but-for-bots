@@ -2889,6 +2889,18 @@ pub struct Interp {
     /// The reverse of [`Self::symbol_registry`]: a registered symbol's
     /// identity slot → its registry key, so `Symbol.keyFor(sym)` recovers it.
     symbol_registry_keys: std::collections::HashMap<crate::value::SlotIndex, Vec<u8>>,
+    /// A symbol value's descriptor slot → the program-local property **id** it
+    /// is interned under when used as a property key (XS's `mxID(symbol)`: a
+    /// symbol IS an id there; here a symbol's descriptor-slot identity is
+    /// minted a stable key id on first key-use, from [`Self::next_intern_id`],
+    /// so `o[sym]` round-trips and two uses of the SAME symbol resolve the same
+    /// property). Keyed by the descriptor `SlotIndex` (stable — "slots never
+    /// move"), exactly like [`Self::symbol_registry_keys`]. A symbol-keyed
+    /// property is thus stored/read like any other, but its id lies outside the
+    /// program-symbol-name range, so `Object.keys`/`Reflect.ownKeys` (the
+    /// string-key enumerations) skip it — matching the spec's string/symbol key
+    /// partition (and the boot-key soundness gate).
+    symbol_key_ids: std::collections::HashMap<crate::value::SlotIndex, u16>,
     /// Native prototype/namespace **numeric** data properties to bind at link
     /// time: `(owner instance, property name, value)`. Used for `Math.PI` &co.
     /// (the `Math` constants) and `Number.MAX_VALUE` &co.; bound only when the
@@ -3270,6 +3282,7 @@ impl Interp {
             symbol_proto: crate::value::SlotIndex::NULL,
             symbol_registry: std::collections::HashMap::new(),
             symbol_registry_keys: std::collections::HashMap::new(),
+            symbol_key_ids: std::collections::HashMap::new(),
             proto_value_data: Vec::new(),
             iterators: std::collections::HashMap::new(),
             value_id: None,
@@ -6530,30 +6543,42 @@ impl Interp {
                         Payload::Reference(r) => r,
                         _ => return Halt::Unsupported(op.name()),
                     };
-                    let s = match key.value {
-                        Payload::String(off) if key.kind == Kind::String => {
-                            self.str_text(off)
+                    // A **symbol** key (`sym in o`) resolves its descriptor-slot
+                    // identity to the interned id (`mxID(symbol)`); no index /
+                    // boot-default gate applies (a symbol is never an index and
+                    // never a boot string name). A **string** key interns as a
+                    // name, gating out an index-valued string (the exotic index
+                    // [[HasProperty]]) and a boot default-key name the program
+                    // never referenced (which could be an unlinked inherited
+                    // built-in — `'toString' in {}` is `true` in XS — so a
+                    // `false` would risk being wrong).
+                    let id = match key.kind {
+                        Kind::Symbol => match key.value {
+                            Payload::Reference(desc) => self.intern_symbol_key(desc),
+                            _ => return Halt::Unsupported(op.name()),
+                        },
+                        Kind::String => {
+                            let s = match key.value {
+                                Payload::String(off) => self.str_text(off),
+                                _ => return Halt::Unsupported(op.name()),
+                            };
+                            if string_to_index(&s).is_some() {
+                                return Halt::Unsupported(op.name());
+                            }
+                            if !self.symbol_ids.contains_key(&s)
+                                && self.default_keys.contains(s.as_str())
+                            {
+                                return Halt::Unsupported(op.name());
+                            }
+                            // Resolve exactly as `fxAt` does (a novel name meters
+                            // one `fxNewSlot`; a known one none).
+                            self.intern_key(&s)
                         }
                         _ => return Halt::Unsupported(op.name()),
                     };
-                    // An index-valued key routes through the exotic index
-                    // [[HasProperty]], not modeled here — self-name.
-                    if string_to_index(&s).is_some() {
-                        return Halt::Unsupported(op.name());
-                    }
-                    // A boot default-key name the program never referenced as a
-                    // symbol could be an inherited built-in endor never linked
-                    // (`'toString' in {}` is `true` in XS) — do not risk a wrong
-                    // `false`; self-name before interning.
-                    if !self.symbol_ids.contains_key(&s) && self.default_keys.contains(s.as_str()) {
-                        return Halt::Unsupported(op.name());
-                    }
-                    // Resolve the key through the intern table exactly as
-                    // `fxAt` does (a novel name meters one `fxNewSlot`; a known
-                    // one none), then answer with the metered chain walk: XS
-                    // meters one `XS_CODE_METERING` per prototype level the
+                    // Answer with the metered chain walk: XS meters one
+                    // `XS_CODE_METERING` per prototype level the
                     // `fxOrdinaryHasProperty` recursion descends.
-                    let id = self.intern_key(&s);
                     let (present, recursions) = self.instance_has(objref, id);
                     self.meter.tick_raw(IN_METERING);
                     self.meter.tick_code_n(recursions);
@@ -10520,16 +10545,27 @@ impl Interp {
                 {
                     return Err(Halt::Unsupported("getOwnPropertyDescriptor:exotic-object"));
                 }
-                let key = match arg1.value {
-                    Payload::String(off) => {
-                        self.str_text(off)
+                // A symbol key resolves to its interned key id; a string key
+                // interns as a name (an index-valued string is the exotic-index
+                // corner — honest skip). Own-only, so no boot-default gate: an
+                // own miss is soundly `undefined`.
+                let id = match arg1.kind {
+                    Kind::Symbol => match arg1.value {
+                        Payload::Reference(desc) => self.intern_symbol_key(desc),
+                        _ => return Err(Halt::Unsupported("getOwnPropertyDescriptor:bad-symbol-key")),
+                    },
+                    Kind::String => {
+                        let key = match arg1.value {
+                            Payload::String(off) => self.str_text(off),
+                            _ => return Err(Halt::Unsupported("getOwnPropertyDescriptor:non-string-key")),
+                        };
+                        if string_to_index(&key).is_some() {
+                            return Err(Halt::Unsupported("getOwnPropertyDescriptor:index-key"));
+                        }
+                        self.intern_key(&key)
                     }
                     _ => return Err(Halt::Unsupported("getOwnPropertyDescriptor:non-string-key")),
                 };
-                if string_to_index(&key).is_some() {
-                    return Err(Halt::Unsupported("getOwnPropertyDescriptor:index-key"));
-                }
-                let id = self.intern_key(&key);
                 match self.find_property(inst, id) {
                     Some(p) => {
                         let prop = *self.slots.get(p);
@@ -10602,20 +10638,33 @@ impl Interp {
                     Payload::Reference(d) => d,
                     _ => return Err(Halt::Unsupported("defineProperty:non-object-descriptor")),
                 };
-                let key = match arg1.value {
-                    Payload::String(off) if arg1.kind == Kind::String => {
-                        self.str_text(off)
+                // A symbol key resolves to its interned key id (`mxID(symbol)`);
+                // a string key interns as a name, rejecting an index-valued
+                // string (the exotic-index corner) and a boot default-key name
+                // the program never symbol-referenced (the intern-table gate —
+                // it cannot be keyed soundly).
+                let key_id = match arg1.kind {
+                    Kind::Symbol => match arg1.value {
+                        Payload::Reference(desc) => self.intern_symbol_key(desc),
+                        _ => return Err(Halt::Unsupported("defineProperty:bad-symbol-key")),
+                    },
+                    Kind::String => {
+                        let key = match arg1.value {
+                            Payload::String(off) => self.str_text(off),
+                            _ => return Err(Halt::Unsupported("defineProperty:non-string-key")),
+                        };
+                        if string_to_index(&key).is_some() {
+                            return Err(Halt::Unsupported("defineProperty:index-key"));
+                        }
+                        if !self.symbol_ids.contains_key(&key)
+                            && self.default_keys.contains(key.as_str())
+                        {
+                            return Err(Halt::Unsupported("defineProperty:ambiguous-default-key"));
+                        }
+                        self.intern_key(&key)
                     }
                     _ => return Err(Halt::Unsupported("defineProperty:non-string-key")),
                 };
-                if string_to_index(&key).is_some() {
-                    return Err(Halt::Unsupported("defineProperty:index-key"));
-                }
-                // A boot default-key name the program never symbol-referenced
-                // can't be rendered/keyed soundly (see the intern-table gate).
-                if !self.symbol_ids.contains_key(&key) && self.default_keys.contains(key.as_str()) {
-                    return Err(Halt::Unsupported("defineProperty:ambiguous-default-key"));
-                }
                 // Read the descriptor's four data fields (their keys are the
                 // descriptor literal's program symbols). Any get/set present,
                 // or any of the four absent, is outside the covered shape.
@@ -10654,7 +10703,7 @@ impl Interp {
                     (Some(w), Some(e), Some(c)) => (w, e, c),
                     _ => return Err(Halt::Unsupported("defineProperty:non-boolean-attribute")),
                 };
-                let id = self.intern_key(&key);
+                let id = key_id;
                 // Only a genuinely-new own property is covered; a redefine runs
                 // the configurable-compatibility checks (different metering).
                 if self.find_property(inst, id).is_some() {
@@ -12569,39 +12618,6 @@ impl Interp {
         Ok(())
     }
 
-    /// Resolve a `Reflect.*` string property key to its interned id, applying
-    /// the same soundness gates the property-op surface uses. A symbol or
-    /// numeric key (the covered grammar's `Reflect` callers pass string keys)
-    /// and an index-valued string (routed through the exotic index behavior)
-    /// self-name. When `gate_default` is set, a boot default-key name the
-    /// program never referenced as a symbol also self-names — the same gate
-    /// `XS_CODE_IN` / `resolve_at_key` apply, because such a name could be an
-    /// unlinked inherited built-in and a chain-walking `has`/`get` (or an
-    /// own-property *create* under an ambiguous id) would otherwise risk a
-    /// wrong answer. A pure own-read (`getOwnPropertyDescriptor`) needs no such
-    /// gate: an own miss is soundly `undefined`.
-    fn reflect_string_key(
-        &mut self,
-        key: Slot,
-        gate_default: bool,
-        ctx: &'static str,
-    ) -> Result<u16, Halt> {
-        let s = match key.value {
-            Payload::String(off) if key.kind == Kind::String => self.str_text(off),
-            _ => return Err(Halt::Unsupported(ctx)),
-        };
-        if string_to_index(&s).is_some() {
-            return Err(Halt::Unsupported(ctx));
-        }
-        if gate_default
-            && !self.symbol_ids.contains_key(&s)
-            && self.default_keys.contains(s.as_str())
-        {
-            return Err(Halt::Unsupported(ctx));
-        }
-        Ok(self.intern_key(&s))
-    }
-
     /// Dispatch a `Reflect.*` reflective built-in (`xsProxy.c` `fx_Reflect_*`
     /// → the `mxBehavior*` object-behavior primitives). Each reflects a value
     /// out of / into an ordinary object with no re-entry into user code
@@ -12686,11 +12702,9 @@ impl Interp {
                         "Reflect.getOwnPropertyDescriptor:exotic-object",
                     ));
                 }
-                let id = self.reflect_string_key(
-                    arg1,
-                    false,
-                    "Reflect.getOwnPropertyDescriptor:non-string-key",
-                )?;
+                let id = self
+                    .property_key_id(arg1, false)
+                    .ok_or(Halt::Unsupported("Reflect.getOwnPropertyDescriptor:non-string-key"))?;
                 match self.find_property(inst, id) {
                     Some(p) => {
                         let prop = *self.slots.get(p);
@@ -12741,11 +12755,9 @@ impl Interp {
                         ))
                     }
                 };
-                let id = self.reflect_string_key(
-                    arg1,
-                    true,
-                    "Reflect.defineProperty:non-string-key",
-                )?;
+                let id = self
+                    .property_key_id(arg1, true)
+                    .ok_or(Halt::Unsupported("Reflect.defineProperty:non-string-key"))?;
                 let field = |slf: &Self, name: &str| -> Option<Slot> {
                     slf.symbol_ids
                         .get(name)
@@ -12849,7 +12861,7 @@ impl Interp {
                 if !self.is_ordinary_object(inst) {
                     return Err(Halt::Unsupported("Reflect.has:exotic-object"));
                 }
-                let id = self.reflect_string_key(arg1, true, "Reflect.has:non-string-key")?;
+                let id = self.property_key_id(arg1, true).ok_or(Halt::Unsupported("Reflect.has:non-string-key"))?;
                 let (present, recursions) = self.instance_has(inst, id);
                 self.meter.tick_raw(REFLECT_FRAME_METERING);
                 self.meter.tick_code_n(recursions);
@@ -12866,7 +12878,7 @@ impl Interp {
                 if !self.is_ordinary_object(inst) {
                     return Err(Halt::Unsupported("Reflect.get:exotic-object"));
                 }
-                let id = self.reflect_string_key(arg1, true, "Reflect.get:non-string-key")?;
+                let id = self.property_key_id(arg1, true).ok_or(Halt::Unsupported("Reflect.get:non-string-key"))?;
                 self.meter.tick_raw(REFLECT_FRAME_METERING);
                 Ok(self.instance_get(inst, id))
             }
@@ -12882,7 +12894,7 @@ impl Interp {
                 if !self.is_ordinary_object(inst) {
                     return Err(Halt::Unsupported("Reflect.set:exotic-object"));
                 }
-                let id = self.reflect_string_key(arg1, true, "Reflect.set:non-string-key")?;
+                let id = self.property_key_id(arg1, true).ok_or(Halt::Unsupported("Reflect.set:non-string-key"))?;
                 // An accessor own property routes through a setter (re-entrant,
                 // not modeled) — self-name rather than clobber it as data.
                 if let Some(p) = self.find_property(inst, id) {
@@ -12909,7 +12921,7 @@ impl Interp {
                     return Err(Halt::Unsupported("Reflect.deleteProperty:exotic-object"));
                 }
                 let id =
-                    self.reflect_string_key(arg1, true, "Reflect.deleteProperty:non-string-key")?;
+                    self.property_key_id(arg1, true).ok_or(Halt::Unsupported("Reflect.deleteProperty:non-string-key"))?;
                 self.meter.tick_raw(REFLECT_FRAME_METERING);
                 Ok(Slot::boolean(self.delete_own_property(inst, id)))
             }
@@ -15529,6 +15541,72 @@ impl Interp {
         id
     }
 
+    /// The program-local property **id** a symbol value is keyed under (XS's
+    /// `mxID(symbol)` — a symbol already carries its id there; here a symbol's
+    /// descriptor-slot identity is minted a stable id on first key-use). The
+    /// same symbol (same descriptor slot) always resolves the same id, so
+    /// `o[sym]` round-trips and `sym1 === sym2` implies same key. No metering:
+    /// the symbol was already allocated (its descriptor slot); using it as a
+    /// key allocates no new name slot in XS (`mxID` is a field read). The id is
+    /// drawn from the shared [`Self::next_intern_id`] counter, so it never
+    /// collides with a string key or a program symbol.
+    fn intern_symbol_key(&mut self, desc: crate::value::SlotIndex) -> u16 {
+        if let Some(&id) = self.symbol_key_ids.get(&desc) {
+            return id;
+        }
+        let id = self.next_intern_id;
+        self.next_intern_id = self.next_intern_id.saturating_add(1);
+        self.symbol_key_ids.insert(desc, id);
+        id
+    }
+
+    /// Whether property id `id` was minted for a **symbol** key (present as a
+    /// value in [`Self::symbol_key_ids`]) — so the string-key enumerations
+    /// (`Object.keys` / `Reflect.ownKeys`) can partition it out. The symbol-key
+    /// set is empty until a symbol is first used as a key, so this is a no-op
+    /// (always `false`) for a program that never keys by symbol.
+    fn is_symbol_key_id(&self, id: u16) -> bool {
+        !self.symbol_key_ids.is_empty() && self.symbol_key_ids.values().any(|&v| v == id)
+    }
+
+    /// Resolve a property key `Slot` (string or symbol) to its interned id for
+    /// the property-op surface, or `None` when the key is out of the covered
+    /// grammar. A **symbol** key routes through [`Self::intern_symbol_key`]
+    /// (its descriptor-slot identity). A **string** key interns as a name,
+    /// applying the boot-default-key soundness gate when `gate_default` is set
+    /// (a boot default-key name the program never symbol-referenced could be an
+    /// unlinked inherited built-in, so a chain-walking `has`/`get` or an
+    /// own-property create under an ambiguous id would risk a wrong answer — the
+    /// same gate `XS_CODE_IN`/`resolve_at_key` apply); an index-valued string
+    /// stays out (the exotic index behavior). A pure own-read
+    /// (`getOwnPropertyDescriptor`) passes `gate_default = false`: an own miss is
+    /// soundly `undefined`. Returns `None` for any other key kind.
+    fn property_key_id(&mut self, key: Slot, gate_default: bool) -> Option<u16> {
+        match key.kind {
+            Kind::Symbol => match key.value {
+                Payload::Reference(desc) => Some(self.intern_symbol_key(desc)),
+                _ => None,
+            },
+            Kind::String => {
+                let s = match key.value {
+                    Payload::String(off) => self.str_text(off),
+                    _ => return None,
+                };
+                if string_to_index(&s).is_some() {
+                    return None;
+                }
+                if gate_default
+                    && !self.symbol_ids.contains_key(&s)
+                    && self.default_keys.contains(s.as_str())
+                {
+                    return None;
+                }
+                Some(self.intern_key(&s))
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve a computed key at an `AT`/`AT_2` opcode, **interning** a
     /// genuinely-novel string name through the global intern table (XS's
     /// `fxNewNameX`/`fxNewName` in the `XS_CODE_AT_ALL` string branch). This
@@ -15574,7 +15652,16 @@ impl Interp {
                     Some(Slot::of(Kind::At, Payload::At(id, 0)))
                 }
             }
-            Kind::Symbol => None,
+            // A symbol key (`o[sym]`): resolve its descriptor-slot identity to
+            // the interned property id (XS's `mxID(symbol)`). No index branch —
+            // a symbol never string-coerces to an array index.
+            Kind::Symbol => match key.value {
+                Payload::Reference(desc) => {
+                    let id = self.intern_symbol_key(desc);
+                    Some(Slot::of(Kind::At, Payload::At(id, 0)))
+                }
+                _ => None,
+            },
             Kind::String => {
                 let content = match key.value {
                     Payload::String(off) => self.str_text(off).into_bytes(),
@@ -15880,6 +15967,12 @@ impl Interp {
             if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
                 return None;
             }
+            // A symbol-keyed property is excluded from `Object.keys` (the
+            // string-key enumeration) — skip it, keeping the string keys.
+            if self.is_symbol_key_id(s.id) {
+                cur = s.next;
+                continue;
+            }
             // A non-enumerable data property (an `Object.defineProperty` with
             // `enumerable:false`) is present but excluded from the key set;
             // an enumerable one — flag 0 or carrying only `writable`/
@@ -15917,6 +16010,13 @@ impl Interp {
         while !cur.is_null() {
             let s = self.slots.get(cur);
             if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                return None;
+            }
+            // `Reflect.ownKeys` returns the string keys THEN the symbol keys;
+            // endor renders only the string portion, so an object carrying a
+            // symbol-keyed property is an honest skip (the symbol elements
+            // cannot be placed in the string-keyed result faithfully).
+            if self.is_symbol_key_id(s.id) {
                 return None;
             }
             let name_idx = (s.id as usize).checked_sub(1)?;

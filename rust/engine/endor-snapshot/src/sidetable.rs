@@ -170,6 +170,15 @@ pub enum SideTable {
     /// `symbol_names` is serialized (`SYMB`); `symbol_ids` and
     /// `next_intern_id` are re-derived from it at restore.
     SymbolTables,
+    /// `symbol_key_ids` — the symbol-value descriptor slot → property id map
+    /// minted when a symbol is used as a property key (`o[sym]` /
+    /// `Object.defineProperty(o, sym, …)`). The symbol-keyed property *slot*
+    /// round-trips in the arena, but the desc→id map that re-keys it by the
+    /// same symbol is runtime-minted (not boot-derived, not derivable from
+    /// `symbol_names`), so a machine suspended holding a symbol key cannot
+    /// re-resolve it after restore until an atom carries this — honestly
+    /// `Pending`, exactly like `SymbolRegistry`.
+    SymbolKeyIds,
     /// The module records/maps (`endor_vm::module::ModuleGraph`): a
     /// worker that has imported modules carries linked module records and
     /// namespace objects.
@@ -216,6 +225,7 @@ impl SideTable {
         SideTable::CtorPrototype,
         SideTable::SymbolRegistry,
         SideTable::SymbolTables,
+        SideTable::SymbolKeyIds,
         SideTable::Modules,
         SideTable::HardenState,
         SideTable::Meter,
@@ -262,6 +272,13 @@ impl SideTable {
             }
             // Boot objects/ids re-derived by re-linking intrinsics.
             SideTable::SymbolRegistry => ("symbol_registry/symbol_registry_keys", Pending),
+            // The symbol-key desc→id map: runtime-minted, not arena-recoverable
+            // and not derivable from `symbol_names`, so a suspended symbol key
+            // cannot re-resolve after restore until an atom carries it. A
+            // cross-crank symbol-keyed round-trip is unreachable today
+            // regardless of restore (as with `CtorPrototype`), so this row
+            // cannot be claimed covered.
+            SideTable::SymbolKeyIds => ("symbol_key_ids", Pending),
             // The rich per-instance/per-activation tables still to be wired
             // into dedicated atoms (child-3-adjacent; the honest remainder).
             SideTable::Functions => ("functions", Pending),
@@ -330,7 +347,7 @@ mod tests {
     fn all_is_exhaustive() {
         // Count of variants, kept beside the enum. Bump when a variant is
         // added — the assertion below then forces the ALL entry too.
-        const VARIANT_COUNT: usize = 28;
+        const VARIANT_COUNT: usize = 29;
         assert_eq!(SideTable::ALL.len(), VARIANT_COUNT);
 
         // No duplicates: each field name appears once.
