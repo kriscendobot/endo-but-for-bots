@@ -325,6 +325,18 @@ pub const GOPD_ABSENT_RESIDUAL_METERING: u64 = 65560;
 /// loop already meters. Calibrated against the pin via the isolated raw-gap. A
 /// novel key's intern slot is metered separately by [`Interp::intern_key`].
 pub const DEFINE_PROPERTY_NEW_RESIDUAL_METERING: u64 = 622024;
+/// `Reflect.*` native-frame **advisory** residual: a modest per-call base for
+/// the reflective built-ins (`getPrototypeOf`/`has`/`get`/`set`/… — XS's
+/// `mxBehavior*` one-liners). Per the accuracy-over-parity doctrine, the
+/// `Reflect` corpus is **result-gated** (the oracle certifies the reflected
+/// value; computrons are advisory telemetry), so this is a directional native
+/// frame charge — the same `1<<16` scale the other O(1) property-op residuals
+/// use ([`PROPERTY_IS_ENUMERABLE_METERING`]) — not an isolated-raw-gap
+/// calibration. The descriptor-shaped members (`getOwnPropertyDescriptor`/
+/// `defineProperty`) reuse the calibrated `Object.*` residuals above, since
+/// their bodies run the identical `fxFromPropertyDescriptor` /
+/// `fxOrdinaryDefineOwnProperty` build.
+pub const REFLECT_FRAME_METERING: u64 = 1 << 16;
 /// `Object.preventExtensions(o)` native-body residual (constant, no per-key
 /// work): `mxBehaviorPreventExtensions` sets the instance's
 /// `XS_DONT_PATCH_FLAG` and meters nothing beyond the native frame. Calibrated
@@ -1500,6 +1512,66 @@ pub enum NativeMethod {
     /// `Object.prototype.propertyIsEnumerable(k)` — whether `k` is an own
     /// enumerable property of the receiver.
     ObjectPropertyIsEnumerable,
+    /// `Reflect.getPrototypeOf(target)` (`fx_Reflect_getPrototypeOf` →
+    /// `mxBehaviorGetPrototype`): the target's `[[Prototype]]` — a reference to
+    /// the prototype instance, or `null` for a null-prototype object. A
+    /// non-object target self-names (XS throws a TypeError; the covered grammar
+    /// never passes a primitive here).
+    ReflectGetPrototypeOf,
+    /// `Reflect.setPrototypeOf(target, proto)` (`fx_Reflect_setPrototypeOf` →
+    /// `mxBehaviorSetPrototype`): install `proto` (an object or `null`) as the
+    /// target's `[[Prototype]]`, returning whether it succeeded — `false` only
+    /// when the target is non-extensible and `proto` differs from the current
+    /// prototype. Ordinary receivers only (an exotic side-table object skips).
+    ReflectSetPrototypeOf,
+    /// `Reflect.getOwnPropertyDescriptor(target, key)`
+    /// (`fx_Reflect_getOwnPropertyDescriptor`): identical result to
+    /// `Object.getOwnPropertyDescriptor` (the data-descriptor object or
+    /// `undefined`), but a non-object target self-names rather than coercing.
+    ReflectGetOwnPropertyDescriptor,
+    /// `Reflect.defineProperty(target, key, descriptor)`
+    /// (`fx_Reflect_defineProperty` → `mxBehaviorDefineOwnProperty`): the same
+    /// new-own-data-property define as `Object.defineProperty`, but returns a
+    /// **boolean** (`true` on success) instead of the object and never throws
+    /// on rejection. The covered shape is the four-field data descriptor on a
+    /// genuinely-new key of an ordinary receiver.
+    ReflectDefineProperty,
+    /// `Reflect.ownKeys(target)` (`fx_Reflect_ownKeys` → `mxBehaviorOwnKeys`):
+    /// a fresh `Array` of **all** own string-keyed property names (enumerable
+    /// or not), in creation order. Ordinary receivers with string keys only;
+    /// an exotic object or an unclassifiable key self-names.
+    ReflectOwnKeys,
+    /// `Reflect.has(target, key)` (`fx_Reflect_has` → `mxBehaviorHasProperty`):
+    /// the `key in target` chain walk as a boolean. Same soundness gate as the
+    /// `in` operator (a boot default-key name the program never referenced
+    /// self-names rather than risk a wrong `false`).
+    ReflectHas,
+    /// `Reflect.get(target, key[, receiver])` (`fx_Reflect_get` →
+    /// `mxBehaviorGetProperty`): the own-or-inherited data-property value (the
+    /// `receiver` argument is irrelevant to a data property, so it is ignored).
+    /// Same default-key soundness gate as `has`.
+    ReflectGet,
+    /// `Reflect.set(target, key, value[, receiver])` (`fx_Reflect_set` →
+    /// `mxBehaviorSetProperty`): an ordinary `[[Set]]` returning whether it was
+    /// accepted — `false` when the own data property is non-writable or a new
+    /// key lands on a non-extensible receiver, `true` otherwise (creating or
+    /// updating the own property).
+    ReflectSet,
+    /// `Reflect.deleteProperty(target, key)` (`fx_Reflect_deleteProperty` →
+    /// `mxBehaviorDeleteProperty`): the ordinary own-property delete as a
+    /// boolean (`false` for a non-configurable own property, `true` otherwise
+    /// or when absent).
+    ReflectDeleteProperty,
+    /// `Reflect.apply(target, thisArgument, argumentsList)` — an honest named
+    /// skip this child: the argument-list spread re-enters the interpreter
+    /// frame machinery (the same re-entrant trampoline as
+    /// `Function.prototype.apply` with an actual array), whose metering is a
+    /// later increment.
+    ReflectApply,
+    /// `Reflect.construct(target, argumentsList[, newTarget])` — an honest
+    /// named skip this child: re-entrant construction with a spread argument
+    /// list, out of the covered trampoline scope.
+    ReflectConstruct,
     FunctionToString,
     /// `Function.prototype.call` — a re-entrant trampoline: invoke the
     /// receiver function with the first argument as `this` and the rest as
@@ -3813,7 +3885,43 @@ impl Interp {
         self.create_string_proto();
         self.create_number_globals();
         self.create_json();
+        self.create_reflect();
         self.create_hardened_globals();
+    }
+
+    /// Build the `Reflect` namespace object (XS's `mxReflectObject`,
+    /// `xsProxy.c` `fxBuildReflect`): a boot object chaining to
+    /// `%Object.prototype%`, carrying the reflective built-ins the SES shim and
+    /// the boot bundles consume as own methods, bound into the global object
+    /// under the program-local `Reflect` id at link time only when the program
+    /// references the name. Not a function, so `typeof Reflect === "object"`.
+    /// The re-entrant `apply`/`construct` are bound too, but self-name an
+    /// honest skip on invocation (their spread-argument trampoline metering is
+    /// a later increment) — a reference is a NAMED skip rather than a wrong
+    /// `Reflect.M is not a function`.
+    fn create_reflect(&mut self) {
+        let object_proto = self.object_proto;
+        let reflect = self.slots.alloc(Slot::instance(object_proto));
+        self.intrinsics.insert("Reflect", reflect);
+        for (name, m) in [
+            ("getPrototypeOf", NativeMethod::ReflectGetPrototypeOf),
+            ("setPrototypeOf", NativeMethod::ReflectSetPrototypeOf),
+            (
+                "getOwnPropertyDescriptor",
+                NativeMethod::ReflectGetOwnPropertyDescriptor,
+            ),
+            ("defineProperty", NativeMethod::ReflectDefineProperty),
+            ("ownKeys", NativeMethod::ReflectOwnKeys),
+            ("has", NativeMethod::ReflectHas),
+            ("get", NativeMethod::ReflectGet),
+            ("set", NativeMethod::ReflectSet),
+            ("deleteProperty", NativeMethod::ReflectDeleteProperty),
+            ("apply", NativeMethod::ReflectApply),
+            ("construct", NativeMethod::ReflectConstruct),
+        ] {
+            let mf = self.alloc_method(m);
+            self.proto_methods.push((reflect, name, mf));
+        }
     }
 
     /// Bind the Hardened-JavaScript global functions (`xsLockdown.c`) the
@@ -12039,6 +12147,17 @@ impl Interp {
                 self.array_iterator_next(iter)?
             }
             NativeMethod::Math(id) => self.call_math(id, base, argc)?,
+            NativeMethod::ReflectGetPrototypeOf
+            | NativeMethod::ReflectSetPrototypeOf
+            | NativeMethod::ReflectGetOwnPropertyDescriptor
+            | NativeMethod::ReflectDefineProperty
+            | NativeMethod::ReflectOwnKeys
+            | NativeMethod::ReflectHas
+            | NativeMethod::ReflectGet
+            | NativeMethod::ReflectSet
+            | NativeMethod::ReflectDeleteProperty
+            | NativeMethod::ReflectApply
+            | NativeMethod::ReflectConstruct => self.call_reflect(m, base, argc)?,
             NativeMethod::StringCharCodeAt
             | NativeMethod::StringCodePointAt
             | NativeMethod::StringCharAt
@@ -12387,6 +12506,363 @@ impl Interp {
         self.stack.truncate(base);
         self.push(result);
         Ok(())
+    }
+
+    /// Resolve a `Reflect.*` string property key to its interned id, applying
+    /// the same soundness gates the property-op surface uses. A symbol or
+    /// numeric key (the covered grammar's `Reflect` callers pass string keys)
+    /// and an index-valued string (routed through the exotic index behavior)
+    /// self-name. When `gate_default` is set, a boot default-key name the
+    /// program never referenced as a symbol also self-names — the same gate
+    /// `XS_CODE_IN` / `resolve_at_key` apply, because such a name could be an
+    /// unlinked inherited built-in and a chain-walking `has`/`get` (or an
+    /// own-property *create* under an ambiguous id) would otherwise risk a
+    /// wrong answer. A pure own-read (`getOwnPropertyDescriptor`) needs no such
+    /// gate: an own miss is soundly `undefined`.
+    fn reflect_string_key(
+        &mut self,
+        key: Slot,
+        gate_default: bool,
+        ctx: &'static str,
+    ) -> Result<u16, Halt> {
+        let s = match key.value {
+            Payload::String(off) if key.kind == Kind::String => self.str_text(off),
+            _ => return Err(Halt::Unsupported(ctx)),
+        };
+        if string_to_index(&s).is_some() {
+            return Err(Halt::Unsupported(ctx));
+        }
+        if gate_default
+            && !self.symbol_ids.contains_key(&s)
+            && self.default_keys.contains(s.as_str())
+        {
+            return Err(Halt::Unsupported(ctx));
+        }
+        Ok(self.intern_key(&s))
+    }
+
+    /// Dispatch a `Reflect.*` reflective built-in (`xsProxy.c` `fx_Reflect_*`
+    /// → the `mxBehavior*` object-behavior primitives). Each reflects a value
+    /// out of / into an ordinary object with no re-entry into user code
+    /// (`apply`/`construct`, which re-enter, self-name this child). The result
+    /// is oracle-certified; the metering is the advisory native-frame residual
+    /// (accuracy-over-parity: the `Reflect` corpus is result-gated).
+    fn call_reflect(&mut self, m: NativeMethod, base: usize, argc: usize) -> Result<Slot, Halt> {
+        let _ = argc;
+        let arg0 = self.stack.get(base + 4).copied().unwrap_or_else(Slot::undefined);
+        let arg1 = self.stack.get(base + 5).copied().unwrap_or_else(Slot::undefined);
+        let arg2 = self.stack.get(base + 6).copied().unwrap_or_else(Slot::undefined);
+        match m {
+            // `Reflect.getPrototypeOf(target)`: the target's `[[Prototype]]` —
+            // a reference to the prototype instance, or `null`. Sound for any
+            // object receiver (the prototype is the instance slot's payload).
+            NativeMethod::ReflectGetPrototypeOf => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.getPrototypeOf:non-object")),
+                };
+                self.meter.tick_raw(REFLECT_FRAME_METERING);
+                let proto = self.instance_prototype(inst);
+                if proto.is_null() {
+                    Ok(Slot::null())
+                } else {
+                    Ok(Slot::of(Kind::Reference, Payload::Reference(proto)))
+                }
+            }
+            // `Reflect.setPrototypeOf(target, proto)`: install `proto` (object
+            // or `null`) as the target's prototype, returning success. Ordinary
+            // receivers only. Rejected (→ `false`) only when the target is
+            // non-extensible and the prototype actually changes.
+            NativeMethod::ReflectSetPrototypeOf => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.setPrototypeOf:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.setPrototypeOf:exotic-object"));
+                }
+                let new_proto = match arg1.kind {
+                    Kind::Null => crate::value::SlotIndex::NULL,
+                    Kind::Reference => match arg1.value {
+                        Payload::Reference(p) => p,
+                        _ => return Err(Halt::Unsupported("Reflect.setPrototypeOf:bad-proto")),
+                    },
+                    _ => return Err(Halt::Unsupported("Reflect.setPrototypeOf:non-object-proto")),
+                };
+                self.meter.tick_raw(REFLECT_FRAME_METERING);
+                let current = self.instance_prototype(inst);
+                if current == new_proto {
+                    return Ok(Slot::boolean(true));
+                }
+                if !self.instance_extensible(inst) {
+                    return Ok(Slot::boolean(false));
+                }
+                // Store the new prototype in the instance slot's payload
+                // (`Reference(proto)`, or a `None` payload for a null prototype
+                // — the `instance_prototype` NULL sentinel).
+                let slot = self.slots.get_mut(inst);
+                if new_proto.is_null() {
+                    slot.value = Payload::None;
+                } else {
+                    slot.value = Payload::Reference(new_proto);
+                }
+                Ok(Slot::boolean(true))
+            }
+            // `Reflect.getOwnPropertyDescriptor(target, key)`: identical result
+            // to `Object.getOwnPropertyDescriptor` — the data-descriptor object
+            // or `undefined`. A non-object target self-names (no coercion).
+            NativeMethod::ReflectGetOwnPropertyDescriptor => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => {
+                        return Err(Halt::Unsupported(
+                            "Reflect.getOwnPropertyDescriptor:non-object",
+                        ))
+                    }
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported(
+                        "Reflect.getOwnPropertyDescriptor:exotic-object",
+                    ));
+                }
+                let id = self.reflect_string_key(
+                    arg1,
+                    false,
+                    "Reflect.getOwnPropertyDescriptor:non-string-key",
+                )?;
+                match self.find_property(inst, id) {
+                    Some(p) => {
+                        let prop = *self.slots.get(p);
+                        if prop.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                            return Err(Halt::Unsupported(
+                                "Reflect.getOwnPropertyDescriptor:accessor-property",
+                            ));
+                        }
+                        let writable = prop.flag & XS_DONT_SET_FLAG == 0;
+                        let enumerable = prop.flag & XS_DONT_ENUM_FLAG == 0;
+                        let configurable = prop.flag & XS_DONT_DELETE_FLAG == 0;
+                        self.meter.tick_raw(GOPD_PRESENT_RESIDUAL_METERING);
+                        let value = Slot::of(prop.kind, prop.value);
+                        let desc = self.slots.alloc(Slot::instance(self.object_proto));
+                        self.define_descriptor_field(desc, "value", value);
+                        self.define_descriptor_field(desc, "writable", Slot::boolean(writable));
+                        self.define_descriptor_field(desc, "enumerable", Slot::boolean(enumerable));
+                        self.define_descriptor_field(
+                            desc,
+                            "configurable",
+                            Slot::boolean(configurable),
+                        );
+                        Ok(Slot::of(Kind::Reference, Payload::Reference(desc)))
+                    }
+                    None => {
+                        self.meter.tick_raw(GOPD_ABSENT_RESIDUAL_METERING);
+                        Ok(Slot::undefined())
+                    }
+                }
+            }
+            // `Reflect.defineProperty(target, key, descriptor)`: the same
+            // new-own-data-property define as `Object.defineProperty`, but
+            // returning a boolean and never throwing on rejection. Covered
+            // shape: a four-field data descriptor on a genuinely-new key.
+            NativeMethod::ReflectDefineProperty => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.defineProperty:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.defineProperty:exotic-object"));
+                }
+                let descref = match arg2.value {
+                    Payload::Reference(d) if arg2.kind == Kind::Reference => d,
+                    _ => {
+                        return Err(Halt::Unsupported(
+                            "Reflect.defineProperty:non-object-descriptor",
+                        ))
+                    }
+                };
+                let id = self.reflect_string_key(
+                    arg1,
+                    true,
+                    "Reflect.defineProperty:non-string-key",
+                )?;
+                let field = |slf: &Self, name: &str| -> Option<Slot> {
+                    slf.symbol_ids
+                        .get(name)
+                        .and_then(|&fid| slf.find_property(descref, fid))
+                        .map(|p| {
+                            let s = slf.slots.get(p);
+                            Slot::of(s.kind, s.value)
+                        })
+                };
+                if field(self, "get").is_some() || field(self, "set").is_some() {
+                    return Err(Halt::Unsupported("Reflect.defineProperty:accessor-descriptor"));
+                }
+                let (value, writable, enumerable, configurable) = match (
+                    field(self, "value"),
+                    field(self, "writable"),
+                    field(self, "enumerable"),
+                    field(self, "configurable"),
+                ) {
+                    (Some(v), Some(w), Some(e), Some(c)) => (v, w, e, c),
+                    _ => return Err(Halt::Unsupported("Reflect.defineProperty:partial-descriptor")),
+                };
+                let as_bool = |s: Slot| -> Option<bool> {
+                    match s.kind {
+                        Kind::Boolean => Some(matches!(s.value, Payload::Boolean(true))),
+                        _ => None,
+                    }
+                };
+                let (w, e, c) = match (as_bool(writable), as_bool(enumerable), as_bool(configurable))
+                {
+                    (Some(w), Some(e), Some(c)) => (w, e, c),
+                    _ => {
+                        return Err(Halt::Unsupported(
+                            "Reflect.defineProperty:non-boolean-attribute",
+                        ))
+                    }
+                };
+                if self.find_property(inst, id).is_some() {
+                    return Err(Halt::Unsupported("Reflect.defineProperty:redefine"));
+                }
+                let mut flag = 0u8;
+                if !w {
+                    flag |= XS_DONT_SET_FLAG;
+                }
+                if !e {
+                    flag |= XS_DONT_ENUM_FLAG;
+                }
+                if !c {
+                    flag |= XS_DONT_DELETE_FLAG;
+                }
+                self.meter.tick_raw(DEFINE_PROPERTY_NEW_RESIDUAL_METERING);
+                let mut prop = value;
+                prop.id = id;
+                prop.flag = flag;
+                let head = self.slots.get(inst).next;
+                prop.next = head;
+                let idx = self.slots.alloc(prop);
+                self.slots.get_mut(inst).next = idx;
+                Ok(Slot::boolean(true))
+            }
+            // `Reflect.ownKeys(target)`: a fresh `Array` of ALL own string keys
+            // (enumerable or not), in creation order. Ordinary receivers with
+            // string keys only; an exotic object or an unclassifiable key
+            // self-names.
+            NativeMethod::ReflectOwnKeys => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.ownKeys:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.ownKeys:exotic-object"));
+                }
+                let ids = match self.own_all_string_ids(inst) {
+                    Some(v) => v,
+                    None => return Err(Halt::Unsupported("Reflect.ownKeys:unclassified-property")),
+                };
+                let n = ids.len() as u32;
+                self.meter.tick_raw(OBJECT_KEYS_FRAME_METERING);
+                self.meter.tick_raw(self.array_chunk_size_metering(n));
+                for _ in 0..n {
+                    self.meter.tick_slot_alloc();
+                }
+                let result = self.slots.alloc(Slot::instance(self.array_proto));
+                let mut data = ArrayData::default();
+                data.length = n;
+                for (i, &id) in ids.iter().enumerate() {
+                    let name = self.symbol_names[(id - 1) as usize].clone();
+                    let off = self.alloc_str_text(name.as_bytes());
+                    data.items
+                        .insert(i as u32, Slot::of(Kind::String, Payload::String(off)));
+                }
+                self.arrays.insert(result, data);
+                Ok(Slot::of(Kind::Reference, Payload::Reference(result)))
+            }
+            // `Reflect.has(target, key)`: the `key in target` chain walk as a
+            // boolean (same soundness gate as `XS_CODE_IN`).
+            NativeMethod::ReflectHas => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.has:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.has:exotic-object"));
+                }
+                let id = self.reflect_string_key(arg1, true, "Reflect.has:non-string-key")?;
+                let (present, recursions) = self.instance_has(inst, id);
+                self.meter.tick_raw(REFLECT_FRAME_METERING);
+                self.meter.tick_code_n(recursions);
+                Ok(Slot::boolean(present))
+            }
+            // `Reflect.get(target, key[, receiver])`: the own-or-inherited
+            // data-property value (the `receiver` is irrelevant to a data
+            // property — no getters in the covered grammar — so it is ignored).
+            NativeMethod::ReflectGet => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.get:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.get:exotic-object"));
+                }
+                let id = self.reflect_string_key(arg1, true, "Reflect.get:non-string-key")?;
+                self.meter.tick_raw(REFLECT_FRAME_METERING);
+                Ok(self.instance_get(inst, id))
+            }
+            // `Reflect.set(target, key, value[, receiver])`: an ordinary
+            // `[[Set]]` returning whether it was accepted. `false` for a
+            // non-writable own property or a new key on a non-extensible
+            // receiver; otherwise `true`, creating/updating the own property.
+            NativeMethod::ReflectSet => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.set:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.set:exotic-object"));
+                }
+                let id = self.reflect_string_key(arg1, true, "Reflect.set:non-string-key")?;
+                // An accessor own property routes through a setter (re-entrant,
+                // not modeled) — self-name rather than clobber it as data.
+                if let Some(p) = self.find_property(inst, id) {
+                    if self.slots.get(p).flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                        return Err(Halt::Unsupported("Reflect.set:accessor-property"));
+                    }
+                }
+                self.meter.tick_raw(REFLECT_FRAME_METERING);
+                if self.ordinary_write_rejected(inst, id) {
+                    return Ok(Slot::boolean(false));
+                }
+                self.instance_put(inst, id, arg2);
+                Ok(Slot::boolean(true))
+            }
+            // `Reflect.deleteProperty(target, key)`: the ordinary own-property
+            // delete as a boolean (`false` for a non-configurable own property,
+            // `true` otherwise or when absent).
+            NativeMethod::ReflectDeleteProperty => {
+                let inst = match arg0.value {
+                    Payload::Reference(o) if arg0.kind == Kind::Reference => o,
+                    _ => return Err(Halt::Unsupported("Reflect.deleteProperty:non-object")),
+                };
+                if !self.is_ordinary_object(inst) {
+                    return Err(Halt::Unsupported("Reflect.deleteProperty:exotic-object"));
+                }
+                let id =
+                    self.reflect_string_key(arg1, true, "Reflect.deleteProperty:non-string-key")?;
+                self.meter.tick_raw(REFLECT_FRAME_METERING);
+                Ok(Slot::boolean(self.delete_own_property(inst, id)))
+            }
+            // `Reflect.apply` / `Reflect.construct`: re-entrant (spread argument
+            // list into the interpreter frame machinery); an honest named skip
+            // this child.
+            NativeMethod::ReflectApply => {
+                Err(Halt::Unsupported("Reflect.apply:reentrant-trampoline"))
+            }
+            NativeMethod::ReflectConstruct => {
+                Err(Halt::Unsupported("Reflect.construct:reentrant-trampoline"))
+            }
+            _ => Err(Halt::Unsupported("Reflect:unexpected")),
+        }
     }
 
     /// Dispatch a Map/Set/WeakMap/WeakSet mutator or query method (xsMapSet.c).
@@ -15361,6 +15837,35 @@ impl Interp {
         }
         // The own-property chain is newest-first (`instance_put` prepends);
         // `Object.keys` yields keys in creation order, so reverse.
+        ids.reverse();
+        Some(ids)
+    }
+
+    /// The ids of **all** of `inst`'s own string-keyed data properties
+    /// (enumerable or not), in property-creation order — XS's `fxOwnKeys` for
+    /// `Reflect.ownKeys` over an ordinary object with no integer-index keys.
+    /// Unlike [`Self::own_enumerable_ids`] it keeps non-enumerable keys, but
+    /// like it returns `None` for a property endor cannot classify (an accessor
+    /// own property, or an id with no program-symbol name), so the caller
+    /// honest-skips rather than emit a wrong key set. Symbol-keyed properties
+    /// (a later increment) are not present in the covered grammar's ordinary
+    /// objects, so a well-formed data-property chain is fully string-keyed.
+    fn own_all_string_ids(&self, inst: crate::value::SlotIndex) -> Option<Vec<u16>> {
+        let mut ids = Vec::new();
+        let mut cur = self.slots.get(inst).next;
+        while !cur.is_null() {
+            let s = self.slots.get(cur);
+            if s.flag & (XS_GETTER_FLAG | XS_SETTER_FLAG) != 0 {
+                return None;
+            }
+            let name_idx = (s.id as usize).checked_sub(1)?;
+            if name_idx >= self.symbol_names.len() {
+                return None;
+            }
+            ids.push(s.id);
+            cur = s.next;
+        }
+        // Newest-first chain → creation order.
         ids.reverse();
         Some(ids)
     }
