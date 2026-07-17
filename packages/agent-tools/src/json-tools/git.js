@@ -146,8 +146,21 @@ const gitToolSchemas = harden({
       type: 'object',
       properties: {
         message: COMMIT_PROP,
+        options: COMMIT_OPTIONS_PROP,
       },
       required: ['message'],
+      additionalProperties: false,
+    },
+  },
+  reword: {
+    description: 'Replace a commit message while keeping its patch unchanged.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: REF_PROP,
+        message: { type: 'string', description: 'The replacement message.' },
+      },
+      required: ['ref', 'message'],
       additionalProperties: false,
     },
   },

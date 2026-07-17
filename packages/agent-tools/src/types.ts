@@ -36,6 +36,7 @@ export type GitToolCapability = Pick<
   | 'diff'
   | 'show'
   | 'commit'
+  | 'reword'
   | 'branches'
   | 'createBranch'
   | 'switchBranch'
