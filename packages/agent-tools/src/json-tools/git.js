@@ -3,15 +3,14 @@
 
 /** @import { ERef } from '@endo/eventual-send' */
 /** @import { InterfaceGuard, Pattern } from '@endo/patterns' */
-/** @import { GitHistoryToolCapability, GitToolCapability, ToolRecord } from '../types.js' */
+/** @import { GitToolCapability, ToolRecord } from '../types.js' */
 
-/** @typedef {Record<keyof GitToolCapability | keyof GitHistoryToolCapability, (...args: unknown[]) => Promise<unknown>>} GitToolDispatch */
+/** @typedef {Record<keyof GitToolCapability, (...args: unknown[]) => Promise<unknown>>} GitToolDispatch */
 
 import { E } from '@endo/eventual-send';
 import {
   getInterfaceGuardPayload,
   getMethodGuardPayload,
-  M,
 } from '@endo/patterns';
 import { GitInterface } from '@endo/exo-git';
 import { GitRebaseStartInputShape } from '@endo/exo-git/src/interfaces.js';
@@ -104,16 +103,6 @@ const REBASE_START_INPUT_PROP = harden({
   additionalProperties: false,
 });
 
-const REBASE_START_INPUT_SHAPE = M.splitRecord(
-  {
-    mode: 'start',
-    upstream: M.string(),
-  },
-  {
-    autosquash: M.boolean(),
-  },
-  harden({}),
-);
 /**
  * This package intentionally exposes only a curated JSON-safe writable Git slice
  * for now. Methods that remotely accept capabilities or can return
@@ -187,11 +176,18 @@ const gitToolSchemas = harden({
     },
   },
   rebase: {
-    description: 'Replay the current branch onto an upstream ref.',
+    description:
+      'Start replaying the current branch onto an upstream ref. ' +
+      'This JSON tool does not expose rebase continue, abort, or skip.',
     parameters: {
       type: 'object',
       properties: {
-        input: REBASE_START_INPUT_PROP,
+        input: {
+          ...REBASE_START_INPUT_PROP,
+          description:
+            'Start-only rebase input. Continue, abort, and skip are not ' +
+            'available through this JSON tool.',
+        },
       },
       required: ['input'],
       additionalProperties: false,
@@ -231,52 +227,6 @@ const gitToolSchemas = harden({
   },
 });
 
-/** @type {Record<keyof GitHistoryToolCapability, { description: string, parameters: object }>} */
-const gitHistoryToolSchemas = harden({
-  commit: {
-    description: 'Record staged changes, or amend HEAD when requested.',
-    parameters: {
-      type: 'object',
-      properties: {
-        message: COMMIT_PROP,
-        options: COMMIT_OPTIONS_PROP,
-      },
-      required: ['message'],
-      additionalProperties: false,
-    },
-  },
-  reword: {
-    description: 'Replace a commit message while keeping its patch unchanged.',
-    parameters: {
-      type: 'object',
-      properties: {
-        ref: REF_PROP,
-        message: { type: 'string', description: 'The replacement message.' },
-      },
-      required: ['ref', 'message'],
-      additionalProperties: false,
-    },
-  },
-  cherryPick: {
-    description: 'Replay an existing commit onto the current branch.',
-    parameters: {
-      type: 'object',
-      properties: { ref: REF_PROP, options: CHERRY_PICK_OPTIONS_PROP },
-      required: ['ref'],
-      additionalProperties: false,
-    },
-  },
-  rebase: {
-    description: 'Replay the current branch onto an upstream ref.',
-    parameters: {
-      type: 'object',
-      properties: { input: REBASE_START_INPUT_PROP },
-      required: ['input'],
-      additionalProperties: false,
-    },
-  },
-});
-
 /**
  * @type {(keyof GitToolCapability)[]}
  */
@@ -284,18 +234,11 @@ const gitToolMethods = harden(
   /** @type {(keyof GitToolCapability)[]} */ (Object.keys(gitToolSchemas)),
 );
 
-/** @type {(keyof GitHistoryToolCapability)[]} */
-const gitHistoryToolMethods = harden(
-  /** @type {(keyof GitHistoryToolCapability)[]} */ (
-    Object.keys(gitHistoryToolSchemas)
-  ),
-);
-
 /**
  * @type {Partial<Record<keyof GitToolCapability, Pattern[]>>}
  */
 const gitToolArgGuards = harden({
-  rebase: harden([REBASE_START_INPUT_SHAPE]),
+  rebase: harden([GitRebaseStartInputShape]),
 });
 
 /**
@@ -315,17 +258,10 @@ const positionalArgGuards = method => {
   return harden([...argGuards, ...(optionalArgGuards || [])]);
 };
 
-/** @type {Partial<Record<keyof GitHistoryToolCapability, Pattern[]>>} */
-const gitHistoryToolArgGuards = harden({
-  rebase: harden([
-    M.and(positionalArgGuards('rebase')[0], GitRebaseStartInputShape),
-  ]),
-});
-
 /**
  * Build agent-tool records for a live `Git` capability.
  *
- * @param {ERef<GitToolCapability | GitHistoryToolCapability>} gitCap
+ * @param {ERef<GitToolCapability>} gitCap
  *   A live `Git` capability. The exo `Git` cap is reached by dynamic method
  *   name through `E`, so this records only the invocation shape this maker
  *   needs.
@@ -379,20 +315,3 @@ const makeGitTools = (gitCap, methods, schemas, argGuardsByMethod = {}) => {
 export const makeGitTool = gitCap =>
   makeGitTools(gitCap, gitToolMethods, gitToolSchemas, gitToolArgGuards);
 harden(makeGitTool);
-
-/**
- * Build explicitly elevated history-rewrite tool records for a live `Git`
- * capability.
- * Hosts must opt in to exposing these operations to a model.
- *
- * @param {ERef<GitHistoryToolCapability>} gitCap
- * @returns {ToolRecord[]}
- */
-export const makeGitHistoryTool = gitCap =>
-  makeGitTools(
-    gitCap,
-    gitHistoryToolMethods,
-    gitHistoryToolSchemas,
-    gitHistoryToolArgGuards,
-  );
-harden(makeGitHistoryTool);

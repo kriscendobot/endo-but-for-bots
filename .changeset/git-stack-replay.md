@@ -6,8 +6,7 @@
 ---
 
 Add cherry-pick and structured autosquash rebase operations to the Git APIs.
-`@endo/agent-tools` exposes these history-rewrite operations through the
-explicitly elevated `makeGitHistoryTool` maker.
-Code-mode agents that need the history-rewrite surface must select
-`gitMode: 'historyRewrite'` with a Git capability that has history-rewrite
-authority.
+`@endo/agent-tools` includes these narrow history-rewrite operations in the
+default `makeGitTool` inventory.
+The live Git capability still requires history-rewrite authority, and the JSON
+rebase tool is start-only: it does not expose continue, abort, or skip.

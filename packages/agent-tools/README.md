@@ -60,7 +60,6 @@ The package root exports the parked JSON record makers and their types:
 ```js
 import {
   makeTool,
-  makeGitHistoryTool,
   makeGitTool,
   makeGitMountTools,
   makeMountReadTool,
@@ -117,9 +116,10 @@ Capability-bearing values remain out of band.
 
 ## Git history tools
 
-The default `makeGitTool` inventory excludes history-rewriting operations.
-Hosts that deliberately grant the elevated history capability can use
-`makeGitHistoryTool` to expose `commit` with `options.amend`, `reword`,
-`cherryPick`, and an autosquash-capable `rebase` start operation.
-Rebase control modes remain available through the elevated code-mode Git
-capability, but are not exposed as JSON tools.
+The default `makeGitTool` inventory includes the narrow history operations:
+`commit` with `options.amend`, `reword`, `cherryPick`, and an autosquash-capable
+`rebase` start operation.
+The live Git capability still enforces its separate `allowHistoryRewrite`
+authority, so a cap created without that option rejects those calls.
+Rebase is start-only here; continue, abort, and skip are not exposed as JSON
+tools.

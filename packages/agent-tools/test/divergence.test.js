@@ -6,7 +6,7 @@ import '@endo/init/debug.js';
 
 /** @import { ERef } from '@endo/eventual-send' */
 /** @import { InterfaceGuard, Pattern } from '@endo/patterns' */
-/** @import { GitHistoryToolCapability, GitToolCapability, ToolRecord } from '../src/types.js' */
+/** @import { GitToolCapability, ToolRecord } from '../src/types.js' */
 
 import test from 'ava';
 import { Ajv } from 'ajv';
@@ -19,8 +19,7 @@ import {
 import { Far } from '@endo/pass-style';
 import { GitInterface } from '@endo/exo-git';
 import { GitRebaseStartInputShape } from '@endo/exo-git/src/interfaces.js';
-
-import { makeGitHistoryTool, makeGitTool } from '../src/json-tools/git.js';
+import { makeGitTool } from '../src/json-tools/git.js';
 
 /**
  * Conformance checks for hand-authored JSON Schemas and runtime guards.
@@ -34,23 +33,6 @@ const ajv = new Ajv({ strict: false });
  * @param {string} method
  */
 const guardShapeFor = method => {
-  if (method === 'rebase') {
-    return {
-      requiredCount: 1,
-      guards: harden([
-        M.splitRecord(
-          {
-            mode: 'start',
-            upstream: M.string(),
-          },
-          {
-            autosquash: M.boolean(),
-          },
-          {},
-        ),
-      ]),
-    };
-  }
   const { methodGuards } = getInterfaceGuardPayload(
     /** @type {InterfaceGuard} */ (GitInterface),
   );
@@ -185,13 +167,6 @@ const gitTools = makeGitTool(
   ),
 );
 
-const gitHistoryTools = makeGitHistoryTool(
-  // This test inspects schemas and guards; it never invokes the capability.
-  /** @type {ERef<GitHistoryToolCapability>} */ (
-    /** @type {unknown} */ (Far('InertGitHistory', {}))
-  ),
-);
-
 /**
  * For one git tool, assert its hand-authored JSON Schema and its runtime guard
  * agree on every candidate args record.
@@ -225,14 +200,6 @@ const schemaGuardAgree = test.macro({
 
 for (const tool of gitTools) {
   test(schemaGuardAgree, tool);
-}
-
-for (const tool of gitHistoryTools) {
-  test(
-    `schema ⟷ guard agree for gitHistory.${tool.name}`,
-    schemaGuardAgree,
-    tool,
-  );
 }
 
 // --- bigint synthetic case ----------------------------------------------

@@ -6,15 +6,20 @@ import type { HttpClient, HttpResponse } from '@endo/exo-http-client';
 import type { Pattern } from '@endo/patterns';
 
 /**
- * The read, branch-navigation, and additive-commit slice of `WritableEndoGit` that
- * the default git tool catalog exposes to an LLM.
+ * The read, branch-navigation, and selected-write slice of `WritableEndoGit`
+ * that the default git tool catalog exposes to an LLM.
  *
  * Deliberately omits destructive worktree operations such as `merge`,
  * `restore`, branch deletion/renaming, the `stash*` family, and the
  * working-tree/detach mutators (`switch`, `detach`). `commit`, `reword`,
  * `cherryPick`, and the `mode: "start"` case of `rebase` are included as the
  * narrow JSON-safe write and history surface this tool intentionally grants.
- * Widening this `Pick` is a deliberate authority decision, not a convenience.
+ * The history methods are safe to advertise here because the live `Git`
+ * capability still checks its separate `allowHistoryRewrite` authority before
+ * any rewrite reaches the backend.
+ * A capability made without that authority therefore rejects these tool calls;
+ * hosts that want to use them must provide a Git cap made with
+ * `allowHistoryRewrite: true`.
  *
  * This slice holds only the JSON-transparent methods whose hand-authored tool
  * schemas map one-to-one onto their `GitInterface` guards (the divergence gate
@@ -37,16 +42,6 @@ export type GitToolCapability = Pick<
   | 'createBranch'
   | 'switchBranch'
   | 'currentBranch'
->;
-
-/**
- * Explicit history-rewrite slice accepted by `makeGitHistoryTool`.
- * Hosts may use this maker when they want the history surface to be explicit
- * in the capability type they pass to the tool constructor.
- */
-export type GitHistoryToolCapability = Pick<
-  WritableEndoGit,
-  'commit' | 'reword' | 'cherryPick' | 'rebase'
 >;
 
 /**
@@ -121,10 +116,6 @@ export declare function makeTool(spec: ToolSpec): ToolRecord;
 
 export declare function makeGitTool(
   gitCap: ERef<GitToolCapability>,
-): ToolRecord[];
-
-export declare function makeGitHistoryTool(
-  gitCap: ERef<GitHistoryToolCapability>,
 ): ToolRecord[];
 
 export declare function makeGitMountTools(

@@ -217,6 +217,31 @@ test('the runtime guard rejects a bad arg before reaching the live cap', async t
   await t.throwsAsync(() => byName('commit').invoke({ bogus: 'x' }));
 });
 
+test('default history tools still require Git history-rewrite authority', async t => {
+  const { git } = await provisionGit(t);
+  const byName = byNameOf(makeGitTool(git));
+
+  await t.throwsAsync(
+    () =>
+      byName('commit').invoke({ message: 'amend', options: { amend: true } }),
+    { message: /without history-rewrite authority/ },
+  );
+  await t.throwsAsync(
+    () => byName('reword').invoke({ ref: 'HEAD', message: 'replacement' }),
+    { message: /without history-rewrite authority/ },
+  );
+  await t.throwsAsync(() => byName('cherryPick').invoke({ ref: 'HEAD' }), {
+    message: /without history-rewrite authority/,
+  });
+  await t.throwsAsync(
+    () =>
+      byName('rebase').invoke({
+        input: { mode: 'start', upstream: 'HEAD' },
+      }),
+    { message: /without history-rewrite authority/ },
+  );
+});
+
 test('add/restore/checkoutConflict stay out of makeGitTool', t => {
   // The cap is only touched at invoke time, so an empty object suffices to
   // inspect the record names.

@@ -7,10 +7,10 @@ import '@endo/init/debug.js';
 import test from 'ava';
 import { Far } from '@endo/pass-style';
 
-import { makeGitHistoryTool, makeGitTool } from '../src/json-tools/git.js';
+import { makeGitTool } from '../src/json-tools/git.js';
 
 /** @import { ERef } from '@endo/eventual-send' */
-/** @import { GitHistoryToolCapability, GitToolCapability } from '../src/types.js' */
+/** @import { GitToolCapability } from '../src/types.js' */
 
 const SLICE = [
   'log',
@@ -81,30 +81,6 @@ const makeStubGit = calls => {
   };
   return Far('StubGit', stubGit);
 };
-
-/**
- * @param {unknown[][]} calls
- * @returns {ERef<GitHistoryToolCapability>}
- */
-const makeHistoryStubGit = calls =>
-  Far('HistoryStubGit', {
-    commit: async (...a) => {
-      calls.push(['commit', ...a]);
-      return { oid: 'x', summary: a[0] };
-    },
-    reword: async (...a) => {
-      calls.push(['reword', ...a]);
-      return { oid: 'x', summary: a[1] };
-    },
-    cherryPick: async (...a) => {
-      calls.push(['cherryPick', ...a]);
-      return '';
-    },
-    rebase: async (...a) => {
-      calls.push(['rebase', ...a]);
-      return '';
-    },
-  });
 
 test('makeGitTool builds one record per non-remotable-slice method', t => {
   const tools = makeGitTool(makeStubGit([]));
@@ -213,45 +189,6 @@ test('the schemas advertise real, declarative property names', t => {
   t.deepEqual(propsOf('switchBranch'), ['branch']);
   t.deepEqual(propsOf('log'), ['options']);
   t.deepEqual(propsOf('diff'), ['options']);
-});
-
-test('makeGitHistoryTool requires an explicit elevated capability', async t => {
-  const calls = [];
-  const tools = makeGitHistoryTool(makeHistoryStubGit(calls));
-  t.deepEqual(tools.map(tool => tool.name).sort(), [
-    'cherryPick',
-    'commit',
-    'rebase',
-    'reword',
-  ]);
-  const byName = name => {
-    const found = tools.find(tool => tool.name === name);
-    if (!found) throw new Error(`no history tool named ${name}`);
-    return found;
-  };
-
-  await byName('commit').invoke({
-    message: 'amended message',
-    options: harden({ amend: true }),
-  });
-  await byName('reword').invoke({ ref: 'HEAD~1', message: 'new subject' });
-  await byName('cherryPick').invoke({
-    ref: 'side',
-    options: harden({ noCommit: true }),
-  });
-  await byName('rebase').invoke({
-    input: harden({ mode: 'start', upstream: 'main', autosquash: true }),
-  });
-  await t.throwsAsync(
-    byName('rebase').invoke({ input: harden({ mode: 'abort' }) }),
-    { message: /rebase input.*missing properties.*upstream/ },
-  );
-  t.deepEqual(calls, [
-    ['commit', 'amended message', { amend: true }],
-    ['reword', 'HEAD~1', 'new subject'],
-    ['cherryPick', 'side', { noCommit: true }],
-    ['rebase', { mode: 'start', upstream: 'main', autosquash: true }],
-  ]);
 });
 
 test('invoke resolves named args by their real property names', async t => {

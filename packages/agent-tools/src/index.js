@@ -1,7 +1,7 @@
 // @ts-check
 
 export { makeTool } from './tool.js';
-export { makeGitHistoryTool, makeGitTool } from './json-tools/git.js';
+export { makeGitTool } from './json-tools/git.js';
 export { makeGitMountTools } from './json-tools/git-mount.js';
 export {
   makeMountReadTool,
