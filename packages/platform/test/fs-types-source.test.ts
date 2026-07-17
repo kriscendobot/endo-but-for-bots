@@ -21,6 +21,30 @@ import type {
 import type { Reader } from '@endo/stream';
 
 import type {
+  DirEntry as PackageBackendDirEntry,
+  FsBackend as PackageBackendFsBackend,
+  NodeKind as PackageBackendNodeKind,
+  WatchEvent as PackageBackendWatchEvent,
+} from '@endo/platform/fs/extended/backend-types';
+import type {
+  DirEntry as PackageJsBackendDirEntry,
+  FsBackend as PackageJsBackendFsBackend,
+  NodeKind as PackageJsBackendNodeKind,
+  WatchEvent as PackageJsBackendWatchEvent,
+} from '@endo/platform/fs/extended/backend-types.js';
+import type {
+  DirEntry as PackageExtendedDirEntry,
+  FsBackend as PackageExtendedFsBackend,
+  NodeKind as PackageExtendedNodeKind,
+  WatchEvent as PackageExtendedWatchEvent,
+} from '@endo/platform/fs/extended';
+import type {
+  DirEntry as PackageJsExtendedDirEntry,
+  FsBackend as PackageJsExtendedFsBackend,
+  NodeKind as PackageJsExtendedNodeKind,
+  WatchEvent as PackageJsExtendedWatchEvent,
+} from '@endo/platform/fs/extended/types-index.js';
+import type {
   ContentStore as SourceContentStore,
   ContentStoreBlob as SourceContentStoreBlob,
   ReadableBlob as SourceReadableBlob,
@@ -31,6 +55,12 @@ import type {
   Search as SourceSearch,
   SearchFilePowers as SourceSearchFilePowers,
 } from '../src/fs/search.types.js';
+import type {
+  DirEntry as SourceBackendDirEntry,
+  FsBackend as SourceBackendFsBackend,
+  NodeKind as SourceBackendNodeKind,
+  WatchEvent as SourceBackendWatchEvent,
+} from '../src/fs/extended/backend-types.js';
 
 type Equal<Left, Right> =
   (<T>() => T extends Left ? 1 : 2) extends <T>() => T extends Right ? 1 : 2
@@ -124,4 +154,53 @@ type _PackageSearchPowersMatchSource = Assert<
 >;
 type _PackageJsSearchPowersMatchSource = Assert<
   Equal<PackageJsSearchFilePowers, SourceSearchFilePowers>
+>;
+
+type _PackageBackendDirEntryMatchesSource = Assert<
+  Equal<PackageBackendDirEntry, SourceBackendDirEntry>
+>;
+type _PackageJsBackendDirEntryMatchesSource = Assert<
+  Equal<PackageJsBackendDirEntry, SourceBackendDirEntry>
+>;
+type _PackageBackendFsBackendMatchesSource = Assert<
+  Equal<PackageBackendFsBackend, SourceBackendFsBackend>
+>;
+type _PackageJsBackendFsBackendMatchesSource = Assert<
+  Equal<PackageJsBackendFsBackend, SourceBackendFsBackend>
+>;
+type _PackageBackendNodeKindMatchesSource = Assert<
+  Equal<PackageBackendNodeKind, SourceBackendNodeKind>
+>;
+type _PackageJsBackendNodeKindMatchesSource = Assert<
+  Equal<PackageJsBackendNodeKind, SourceBackendNodeKind>
+>;
+type _PackageBackendWatchEventMatchesSource = Assert<
+  Equal<PackageBackendWatchEvent, SourceBackendWatchEvent>
+>;
+type _PackageJsBackendWatchEventMatchesSource = Assert<
+  Equal<PackageJsBackendWatchEvent, SourceBackendWatchEvent>
+>;
+type _PackageExtendedDirEntryMatchesSource = Assert<
+  Equal<PackageExtendedDirEntry, SourceBackendDirEntry>
+>;
+type _PackageJsExtendedDirEntryMatchesSource = Assert<
+  Equal<PackageJsExtendedDirEntry, SourceBackendDirEntry>
+>;
+type _PackageExtendedFsBackendMatchesSource = Assert<
+  Equal<PackageExtendedFsBackend, SourceBackendFsBackend>
+>;
+type _PackageJsExtendedFsBackendMatchesSource = Assert<
+  Equal<PackageJsExtendedFsBackend, SourceBackendFsBackend>
+>;
+type _PackageExtendedNodeKindMatchesSource = Assert<
+  Equal<PackageExtendedNodeKind, SourceBackendNodeKind>
+>;
+type _PackageJsExtendedNodeKindMatchesSource = Assert<
+  Equal<PackageJsExtendedNodeKind, SourceBackendNodeKind>
+>;
+type _PackageExtendedWatchEventMatchesSource = Assert<
+  Equal<PackageExtendedWatchEvent, SourceBackendWatchEvent>
+>;
+type _PackageJsExtendedWatchEventMatchesSource = Assert<
+  Equal<PackageJsExtendedWatchEvent, SourceBackendWatchEvent>
 >;
