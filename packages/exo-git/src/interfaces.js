@@ -70,6 +70,8 @@ const GitCommitOptionsShape = M.splitRecord(
   harden({}),
 );
 
+const GitConflictSideShape = M.or(M.eq('ours'), M.eq('theirs'));
+
 const GitCherryPickOptionsShape = M.splitRecord(
   {},
   { noCommit: M.boolean() },
@@ -115,6 +117,10 @@ export const GitInterface = M.interface('Git', {
   restore: M.callWhen(M.arrayOf(M.remotable()))
     .optional(M.recordOf(M.string(), M.any()))
     .returns(M.undefined()),
+  checkoutConflict: M.callWhen(
+    M.arrayOf(M.remotable()),
+    GitConflictSideShape,
+  ).returns(M.undefined()),
   commit: M.callWhen(M.string())
     .optional(GitCommitOptionsShape)
     .returns(GitCommitShape),

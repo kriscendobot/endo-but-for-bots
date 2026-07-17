@@ -5,6 +5,7 @@ import type {
   GitCherryPickOptions,
   GitCommit,
   GitCommitOptions,
+  GitConflictSide,
   GitCreateBranchOptions,
   GitDeleteBranchOptions,
   GitDiffOptions,
@@ -165,6 +166,10 @@ type ExpectedWritableEndoGit = ExpectedReadOnlyEndoGit & {
   worktree: () => Promise<WritableGitWorktree>;
   add: (entries: PathEntry[]) => Promise<void>;
   restore: (entries: PathEntry[], options?: GitRestoreOptions) => Promise<void>;
+  checkoutConflict: (
+    entries: PathEntry[],
+    side: GitConflictSide,
+  ) => Promise<void>;
   commit: (message: string, options?: GitCommitOptions) => Promise<GitCommit>;
   reword: (ref: GitRef | string, message: string) => Promise<GitCommit>;
   cherryPick: (
@@ -222,6 +227,7 @@ type _WritableWorktreeIssuesEntries = Assert<
 type Mutator =
   | 'add'
   | 'restore'
+  | 'checkoutConflict'
   | 'commit'
   | 'reword'
   | 'createBranch'
