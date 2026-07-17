@@ -34,6 +34,23 @@ const ajv = new Ajv({ strict: false });
  * @param {string} method
  */
 const guardShapeFor = method => {
+  if (method === 'rebase') {
+    return {
+      requiredCount: 1,
+      guards: harden([
+        M.splitRecord(
+          {
+            mode: 'start',
+            upstream: M.string(),
+          },
+          {
+            autosquash: M.boolean(),
+          },
+          {},
+        ),
+      ]),
+    };
+  }
   const { methodGuards } = getInterfaceGuardPayload(
     /** @type {InterfaceGuard} */ (GitInterface),
   );

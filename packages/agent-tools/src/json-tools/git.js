@@ -104,6 +104,16 @@ const REBASE_START_INPUT_PROP = harden({
   additionalProperties: false,
 });
 
+const REBASE_START_INPUT_SHAPE = M.splitRecord(
+  {
+    mode: 'start',
+    upstream: M.string(),
+  },
+  {
+    autosquash: M.boolean(),
+  },
+  harden({}),
+);
 /**
  * This package intentionally exposes only a curated JSON-safe writable Git slice
  * for now. Methods that remotely accept capabilities or can return
@@ -161,6 +171,29 @@ const gitToolSchemas = harden({
         message: { type: 'string', description: 'The replacement message.' },
       },
       required: ['ref', 'message'],
+      additionalProperties: false,
+    },
+  },
+  cherryPick: {
+    description: 'Replay an existing commit onto the current branch.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: REF_PROP,
+        options: CHERRY_PICK_OPTIONS_PROP,
+      },
+      required: ['ref'],
+      additionalProperties: false,
+    },
+  },
+  rebase: {
+    description: 'Replay the current branch onto an upstream ref.',
+    parameters: {
+      type: 'object',
+      properties: {
+        input: REBASE_START_INPUT_PROP,
+      },
+      required: ['input'],
       additionalProperties: false,
     },
   },
@@ -259,6 +292,13 @@ const gitHistoryToolMethods = harden(
 );
 
 /**
+ * @type {Partial<Record<keyof GitToolCapability, Pattern[]>>}
+ */
+const gitToolArgGuards = harden({
+  rebase: harden([REBASE_START_INPUT_SHAPE]),
+});
+
+/**
  * Positional arg guards for a method, required first and then optional.
  * `getMethodGuardPayload` unwraps the `M.callWhen` await-arg wrappers.
  *
@@ -337,7 +377,7 @@ const makeGitTools = (gitCap, methods, schemas, argGuardsByMethod = {}) => {
  * @returns {ToolRecord[]}
  */
 export const makeGitTool = gitCap =>
-  makeGitTools(gitCap, gitToolMethods, gitToolSchemas);
+  makeGitTools(gitCap, gitToolMethods, gitToolSchemas, gitToolArgGuards);
 harden(makeGitTool);
 
 /**

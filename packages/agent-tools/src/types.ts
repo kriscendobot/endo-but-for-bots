@@ -9,18 +9,12 @@ import type { Pattern } from '@endo/patterns';
  * The read, branch-navigation, and additive-commit slice of `WritableEndoGit` that
  * the default git tool catalog exposes to an LLM.
  *
- * Deliberately omits the destructive and history-rewriting methods of
- * `WritableEndoGit`
- * — `merge`, `restore`, `deleteBranch`, `renameBranch`, the `stash*`
- * family, the working-tree/detach mutators (`switch`, `detach`), and history
- * rewrites (`commit` with `amend`, `reword`, `cherryPick`, `rebase`).
- * Those carry authority a tool
- * surface handed to a model should not advertise: they can discard uncommitted
- * work or rewrite shared history. `commit` is included only through the default
- * maker's message-only schema, so it creates a new commit.
- * Widening this `Pick`
- * is a deliberate authority decision, not a convenience — add a method only
- * when the tool surface is meant to grant it.
+ * Deliberately omits destructive worktree operations such as `merge`,
+ * `restore`, branch deletion/renaming, the `stash*` family, and the
+ * working-tree/detach mutators (`switch`, `detach`). `commit`, `reword`,
+ * `cherryPick`, and the `mode: "start"` case of `rebase` are included as the
+ * narrow JSON-safe write and history surface this tool intentionally grants.
+ * Widening this `Pick` is a deliberate authority decision, not a convenience.
  *
  * This slice holds only the JSON-transparent methods whose hand-authored tool
  * schemas map one-to-one onto their `GitInterface` guards (the divergence gate
@@ -37,6 +31,8 @@ export type GitToolCapability = Pick<
   | 'show'
   | 'commit'
   | 'reword'
+  | 'cherryPick'
+  | 'rebase'
   | 'branches'
   | 'createBranch'
   | 'switchBranch'
@@ -44,9 +40,9 @@ export type GitToolCapability = Pick<
 >;
 
 /**
- * Explicitly elevated history-rewrite slice for `makeGitHistoryTool`.
- * Hosts must opt into constructing these tools; the default `makeGitTool`
- * inventory does not advertise these operations.
+ * Explicit history-rewrite slice accepted by `makeGitHistoryTool`.
+ * Hosts may use this maker when they want the history surface to be explicit
+ * in the capability type they pass to the tool constructor.
  */
 export type GitHistoryToolCapability = Pick<
   WritableEndoGit,
