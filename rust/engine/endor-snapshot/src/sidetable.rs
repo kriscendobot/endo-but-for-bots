@@ -144,6 +144,9 @@ pub enum SideTable {
     PromiseGuards,
     /// `promise_jobs` — the pending microtask (reaction-job) queue.
     PromiseJobs,
+    /// `combinators` — the shared `Promise.all`/`allSettled`/`race`/`any`
+    /// element-accumulation state a `ReactionKind::Combine` reaction indexes.
+    Combinators,
     /// `generators` — per-instance suspended activation + lifecycle state.
     Generators,
     /// `gen_run_stack` — generators currently mid-`resume_generator`
@@ -217,6 +220,7 @@ impl SideTable {
         SideTable::PromiseFunctions,
         SideTable::PromiseGuards,
         SideTable::PromiseJobs,
+        SideTable::Combinators,
         SideTable::Generators,
         SideTable::GenRunStack,
         SideTable::AsyncInstances,
@@ -297,6 +301,7 @@ impl SideTable {
             SideTable::PromiseFunctions => ("promise_functions", Pending),
             SideTable::PromiseGuards => ("promise_guards", Pending),
             SideTable::PromiseJobs => ("promise_jobs", Pending),
+            SideTable::Combinators => ("combinators", Pending),
             SideTable::Generators => ("generators", Pending),
             SideTable::GenRunStack => ("gen_run_stack", Pending),
             SideTable::AsyncInstances => ("async_instances", Pending),
@@ -347,7 +352,7 @@ mod tests {
     fn all_is_exhaustive() {
         // Count of variants, kept beside the enum. Bump when a variant is
         // added — the assertion below then forces the ALL entry too.
-        const VARIANT_COUNT: usize = 29;
+        const VARIANT_COUNT: usize = 30;
         assert_eq!(SideTable::ALL.len(), VARIANT_COUNT);
 
         // No duplicates: each field name appears once.

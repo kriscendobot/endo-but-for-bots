@@ -1343,6 +1343,26 @@ pub const PROMISE_THENABLE_JOB_FRAME_METERING: u64 = 393216;
 /// `mxRunCount(1)` framing the success path uses, so this is near-zero.
 /// Calibrated raw-exact against the pin.
 pub const PROMISE_HANDLER_THROW_METERING: u64 = 0;
+/// The native frame residual of `fx_Promise_prototype_finally` BEYOND the
+/// derived capability ([`PROMISE_CAPABILITY_METERING`]) and the native
+/// reaction registration ([`Interp::promise_then_native`]): the frame, the
+/// `mxGetID(_then)`, and the `thenFinally`/`catchFinally` closure framing XS
+/// builds. **Advisory** under the accuracy-over-parity doctrine (endor's own
+/// frozen cost table; result agreement is the gate, computrons advisory), set
+/// in the `catch`/`then` frame family.
+pub const PROMISE_FINALLY_FRAME_METERING: u64 = 2 << 16;
+/// The native frame residual of a `Promise.all`/`allSettled`/`race`/`any`
+/// call BEYOND the derived capability ([`PROMISE_CAPABILITY_METERING`]) and
+/// the per-element work: the frame, `fxGetIterator`, and the
+/// `remainingElementsCount` cell setup. **Advisory** (see
+/// [`PROMISE_FINALLY_FRAME_METERING`]).
+pub const PROMISE_COMBINATOR_FRAME_METERING: u64 = 3 << 16;
+/// The per-element native residual of a combinator's iteration step (XS's
+/// `C.resolve(element)` species probe + the element-resolve function alloc +
+/// the `mxRunCount` `.then` re-dispatch), BEYOND the element promise's own
+/// `Promise.resolve`/reaction costs the shared helpers already charge.
+/// **Advisory** (see [`PROMISE_FINALLY_FRAME_METERING`]).
+pub const PROMISE_COMBINATOR_PER_ELEMENT_METERING: u64 = 1 << 16;
 
 /// Metadata for a user function instance created by
 /// `constructor_function`/`function`: the byte range of its body in the
@@ -2280,6 +2300,20 @@ enum ReactionKind {
     /// awaited promise: resume the suspended async instance (the payload) with
     /// the settled value (fulfilled → `NoStatus`, rejected → `Throw`).
     AsyncAwait(crate::value::SlotIndex),
+    /// A `Promise.prototype.finally` reaction (XS's `then` whose native
+    /// handlers run `onFinally` and pass the settlement through). The
+    /// reaction's `on_fulfilled` slot carries the `onFinally` function (or
+    /// `undefined` for a non-callable argument, a pure pass-through); its
+    /// `resolve`/`reject` slots are the derived promise's capability, settled
+    /// with the ORIGINAL value/reason once `onFinally` returns (a non-thenable
+    /// result is ignored — the pass-through). Drives
+    /// [`Interp::run_finally_reaction`].
+    FinallyReturn,
+    /// A `Promise.all`/`allSettled`/`race`/`any` element reaction: `(combinator
+    /// index into [`Interp::combinators`], element index)`. At the drain each
+    /// settled element updates the shared [`CombinatorState`] and, on the
+    /// completing element, settles the combinator's derived promise.
+    Combine(u32, u32),
 }
 
 /// A resolve/reject function's bound data (XS's `fxPushPromiseFunctions`
@@ -2329,6 +2363,46 @@ enum PromiseJob {
         resolve: Slot,
         reject: Slot,
     },
+}
+
+/// Which promise combinator a [`CombinatorState`] drives (XS's distinct
+/// `fx_Promise_all`/`allSettled`/`race`/`any` bodies, each with its own
+/// element-resolve closure).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CombinatorKind {
+    All,
+    AllSettled,
+    Race,
+    Any,
+}
+
+/// The shared state one `Promise.all`/`allSettled`/`race`/`any` call threads
+/// across its per-element reactions (XS's `remainingElementsCount` cell + the
+/// values/errors Array closed over by each element-resolve function). Kept in
+/// the [`Interp::combinators`] side table, indexed by the combinator's
+/// position; each element reaction ([`ReactionKind::Combine`]) carries that
+/// index plus its own element index. `remaining` counts the not-yet-settled
+/// elements (`all`/`allSettled` resolve when it reaches 0; `any` rejects when
+/// it reaches 0); `results` is the accumulator Array (values for `all`,
+/// `{status,value|reason}` records for `allSettled`, errors for `any`; unused
+/// for `race`). `done` latches the derived's first settlement so later element
+/// reactions are no-ops — endor's stand-in for the shared `[[AlreadyResolved]]`
+/// guard XS's element functions trip through the one capability.
+#[derive(Clone, Debug)]
+struct CombinatorState {
+    kind: CombinatorKind,
+    /// The derived promise the combinator returns. Settled directly through
+    /// [`Interp::settle_promise`] (guarded by `done` — endor's stand-in for the
+    /// shared `[[AlreadyResolved]]` guard XS's element functions trip), so the
+    /// capability's resolve/reject functions are built but never re-invoked.
+    derived: crate::value::SlotIndex,
+    /// Count of elements not yet settled (drives the completion latch).
+    remaining: u32,
+    /// The accumulator Array instance (values/records/errors; unused for race).
+    results: crate::value::SlotIndex,
+    /// Set once the derived promise is settled — subsequent element reactions
+    /// short-circuit (the shared-capability guard).
+    done: bool,
 }
 
 /// An iterator's state. For an **array iterator** (`kind` 0 = values, 1 =
@@ -2978,6 +3052,12 @@ pub struct Interp {
     /// the host-driven pump-loop drain the endor embedding performs (design
     /// § promises, the pump-loop latch).
     promise_jobs: std::collections::VecDeque<PromiseJob>,
+    /// The shared state of each in-flight `Promise.all`/`allSettled`/`race`/
+    /// `any` call (XS's `remainingElementsCount` cell + the values/errors
+    /// Array its element-resolve closures share). Indexed by a
+    /// [`ReactionKind::Combine`]'s combinator index; append-only within a run,
+    /// consumed as its element reactions drain. See [`CombinatorState`].
+    combinators: Vec<CombinatorState>,
     /// The program-local symbol id of `then` (XS's `mxID(_then)`), resolved
     /// at [`Self::link_intrinsics`], so thenable adoption can probe an
     /// argument's `.then`. `None` when the program never references `then`.
@@ -3299,6 +3379,7 @@ impl Interp {
             promise_functions: std::collections::HashMap::new(),
             promise_guards: Vec::new(),
             promise_jobs: std::collections::VecDeque::new(),
+            combinators: Vec::new(),
             then_id: None,
             regexps: std::collections::HashMap::new(),
             regexp_proto: crate::value::SlotIndex::NULL,
@@ -9466,14 +9547,9 @@ impl Interp {
     /// (`run_promise_job`) dispatches on. A pending promise appends the reaction
     /// (+1 THENS-list slot); an already-settled promise queues the job now.
     fn promise_then_native(&mut self, promise: crate::value::SlotIndex, kind: ReactionKind) {
-        // `fxPromiseThen` reaction instance: 5 `fxNewSlot`s for a null-capability
-        // reaction (the reaction instance + resolve/reject/onFulfilled/onRejected
-        // slots; the `__result__` derived-promise slot the user path adds is
-        // absent).
-        for _ in 0..5 {
-            self.meter.tick_slot_alloc();
-        }
-        self.meter.tick_raw(PROMISE_REACTION_METERING);
+        // A handler-less null-capability reaction carrying only its `kind`
+        // (the drain drives the native behavior). Shares the 5-slot
+        // registration with `finally`/the combinators.
         let reaction = PromiseReaction {
             on_fulfilled: Slot::undefined(),
             on_rejected: Slot::undefined(),
@@ -9481,25 +9557,7 @@ impl Interp {
             reject: Slot::undefined(),
             kind,
         };
-        // A native reaction (`await`, `finally`, the combinators) observes the
-        // promise too — mark it handled for the unhandled-rejection latch.
-        self.promises.get_mut(&promise).unwrap().ever_handled = true;
-        let state = self.promises[&promise].state;
-        match state {
-            PromiseState::Pending => {
-                self.meter.tick_slot_alloc();
-                self.promises.get_mut(&promise).unwrap().reactions.push(reaction);
-            }
-            PromiseState::Fulfilled | PromiseState::Rejected => {
-                let value = self.promises[&promise].result;
-                let rejected = state == PromiseState::Rejected;
-                self.queue_promise_job(PromiseJob::Reaction {
-                    reaction,
-                    value,
-                    rejected,
-                });
-            }
-        }
+        self.register_native_reaction(promise, reaction);
     }
 
     /// A promise resolve/reject function call (XS's `fxResolvePromise`/
@@ -9742,6 +9800,19 @@ impl Interp {
             };
             return self.step_async(code, inst, status, value, false);
         }
+        // The `finally` native reaction: run `onFinally` and pass the
+        // settlement through (the `fxOnResolvedPromise`/`fxOnRejectedPromise`
+        // trampoline frame).
+        if reaction.kind == ReactionKind::FinallyReturn {
+            self.meter.tick_raw(PROMISE_JOB_FRAME_METERING);
+            return self.run_finally_reaction(code, reaction, value, rejected);
+        }
+        // A combinator element reaction: fold this element's settlement into
+        // the shared `Promise.all`/`allSettled`/`race`/`any` state.
+        if let ReactionKind::Combine(ci, ei) = reaction.kind {
+            self.meter.tick_raw(PROMISE_JOB_FRAME_METERING);
+            return self.run_combine_reaction(ci as usize, ei as usize, value, rejected);
+        }
         let handler = if rejected {
             reaction.on_rejected
         } else {
@@ -9820,6 +9891,378 @@ impl Interp {
             Err(Halt::Throw(_)) => Err(Halt::Unsupported("promise:thenable-then-throw")),
             Err(h) => Err(h),
         }
+    }
+
+    /// Register a fully-built native reaction on `promise` (the shared core of
+    /// [`Self::promise_then_native`] and the `finally`/combinator paths): a
+    /// null-capability reaction (5 `fxNewSlot`s, no derived `__result__` slot)
+    /// whose `kind` the drain dispatches on. A pending promise appends it (+1
+    /// THENS-list slot); an already-settled promise queues the job now. Marks
+    /// the promise handled for the unhandled-rejection latch.
+    fn register_native_reaction(&mut self, promise: crate::value::SlotIndex, reaction: PromiseReaction) {
+        for _ in 0..5 {
+            self.meter.tick_slot_alloc();
+        }
+        self.meter.tick_raw(PROMISE_REACTION_METERING);
+        self.promises.get_mut(&promise).unwrap().ever_handled = true;
+        let state = self.promises[&promise].state;
+        match state {
+            PromiseState::Pending => {
+                self.meter.tick_slot_alloc();
+                self.promises.get_mut(&promise).unwrap().reactions.push(reaction);
+            }
+            PromiseState::Fulfilled | PromiseState::Rejected => {
+                let value = self.promises[&promise].result;
+                let rejected = state == PromiseState::Rejected;
+                self.queue_promise_job(PromiseJob::Reaction {
+                    reaction,
+                    value,
+                    rejected,
+                });
+            }
+        }
+    }
+
+    /// `Promise.resolve(v)` reduced to the promise instance it yields (XS's
+    /// `fx_Promise_resolve` used internally by the combinators for each
+    /// element): a native promise is returned as-is (the identity fast path); a
+    /// non-promise value builds a fresh capability and settles it (adopting a
+    /// user thenable through the queued keystone job). Shares
+    /// [`PROMISE_RESOLVE_SAME_METERING`]/[`PROMISE_RESOLVE_STATIC_METERING`]
+    /// with the `Promise.resolve` static.
+    fn promise_resolve_to_instance(&mut self, v: Slot) -> Result<crate::value::SlotIndex, Halt> {
+        if let Payload::Reference(r) = v.value {
+            if self.promises.contains_key(&r) {
+                self.meter.tick_raw(PROMISE_RESOLVE_SAME_METERING);
+                return Ok(r);
+            }
+        }
+        self.meter.tick_raw(PROMISE_RESOLVE_STATIC_METERING);
+        let (derived, _resolve, _reject) = self.new_promise_capability();
+        self.settle_promise(derived, v, false)?;
+        Ok(derived)
+    }
+
+    /// `Promise.prototype.finally(onFinally)` (`fx_Promise_prototype_finally`):
+    /// register a native FINALLY reaction carrying `onFinally` (in the
+    /// reaction's `on_fulfilled` slot) plus the derived promise's capability,
+    /// and return the derived promise. The reaction runs `onFinally` at the
+    /// drain and passes the original settlement through
+    /// ([`Self::run_finally_reaction`]).
+    fn promise_finally(
+        &mut self,
+        promise: crate::value::SlotIndex,
+        on_finally: Slot,
+    ) -> Result<Slot, Halt> {
+        self.meter.tick_raw(PROMISE_FINALLY_FRAME_METERING);
+        let (derived, resolve, reject) = self.new_promise_capability();
+        let reaction = PromiseReaction {
+            on_fulfilled: on_finally,
+            on_rejected: Slot::undefined(),
+            resolve,
+            reject,
+            kind: ReactionKind::FinallyReturn,
+        };
+        self.register_native_reaction(promise, reaction);
+        Ok(Slot::of(Kind::Reference, Payload::Reference(derived)))
+    }
+
+    /// The drain behavior of a `Promise.prototype.finally` reaction: recover the
+    /// derived promise, run `onFinally()` (a user function, no args) when
+    /// callable, then settle the derived with the ORIGINAL `(value, rejected)`
+    /// pass-through. A non-callable `onFinally` is a pure pass-through
+    /// (`this.then(x, x)`). `onFinally` returning a thenable (whose settlement
+    /// the derived would await) and `onFinally` throwing (the re-entrant
+    /// unwind the reaction-handler path already defers) both self-name.
+    fn run_finally_reaction(
+        &mut self,
+        code: &[u8],
+        reaction: PromiseReaction,
+        value: Slot,
+        rejected: bool,
+    ) -> Result<(), Halt> {
+        let derived = match reaction.resolve.value {
+            Payload::Reference(rf) => match self.promise_functions.get(&rf) {
+                Some(d) => d.promise,
+                None => return Err(Halt::Unsupported("promise:finally-bad-capability")),
+            },
+            _ => return Err(Halt::Unsupported("promise:finally-bad-capability")),
+        };
+        let on_finally = reaction.on_fulfilled;
+        if self.is_callable_value(on_finally) {
+            if !self.is_user_function_value(on_finally) {
+                return Err(Halt::Unsupported("finally:native-onfinally"));
+            }
+            match self.run_callback(code, on_finally, Slot::undefined(), &[]) {
+                Ok(r) => {
+                    // A thenable return would sequence the derived's settlement
+                    // behind it (XS's `thenFinally`/`catchFinally`); not modeled.
+                    if let Payload::Reference(ro) = r.value {
+                        if r.kind == Kind::Reference {
+                            let has_then = self
+                                .then_id
+                                .map(|tid| self.is_callable_value(self.instance_get(ro, tid)))
+                                .unwrap_or(false);
+                            if has_then {
+                                return Err(Halt::Unsupported("finally:thenable-return"));
+                            }
+                        }
+                    }
+                    self.settle_promise(derived, value, rejected)
+                }
+                Err(Halt::Throw(_)) => Err(Halt::Unsupported("promise:handler-throw")),
+                Err(h) => Err(h),
+            }
+        } else {
+            self.settle_promise(derived, value, rejected)
+        }
+    }
+
+    /// `Promise.all`/`allSettled`/`race`/`any` (`fx_Promise_all` …): build the
+    /// derived promise and its shared [`CombinatorState`], then walk the
+    /// (dense-Array) iterable resolving each element to a promise and
+    /// registering a native COMBINE reaction on it. Returns the derived
+    /// promise. Only a dense Array iterable is modeled (mirroring
+    /// [`Self::build_aggregate_error`]); any other iterable self-names. Each
+    /// element reaction settles into the shared state at the drain
+    /// ([`Self::run_combine_reaction`]).
+    fn promise_combinator(&mut self, kind: CombinatorKind, iterable: Slot) -> Result<Slot, Halt> {
+        let elems: Vec<Slot> = match iterable.value {
+            Payload::Reference(arr) if self.arrays.contains_key(&arr) => {
+                let data = &self.arrays[&arr];
+                let len = data.length;
+                if (0..len).any(|i| !data.items.contains_key(&i)) {
+                    return Err(Halt::Unsupported("promise-combinator:sparse-iterable"));
+                }
+                (0..len).map(|i| data.items[&i]).collect()
+            }
+            _ => return Err(Halt::Unsupported("promise-combinator:non-array-iterable")),
+        };
+        self.meter.tick_raw(PROMISE_COMBINATOR_FRAME_METERING);
+        let (derived, _resolve, _reject) = self.new_promise_capability();
+        let total = elems.len() as u32;
+        // The accumulator Array: values (all), `{status,...}` records
+        // (allSettled), or errors (any). `race` ignores it. Preset dense length
+        // so the resolved array reports `total`.
+        let results = self.new_array();
+        self.arrays.get_mut(&results).unwrap().length = total;
+        let comb_idx = self.combinators.len();
+        self.combinators.push(CombinatorState {
+            kind,
+            derived,
+            remaining: total,
+            results,
+            done: false,
+        });
+        for (i, elem) in elems.into_iter().enumerate() {
+            self.meter.tick_raw(PROMISE_COMBINATOR_PER_ELEMENT_METERING);
+            let elem_promise = self.promise_resolve_to_instance(elem)?;
+            let reaction = PromiseReaction {
+                on_fulfilled: Slot::undefined(),
+                on_rejected: Slot::undefined(),
+                resolve: Slot::undefined(),
+                reject: Slot::undefined(),
+                kind: ReactionKind::Combine(comb_idx as u32, i as u32),
+            };
+            self.register_native_reaction(elem_promise, reaction);
+        }
+        // An empty iterable settles synchronously (XS's `remainingElementsCount`
+        // reaching 0 after the initial +1 with no elements to add).
+        if total == 0 {
+            self.settle_empty_combinator(comb_idx)?;
+        }
+        Ok(Slot::of(Kind::Reference, Payload::Reference(derived)))
+    }
+
+    /// Settle a combinator whose iterable was empty: `all`/`allSettled` resolve
+    /// with the empty results Array; `any` rejects with a zero-error
+    /// `AggregateError`; `race` stays pending forever (no settlement).
+    fn settle_empty_combinator(&mut self, ci: usize) -> Result<(), Halt> {
+        let kind = self.combinators[ci].kind;
+        match kind {
+            CombinatorKind::All | CombinatorKind::AllSettled => {
+                let (derived, results) =
+                    (self.combinators[ci].derived, self.combinators[ci].results);
+                self.combinators[ci].done = true;
+                self.settle_promise(derived, Slot::of(Kind::Reference, Payload::Reference(results)), false)
+            }
+            CombinatorKind::Race => Ok(()),
+            CombinatorKind::Any => {
+                let derived = self.combinators[ci].derived;
+                self.combinators[ci].done = true;
+                let agg = self.new_aggregate_error(Vec::new());
+                self.settle_promise(derived, agg, true)
+            }
+        }
+    }
+
+    /// The drain behavior of one combinator element reaction (XS's per-element
+    /// resolve/reject closures over the shared `remainingElementsCount`). A
+    /// combinator whose derived is already settled (`done`) short-circuits.
+    fn run_combine_reaction(
+        &mut self,
+        ci: usize,
+        ei: usize,
+        value: Slot,
+        rejected: bool,
+    ) -> Result<(), Halt> {
+        if self.combinators[ci].done {
+            return Ok(());
+        }
+        match self.combinators[ci].kind {
+            // `all`: reject on the first rejection; otherwise store the value
+            // and resolve with the results Array once all have fulfilled.
+            CombinatorKind::All => {
+                if rejected {
+                    let derived = self.combinators[ci].derived;
+                    self.combinators[ci].done = true;
+                    self.settle_promise(derived, value, true)
+                } else {
+                    let results = self.combinators[ci].results;
+                    self.array_set_dense(results, ei as u32, value);
+                    self.combinators[ci].remaining -= 1;
+                    if self.combinators[ci].remaining == 0 {
+                        let derived = self.combinators[ci].derived;
+                        self.combinators[ci].done = true;
+                        self.settle_promise(
+                            derived,
+                            Slot::of(Kind::Reference, Payload::Reference(results)),
+                            false,
+                        )
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+            // `allSettled`: never rejects; store a `{status, value|reason}`
+            // record per element and resolve once all have settled.
+            CombinatorKind::AllSettled => {
+                let record = self.make_settled_record(value, rejected);
+                let results = self.combinators[ci].results;
+                self.array_set_dense(results, ei as u32, record);
+                self.combinators[ci].remaining -= 1;
+                if self.combinators[ci].remaining == 0 {
+                    let derived = self.combinators[ci].derived;
+                    self.combinators[ci].done = true;
+                    self.settle_promise(
+                        derived,
+                        Slot::of(Kind::Reference, Payload::Reference(results)),
+                        false,
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            // `race`: the first element to settle (fulfill or reject) wins.
+            CombinatorKind::Race => {
+                let derived = self.combinators[ci].derived;
+                self.combinators[ci].done = true;
+                self.settle_promise(derived, value, rejected)
+            }
+            // `any`: the first fulfillment wins; store each rejection's reason
+            // and reject with an `AggregateError` once all have rejected.
+            CombinatorKind::Any => {
+                if !rejected {
+                    let derived = self.combinators[ci].derived;
+                    self.combinators[ci].done = true;
+                    self.settle_promise(derived, value, false)
+                } else {
+                    let results = self.combinators[ci].results;
+                    self.array_set_dense(results, ei as u32, value);
+                    self.combinators[ci].remaining -= 1;
+                    if self.combinators[ci].remaining == 0 {
+                        let errs: Vec<Slot> = {
+                            let data = &self.arrays[&results];
+                            (0..data.length)
+                                .map(|i| data.items.get(&i).copied().unwrap_or_else(Slot::undefined))
+                                .collect()
+                        };
+                        let agg = self.new_aggregate_error(errs);
+                        let derived = self.combinators[ci].derived;
+                        self.combinators[ci].done = true;
+                        self.settle_promise(derived, agg, true)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write `value` at dense index `i` of array `inst` (clearing the value's
+    /// property linkage first, as the array-literal/`AggregateError` builders
+    /// do), growing `length` to cover it.
+    fn array_set_dense(&mut self, inst: crate::value::SlotIndex, i: u32, value: Slot) {
+        let mut v = value;
+        v.id = 0;
+        v.next = crate::value::SlotIndex::NULL;
+        let data = self.arrays.get_mut(&inst).unwrap();
+        data.items.insert(i, v);
+        if i + 1 > data.length {
+            data.length = i + 1;
+        }
+    }
+
+    /// Build an `allSettled` result record: `{status:"fulfilled", value}` for a
+    /// fulfilled element, `{status:"rejected", reason}` for a rejected one. The
+    /// keys/`status` string resolve through the global intern table so a guest
+    /// `.status`/`.value`/`.reason` read hits the same ids.
+    fn make_settled_record(&mut self, value: Slot, rejected: bool) -> Slot {
+        let inst = self.new_object();
+        let status_text: &[u8] = if rejected { b"rejected" } else { b"fulfilled" };
+        let off = self.alloc_str_text(status_text);
+        let status = Slot::of(Kind::String, Payload::String(off));
+        self.define_descriptor_field(inst, "status", status);
+        if rejected {
+            self.define_descriptor_field(inst, "reason", value);
+        } else {
+            self.define_descriptor_field(inst, "value", value);
+        }
+        Slot::of(Kind::Reference, Payload::Reference(inst))
+    }
+
+    /// Build an `AggregateError` instance over `errors` (no message) — the
+    /// rejection reason `Promise.any` produces when every element rejects.
+    /// Shares the instance/`errors`-Array construction with
+    /// [`Self::build_aggregate_error`].
+    fn new_aggregate_error(&mut self, errors: Vec<Slot>) -> Slot {
+        self.meter.tick_builtin();
+        let inst = self.new_object();
+        self.meter.tick_raw(ERROR_CONSTRUCT_EXTRA);
+        if let Some(proto) = self
+            .intrinsics
+            .get("AggregateError")
+            .and_then(|&c| self.prototype_of(c))
+        {
+            self.slots.get_mut(inst).value = Payload::Reference(proto);
+        }
+        self.error_data.insert(
+            inst,
+            ErrorInfo {
+                name: "AggregateError",
+                message: None,
+            },
+        );
+        let n = errors.len() as u64;
+        self.meter
+            .tick_raw(AGGREGATE_ERROR_EXTRA + n * AGGREGATE_ERROR_PER_ELEMENT);
+        let arr_inst = self.slots.alloc(Slot::instance(self.array_proto));
+        let mut arr_data = ArrayData::default();
+        for (i, mut v) in errors.into_iter().enumerate() {
+            v.id = 0;
+            v.next = crate::value::SlotIndex::NULL;
+            arr_data.items.insert(i as u32, v);
+        }
+        arr_data.length = n as u32;
+        self.arrays.insert(arr_inst, arr_data);
+        if let Some(&eid) = self.symbol_ids.get("errors") {
+            self.set_own_unmetered(
+                inst,
+                eid,
+                Slot::of(Kind::Reference, Payload::Reference(arr_inst)),
+            );
+        }
+        Slot::of(Kind::Reference, Payload::Reference(inst))
     }
 
     /// Build a fresh Error instance of type `name` from a native Error
@@ -12520,13 +12963,29 @@ impl Interp {
                 self.meter.tick_raw(PROMISE_CATCH_FRAME_METERING);
                 self.promise_then_with(promise, Slot::undefined(), arg0)?
             }
-            NativeMethod::PromiseFinally
-            | NativeMethod::PromiseAll
-            | NativeMethod::PromiseRace
-            | NativeMethod::PromiseAllSettled
-            | NativeMethod::PromiseAny => {
-                return Err(Halt::Unsupported(promise_method_unsupported_name(m)))
+            // `Promise.prototype.finally(onFinally)` (`fx_Promise_prototype_
+            // finally`): register a native FINALLY reaction that runs
+            // `onFinally` and passes the settlement through, returning a fresh
+            // derived promise (no synchronous re-entry — `onFinally` runs at
+            // the drain).
+            NativeMethod::PromiseFinally => {
+                let promise = match this.value {
+                    Payload::Reference(r) if self.promises.contains_key(&r) => r,
+                    _ => return Err(Halt::Unsupported("finally:non-promise-this")),
+                };
+                self.promise_finally(promise, arg0)?
             }
+            // `Promise.all`/`allSettled`/`race`/`any` (`fx_Promise_all` …): build
+            // the derived promise, resolve each (dense-Array) element to a
+            // promise, and register a native COMBINE reaction on it; the shared
+            // `remainingElementsCount`/results state settles the derived at the
+            // drain. No synchronous user re-entry.
+            NativeMethod::PromiseAll => self.promise_combinator(CombinatorKind::All, arg0)?,
+            NativeMethod::PromiseAllSettled => {
+                self.promise_combinator(CombinatorKind::AllSettled, arg0)?
+            }
+            NativeMethod::PromiseRace => self.promise_combinator(CombinatorKind::Race, arg0)?,
+            NativeMethod::PromiseAny => self.promise_combinator(CombinatorKind::Any, arg0)?,
             // The resolve/reject functions settle in the `RUN` dispatch
             // (`call_promise_function`) and never reach here.
             NativeMethod::PromiseResolveFunction | NativeMethod::PromiseRejectFunction => {
@@ -17143,23 +17602,6 @@ fn regexp_flag_bit_for(g: RegExpGetterIds, id: u16) -> Option<u32> {
         Some(XS_REGEXP_V)
     } else {
         None
-    }
-}
-
-/// The self-naming skip label for a `Promise` method endor does not yet
-/// model (an honest `Halt::Unsupported`, never a wrong value).
-fn promise_method_unsupported_name(m: NativeMethod) -> &'static str {
-    match m {
-        NativeMethod::PromiseThen => "Promise.prototype.then",
-        NativeMethod::PromiseCatch => "Promise.prototype.catch",
-        NativeMethod::PromiseFinally => "Promise.prototype.finally",
-        NativeMethod::PromiseResolveStatic => "Promise.resolve",
-        NativeMethod::PromiseRejectStatic => "Promise.reject",
-        NativeMethod::PromiseAll => "Promise.all",
-        NativeMethod::PromiseRace => "Promise.race",
-        NativeMethod::PromiseAllSettled => "Promise.allSettled",
-        NativeMethod::PromiseAny => "Promise.any",
-        _ => "Promise.method",
     }
 }
 
