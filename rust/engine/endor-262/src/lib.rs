@@ -424,8 +424,11 @@ fn boot_gap_key(r: &DualRun) -> String {
     match &r.endor_halt {
         Halt::Unsupported(op) => format!("boot:unsupported:{op}"),
         Halt::Throw(msg) if msg.contains("undefined variable") => {
-            // The committed bundle's first statement reads `globalThis`; endor
-            // has no live global-object binding, so every bundle stops here.
+            // Historical stage-4 gap: before stage-7 child 1 the committed
+            // bundle's first statement (`globalThis`) had no live global-object
+            // binding and every bundle stopped here. That binding has since
+            // landed, so this key is retained only as the stable ledger name
+            // for that (now-closed) gap; a bundle no longer reaches it.
             "boot:no-globalThis-global-object-binding".to_string()
         }
         Halt::Throw(msg) => format!("boot:throw:{msg}"),
@@ -894,18 +897,20 @@ mod tests {
         // accept one the pin rejects. Every program either agrees with the
         // pin or aborts with a SELF-NAMED halt.
         //
-        // Verdict at this closure point: the committed bundle does **not** run
-        // identically on endor yet — its first statement reads `globalThis`,
-        // and endor has no live global-object binding, so every bundle stops
-        // there with an honest throw (`boot:no-globalThis-global-object-
-        // binding`). That is a **named, ledgered post-stage-4 engine gap**
-        // (with the downstream gaps the bundle would hit next — `Reflect`,
-        // typed-array-from-iterable, symbol-keyed `defineProperty`,
+        // Verdict at this closure point: the committed bundle still does
+        // **not** run identically on endor — but the `globalThis` binding it
+        // reads first has now LANDED (stage-7 child 1: a live global-object
+        // binding), so every bundle advances PAST that read and stops at the
+        // next real post-stage-4 engine gap: `polyfills.js` and the boot
+        // prefix at the `to_instance` surface, `host_aliases.js` at the
+        // computed-`at` property surface. Each remains a **named, ledgered
+        // engine gap** (the downstream gaps the bundle would keep hitting —
+        // `Reflect`, typed-array-from-iterable, symbol-keyed `defineProperty`,
         // class-instance construction — enumerated in the README stage-4
         // evidence block and reported to s10), NOT a divergence: endor never
         // lies about the boot bundle, it honestly declines it. This test is
         // the regression guard on that safety property AND the ledger anchor
-        // that flips when the `globalThis` binding lands.
+        // that advances as each successive gap lands.
         let bundles = daemon_boot_bundle_sources();
         assert!(!bundles.is_empty(), "boot-bundle sources must be present");
         let mut divergences = Vec::new();
@@ -937,16 +942,31 @@ mod tests {
             divergences.is_empty(),
             "boot-bundle divergence(s) forbidden by the accuracy-over-parity doctrine: {divergences:?}"
         );
-        // (2) The ledger anchor: while the `globalThis` global-object binding
-        // is unimplemented, every committed bundle stops at exactly that named
-        // gap. When that binding lands, this assertion flips and the ledger
-        // (README stage-4 evidence block) must be updated to the next gap.
+        // (2) The ledger anchor, ADVANCED (stage-7 child 1): the `globalThis`
+        // global-object binding now LANDS, so no committed bundle stops at that
+        // gap any more — each advances past its first `globalThis` read to the
+        // next real post-stage-4 engine gap. Those gaps stay honest, self-named
+        // `Halt::Unsupported` aborts (never divergences, per assertion (1)):
+        // `polyfills.js` and the boot prefix reach the `to_instance` surface,
+        // `host_aliases.js` the computed-`at` property surface. They are the
+        // NEXT ledgered gaps (stage-7's following children); when one lands,
+        // this assertion advances again.
         assert_eq!(
-            gaps.get("boot:no-globalThis-global-object-binding")
-                .copied(),
-            Some(bundles.len()),
-            "expected every committed boot bundle to stop at the ledgered `globalThis` \
-             global-object-binding gap; got {gaps:?} (if a gap closed, advance the ledger)"
+            gaps.get("boot:no-globalThis-global-object-binding").copied(),
+            None,
+            "the `globalThis` global-object binding landed (stage-7 child 1); no committed \
+             bundle should still stop at that gap, but got {gaps:?}"
+        );
+        let expected_gaps: std::collections::BTreeMap<String, usize> = [
+            ("boot:unsupported:at".to_string(), 1usize),
+            ("boot:unsupported:to_instance".to_string(), 2usize),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            gaps, expected_gaps,
+            "expected the committed boot bundles to stop at the advanced stage-7 gaps \
+             (2× to_instance, 1× at); got {gaps:?} (if a gap closed, advance the ledger)"
         );
     }
 

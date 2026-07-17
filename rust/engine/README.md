@@ -935,28 +935,36 @@ committed** — it is a ~1 MB build artifact the daemon bundler (`rollup` over
 bundling the full SES distribution is out of this engine workspace's scope. The
 bar (`endor-262::tests::stage4_daemon_boot_bundle_never_diverges_and_names_its_gaps`,
 locked in `cargo test`) dual-runs the **actual committed bytes** the daemon boots
-against the pin. **Verdict: the committed boot bundle does not run identically on
-endor yet** — its first statement reads `globalThis`, and endor has **no live
-global-object binding**, so every bundle honestly aborts there
-(`boot:no-globalThis-global-object-binding`) rather than diverging. Result
-agreement is the bar and endor **never lies** about the bundle (zero divergence —
-no wrong value, no over-acceptance); it declines it with a self-named halt. This
-is a **named, ledgered post-stage-4 engine gap**, not a fold to be hidden. The
-downstream engine gaps the bundle would hit *after* a `globalThis` binding lands
-(observed by dual-running each polyfill sub-behavior against the pin) are the
-rest of the ledger:
+against the pin. **Verdict: the committed boot bundle still does not run
+identically on endor yet, but the `globalThis` binding it reads first has now
+landed** (stage-7 child 1: a live global-object binding — `globalThis` resolves
+to the real global object, its properties are the same state `var`/sloppy-global
+declarations and identifier resolution see, and the intrinsics are reachable as
+its properties). So every bundle now advances **past** its opening
+`globalThis` read and stops at the *next* real engine gap: `polyfills.js` and the
+boot prefix at the `to_instance` surface (`boot:unsupported:to_instance`),
+`host_aliases.js` at the computed-`at` property surface
+(`boot:unsupported:at`). Result agreement is the bar and endor **never lies**
+about the bundle (zero divergence — no wrong value, no over-acceptance); it
+declines it with a self-named halt. These remain **named, ledgered post-stage-4
+engine gaps**, not folds to be hidden. The ledger (the `globalThis` row now
+struck through as landed; the current stopping points and the further-out gaps
+each bundle would hit as they land, observed by dual-running each polyfill
+sub-behavior against the pin):
 
 | Ledgered boot-bundle gap | Blocking construct in the bundle |
 |---|---|
-| `boot:no-globalThis-global-object-binding` | `typeof globalThis.TextEncoder` (first statement; blocks all three bundles today) |
+| ~~`boot:no-globalThis-global-object-binding`~~ | **LANDED** (stage-7 child 1): `globalThis` is now a live global-object binding; no bundle stops here |
+| `boot:unsupported:to_instance` | the `to_instance` (primitive-`this` boxing / member-on-primitive) opcode surface — where `polyfills.js` and the boot prefix now stop |
+| `boot:unsupported:at` | the computed-`at` property opcode surface — where `host_aliases.js` now stops |
 | `boot:Reflect-intrinsic` | `Reflect.ownKeys(descs)` in the harden deep-freeze |
 | `boot:typed-array-from-iterable` | `new Uint8Array([...])` (the from-array form; the length form works) |
 | `boot:defineProperty-symbol-key` | `Object.defineProperty(Object, Symbol.for('harden'), …)` |
 | `boot:class-instance-construction` | `new TextEncoder()` (class-body method dispatch on a constructed instance) |
 | `boot:ses-lockdown-bundle` | `ses_boot.js` — the uncommitted ~1 MB SES bundle (bundler out of scope) |
 
-The bar flips to green (and the ledger advances to the next row) the moment the
-`globalThis` binding lands. No committed bundle was silently narrowed to make the
+The bar flips to green (and the ledger advances to the next row) as each
+successive gap lands. No committed bundle was silently narrowed to make the
 bar pass.
 
 **SES conformance (`ses-xs-parity`) tally.** The repo's `ses-xs-parity` feature

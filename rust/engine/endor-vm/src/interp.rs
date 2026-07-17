@@ -4172,6 +4172,26 @@ impl Interp {
                 // properties holding the value, so a reference reads it with
                 // no built-in step (pure dispatch, bit-exact against the pin).
                 self.create_global_property(id, (v.kind, v.value));
+            } else if name == "globalThis" {
+                // The realm's live `globalThis`: an own global property whose
+                // value **references the global object itself** (XS's
+                // `mxGlobal`, a non-configurable realm global present before
+                // the guest runs, so unmetered). Because it is an ordinary
+                // global property over `global_obj`, three things follow for
+                // free: identifier `globalThis` resolves through the same
+                // `global_props` fast index every other global uses; a
+                // property read/write on it (`globalThis.x`) walks
+                // `global_obj`'s own-property chain — the SAME slots a
+                // `var`/sloppy-global declaration materializes and plain
+                // identifier resolution sees (kept in lock-step by the
+                // `global_obj` arm of `instance_put`/`delete_own_property`);
+                // and the intrinsic bindings (`Object`, `Math`, …) are
+                // reachable as its properties, since each is itself an own
+                // property of `global_obj`. The self-reference
+                // (`globalThis.globalThis === globalThis`) is exact — the
+                // property's value slot points back at `global_obj`.
+                let g = self.global_obj;
+                self.create_global_property(id, (Kind::Reference, Payload::Reference(g)));
             }
         }
         // Install the native prototype methods whose names this program
@@ -4342,9 +4362,11 @@ impl Interp {
 
     /// Rebuild the [`Self::global_props`] id→slot fast index by walking the
     /// restored global object's own-property list. `create_global_property`
-    /// is the *only* writer of `global_props`, and it links every entry into
-    /// `global_obj`'s property chain as it inserts into the map, so the chain
-    /// and the map are one-to-one — walking the chain reconstructs the map
+    /// is the *only* writer of `global_props` (a runtime `globalThis.x = 1`
+    /// create and a `delete globalThis.x` route their fast-index mutation
+    /// through it and `global_props.remove` respectively), and every insert
+    /// links its entry into `global_obj`'s property chain, so the chain and
+    /// the map stay one-to-one — walking the chain reconstructs the map
     /// exactly. Used at restore, where the arena round-trips the chain but the
     /// map (plain side-table state, not arena-resident) must be re-derived.
     ///
@@ -15570,13 +15592,27 @@ impl Interp {
             false
         } else {
             self.tick_property_create(); // fxNewSlot + property-table growth (536)
-            let head = self.slots.get(inst).next;
-            let mut prop = value;
-            prop.id = id;
-            prop.flag = 0;
-            prop.next = head;
-            let idx = self.slots.alloc(prop);
-            self.slots.get_mut(inst).next = idx;
+            if inst == self.global_obj {
+                // A new own property of the global object — a `globalThis.x = 1`
+                // (or computed `globalThis["x"] = 1`) creating a binding — is a
+                // new *global*, which identifier resolution and every later
+                // `var`/sloppy-global op must see. Route it through
+                // `create_global_property`, the sole writer of the
+                // `global_props` fast index, so the index and the chain stay
+                // one-to-one (the invariant `rebuild_global_props` relies on).
+                // The metering is already charged above, exactly as for any
+                // other property create; `create_global_property` itself does
+                // not meter.
+                self.create_global_property(id, (value.kind, value.value));
+            } else {
+                let head = self.slots.get(inst).next;
+                let mut prop = value;
+                prop.id = id;
+                prop.flag = 0;
+                prop.next = head;
+                let idx = self.slots.alloc(prop);
+                self.slots.get_mut(inst).next = idx;
+            }
             true
         }
     }
@@ -15606,6 +15642,14 @@ impl Interp {
                 // Unlink `cur` from the chain and free its slot.
                 self.slots.get_mut(prev).next = s.next;
                 self.slots.free(cur);
+                // Keep the global-object fast index one-to-one with the chain:
+                // `delete globalThis.x` (or `delete` of a sloppy global) must
+                // drop the `global_props` entry too, else identifier resolution
+                // would keep reading the now-freed slot. Only the global object
+                // carries a fast index; every other instance has none.
+                if inst == self.global_obj {
+                    self.global_props.remove(&id);
+                }
                 return true;
             }
             prev = cur;

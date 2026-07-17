@@ -234,8 +234,9 @@ impl SideTable {
             // index that `resolve_get`/`resolve_set` consult is a HashMap, not
             // arena state, and boot leaves it empty. `restore_snapshot_state`
             // rebuilds it by walking the restored chain (`rebuild_global_props`),
-            // so a runtime-materialized global (`var x = 5` in an earlier crank)
-            // resolves after resume. Regression: `restore_side_tables.rs`
+            // so a runtime-materialized global (`var x = 5`, or a
+            // `globalThis.x = 1` create, in an earlier crank) resolves after
+            // resume. Regression: `restore_side_tables.rs`
             // (`runtime_global_survives_suspend_resume`).
             SideTable::GlobalProps => ("global_props", RebuiltAtRestore),
             // `ctor_prototype` is a HashMap-only link (a constructor's default
