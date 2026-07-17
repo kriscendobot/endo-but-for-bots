@@ -12,8 +12,10 @@ the outgoing PR diff.
 
 - Branch: detached worktree at PR head `1ed75df5973cc68226b81585df97ed5867343598`.
 - Base: `origin/llm` at `e8edeb2b232dae9a019112c70809e4b91176b3ca`.
-- Commit map: existing PR commits are `654255f86`, `63b42a8da`,
-  `35d084900`, followed by fixups `496dc3bcd` and `1ed75df59`.
+- Commit map: existing PR commits are now autosquashed as `654255f86`,
+  `5053a07ff`, and `d2bd9957f`; `8db191ba2` reconciles the default history
+  tool surface, release notes, README, canonical rebase guard, and authority
+  regression test.
 - Confirmed PR #646 is draft and its head matches the requested SHA.
 
 ## Decisions
@@ -27,10 +29,9 @@ the outgoing PR diff.
 
 ## Pending work
 
-1. Autosquash the two existing fixup commits into their targets.
-2. Implement the authority/docs/schema/test/backend fixes and add a changeset.
-3. Run focused tests, lint, type checks, docs/checklist, and pre-push gates.
-4. Commit the final removal of `STATE.md`, push, verify draft state, and request
+1. Complete conflict checkout preflight, tool errors, and model-facing text.
+2. Run focused tests, lint, type checks, docs/checklist, and pre-push gates.
+3. Commit the final removal of `STATE.md`, push, verify draft state, and request
    the next code-panel run.
 
 ## Hazards and verification
