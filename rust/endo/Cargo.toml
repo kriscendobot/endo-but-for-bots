@@ -24,8 +24,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 
 [[bin]]
-name = "endot"
-path = "src/bin/endot.rs"
+name = "endor"
+path = "src/bin/endor.rs"
 
 [[bench]]
 name = "codec"

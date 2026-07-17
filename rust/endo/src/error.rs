@@ -16,7 +16,7 @@ impl fmt::Display for EndoError {
             EndoError::Config(msg) => write!(f, "{msg}"),
             EndoError::Timeout(msg) => write!(f, "{msg}"),
             EndoError::NotRunning => {
-                write!(f, "endot is not running (start with: endot start)")
+                write!(f, "endor is not running (start with: endor start)")
             }
         }
     }

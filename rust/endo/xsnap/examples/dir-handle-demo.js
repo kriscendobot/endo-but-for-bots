@@ -1,7 +1,7 @@
 // Demo: open directory handles and filesystem operations.
 //
 // This module is loaded as a compartment-map archive and executed
-// by `endot run`.  All host functions are provided as
+// by `endor run`.  All host functions are provided as
 // Compartment endowments.
 
 /* global print, writeFileText, readFileText, readDir,

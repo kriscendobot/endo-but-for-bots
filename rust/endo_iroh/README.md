@@ -1,7 +1,7 @@
 # endo_iroh
 
 An [iroh](https://www.iroh.computer) QUIC network transport for the Rust
-`endot` daemon, wire-compatible with the Node.js `@endo/daemon` iroh transport
+`endor` daemon, wire-compatible with the Node.js `@endo/daemon` iroh transport
 so the two runtimes cross-connect.
 
 "Dial keys, not IPs": a peer is reached by its Ed25519 node id and resolved
@@ -52,7 +52,7 @@ over the Unix-socket bridge in `endo::socket`.
 | `netstring`   | Async `<len>:<data>,` framing over any `AsyncRead`/`Write`. |
 | `transport`   | Bind an endpoint, accept/dial, frame CapTP per stream.      |
 
-## Integration into `endot`
+## Integration into `endor`
 
 `endo::iroh_net` is the supervisor-side bridge, the iroh counterpart of
 `endo::socket`.
@@ -61,7 +61,7 @@ control message carrying the daemon's `NodeNumber`; the supervisor binds the
 endpoint, replies `listening-iroh` with the published address, and bridges
 each inbound peer to the manager as `connect` / `deliver` / `disconnect`
 envelopes — identical to the Unix-socket bridge.
-This lets a Node.js Endo daemon dial a Rust `endot` (and, with the
+This lets a Node.js Endo daemon dial a Rust `endor` (and, with the
 manager-side proxy network that drives these control messages, vice versa).
 
 ## The `endo-iroh` harness

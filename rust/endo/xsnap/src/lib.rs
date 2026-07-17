@@ -296,7 +296,7 @@ impl Machine {
     ///
     /// Drains promise jobs, fires due timers, and repeats until both
     /// the promise queue and timer list are empty.  This gives
-    /// standalone `endot run` proper run-until-idle semantics:
+    /// standalone `endor run` proper run-until-idle semantics:
     /// programs with no async work exit immediately, programs with
     /// promises drain to completion, and programs with setTimeout run
     /// until all timers fire.
@@ -885,7 +885,7 @@ pub const MANAGER_BOOTSTRAP: &str = include_str!("daemon_bootstrap.js");
 // XS process entry points
 //
 // These functions contain the full bootstrap/dispatch logic that used
-// to live in the `endo-rust-xs` binary. The unified `endot` binary
+// to live in the `endo-rust-xs` binary. The unified `endor` binary
 // in the `endo` crate calls into these from its subcommand dispatch.
 // --------------------------------------------------------------------
 
@@ -1426,7 +1426,7 @@ pub enum XsProgram<'a> {
 /// |---|---|---|
 /// | `Bundle` | `Some` | Supervised XS peer (workers, manager).   |
 /// | `Archive` | `Some` | Supervised archive (future: in-process). |
-/// | `Archive` | `None`  | Standalone run-to-idle (`endot run`).    |
+/// | `Archive` | `None`  | Standalone run-to-idle (`endor run`).    |
 /// | `Bundle`  | `None`  | Run-to-idle for an embedded bundle.     |
 ///
 /// Supervised modes run the main loop dispatching envelopes into
@@ -1762,7 +1762,7 @@ pub fn run_xs_program(
 /// 3/4 and the worker bundle runs a single CapTP session on the
 /// parent daemon handle.
 ///
-/// Used by `endot worker`.
+/// Used by `endor worker`.
 ///
 /// # Safety
 ///
@@ -1773,7 +1773,7 @@ pub unsafe fn run_xs_worker() -> Result<(), XsnapError> {
     run_xs_program(
         XsProgram::Bundle(WORKER_BOOTSTRAP),
         &WORKER_CREATION,
-        "endot[worker]",
+        "endor[worker]",
         Some(Box::new(t)),
     )
 }
@@ -1789,7 +1789,7 @@ pub fn run_xs_manager_inproc(
     run_xs_program(
         XsProgram::Bundle(MANAGER_BOOTSTRAP),
         &MANAGER_CREATION,
-        "endot[manager]",
+        "endor[manager]",
         Some(transport),
     )
 }
@@ -1807,7 +1807,7 @@ pub fn run_xs_worker_inproc(
     run_xs_program(
         XsProgram::Bundle(WORKER_BOOTSTRAP),
         &WORKER_CREATION,
-        "endot[worker]",
+        "endor[worker]",
         Some(transport),
     )
 }
@@ -1816,15 +1816,15 @@ pub fn run_xs_worker_inproc(
 /// import its entry module, drain promise jobs and timers, and
 /// return.
 ///
-/// Used by `endot run`.
+/// Used by `endor run`.
 pub fn run_xs_archive(archive_path: &std::path::Path) -> Result<(), XsnapError> {
-    eprintln!("endot[run]: {}", archive_path.display());
+    eprintln!("endor[run]: {}", archive_path.display());
     let bytes = std::fs::read(archive_path)
         .map_err(|e| XsnapError::Io(format!("cannot open {}: {e}", archive_path.display())))?;
     run_xs_program(
         XsProgram::Archive(&bytes),
         &WORKER_CREATION,
-        "endot[run]",
+        "endor[run]",
         None,
     )
 }
@@ -1833,10 +1833,10 @@ pub fn run_xs_archive(archive_path: &std::path::Path) -> Result<(), XsnapError> 
 ///
 /// Same as `run_xs_archive` but skips the ZIP parsing step.
 pub fn run_xs_archive_loaded(loaded: &archive::LoadedArchive) -> Result<(), XsnapError> {
-    eprintln!("endot[run]: from pre-loaded archive");
+    eprintln!("endor[run]: from pre-loaded archive");
     ensure_shared_cluster();
 
-    let machine = Machine::new(&WORKER_CREATION, "endot[run]")
+    let machine = Machine::new(&WORKER_CREATION, "endor[run]")
         .ok_or_else(|| XsnapError::MachineInit("failed to create XS machine".to_string()))?;
 
     machine.register_worker_io();

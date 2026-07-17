@@ -308,7 +308,7 @@ pub fn start_routing(
 fn route_message(sup: &Arc<Supervisor>, msg: Message, callbacks: &RoutingCallbacks) {
     if is_debug() {
         eprintln!(
-            "endot: route from={} to={} verb={} nonce={}",
+            "endor: route from={} to={} verb={} nonce={}",
             msg.from, msg.to, msg.envelope.verb, msg.envelope.nonce
         );
     }
@@ -322,7 +322,7 @@ fn route_message(sup: &Arc<Supervisor>, msg: Message, callbacks: &RoutingCallbac
         if let Some(suspended) = sup.take_suspended(msg.to) {
             if is_debug() {
                 eprintln!(
-                    "endot: resuming suspended worker {} (sha256={})",
+                    "endor: resuming suspended worker {} (sha256={})",
                     msg.to, suspended.sha256
                 );
             }
@@ -341,7 +341,7 @@ fn route_message(sup: &Arc<Supervisor>, msg: Message, callbacks: &RoutingCallbac
                 if !sup.can_block(msg.from, msg.to) {
                     if is_debug() {
                         eprintln!(
-                            "endot: sync call denied: {} -> {}",
+                            "endor: sync call denied: {} -> {}",
                             msg.from, msg.to
                         );
                     }
@@ -357,7 +357,7 @@ fn route_message(sup: &Arc<Supervisor>, msg: Message, callbacks: &RoutingCallbac
     if let Some(inbox) = inboxes.get(&msg.to) {
         inbox.deliver(msg);
     } else if is_debug() {
-        eprintln!("endot: no inbox for handle {}", msg.to);
+        eprintln!("endor: no inbox for handle {}", msg.to);
     }
 }
 

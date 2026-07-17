@@ -10,7 +10,7 @@
 //! The wire is identical to the Node.js `@endo/daemon` iroh transport
 //! (ALPN `endo/captp/0`, the `iroh+captp0://` address scheme, the
 //! NodeNumber-derived identity, and one netstring-framed bidi stream per
-//! connection), so a Rust `endot` and a Node.js daemon cross-connect. All of
+//! connection), so a Rust `endor` and a Node.js daemon cross-connect. All of
 //! the iroh-specific machinery lives in the `endo_iroh` crate, which is built
 //! and tested independently of the XS engine.
 //!
@@ -85,7 +85,7 @@ pub fn start_iroh_listener(
 
         let address = transport.address(publish_private);
         eprintln!(
-            "endot: iroh listener started, node {} at {address}",
+            "endor: iroh listener started, node {} at {address}",
             transport.node_id(),
         );
 
@@ -114,7 +114,7 @@ pub fn start_iroh_listener(
                 Some(Err(e)) => {
                     // A single failed inbound attempt must not tear down the
                     // listener, so log and keep accepting.
-                    eprintln!("endot: iroh inbound connection error: {e}");
+                    eprintln!("endor: iroh inbound connection error: {e}");
                 }
                 Some(Ok(session)) => {
                     let conn_handle = sup.alloc_handle();
@@ -192,7 +192,7 @@ fn wire_iroh_connection(
                     return;
                 }
                 Err(e) => {
-                    eprintln!("endot: iroh peer {conn_handle} read error: {e}");
+                    eprintln!("endor: iroh peer {conn_handle} read error: {e}");
                     disconnect(&sup_read, conn_handle, daemon_handle);
                     connection.close(0, b"read error");
                     return;
@@ -210,7 +210,7 @@ fn wire_iroh_connection(
                 Some(msg) => {
                     if msg.envelope.verb == "deliver" {
                         if let Err(e) = write_netstring(&mut send, &msg.envelope.payload).await {
-                            eprintln!("endot: iroh peer {conn_handle} write error: {e}");
+                            eprintln!("endor: iroh peer {conn_handle} write error: {e}");
                             return;
                         }
                     }
@@ -219,7 +219,7 @@ fn wire_iroh_connection(
                         if msg.envelope.verb == "deliver" {
                             if let Err(e) = write_netstring(&mut send, &msg.envelope.payload).await
                             {
-                                eprintln!("endot: iroh peer {conn_handle} write error: {e}");
+                                eprintln!("endor: iroh peer {conn_handle} write error: {e}");
                                 return;
                             }
                         }
@@ -249,7 +249,7 @@ fn disconnect(sup: &Arc<Supervisor>, conn_handle: Handle, daemon_handle: Handle)
 
 /// Deliver an `error` envelope to the manager (used when binding fails).
 fn deliver_error(sup: &Arc<Supervisor>, reply_to: Handle, nonce: i64, message: String) {
-    eprintln!("endot: {message}");
+    eprintln!("endor: {message}");
     sup.deliver(Message {
         from: 0,
         to: reply_to,

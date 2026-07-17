@@ -453,7 +453,7 @@ pub unsafe extern "C" fn host_issue_command(the: *mut XsMachine) {
     let slot = (*the).frame.sub(1);
     if let Some(buf) = read_typed_array_bytes(the, slot) {
         if let Err(e) = with_transport(|t| t.send_frame(&buf)) {
-            eprintln!("endot: issueCommand error: {}", e);
+            eprintln!("endor: issueCommand error: {}", e);
         }
     }
 }
@@ -463,7 +463,7 @@ pub unsafe extern "C" fn host_send_raw_frame(the: *mut XsMachine) {
     let slot = (*the).frame.sub(1);
     if let Some(buf) = read_typed_array_bytes(the, slot) {
         if let Err(e) = with_transport(|t| t.send_raw_frame(&buf)) {
-            eprintln!("endot: sendRawFrame error: {}", e);
+            eprintln!("endor: sendRawFrame error: {}", e);
         }
     }
 }
@@ -533,7 +533,7 @@ pub unsafe extern "C" fn host_import_archive(the: *mut XsMachine) {
 /// `trace(msg: string) -> undefined`
 pub unsafe extern "C" fn host_trace(the: *mut XsMachine) {
     let msg = arg_str(the, 0);
-    eprintln!("endot: [trace] {}", msg);
+    eprintln!("endor: [trace] {}", msg);
 }
 
 /// `stdoutLine(msg: string) -> undefined`

@@ -254,7 +254,7 @@ const printResults = (variant, results) => {
 
 const main = async () => {
   const endorBin =
-    process.env.ENDO_BIN || path.resolve(dirname, '../../target/release/endot');
+    process.env.ENDO_BIN || path.resolve(dirname, '../../target/release/endor');
   const hasEndor = fs.existsSync(endorBin);
 
   // Determine which variants to run.
@@ -263,7 +263,7 @@ const main = async () => {
 
   if (!hasEndor && !process.argv.includes('--node-only')) {
     console.log(
-      `  [note] endot binary not found at ${endorBin}, skipping Rust+XS`,
+      `  [note] endor binary not found at ${endorBin}, skipping Rust+XS`,
     );
     console.log(`  [note] build with: cargo build -p endo --release`);
   }

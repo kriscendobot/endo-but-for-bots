@@ -1,6 +1,6 @@
 //! Iroh QUIC network transport for Endo.
 //!
-//! This crate gives the Rust `endot` daemon an iroh transport that is
+//! This crate gives the Rust `endor` daemon an iroh transport that is
 //! wire-compatible with the Node.js `@endo/daemon` iroh transport, so the two
 //! runtimes can cross-connect. "Dial keys, not IPs": a peer is reached by its
 //! Ed25519 node id and resolved through iroh discovery and relays, over a

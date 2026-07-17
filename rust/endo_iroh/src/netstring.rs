@@ -4,7 +4,7 @@
 //! layers CapTP over netstring framing on every byte transport; each frame's
 //! payload is one JSON-serialized CapTP message. The iroh transport moves
 //! these frames opaquely, exactly as the Unix-socket bridge does in
-//! `endo::socket`, so a Rust endot and a Node.js daemon frame identically.
+//! `endo::socket`, so a Rust endor and a Node.js daemon frame identically.
 //!
 //! The codec is generic over any `AsyncRead`/`AsyncWrite`, so it works on an
 //! iroh `RecvStream`/`SendStream` as well as a Unix socket half.
