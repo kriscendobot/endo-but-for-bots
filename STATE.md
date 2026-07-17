@@ -15,7 +15,10 @@ the outgoing PR diff.
 - Commit map: existing PR commits are now autosquashed as `654255f86`,
   `5053a07ff`, and `d2bd9957f`; `8db191ba2` reconciles the default history
   tool surface, release notes, README, canonical rebase guard, and authority
-  regression test.
+  regression test; `98ffe7f7a` preflights conflict side checkout, reports
+  clear tool errors, and covers clean, mixed, duplicate, and modify/delete
+  paths; `a5ac1011c` and `6cd798d80` are test/lint fixups for that commit and
+  must be autosquashed before push.
 - Confirmed PR #646 is draft and its head matches the requested SHA.
 
 ## Decisions
@@ -29,10 +32,9 @@ the outgoing PR diff.
 
 ## Pending work
 
-1. Complete conflict checkout preflight, tool errors, and model-facing text.
-2. Run focused tests, lint, type checks, docs/checklist, and pre-push gates.
-3. Commit the final removal of `STATE.md`, push, verify draft state, and request
-   the next code-panel run.
+Step 1: Run focused tests, lint, type checks, docs/checklist, and pre-push gates.
+Step 2: Autosquash `a5ac1011c` and `6cd798d80`, remove `STATE.md`, push, verify draft
+   state, and request the next code-panel run.
 
 ## Hazards and verification
 

@@ -2336,13 +2336,69 @@ export const makeNativeGitBackend = ({ repoRoot, identity }) => {
       if (!Array.isArray(paths) || paths.length === 0) {
         throw new Error('checkoutConflict: paths must be a non-empty array');
       }
+      const seenPaths = new Set();
       for (const p of paths) {
         requireNonEmptyString(p, 'checkoutConflict path');
+        if (seenPaths.has(p)) {
+          throw new Error(`checkoutConflict: duplicate path ${q(p)}`);
+        }
+        seenPaths.add(p);
       }
       if (side !== 'ours' && side !== 'theirs') {
         throw new Error('checkoutConflict.side must be ours or theirs');
       }
       await assertNoExecutableRepoConfig();
+
+      // Preflight every path and the requested index stage before touching
+      // the worktree; this prevents a mixed batch from resolving an early
+      // path before a later clean path or modify/delete path is rejected.
+      const unmerged = await runGitRaw([
+        'ls-files',
+        '--unmerged',
+        '-z',
+        '--',
+        ...paths,
+      ]);
+      /** @type {Map<string, Set<string>>} */
+      const stagesByPath = new Map();
+      for (const record of unmerged.split('\0')) {
+        if (record !== '') {
+          const separator = record.indexOf('\t');
+          if (separator < 0) {
+            throw new Error(
+              'checkoutConflict: git returned an invalid unmerged index record',
+            );
+          }
+          const fields = record.slice(0, separator).split(' ');
+          const recordPath = record.slice(separator + 1);
+          const stage = fields[2];
+          if (stage === undefined || recordPath === '') {
+            throw new Error(
+              'checkoutConflict: git returned an invalid unmerged index record',
+            );
+          }
+          let stages = stagesByPath.get(recordPath);
+          if (stages === undefined) {
+            stages = new Set();
+            stagesByPath.set(recordPath, stages);
+          }
+          stages.add(stage);
+        }
+      }
+      const requiredStage = side === 'ours' ? '2' : '3';
+      for (const p of paths) {
+        const stages = stagesByPath.get(p);
+        if (stages === undefined) {
+          throw new Error(
+            `checkoutConflict: path ${q(p)} is not an unmerged conflict`,
+          );
+        }
+        if (!stages.has(requiredStage)) {
+          throw new Error(
+            `checkoutConflict: path ${q(p)} has no ${side} index stage (${requiredStage})`,
+          );
+        }
+      }
       await runGit(['checkout', `--${side}`, '--', ...paths]);
       await runGit(['add', '--', ...paths]);
     },

@@ -185,7 +185,7 @@ const gitToolSchemas = harden({
         input: {
           ...REBASE_START_INPUT_PROP,
           description:
-            'Start-only rebase input. Continue, abort, and skip are not ' +
+            'Start-only rebase input; continue, abort, and skip are not ' +
             'available through this JSON tool.',
         },
       },

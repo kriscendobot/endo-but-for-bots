@@ -69,8 +69,9 @@ const checkoutConflictParameters = harden({
     side: {
       enum: ['ours', 'theirs'],
       description:
-        'The unmerged index side to select for every path. "ours" selects ' +
-        'the current branch side; "theirs" selects the incoming side.',
+        'The unmerged Git index stage to select for every path. "ours" ' +
+        'selects stage 2 and "theirs" selects stage 3; these stage names ' +
+        'invert their usual current/incoming meaning during rebase.',
     },
   },
   required: ['paths', 'side'],
@@ -195,8 +196,9 @@ export const makeGitMountTools = gitCap => {
   const checkoutConflictTool = makeTool({
     name: 'checkoutConflict',
     description:
-      'Resolve conflicted paths by selecting the current branch side ' +
-      '("ours") or incoming side ("theirs"), then stage the resolution.',
+      'Resolve unmerged paths by selecting Git index stage 2 ("ours") or ' +
+      'stage 3 ("theirs"), then stage the resolution; these stage names ' +
+      'invert their usual current/incoming meaning during rebase.',
     parameters: checkoutConflictParameters,
     argGuards: harden([M.arrayOf(M.string()), M.or('ours', 'theirs')]),
     execute: async args => {
@@ -204,7 +206,12 @@ export const makeGitMountTools = gitCap => {
         /** @type {{ paths: string[], side: 'ours' | 'theirs' }} */ (args);
       const segmentsByPath = pathsToSegments('checkoutConflict', paths);
       const entries = await entriesForSegments(gitCap, segmentsByPath);
-      await E(gitCap).checkoutConflict(harden(entries), side);
+      try {
+        await E(gitCap).checkoutConflict(harden(entries), side);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`checkoutConflict failed: ${detail}`);
+      }
       return (
         `Selected ${side} for ${paths.length} conflicted ` +
         `path${paths.length === 1 ? '' : 's'}.`
