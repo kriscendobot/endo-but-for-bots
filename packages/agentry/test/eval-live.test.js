@@ -72,7 +72,6 @@ const evalRows = [
   },
   {
     title: 'a live model performs stack surgery (outcome assertion)',
-    skipReason: 'blocked on agentry-git-verb-gaps verbs',
     provisionRepo: t => provisionStackSurgeryRepo(t),
     makeScenario: () => makeStackSurgeryScenario(),
   },
