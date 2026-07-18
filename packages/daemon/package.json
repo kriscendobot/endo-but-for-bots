@@ -32,6 +32,7 @@
     "./type-guards.js": "./src/type-guards.js",
     "./src/interfaces.js": "./src/interfaces.js",
     "./src/mount.js": "./src/mount.js",
+    "./src/hashline.js": "./src/hashline.js",
     "./src/manager-node-powers.js": "./src/manager-node-powers.js",
     "./package.json": "./package.json"
   },
