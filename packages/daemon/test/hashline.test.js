@@ -22,8 +22,7 @@ import {
 const sha256Hex = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** @param {string} text */
-const hashOfText = text =>
-  sha256Hex(new TextEncoder().encode(text));
+const hashOfText = text => sha256Hex(new TextEncoder().encode(text));
 
 /**
  * A patch envelope against `text` with anchors computed from the live
@@ -277,7 +276,10 @@ test('applyEditPatch applies the design worked example', t => {
     result.newText,
     '# Today’s notes\n\nBuy milk.\nBuy eggs (the brown ones).\nBuy bread.\n\n',
   );
-  t.is(result.fileHashAfter, hashOfText(/** @type {string} */ (result.newText)));
+  t.is(
+    result.fileHashAfter,
+    hashOfText(/** @type {string} */ (result.newText)),
+  );
 });
 
 // --- applyEditPatch: CAS and anchor validation ---

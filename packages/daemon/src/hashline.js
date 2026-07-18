@@ -283,10 +283,7 @@ const validateAnchor = (value, where) => {
       X`${q(where)}: anchor.line must be a positive integer, got ${q(anchor.line)}`,
     );
   }
-  if (
-    typeof anchor.hash !== 'string' ||
-    !/^[0-9a-f]{2,4}$/.test(anchor.hash)
-  ) {
+  if (typeof anchor.hash !== 'string' || !/^[0-9a-f]{2,4}$/.test(anchor.hash)) {
     throw makeError(
       X`${q(where)}: anchor.hash must be 2 to 4 lowercase hex chars, got ${q(anchor.hash)}`,
     );
@@ -538,9 +535,7 @@ export const parseHashlineText = text => {
       }
     } else if (line.startsWith('| ') || line === '|') {
       if (currentOp === undefined) {
-        throw makeError(
-          X`${q(where)}: payload line outside any @op operation`,
-        );
+        throw makeError(X`${q(where)}: payload line outside any @op operation`);
       }
       currentPayload.push(line === '|' ? '' : line.slice(2));
       currentHasPayload = true;
@@ -620,8 +615,11 @@ const failureResult = (fileHashActual, reason, message, extra = {}) =>
  * @returns {EditResult}
  */
 export const applyEditPatch = (fileText, patchValue, options) => {
-  const { sha256Hex, reapply = false, reapplyWindow = REAPPLY_WINDOW_DEFAULT } =
-    options;
+  const {
+    sha256Hex,
+    reapply = false,
+    reapplyWindow = REAPPLY_WINDOW_DEFAULT,
+  } = options;
   if (typeof sha256Hex !== 'function') {
     throw makeError(X`applyEditPatch: options.sha256Hex is required`);
   }
@@ -727,7 +725,9 @@ export const applyEditPatch = (fileText, patchValue, options) => {
     if (candidates.length === 1) {
       relocations.set(anchor, candidates[0]);
     } else if (candidates.length > 1) {
-      ambiguities.push(harden({ line: anchor.line, candidates: harden(candidates) }));
+      ambiguities.push(
+        harden({ line: anchor.line, candidates: harden(candidates) }),
+      );
     } else {
       recordMismatch(anchor);
     }
@@ -922,7 +922,8 @@ export const applyEditPatch = (fileText, patchValue, options) => {
     actions.push({
       start: span.start,
       end: span.end,
-      content: op.op === 'delete' ? [] : [.../** @type {string[]} */ (op.payload)],
+      content:
+        op.op === 'delete' ? [] : [.../** @type {string[]} */ (op.payload)],
     });
   }
 
