@@ -24,6 +24,7 @@
   "scripts": {
     "build": "exit 0",
     "setup-factory": "./setup-factory.sh",
+    "test": "ava",
     "lint": "yarn lint:eslint",
     "lint-fix": "yarn lint:eslint --fix",
     "lint:eslint": "eslint '**/*.js'"
@@ -31,6 +32,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.1",
     "@endo/conversation-tree": "workspace:^",
+    "@endo/env-options": "workspace:^",
     "@endo/eventual-send": "workspace:^",
     "@endo/exo": "workspace:^",
     "@endo/exo-stream": "workspace:^",
@@ -42,6 +44,10 @@
   },
   "devDependencies": {
     "@endo/cli": "workspace:^",
+    "@endo/daemon": "workspace:^",
+    "@endo/init": "workspace:^",
+    "@endo/promise-kit": "workspace:^",
+    "@endo/ses-ava": "workspace:^",
     "ava": "catalog:dev",
     "c8": "catalog:dev",
     "eslint": "catalog:dev"
