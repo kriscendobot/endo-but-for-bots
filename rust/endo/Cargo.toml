@@ -3,6 +3,18 @@ name = "endo"
 version = "0.1.0"
 edition = "2021"
 
+
+[dependencies.endor-vm]
+path = '../engine/endor-vm'
+optional = true
+
+[dependencies.endor-compile]
+path = '../engine/endor-compile'
+optional = true
+
+[features]
+default = []
+endor-engine = ['endor-vm', 'endor-compile']
 [dependencies]
 base64 = "0.22"
 endo_iroh = { path = "../endo_iroh" }
