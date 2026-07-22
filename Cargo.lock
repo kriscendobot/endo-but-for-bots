@@ -1033,6 +1033,8 @@ dependencies = [
  "base64",
  "criterion",
  "endo_iroh",
+ "endor-compile",
+ "endor-vm",
  "flate2",
  "hex",
  "libc",
@@ -1056,6 +1058,24 @@ dependencies = [
  "iroh",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "endor-compile"
+version = "0.0.1"
+dependencies = [
+ "endor-regexp",
+]
+
+[[package]]
+name = "endor-regexp"
+version = "0.0.1"
+
+[[package]]
+name = "endor-vm"
+version = "0.0.1"
+dependencies = [
+ "endor-regexp",
 ]
 
 [[package]]
