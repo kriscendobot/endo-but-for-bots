@@ -161,7 +161,7 @@ test('TextDecoder with explicit options works', t => {
 // simulated from a post-lockdown Compartment: universal intrinsics are added
 // to every compartment regardless of its `globalNames`. It is exercised in a
 // dedicated worker that deletes the globals before `lockdown()`, in
-// text-encoder-decoder-missing.test.js (mirroring url-shim-missing.test.js).
+// text-encoder-decoder-missing.test.js (mirroring url-missing.test.js).
 
 // ---------------------------------------------------------------------------
 // 6. No prototype pollution — ensure codecs are not iterable
