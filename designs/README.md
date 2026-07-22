@@ -1,6 +1,6 @@
 # Endo Design Documents
 
-*Last updated: 2026-07-22 (added [endor-native-zip-xs](endor-native-zip-xs.md) to M11: raw-DEFLATE Rust host functions selected by `@endo/zip` with `-C xs`, bounded inflation, and a snapshot callback-table migration. Summary, M11, estimates, totals, and timeline synced.
+*Last updated: 2026-07-22 (retired the superseded `streamReply` roadmap entry in favor of the merged [daemon message revision](daemon-message-streaming.md) surface, filed the previously unattended designs, and made the Minion Town federation experiment the roadmap's execution lead. Existing milestone order remains the dependency order.
 Layered on 2026-07-20 (weekly designs grooming pass: flipped [chat-pending-commands](chat-pending-commands.md) from In Progress to **Complete**. PR #133 merged to `llm` 2026-07-13 (merge commit `82c81afa1`), and the region landed as `packages/spaces-util/src/pending-commands.js` with the `#pending-commands-region` mount point in `packages/chat/chat.js`. Synced the summary, dependency-graph, milestone, and estimate rows and the totals (Complete 42 -> 43, In Progress 23 -> 22). Repaired dangling internal links: `cbors.md` -> `ocapn-tcp-syrups-framing.md` (missing plural), the removed `endo-gateway.md` (folded into `gateway-package.md` via #343) -> `gateway-package.md` in `endo-gateway-mcp.md` and `registry-capability.md`, and the `d256.md` shorthand -> `daemon-256-bit-identifiers.md` in `chat-inventory-create-menu.md`.)
 Layered on 2026-07-19 (revised [ocapn-noise-key-only-session-boundary](ocapn-noise-key-only-session-boundary.md) per review: OCapN, the relay, and the Noise listener are independent components. An application injects a network adapter, such as Noise over WebSocket, into OCapN; the relay depends on neither. The Node controller exo supplies relay configuration and `SIGHUP` replacement while remaining loosely coupled. Summary and estimate rows synced.
 Layered on 2026-07-17 (revised agentry-git-eval-scenarios for issue #753 item 2: the ReadableBlob fetch, rangeRead, and rangeReadText contract now carries the sed-like filesystem/blob bounded-read affordance, while rendered Git output bounds and remote exo propagation remain follow-ups; summary metadata and M3 notes synced.
@@ -245,7 +245,7 @@ LLM-agent stack).*
 | [daemon-git-next-steps](daemon-git-next-steps.md) | 2026-05-27 | 2026-06-03 | Proposed |
 | [endo-content-locators-magnet-urn](endo-content-locators-magnet-urn.md) | 2026-07-10 | 2026-07-10 | Not Started |
 | [endo-fs-from-git](endo-fs-from-git.md) | 2026-05-28 | 2026-05-28 | In Progress |
-| [daemon-message-streaming](daemon-message-streaming.md) | 2026-03-26 | 2026-05-19 | In Progress (PR #287) |
+| [daemon-message-streaming](daemon-message-streaming.md) | 2026-03-26 | 2026-07-22 | **Complete** (PR #125: `editMessage`, `messageHistory`, `done`; supersedes the retired `streamReply` sketch) |
 | [daemon-mount](daemon-mount.md) | 2026-03-20 | 2026-05-27 | In Progress |
 | [daemon-mount-capabilities](daemon-mount-capabilities.md) | 2026-05-18 | 2026-05-27 | **Complete** |
 | [daemon-worker-import-from-mount](daemon-worker-import-from-mount.md) | 2026-05-22 | 2026-06-02 | Proposed |
@@ -358,6 +358,24 @@ LLM-agent stack).*
 | [workers-panel](workers-panel.md) | 2026-02-14 | 2026-02-24 | Not Started |
 | [namehub-interface-unification](namehub-interface-unification.md) | 2026-05-07 | 2026-05-07 | Proposed |
 | [forge-gap-analysis](forge-gap-analysis.md) | 2026-05-20 | 2026-05-20 | Reference (exploratory) |
+| [captp-error-identification](captp-error-identification.md) | 2026-07-02 | 2026-07-02 | Proposed |
+| [daemon-engo-supervisor](daemon-engo-supervisor.md) | 2026-02-25 | 2026-02-25 | Not Started |
+| [daemon-locator-reference](daemon-locator-reference.md) | 2026-03-18 | 2026-05-10 | Reference |
+| [endo-fs-seam-review-followups](endo-fs-seam-review-followups.md) | 2026-06-18 | 2026-06-18 | Proposed |
+| [http-confine](http-confine.md) | 2026-07-08 | 2026-07-08 | Proposed |
+| [inter-package-plain-re-exports](inter-package-plain-re-exports.md) | 2026-06-27 | 2026-06-27 | Not Started |
+| [intra-package-plain-re-exports](intra-package-plain-re-exports.md) | 2026-06-26 | 2026-06-30 | Not Started |
+| [notifier-pubsub-migration](notifier-pubsub-migration.md) | 2026-06-23 | 2026-06-26 | Proposed |
+| [platform-range-and-tree-reads](platform-range-and-tree-reads.md) | 2026-07-12 | 2026-07-12 | In Progress |
+| [unredacted-stack-sanctioned-ses-api](unredacted-stack-sanctioned-ses-api.md) | 2026-07-02 | 2026-07-10 | Proposed |
+| [worker-rust-xs](worker-rust-xs.md) | 2026-03-23 | 2026-03-23 | Not Started |
+| [outliner-design-doc-2](outliner-design-doc-2.md) | 2026-07-22 | 2026-07-22 | Proposed (research note) |
+| [outliner_drag_and_drop](outliner_drag_and_drop.md) | 2026-07-22 | 2026-07-22 | Proposed (research note) |
+| [OUTLINER_INTERACTION_PATTERNS](OUTLINER_INTERACTION_PATTERNS.md) | 2026-07-22 | 2026-07-22 | Reference (research note) |
+| [threading-research-overview](channel%20threads/threading-research-overview.md) | 2026-07-22 | 2026-07-22 | Reference (research note) |
+| [type-1-chat-spec](channel%20threads/type-1-chat-spec.md) | 2026-07-22 | 2026-07-22 | Reference (research note) |
+| [type-2-chat-spec](channel%20threads/type-2-chat-spec.md) | 2026-07-22 | 2026-07-22 | Reference (research note) |
+| [type-3-chat-spec](channel%20threads/type-3-chat-spec.md) | 2026-07-22 | 2026-07-22 | Reference (research note) |
 | [app-sharing-milestone](app-sharing-milestone.md) | 2026-06-01 | 2026-06-01 | Proposed |
 | [familiar-deep-link-invitations](familiar-deep-link-invitations.md) | 2026-06-01 | 2026-06-01 | Proposed |
 | [endo-app-sharing](endo-app-sharing.md) | 2026-06-01 | 2026-06-01 | Proposed |
@@ -366,7 +384,46 @@ LLM-agent stack).*
 **Totals:** 43 Complete/Implemented, 22 In Progress, 39 Not Started, 30 Proposed, 2 Active, 7 Reference, 2 Deprecated, 3 Superseded (148 designs). 2026-07-18 adds `ocapn-noise-key-only-session-boundary` (Proposed), a source-visible but wire-compatible handoff refactor that reduces the gateway to a dumb key-sniffing ciphertext relay: it forwards the encrypted session to the true OCapN listener by the plaintext responder key while responder selection, authentication, and decryption stay at the recipient. 2026-07-13 adds `endo-fetch` (Not Started), the unconfined-plugin redraft of the confined-outbound-HTTP provisioning, and flips `endoclaw-network-fetch` from In Progress to Superseded (its capability shape landed via #566 and remains normative by reference). 2026-07-10 adds `endo-content-locators-magnet-urn` (Not Started): the content-side analogue of the transport locator, a `magnet:` URN that names a readable-blob or readable-tree by its SHA-256 content hash (`xt`) and carries Gateway-vended, configuration-dependent data-plane source hints (the `@planes` content analogue of `@nets`), with HTTP web-seed worked end to end and Git-over-HTTP / BitTorrent named as follow-up back-planes; summary-table row added, milestone/dependency-graph/estimate placement deferred to the next journalist cycle. 2026-07-09 revises `agentry-git-eval-scenarios` (Not Started) into a three-scenario git code-mode eval set: `stage-and-commit`, buildable `conflict-rebase`, and `stack-surgery` with fixture/scorer work landing behind a pending row while live activation depends on agentry-git-verb-gaps. 2026-07-08 adds `agentry-git-verb-gaps` (Proposed), the narrow local-git history-editing surface for the agentry `stack-surgery` eval lane. 2026-07-06 flips `daemon-agent-tools` from Not Started to In Progress: the reconciliation pass replaced its pre-trio `Dir`/`Shell`/`Git` sketch with the landed vocabulary (the filesystem and local-git tool groups shipped via the mount/git trio and `@endo/agent-tools` #523/#524), and the doc now carries the phased remaining work — the mount-derived `Shell` capability, the remaining file tools, the push tier, and provisioning — as buildable spec. 2026-06-25 adds the #416 pair: `endo-agent-tools` (In Progress, since #523 and #524 landed its first tools and the code-mode declaration renderer) and `agentry-agent-builder` (In Progress, its `defineAgent` builder core landed in #517; the extended surface is aspirational), and flips `agent-tools-mount-fs-tools` to Superseded (its raw-mount read tool is replaced by the canonical `ToolRecord` filesystem read tool). 2026-06-19 recounts the summary table (the prose totals had drifted four designs low — `137/18/29` → the recounted `141/21/28` across designs/In Progress/Proposed — and folds in the `fs-interface-consolidation` progress below). 2026-06-18 adds `fs-interface-consolidation` (In Progress), the sequenced follow-up that reduces overlap across the fs/name-hub guards once `fs-interface-reconciliation` aligned their names; all five phases have now landed — C2 shared records, C3/C4 daemon read-surface convergence (including the cross-surface mount unification and the blob range-I/O alignment), C1 EndoNameHub+EndoDirectory unification, and C5 dead-guard removal. The early "retire `BlobRef`" framing was reversed: `BlobRef` is the richest blob shape, so the daemon/lite blobs aligned **up** to its `getInfo`/`fetch` range-I/O surface (the shared `rangeReadMethodGuards` / `ReadableBlobRangeInterface`) and every public hash accessor moved to base64. The 2026-06-15 pass flips `break-dev-dependency-cycles` from In Progress to Complete (on `llm`) on the strength of cycle-graph verification (combined dep+devDep SCC count is 0; self-loop count is 0). 2026-05-27 adds `daemon-git-next-steps` (Proposed) as the forward-looking roadmap over the canonical git trio. Refreshed 2026-06-02 by the daemon-worker-import-from-mount decomposition: three new Proposed designs (`registry-capability`, `mvs-resolver`, `snapshot-mapper`) land as siblings of the repurposed integration-layer doc. The 2026-06-01 pass adds the **Peer App Sharing** milestone (formerly "Milestone A"; now Milestone 8 after the 2026-06-03 renumbering pass) including `app-sharing-milestone` and its three new Proposed designs (`familiar-deep-link-invitations`, `endo-app-sharing`, `familiar-app-ui-hosting`); see "Milestone 8: Peer App Sharing" below. Refreshed 2026-05-19 by a status-only sweep (consolidating the 2026-05-18 sweep with the patterns-diagnostic-feedback and ocapn-noise-session-reconnect Proposed entries; the 12-design jump in Complete/Implemented over the 2026-05-08 snapshot reflects shipped work whose Status field had not previously been updated, not new completions in that pass; see the corresponding "## Status" sections in each design file for evidence pointers (commit SHA or PR number). Totals reflect the 17 design files added on `llm` since the sweep's branch point (the endopi raft of `endopi` + 8 `endopi-*` gap-closing designs, `hardened-text-codecs-shim`, `hardened-url-shim`, namehub-interface-unification (Proposed) added by PR #117 on rebase, forge-gap-analysis (Reference) added 2026-05-20, the daemon mount and git capability trio: `daemon-mount-capabilities` + `daemon-git-capability` + `daemon-git-remotes`, `daemon-git-next-steps` (added 2026-05-27), and `gateway-package`, with the prior endo-gateway design folded into gateway-package and removed), plus the endo-gateway-mcp (Not Started) entry added 2026-05-29, the `daemon-worker-import-from-mount` (Proposed) entry added 2026-05-22, and the three layer-split designs from the 2026-06-02 refresh.
 The 2026-07-17 revision of `agentry-git-eval-scenarios` (Not Started) reconciles its bounded-read section with the ReadableBlob `fetch`/`rangeRead`/`rangeReadText` contract, retaining rendered Git output bounds and remote exo propagation as follow-ups.
 
+**Current totals (2026-07-22):** 44 Complete/Implemented, 22 In Progress,
+43 Not Started, 37 Proposed, 2 Active, 13 Reference, 2 Deprecated, 3
+Superseded (166 designs). This corrects the preceding historical snapshot
+after filing the 17 unattended documents and recording the merged
+`editMessage` successor as Complete.
+
 ## Roadmap
+
+### Execution lead: Minion Town federation experiment
+
+The Minion Town experiment is the leading execution path. It is an integration
+spine across milestones, not a new dependency-free milestone: deliver MCP
+access, OAuth, tool calls, and daemon guests first; then prove federation over
+OCapN by whatever viable transport is available; then carry the validated
+daemon workload into `endor` for compute and storage metering.
+
+| Order | Roadmap slice | Owning milestone and dependencies |
+|---|---|---|
+| 1 | MCP endpoint, OAuth credential flow, agent tool calls, and daemon guests | M3 and M6: `endo-gateway-mcp`, `endopi-provider-registry-and-oauth`, `daemon-agent-tools`, `endo-agent-tools`, `agentry-agent-builder` |
+| 2 | Cross-host federation | M4: OCapN transport separation, network identity, and any viable OCapN netlayer; M5 deployment supplies the public Minion Town edge |
+| 3 | Metered compute and storage | M11: `endor` architecture, Rust/XS worker, supervisor, and metering designs, informed by the federated workload |
+
+The existing milestone sequence remains the dependency order. Work outside this
+spine remains planned and is selected when it is a prerequisite or when the
+spine is blocked.
+
+### Unattended design routing
+
+These documents are now explicit roadmap inputs. A row belongs with the
+milestone whose work it enables; research notes remain references rather than
+inventing implementation commitments.
+
+| Design | Roadmap home | Role in that work |
+|---|---|---|
+| `inter-package-plain-re-exports`, `intra-package-plain-re-exports` | M2 | Package-hygiene cleanup before cross-package capability work. |
+| `http-confine`, `platform-range-and-tree-reads`, `endo-fs-seam-review-followups` | M3 | HTTP and readable-tree foundations for tools and daemon guests. |
+| `captp-error-identification`, `daemon-locator-reference` | M4 | CapTP identity and locator semantics for federation. |
+| `notifier-pubsub-migration`, `unredacted-stack-sanctioned-ses-api` | M10 | Shared ecosystem surface and confinement diagnostics. |
+| `daemon-engo-supervisor`, `worker-rust-xs` | M11 | Supervisor and native worker path for `endor`. |
+| `outliner-design-doc-2`, `outliner_drag_and_drop`, `OUTLINER_INTERACTION_PATTERNS`, `threading-research-overview`, `type-1-chat-spec`, `type-2-chat-spec`, `type-3-chat-spec` | M9 | UX research inputs, held as reference until an owned Chat or Outliner implementation slice needs them. |
 
 ### Dependency Graph
 
@@ -493,7 +550,7 @@ flowchart TD
         dcmd --> cpend
         dmount --> cvedit
         dmount --> cliedit
-        dmstream[daemon-message-streaming<br/><i>IN PROGRESS</i>] --> cemui
+        dmstream[daemon-message-streaming<br/><i>COMPLETE</i>] --> cemui
         invgt --> finsp
         cicmenu[chat-inventory-create-menu]
         dmount --> cicmenu
