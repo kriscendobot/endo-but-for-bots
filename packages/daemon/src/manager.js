@@ -18,9 +18,9 @@ import { bytesToText } from '@endo/bytes/to-string.js';
 import {
   checkinTree as platformCheckinTree,
   snapshotTreeMethods,
-} from '@endo/platform/fs/lite';
-import { toSafeNumber } from '@endo/platform/fs/extended/shared/helpers.js';
-import { makeNativeGitBackend } from '@endo/git';
+} from './fs-lite-stub.js';
+import { toSafeNumber } from './fs-lite-stub.js';
+import { makeNativeGitBackend } from './git-stub.js';
 import {
   makeBasicCredential,
   makeBearerCredential,
@@ -28,8 +28,8 @@ import {
   makeGitRemote,
   makeUnavailableGitCredential,
 } from '@endo/exo-git';
-import { makeShell } from '@endo/exo-shell';
-import { makeHostSpawner } from '@endo/host-spawner';
+import { makeShell } from './exo-shell-stub.js';
+import { makeHostSpawner } from './host-spawner-stub.js';
 import { makeHttpClientAndControl } from '@endo/exo-http-client';
 import { iterateBytesReader } from '@endo/exo-stream/iterate-bytes-reader.js';
 import { iterateReader } from '@endo/exo-stream/iterate-reader.js';

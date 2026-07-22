@@ -21,7 +21,7 @@
 
 import harden from '@endo/harden';
 import { makeContentStore } from '@endo/daemon-cas';
-import { makeSnapshotStore } from '@endo/platform/fs/lite';
+import { makeSnapshotStore } from './fs-lite-stub.js';
 
 import { toHex, fromHex } from './hex.js';
 

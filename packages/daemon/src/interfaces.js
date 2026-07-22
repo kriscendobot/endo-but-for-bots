@@ -12,7 +12,7 @@ import {
   pathEntryIssuerMethodGuards,
   rangeReadMethodGuards,
   getInfoMethodGuard,
-} from '@endo/platform/fs/lite';
+} from './fs-lite-stub.js';
 import {
   NamePathShape,
   NameOrPathShape,

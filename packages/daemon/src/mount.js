@@ -13,8 +13,8 @@ import { mapReader } from '@endo/stream';
 import {
   ReadableBlobRangeInterface,
   ReadableTreeInterface,
-} from '@endo/platform/fs/lite';
-import { toSafeNumber } from '@endo/platform/fs/extended/shared/helpers.js';
+} from './fs-lite-stub.js';
+import { toSafeNumber } from './fs-lite-stub.js';
 import { iterateBytesReader } from '@endo/exo-stream/iterate-bytes-reader.js';
 import { bytesReaderFromIterator } from '@endo/exo-stream/bytes-reader-from-iterator.js';
 import { makeReaderPump } from '@endo/exo-stream/reader-pump.js';
