@@ -42,6 +42,9 @@ const EXCLUDED_PACKAGES = new Set([
   // never executes at runtime — it only needs to be elided from
   // the bundle's compartment graph.
   'better-sqlite3',
+  '@endo/git',
+  '@endo/host-spawner',
+  '@endo/platform',
   'ses',
   'ws',
 ]);
