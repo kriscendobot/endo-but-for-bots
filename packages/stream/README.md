@@ -73,6 +73,26 @@ which promises settle.
 A stream is consequently a pair of queues that transport iteration results,
 one to send messages forward and another to receive acknowledgements.
 
+## Buffer
+
+The `@endo/stream/buffer` submodule provides `makeBuffer`, an unbounded
+asynchronous buffer. It returns a `{ spring, sink }` pair. `spring.next(value)`
+pushes a value or promise for a value without an acknowledgement, while
+`sink.next()` returns a promise for the next iterator result. The corresponding
+`return` and `throw` methods carry terminal results in the respective generator
+and iterator protocol subsets.
+
+This shape is the unidirectional, acknowledgement-free part of a pipe. Its
+terminology and design space follow [A General Theory of
+Reactivity](https://kriskowal.com/gtor). The unbounded implementation in
+`unbounded-buffer.js` uses `makeQueue`, so values can be pushed before or after
+they are pulled.
+
+A bounded buffer is intentionally not implemented. Its synchronous,
+pre-allocated ring-buffer mechanics can refuse reads or writes and often flush
+in bulk, so it belongs in the separate `bounded-buffer.js` module rather than
+sharing this promise-queue implementation.
+
 ## Pump
 
 The `pump` function pumps iterations from a reader to a writer.
@@ -98,7 +118,7 @@ await pump(writer, reader);
 Async generator functions are very useful for making reader adapters.
 
 ```js
-async function *double(reader) {
+async function* double(reader) {
   for await (const value of reader) {
     yield value * 2;
   }
@@ -117,7 +137,7 @@ The `prime` function compensates for this by sending a primer to the generator
 once.
 
 ```js
-async function *logGenerator() {
+async function* logGenerator() {
   for (;;) {
     console.log(yield);
   }

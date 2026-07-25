@@ -30,6 +30,10 @@
       "types": "./types.d.ts",
       "default": "./index.js"
     },
+    "./buffer": {
+      "types": "./buffer.d.ts",
+      "default": "./buffer.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
