@@ -31,6 +31,16 @@ test('buffer preserves queue positions while values settle independently', async
   t.deepEqual(await firstResult, { value: 1, done: false });
 });
 
+test('a rejected value does not terminate the buffer', async t => {
+  const { spring, sink } = makeBuffer();
+  const error = Error('rejected value');
+  spring.next(Promise.reject(error));
+
+  await t.throwsAsync(sink.next(), { is: error });
+  spring.next('after rejection');
+  t.deepEqual(await sink.next(), { value: 'after rejection', done: false });
+});
+
 test('spring return delivers a terminal iterator result', async t => {
   await null;
   /** @type {BufferKit<string, string>} */
