@@ -458,13 +458,38 @@ export const makeXsFilePowers = () => {
       [Symbol.asyncIterator]() {
         return harden({
           async next() {
+            // Separator: yield before doing any work, so a cancel()/return()
+            // (or the revoke signal followNameChanges races against next())
+            // that is already pending runs first.
+            await null;
             while (!closed && buffered.length === 0) {
-              const next = hostWatchNext(handle, 50);
-              if (typeof next === 'string' && next.startsWith('Error: ')) {
+              // `hostWatchNext` is a synchronous, blocking FFI call (the Rust
+              // backend sleeps/kqueue-waits up to the timeout). Poll once, then
+              // yield to the event loop before polling again, so this iterator
+              // never monopolizes the single XS worker thread: a concurrent
+              // cancel()/return() and any racing revoke signal can run between
+              // polls, keeping the watch cancellable and the vat responsive
+              // rather than frozen until the next change.
+              const payload = hostWatchNext(handle, 50);
+              if (
+                typeof payload === 'string' &&
+                payload.startsWith('Error: ')
+              ) {
                 close();
-                throw new Error(next);
+                throw new Error(payload);
               }
-              buffered.push(...JSON.parse(next));
+              buffered.push(...JSON.parse(payload));
+              if (closed || buffered.length > 0) {
+                break;
+              }
+              // eslint-disable-next-line no-await-in-loop
+              await null;
+            }
+            // Once closed (via cancel()/return()), iteration ends — even if a
+            // prior poll left records buffered — so `return()` reliably
+            // terminates the stream.
+            if (closed) {
+              return harden({ value: undefined, done: true });
             }
             const value = buffered.shift();
             if (value === undefined) {

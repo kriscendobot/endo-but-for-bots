@@ -638,6 +638,162 @@ test('XS statPath converts a fractional mtime (ms) to bigint nanoseconds without
   t.is(stat.atime, stat.mtime);
 });
 
+// --- XS watchDirectory adapter (host-global injection) ---
+//
+// makeXsFilePowers().watchDirectory reads hostWatchDirectory / hostWatchNext /
+// hostWatchClose as free globals (the XS supervisor installs them from the Rust
+// powers). Injecting mocks lets us drive the async-iterator adapter — the
+// error-sentinel handling, the poll/buffer loop, the done-vs-yield branch, and
+// close() idempotency — entirely in-process, the same technique the statPath
+// test above uses for hostStat.
+
+/**
+ * Install mock watch host-globals for the duration of a test.
+ *
+ * @param {object} t ava execution context
+ * @param {object} mocks
+ * @param {() => number | string} mocks.watchDirectory
+ * @param {(handle: number, timeoutMs: number) => string} mocks.watchNext
+ * @param {(handle: number) => void} mocks.watchClose
+ */
+const withWatchGlobals = (t, mocks) => {
+  const g = /** @type {any} */ (globalThis);
+  const saved = {
+    d: g.hostWatchDirectory,
+    n: g.hostWatchNext,
+    c: g.hostWatchClose,
+  };
+  g.hostWatchDirectory = mocks.watchDirectory;
+  g.hostWatchNext = mocks.watchNext;
+  g.hostWatchClose = mocks.watchClose;
+  t.teardown(() => {
+    g.hostWatchDirectory = saved.d;
+    g.hostWatchNext = saved.n;
+    g.hostWatchClose = saved.c;
+  });
+};
+
+test.serial('XS watchDirectory throws when the host rejects the watch', t => {
+  withWatchGlobals(t, {
+    watchDirectory: () => 'Error: unknown directory token',
+    watchNext: () => '[]',
+    watchClose: () => {},
+  });
+  const xsPowers = makeXsFilePowers();
+  t.throws(() => xsPowers.watchDirectory('/watched'), {
+    message: 'Error: unknown directory token',
+  });
+});
+
+test.serial(
+  'XS watchDirectory yields host change records then ends on cancel',
+  async t => {
+    let polls = 0;
+    /** @type {number | undefined} */
+    let closedHandle;
+    withWatchGlobals(t, {
+      watchDirectory: () => 7,
+      watchNext: () => {
+        polls += 1;
+        // One batch of records, then quiescent.
+        return polls === 1
+          ? '[{"kind":"add","name":"a.txt"},{"kind":"remove","name":"b.txt"}]'
+          : '[]';
+      },
+      watchClose: handle => {
+        closedHandle = handle;
+      },
+    });
+    const xsPowers = makeXsFilePowers();
+    const watch = xsPowers.watchDirectory('/watched');
+    const iterator = watch.events[Symbol.asyncIterator]();
+    t.deepEqual(await iterator.next(), {
+      value: { kind: 'add', name: 'a.txt' },
+      done: false,
+    });
+    t.deepEqual(await iterator.next(), {
+      value: { kind: 'remove', name: 'b.txt' },
+      done: false,
+    });
+    // cancel() closes the underlying handle; iteration then ends immediately even
+    // though the buffer is drained, and the handle passed to hostWatchClose is
+    // the one hostWatchDirectory returned.
+    watch.cancel();
+    t.deepEqual(await iterator.next(), { value: undefined, done: true });
+    t.is(closedHandle, 7);
+  },
+);
+
+test.serial(
+  'XS watchDirectory next() rejects and closes on a mid-stream host error',
+  async t => {
+    /** @type {number | undefined} */
+    let closedHandle;
+    withWatchGlobals(t, {
+      watchDirectory: () => 9,
+      watchNext: () => 'Error: invalid watch handle',
+      watchClose: handle => {
+        closedHandle = handle;
+      },
+    });
+    const xsPowers = makeXsFilePowers();
+    const watch = xsPowers.watchDirectory('/watched');
+    const iterator = watch.events[Symbol.asyncIterator]();
+    await t.throwsAsync(() => iterator.next(), {
+      message: 'Error: invalid watch handle',
+    });
+    t.is(closedHandle, 9);
+  },
+);
+
+test.serial(
+  'XS watchDirectory cancel()/return() close the handle exactly once',
+  async t => {
+    let closeCount = 0;
+    withWatchGlobals(t, {
+      watchDirectory: () => 1,
+      watchNext: () => '[]',
+      watchClose: () => {
+        closeCount += 1;
+      },
+    });
+    const xsPowers = makeXsFilePowers();
+    const watch = xsPowers.watchDirectory('/watched');
+    const iterator = /** @type {any} */ (watch.events[Symbol.asyncIterator]());
+    t.deepEqual(await iterator.return(), { value: undefined, done: true });
+    watch.cancel();
+    await iterator.return();
+    t.is(closeCount, 1);
+  },
+);
+
+test.serial(
+  'XS watchDirectory next() yields so a concurrent cancel() ends an idle watch',
+  async t => {
+    // Regression pin for the daemon-liveness fix: hostWatchNext is a synchronous
+    // blocking FFI call, so without a yield inside the poll loop next() would
+    // monopolize the single XS worker thread and no concurrent cancel() (nor the
+    // revoke signal followNameChanges races against it) could ever run — an
+    // uncancellable hang on an idle directory. With the `await null` yield, a
+    // cancellation scheduled as a microtask (the shape mount.js uses) runs
+    // between polls and terminates the stream. On the pre-fix synchronous loop
+    // this test never resolves and times out.
+    withWatchGlobals(t, {
+      watchDirectory: () => 5,
+      watchNext: () => '[]', // idle: no change ever arrives
+      watchClose: () => {},
+    });
+    const xsPowers = makeXsFilePowers();
+    const watch = xsPowers.watchDirectory('/idle');
+    const iterator = watch.events[Symbol.asyncIterator]();
+    const pending = iterator.next();
+    // Schedule the cancel as a microtask, exactly as a resolved revoke signal
+    // would deliver it; the fixed next() drains microtasks between polls.
+    Promise.resolve().then(() => watch.cancel());
+    t.deepEqual(await pending, { value: undefined, done: true });
+  },
+);
+
 // Suppress unused-import warnings for the platform interfaces; their
 // presence in this file documents the conformance target.
 void PlatformDirectoryInterface;
