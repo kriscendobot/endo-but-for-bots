@@ -35,6 +35,7 @@
  * - issueCommand, hostTrace (worker_io)
  * - hostReadFile, hostWriteFile, hostReadDir, hostMkdir, hostRemove,
  *   hostRename, hostExists, hostIsDir (powers/fs)
+ * - hostWatchDirectory, hostWatchNext, hostWatchClose (powers/fs)
  * - hostSha256, hostSha256Init, hostSha256Update, hostSha256Finish,
  *   hostRandomHex256, hostEd25519Keygen, hostEd25519Sign (powers/crypto)
  * - hostGetPid, hostGetEnv, hostJoinPath, hostRealPath (powers/process)

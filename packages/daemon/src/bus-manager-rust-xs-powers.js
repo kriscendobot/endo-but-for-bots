@@ -11,6 +11,7 @@
    hostSqliteOpen, hostSqliteClose, hostSqliteExec, hostSqlitePrepare,
    hostSqliteStmtRun, hostSqliteStmtGet, hostSqliteStmtAll,
    hostSqliteStmtColumns, hostSqliteStmtFinalize */
+/* global hostWatchDirectory, hostWatchNext, hostWatchClose */
 
 /**
  * XS daemon powers — factory functions that create FilePowers and
@@ -428,31 +429,57 @@ export const makeXsFilePowers = () => {
   };
 
   /**
-   * Directory-change watcher.  The XS host exposes no `fs.watch`
-   * equivalent, so this returns an event stream that closes
-   * immediately, mirroring the Node powers' documented fallback for
-   * when `fs.watch` is unavailable.  `followNameChanges` under the XS
-   * supervisor therefore yields its initial snapshot and then ends,
-   * a graceful degradation rather than a crash, and the method is
-   * present so the XS powers satisfy the same `FilePowers` contract
-   * as the Node powers (enforced by mount-platform-fs-conformance).
+   * Directory-change watcher backed by a capability-scoped Rust watch handle.
+   * The portable backend diffs successive `cap_std::fs::Dir` snapshots, and
+   * BSD-family hosts use kqueue only to wake that same diff promptly.
    *
    * @type {FilePowers['watchDirectory']}
    */
-  const watchDirectory = _dirPath => {
+  const watchDirectory = directoryPath => {
+    const result = hostWatchDirectory('root', toRelative(directoryPath));
+    if (typeof result === 'string' && result.startsWith('Error: ')) {
+      throw new Error(result);
+    }
+    const handle = /** @type {number} */ (result);
+    /** @type {Array<{ kind: 'add' | 'remove' | 'replace', name: string }>} */
+    const buffered = [];
+    let closed = false;
+
+    const close = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      hostWatchClose(handle);
+    };
+
     /** @type {AsyncIterable<{ kind: 'add' | 'remove' | 'replace', name: string }>} */
     const events = harden({
       [Symbol.asyncIterator]() {
         return harden({
-          next: async () => harden({ value: undefined, done: true }),
-          return: async () => harden({ value: undefined, done: true }),
+          async next() {
+            while (!closed && buffered.length === 0) {
+              const next = hostWatchNext(handle, 50);
+              if (typeof next === 'string' && next.startsWith('Error: ')) {
+                close();
+                throw new Error(next);
+              }
+              buffered.push(...JSON.parse(next));
+            }
+            const value = buffered.shift();
+            if (value === undefined) {
+              return harden({ value: undefined, done: true });
+            }
+            return harden({ value, done: false });
+          },
+          async return() {
+            close();
+            return harden({ value: undefined, done: true });
+          },
         });
       },
     });
-    return harden({
-      events,
-      cancel: () => {},
-    });
+    return harden({ events, cancel: close });
   };
 
   return harden({
