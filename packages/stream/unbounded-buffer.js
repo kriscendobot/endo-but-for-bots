@@ -26,7 +26,7 @@ export const makeUnboundedBuffer = () => {
     reject: rejectSinkFinished,
   } = makePromiseKit();
   /** @type {Promise<IteratorResult<TValue, TReturn>>} */
-  const sinkFinished = rawSinkFinished;
+  const sinkFinished = harden(rawSinkFinished);
   // Terminal rejection is observed by a pending or subsequent sink.next().
   // Registering this inert handler avoids reporting it before a consumer pulls.
   void sinkFinished.catch(() => undefined);
@@ -81,13 +81,15 @@ export const makeUnboundedBuffer = () => {
   const sink = harden({
     next() {
       if (sinkFinishedEarly) return sinkFinished;
-      return Promise.race([queue.get(), sinkFinished]).then(result => {
-        if (result.done) {
-          sinkFinishedEarly = true;
-          resolveSinkFinished(result);
-        }
-        return result;
-      });
+      return harden(
+        Promise.race([queue.get(), sinkFinished]).then(result => {
+          if (result.done) {
+            sinkFinishedEarly = true;
+            resolveSinkFinished(result);
+          }
+          return result;
+        }),
+      );
     },
     /** @param {TReturn} value */
     return(value) {
