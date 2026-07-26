@@ -475,7 +475,7 @@ export const makeXsFilePowers = () => {
               // polls, keeping the watch cancellable and the vat responsive
               // rather than frozen until the next change.
               try {
-                const payload = hostWatchNext(handle, 50);
+                const payload = hostWatchNext(handle, pollTimeoutMs);
                 if (
                   typeof payload === 'string' &&
                   payload.startsWith('Error: ')
