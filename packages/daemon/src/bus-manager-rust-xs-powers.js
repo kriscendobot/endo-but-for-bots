@@ -11,6 +11,7 @@
    hostSqliteOpen, hostSqliteClose, hostSqliteExec, hostSqlitePrepare,
    hostSqliteStmtRun, hostSqliteStmtGet, hostSqliteStmtAll,
    hostSqliteStmtColumns, hostSqliteStmtFinalize */
+/* global hostWatchDirectory, hostWatchNext, hostWatchClose */
 
 /**
  * XS daemon powers — factory functions that create FilePowers and
@@ -428,31 +429,90 @@ export const makeXsFilePowers = () => {
   };
 
   /**
-   * Directory-change watcher.  The XS host exposes no `fs.watch`
-   * equivalent, so this returns an event stream that closes
-   * immediately, mirroring the Node powers' documented fallback for
-   * when `fs.watch` is unavailable.  `followNameChanges` under the XS
-   * supervisor therefore yields its initial snapshot and then ends,
-   * a graceful degradation rather than a crash, and the method is
-   * present so the XS powers satisfy the same `FilePowers` contract
-   * as the Node powers (enforced by mount-platform-fs-conformance).
+   * Directory-change watcher backed by a capability-scoped Rust watch handle.
+   * The portable backend diffs successive `cap_std::fs::Dir` snapshots, and
+   * BSD-family hosts use kqueue only to wake that same diff promptly.
    *
    * @type {FilePowers['watchDirectory']}
    */
-  const watchDirectory = _dirPath => {
+  const watchDirectory = directoryPath => {
+    const result = hostWatchDirectory(DIR_TOKEN, toRelative(directoryPath));
+    if (typeof result === 'string' && result.startsWith('Error: ')) {
+      throw new Error(result);
+    }
+    const handle = /** @type {number} */ (result);
+    /** @type {Array<{ kind: 'add' | 'remove' | 'replace', name: string }>} */
+    const buffered = [];
+    let closed = false;
+
+    const close = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      hostWatchClose(handle);
+    };
+
+    // Each poll blocks the host for up to this window before returning the
+    // changes it observed; it matches the Rust backend's snapshot interval.
+    const pollTimeoutMs = 50;
+
     /** @type {AsyncIterable<{ kind: 'add' | 'remove' | 'replace', name: string }>} */
     const events = harden({
       [Symbol.asyncIterator]() {
         return harden({
-          next: async () => harden({ value: undefined, done: true }),
-          return: async () => harden({ value: undefined, done: true }),
+          async next() {
+            // Separator: yield before doing any work, so a cancel()/return()
+            // (or the revoke signal followNameChanges races against next())
+            // that is already pending runs first.
+            await null;
+            while (!closed && buffered.length === 0) {
+              // `hostWatchNext` is a synchronous, blocking FFI call. The Rust
+              // backend sleeps/kqueue-waits up to the timeout). Poll once, then
+              // yield to the event loop before polling again, so this iterator
+              // never monopolizes the single XS worker thread: a concurrent
+              // cancel()/return() and any racing revoke signal can run between
+              // polls, keeping the watch cancellable and the vat responsive
+              // rather than frozen until the next change.
+              try {
+                const payload = hostWatchNext(handle, pollTimeoutMs);
+                if (
+                  typeof payload === 'string' &&
+                  payload.startsWith('Error: ')
+                ) {
+                  throw new Error(payload);
+                }
+                buffered.push(...JSON.parse(payload));
+              } catch (error) {
+                close();
+                throw error;
+              }
+              if (closed || buffered.length > 0) {
+                break;
+              }
+              // eslint-disable-next-line no-await-in-loop
+              await null;
+            }
+            // Once closed (via cancel()/return()), iteration ends — even if a
+            // prior poll left records buffered — so `return()` reliably
+            // terminates the stream.
+            if (closed) {
+              return harden({ value: undefined, done: true });
+            }
+            const value = buffered.shift();
+            if (value === undefined) {
+              return harden({ value: undefined, done: true });
+            }
+            return harden({ value, done: false });
+          },
+          async return() {
+            close();
+            return harden({ value: undefined, done: true });
+          },
         });
       },
     });
-    return harden({
-      events,
-      cancel: () => {},
-    });
+    return harden({ events, cancel: close });
   };
 
   return harden({

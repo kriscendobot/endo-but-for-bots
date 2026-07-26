@@ -20,7 +20,7 @@ use std::ptr;
 /// Snapshot signature — must change when the host callback table
 /// layout changes.  Includes the XS version implicitly (the
 /// snapshot VERS atom carries it).
-pub const SNAPSHOT_SIGNATURE: &[u8] = b"endo-xs 1";
+pub const SNAPSHOT_SIGNATURE: &[u8] = b"endo-xs 2";
 
 /// Default machine creation parameters.
 /// Sized for a general-purpose worker — not microcontroller-constrained.
@@ -2233,6 +2233,41 @@ mod tests {
                 assert!(s.contains("b.txt"), "expected b.txt in {}", s);
             }
             other => panic!("expected string, got {:?}", js_value_debug(&other)),
+        }
+    }
+
+    #[test]
+    fn fs_watch_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(
+            tmp.path(),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join("watched")).unwrap();
+
+        let mut powers = powers::HostPowers::new();
+        powers.add_dir("test", dir);
+        let machine = new_machine_with_powers(&mut powers);
+
+        machine
+            .eval("var watch = watchDirectory('test', 'watched')")
+            .unwrap();
+        machine
+            .eval("writeFileText('test', 'watched/entry.txt', 'entry')")
+            .unwrap();
+
+        match machine.eval("watchNext(watch, 0)").unwrap() {
+            JsValue::String(changes) => {
+                assert_eq!(changes, "[{\"kind\":\"add\",\"name\":\"entry.txt\"}]");
+            }
+            other => panic!("expected watch changes, got {:?}", js_value_debug(&other)),
+        }
+
+        machine.eval("watchClose(watch)").unwrap();
+        match machine.eval("watchNext(watch, 0)").unwrap() {
+            JsValue::String(error) => assert_eq!(error, "Error: invalid watch handle"),
+            other => panic!("expected watch-handle error, got {:?}", js_value_debug(&other)),
         }
     }
 
