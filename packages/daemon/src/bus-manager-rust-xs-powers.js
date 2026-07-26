@@ -436,7 +436,7 @@ export const makeXsFilePowers = () => {
    * @type {FilePowers['watchDirectory']}
    */
   const watchDirectory = directoryPath => {
-    const result = hostWatchDirectory('root', toRelative(directoryPath));
+    const result = hostWatchDirectory(DIR_TOKEN, toRelative(directoryPath));
     if (typeof result === 'string' && result.startsWith('Error: ')) {
       throw new Error(result);
     }
@@ -453,6 +453,10 @@ export const makeXsFilePowers = () => {
       hostWatchClose(handle);
     };
 
+    // Each poll blocks the host for up to this window before returning the
+    // changes it observed; it matches the Rust backend's snapshot interval.
+    const pollTimeoutMs = 50;
+
     /** @type {AsyncIterable<{ kind: 'add' | 'remove' | 'replace', name: string }>} */
     const events = harden({
       [Symbol.asyncIterator]() {
@@ -463,22 +467,26 @@ export const makeXsFilePowers = () => {
             // that is already pending runs first.
             await null;
             while (!closed && buffered.length === 0) {
-              // `hostWatchNext` is a synchronous, blocking FFI call (the Rust
+              // `hostWatchNext` is a synchronous, blocking FFI call. The Rust
               // backend sleeps/kqueue-waits up to the timeout). Poll once, then
               // yield to the event loop before polling again, so this iterator
               // never monopolizes the single XS worker thread: a concurrent
               // cancel()/return() and any racing revoke signal can run between
               // polls, keeping the watch cancellable and the vat responsive
               // rather than frozen until the next change.
-              const payload = hostWatchNext(handle, 50);
-              if (
-                typeof payload === 'string' &&
-                payload.startsWith('Error: ')
-              ) {
+              try {
+                const payload = hostWatchNext(handle, 50);
+                if (
+                  typeof payload === 'string' &&
+                  payload.startsWith('Error: ')
+                ) {
+                  throw new Error(payload);
+                }
+                buffered.push(...JSON.parse(payload));
+              } catch (error) {
                 close();
-                throw new Error(payload);
+                throw error;
               }
-              buffered.push(...JSON.parse(payload));
               if (closed || buffered.length > 0) {
                 break;
               }
