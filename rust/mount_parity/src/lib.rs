@@ -81,6 +81,16 @@ pub fn contract_dir() -> PathBuf {
         .expect("contract directory packages/daemon/test must exist")
 }
 
+/// The directory containing the fixed, language-neutral I-Regexp profile
+/// corpus. The native `endor` backend consumes this same asset when it lands;
+/// keeping the path here makes the existing parity crate enforce that seam now.
+pub fn regexp_contract_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/regexp/test")
+        .canonicalize()
+        .expect("regexp contract directory packages/regexp/test must exist")
+}
+
 // Fixture manifest.
 
 /// One record in `mount-fixture-manifest.json`.

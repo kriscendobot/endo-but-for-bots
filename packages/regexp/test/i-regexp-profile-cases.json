@@ -1,0 +1,35 @@
+{
+  "profile": "endo-i-regexp-v1",
+  "validity": [
+    { "source": "0x[0-9a-fA-F]{40}", "accepted": true },
+    { "source": "(foo|bar|baz)__[0-9]+", "accepted": true },
+    { "source": "a", "accepted": true },
+    { "source": "", "accepted": true },
+    { "source": "\\p{L}+", "accepted": false, "reason": "unicode-property" },
+    { "source": "\\d+", "accepted": false, "reason": "syntax" },
+    { "source": "^a$", "accepted": true },
+    { "source": "(a*)*$", "accepted": false, "reason": "ambiguous-repetition" },
+    { "source": "([0-9]+)*$", "accepted": false, "reason": "ambiguous-repetition" },
+    { "source": "(a|aa){10}$", "accepted": false, "reason": "ambiguous-repetition" },
+    { "source": "(a|a?)+$", "accepted": false, "reason": "ambiguous-repetition" },
+    { "source": "a{1001}", "accepted": false, "reason": "resource-limit" },
+    { "source": "[z-a]", "accepted": false, "reason": "syntax" }
+  ],
+  "matches": [
+    { "source": "a", "text": "a", "matches": true },
+    { "source": "a", "text": "aa", "matches": false },
+    { "source": ".", "text": "\\n", "matches": false },
+    { "source": ".", "text": "\\r", "matches": false },
+    { "source": "[A-Z]+", "text": "ENDO", "matches": true },
+    { "source": "[A-Z]+", "text": "Endo", "matches": false },
+    { "source": "^a$", "text": "^a$", "matches": true },
+    { "source": "(foo|bar|baz)__[0-9]+", "text": "bar__42", "matches": true },
+    { "source": "(foo|bar|baz)__[0-9]+", "text": "bar__", "matches": false },
+    { "source": "é+", "text": "éé", "matches": true },
+    { "source": "[😀-🙏]", "text": "😀", "matches": true }
+  ],
+  "contains": [
+    { "source": "foo", "text": "a foo b", "matches": true },
+    { "source": "foo", "text": "bar", "matches": false }
+  ]
+}
