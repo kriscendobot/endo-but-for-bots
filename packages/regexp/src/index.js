@@ -122,7 +122,11 @@ class Parser {
 
   branch() {
     const pieces = [];
-    while (this.peek() !== undefined && this.peek() !== ')' && this.peek() !== '|') {
+    while (
+      this.peek() !== undefined &&
+      this.peek() !== ')' &&
+      this.peek() !== '|'
+    ) {
       pieces.push(this.piece());
     }
     return this.node({ type: 'branch', pieces });
@@ -134,7 +138,10 @@ class Parser {
     const character = this.peek();
     if (character === '*' || character === '+' || character === '?') {
       this.take();
-      quantifier = { min: character === '+' ? 1 : 0, max: character === '?' ? 1 : null };
+      quantifier = {
+        min: character === '+' ? 1 : 0,
+        max: character === '?' ? 1 : null,
+      };
     } else if (character === '{') {
       quantifier = this.rangeQuantifier();
     }
@@ -200,12 +207,28 @@ class Parser {
       }
       reject('unicode-property');
     }
-    const escaped = ['(', ')', '*', '+', '-', '.', '?', '[', '\\', ']', '^', '{', '}'];
-    if (escaped.includes(character)) return this.node({ type: 'literal', value: character });
+    const escaped = [
+      '(',
+      ')',
+      '*',
+      '+',
+      '-',
+      '.',
+      '?',
+      '[',
+      '\\',
+      ']',
+      '^',
+      '{',
+      '}',
+    ];
+    if (escaped.includes(character))
+      return this.node({ type: 'literal', value: character });
     if (character === 'n') return this.node({ type: 'literal', value: '\n' });
     if (character === 'r') return this.node({ type: 'literal', value: '\r' });
     if (character === 't') return this.node({ type: 'literal', value: '\t' });
-    if (!inClass && character === '|') return this.node({ type: 'literal', value: '|' });
+    if (!inClass && character === '|')
+      return this.node({ type: 'literal', value: '|' });
     return reject('syntax');
   }
 
@@ -225,7 +248,8 @@ class Parser {
       entries.push(this.classEntry());
     }
     this.take();
-    if (entries.length === 1 && entries[0].value === '^' && !negated) reject('syntax');
+    if (entries.length === 1 && entries[0].value === '^' && !negated)
+      reject('syntax');
     return this.node({ type: 'class', negated, entries });
   }
 
@@ -233,7 +257,8 @@ class Parser {
     const first = this.classAtom();
     if (this.peek() !== '-') return first;
     this.take();
-    if (this.peek() === ']') return this.node({ type: 'literal', value: `${first.value}-` });
+    if (this.peek() === ']')
+      return this.node({ type: 'literal', value: `${first.value}-` });
     const last = this.classAtom();
     if (codePoint(first.value) > codePoint(last.value)) reject('syntax');
     return this.node({ type: 'range', first: first.value, last: last.value });
@@ -242,7 +267,12 @@ class Parser {
   classAtom() {
     const character = this.peek();
     if (character === '\\') return this.escape(true);
-    if (character === undefined || character === ']' || character === '-' || !isClassNormal(character)) {
+    if (
+      character === undefined ||
+      character === ']' ||
+      character === '-' ||
+      !isClassNormal(character)
+    ) {
       reject('syntax');
     }
     this.take();
@@ -252,8 +282,10 @@ class Parser {
 
 /** @param {any} atom */
 const nullable = atom => {
-  if (atom.type === 'literal' || atom.type === 'dot' || atom.type === 'class') return false;
-  if (atom.type === 'group') return atom.expression.branches.some(nullableBranch);
+  if (atom.type === 'literal' || atom.type === 'dot' || atom.type === 'class')
+    return false;
+  if (atom.type === 'group')
+    return atom.expression.branches.some(nullableBranch);
   return false;
 };
 
@@ -301,7 +333,8 @@ const prefixOverlap = blocks =>
   blocks.some((block, index) =>
     blocks.some(
       (other, otherIndex) =>
-        index !== otherIndex && (block.startsWith(other) || other.startsWith(block)),
+        index !== otherIndex &&
+        (block.startsWith(other) || other.startsWith(block)),
     ),
   );
 
@@ -312,13 +345,17 @@ const prefixOverlap = blocks =>
 const validateSafety = (expression, nesting = 0) => {
   for (const branch of expression.branches) {
     for (const piece of branch.pieces) {
-      if (piece.atom.type === 'group') validateSafety(piece.atom.expression, nesting);
+      if (piece.atom.type === 'group')
+        validateSafety(piece.atom.expression, nesting);
       if (piece.quantifier) {
-        if (nesting >= profileLimits.repetitionNesting) reject('resource-limit');
+        if (nesting >= profileLimits.repetitionNesting)
+          reject('resource-limit');
         const blocks = leadingBlocks(piece.atom);
-        if (nullable(piece.atom) || hasQuantifier(piece.atom)) reject('ambiguous-repetition');
+        if (nullable(piece.atom) || hasQuantifier(piece.atom))
+          reject('ambiguous-repetition');
         if (blocks && prefixOverlap(blocks)) reject('ambiguous-repetition');
-        if (piece.atom.type === 'group') validateSafety(piece.atom.expression, nesting + 1);
+        if (piece.atom.type === 'group')
+          validateSafety(piece.atom.expression, nesting + 1);
       }
     }
   }
@@ -330,8 +367,12 @@ const validateSafety = (expression, nesting = 0) => {
  */
 const jsCharacter = (character, inClass = false) => {
   const point = codePoint(character);
-  if (point < 0x20 || point === 0x7f || point > 0x7e) return `\\u{${point.toString(16)}}`;
-  if (character === '\\' || (inClass && (character === ']' || character === '^' || character === '-'))) {
+  if (point < 0x20 || point === 0x7f || point > 0x7e)
+    return `\\u{${point.toString(16)}}`;
+  if (
+    character === '\\' ||
+    (inClass && (character === ']' || character === '^' || character === '-'))
+  ) {
     return `\\${character}`;
   }
   if (!inClass && '^$.*+?()[]{}|'.includes(character)) return `\\${character}`;
@@ -347,7 +388,9 @@ const serializeAtom = atom => {
       .map(entry =>
         entry.type === 'range'
           ? `${jsCharacter(entry.first, true)}-${jsCharacter(entry.last, true)}`
-          : [...entry.value].map(character => jsCharacter(character, true)).join(''),
+          : [...entry.value]
+              .map(character => jsCharacter(character, true))
+              .join(''),
       )
       .join('');
     return `[${atom.negated ? '^' : ''}${entries}]`;
@@ -369,11 +412,15 @@ const serializeQuantifier = quantifier => {
 /** @param {any} branch */
 const serializeBranch = branch =>
   branch.pieces
-    .map(piece => `${serializeAtom(piece.atom)}${piece.quantifier ? serializeQuantifier(piece.quantifier) : ''}`)
+    .map(
+      piece =>
+        `${serializeAtom(piece.atom)}${piece.quantifier ? serializeQuantifier(piece.quantifier) : ''}`,
+    )
     .join('');
 
 /** @param {any} expression */
-const serializeAlternation = expression => expression.branches.map(serializeBranch).join('|');
+const serializeAlternation = expression =>
+  expression.branches.map(serializeBranch).join('|');
 
 /**
  * Parses and validates a source string as Endo I-Regexp v1.
@@ -431,9 +478,21 @@ export const contains = parsed => {
       {
         type: 'branch',
         pieces: [
-          { type: 'piece', atom: { type: 'dot' }, quantifier: { min: 0, max: null } },
-          { type: 'piece', atom: { type: 'group', expression: record.expression }, quantifier: undefined },
-          { type: 'piece', atom: { type: 'dot' }, quantifier: { min: 0, max: null } },
+          {
+            type: 'piece',
+            atom: { type: 'dot' },
+            quantifier: { min: 0, max: null },
+          },
+          {
+            type: 'piece',
+            atom: { type: 'group', expression: record.expression },
+            quantifier: undefined,
+          },
+          {
+            type: 'piece',
+            atom: { type: 'dot' },
+            quantifier: { min: 0, max: null },
+          },
         ],
       },
     ],
@@ -444,7 +503,10 @@ export const contains = parsed => {
     expression,
     javascript: serializeAlternation(expression),
   });
-  parsedRecords.set(contained, { expression, javascript: contained.javascript });
+  parsedRecords.set(contained, {
+    expression,
+    javascript: contained.javascript,
+  });
   return contained;
 };
 
