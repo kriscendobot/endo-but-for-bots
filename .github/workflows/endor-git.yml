@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   native:
     strategy:
@@ -27,6 +31,8 @@ jobs:
     runs-on: ${{ matrix.operating-system }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: cargo test -p endor-git --all-targets --locked
       - run: cargo build --release -p endor-git --example endor-git-link-audit --locked
       - if: runner.os != 'Windows'
@@ -37,6 +43,8 @@ jobs:
 
   linux-zig-cross-build:
     runs-on: ubuntu-latest
+    env:
+      ENDOR_GIT_TARGET: ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,16 +55,20 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: python3 -m pip install --disable-pip-version-check ziglang==0.15.2
       - run: cargo install cargo-zigbuild --version 0.23.0 --locked
-      - run: target="${{ matrix.target }}"; rustup target add "${target%%.*}"
-      - run: rust/endor-git/scripts/cross-build.sh "${{ matrix.target }}"
+      - run: rustup target add "${ENDOR_GIT_TARGET%%.*}"
+      - run: rust/endor-git/scripts/cross-build.sh "$ENDOR_GIT_TARGET"
 
   windows-gnu-zig-probe:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: python3 -m pip install --disable-pip-version-check ziglang==0.15.2
       - run: rustup target add x86_64-pc-windows-gnu
       - run: rust/endor-git/scripts/cross-build.sh x86_64-pc-windows-gnu
@@ -65,10 +77,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rust/endor-git/scripts/reproducibility-check.sh
 
   address-sanitizer:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rust/endor-git/scripts/sanitizer-check.sh
