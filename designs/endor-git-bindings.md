@@ -3,9 +3,26 @@
 | | |
 |---|---|
 | **Created** | 2026-07-15 |
-| **Updated** | 2026-08-14 |
+| **Updated** | 2026-08-22 |
 | **Author** | Kris Kowal (prompted) |
-| **Status** | Proposed |
+| **Status** | In Progress |
+
+## Status
+
+The initial `rust/endor-git` tranche implements the safe object/ref contract,
+filesystem and custom ODB/refdb backends, SHA-1/SHA-256 conformance tests,
+bounded async bridge, vendored static dependency profile, linkage and
+reproducibility audits, and the release build matrix scaffolding.
+The x86_64 Linux glibc and musl Zig artifacts build and run.
+The first Windows GNU attempt reaches the final link after compiling vendored
+libgit2, but Zig 0.15.2 cannot satisfy Rust's `msvcrt` import-library link,
+confirming the design's escalation trigger.
+
+Streaming writes, bounded pack ingestion, the Endor tree-to-`ContentStore`
+adapter, ARM and platform-native corpus runs, macOS SDK lane, and Minion Town
+smart-HTTP integration remain.
+The structured evidence and target gaps are maintained in
+[`rust/endor-git/GAPS.md`](../rust/endor-git/GAPS.md).
 
 ## Revision context
 

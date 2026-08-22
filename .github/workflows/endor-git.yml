@@ -1,0 +1,74 @@
+name: Endor Git bindings
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - rust/endor-git/**
+      - .github/workflows/endor-git.yml
+  push:
+    branches: [llm]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - rust/endor-git/**
+      - .github/workflows/endor-git.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        operating-system: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.operating-system }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo test -p endor-git --all-targets --locked
+      - run: cargo build --release -p endor-git --example endor-git-link-audit --locked
+      - if: runner.os != 'Windows'
+        run: rust/endor-git/scripts/link-audit.sh target/release/examples/endor-git-link-audit
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: rust/endor-git/scripts/link-audit.sh target/release/examples/endor-git-link-audit.exe
+
+  linux-zig-cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu.2.28
+          - aarch64-unknown-linux-gnu.2.28
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m pip install --disable-pip-version-check ziglang==0.15.2
+      - run: cargo install cargo-zigbuild --version 0.23.0 --locked
+      - run: target="${{ matrix.target }}"; rustup target add "${target%%.*}"
+      - run: rust/endor-git/scripts/cross-build.sh "${{ matrix.target }}"
+
+  windows-gnu-zig-probe:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m pip install --disable-pip-version-check ziglang==0.15.2
+      - run: rustup target add x86_64-pc-windows-gnu
+      - run: rust/endor-git/scripts/cross-build.sh x86_64-pc-windows-gnu
+
+  reproducibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rust/endor-git/scripts/reproducibility-check.sh
+
+  address-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rust/endor-git/scripts/sanitizer-check.sh
