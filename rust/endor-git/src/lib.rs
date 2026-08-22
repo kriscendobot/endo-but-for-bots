@@ -92,4 +92,30 @@ mod tests {
             .expect("blocking call succeeds");
         assert_eq!(result, 42);
     }
+
+    #[test]
+    fn blocking_pool_reports_a_panicking_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build Tokio runtime");
+        let pool = GitBlockingPool::new(1).expect("build blocking pool");
+        let error = runtime
+            .block_on(pool.run(|| -> Result<(), GitError> { panic!("test panic") }))
+            .expect_err("panicking blocking task must fail");
+        assert!(matches!(error, GitError::BlockingTask(_)));
+    }
+
+    #[test]
+    fn blocking_pool_preserves_the_synchronous_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build Tokio runtime");
+        let pool = GitBlockingPool::new(1).expect("build blocking pool");
+        let error = runtime
+            .block_on(pool.run(|| -> Result<(), GitError> {
+                Err(GitError::Unsupported("test operation".to_owned()))
+            }))
+            .expect_err("synchronous error must be preserved");
+        assert!(matches!(error, GitError::Unsupported(message) if message == "test operation"));
+    }
 }
