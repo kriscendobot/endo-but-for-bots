@@ -33,6 +33,7 @@ export const makePostponedHandler = HandledPromise => {
   const postponedHandler = {
     get: makePostponedOperation('get'),
     getSendOnly: makePostponedOperation('getSendOnly'),
+    untag: makePostponedOperation('untag'),
     applyFunction: makePostponedOperation('applyFunction'),
     applyFunctionSendOnly: makePostponedOperation('applyFunctionSendOnly'),
     applyMethod: makePostponedOperation('applyMethod'),

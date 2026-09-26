@@ -137,3 +137,22 @@ export const localApplyMethod = (recipient, methodName, args) => {
 };
 
 export const localGet = (t, key) => t[key];
+
+/**
+ * @param {any} target
+ * @param {string} tag
+ */
+export const localUntag = (target, tag) => {
+  typeof tag === 'string' || assert.fail(X`Tag must be a string`, TypeError);
+  target?.[Symbol.for('passStyle')] === 'tagged' ||
+    assert.fail(X`Cannot untag a non-tagged value`, TypeError);
+  const actualTag = target?.[Symbol.toStringTag];
+  actualTag === tag ||
+    assert.fail(
+      X`Tag mismatch: expected ${q(tag)}, got ${q(actualTag)}`,
+      TypeError,
+    );
+  Object.hasOwn(target, 'payload') ||
+    assert.fail(X`Tagged value has no payload`, TypeError);
+  return target.payload;
+};
