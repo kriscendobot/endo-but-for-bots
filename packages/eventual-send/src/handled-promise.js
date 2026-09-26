@@ -6,6 +6,7 @@ import {
   localApplyFunction,
   localApplyMethod,
   localGet,
+  localUntag,
   getMethodNames,
 } from './local.js';
 import { makePostponedHandler } from './postponed.js';
@@ -410,6 +411,10 @@ export const makeHandledPromise = () => {
       prop = coerceToObjectProperty(prop);
       handle(target, 'getSendOnly', [prop]).catch(() => {});
     },
+    untag(target, tag) {
+      typeof tag === 'string' || Fail`Tag must be a string`;
+      return handle(target, 'untag', [tag]);
+    },
     applyFunction(target, args) {
       // Ensure args is an array.
       args = [...args];
@@ -477,6 +482,7 @@ export const makeHandledPromise = () => {
   forwardingHandler = {
     get: makeForwarder('get', localGet),
     getSendOnly: makeForwarder('getSendOnly', localGet),
+    untag: makeForwarder('untag', localUntag),
     applyFunction: makeForwarder('applyFunction', localApplyFunction),
     applyFunctionSendOnly: makeForwarder(
       'applyFunctionSendOnly',
@@ -595,6 +601,7 @@ export const makeHandledPromise = () => {
  * @typedef {{
  *   get?(p: T, name: PropertyKey, returnedP?: Promise<unknown>): unknown;
  *   getSendOnly?(p: T, name: PropertyKey): void;
+ *   untag?(p: T, tag: string, returnedP?: Promise<unknown>): unknown;
  *   applyFunction?(p: T, args: unknown[], returnedP?: Promise<unknown>): unknown;
  *   applyFunctionSendOnly?(p: T, args: unknown[]): void;
  *   applyMethod?(p: T, name: PropertyKey | undefined, args: unknown[], returnedP?: Promise<unknown>): unknown;
@@ -639,6 +646,7 @@ export const makeHandledPromise = () => {
  *   applyMethodSendOnly(target: unknown, prop: PropertyKey, args: unknown[]): void;
  *   get(target: unknown, prop: PropertyKey): Promise<unknown>;
  *   getSendOnly(target: unknown, prop: PropertyKey): void;
+ *   untag(target: unknown, tag: string): Promise<unknown>;
  * }} HandledPromiseStaticMethods
  */
 

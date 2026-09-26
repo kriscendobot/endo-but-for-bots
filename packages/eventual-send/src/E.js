@@ -226,6 +226,20 @@ const makeE = HandledPromise => {
         get: x => new Proxy(objTarget, makeEGetProxyHandler(x, HandledPromise)),
 
         /**
+         * Eventually strip a matching tag and obtain its payload.
+         *
+         * @template T
+         * @param {T} x target tagged value
+         * @param {string} tag expected tag
+         * @returns {Promise<Awaited<T extends { payload: infer U } ? U : unknown>>}
+         * @readonly
+         */
+        untag: (x, tag) =>
+          /** @type {Promise<Awaited<T extends { payload: infer U } ? U : unknown>>} */ (
+            HandledPromise.untag(x, tag)
+          ),
+
+        /**
          * E.resolve(x) converts x to a handled promise. It is
          * shorthand for HandledPromise.resolve(x)
          *

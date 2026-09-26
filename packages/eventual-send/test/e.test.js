@@ -7,6 +7,20 @@ test('E reexports', async t => {
   t.is(E.resolve, HandledPromise.resolve, 'E reexports resolve');
 });
 
+test('E.untag', async t => {
+  const tagged = harden({
+    [Symbol.for('passStyle')]: 'tagged',
+    [Symbol.toStringTag]: 'example',
+    payload: harden({ answer: 42 }),
+  });
+
+  const payload = await E.untag(tagged, 'example');
+  t.deepEqual(payload, { answer: 42 });
+  await t.throwsAsync(E.untag(tagged, 'different'), {
+    message: /Tag mismatch/,
+  });
+});
+
 test('E.when', async t => {
   /** @type {any} */
   let stash;

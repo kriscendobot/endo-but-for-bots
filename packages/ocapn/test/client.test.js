@@ -9,7 +9,6 @@ import {
   testWithErrorUnwrapping,
   makeTestClient,
   makeTestClientPair,
-  makeUntagTestHelper,
   getOcapnDebug,
 } from './_util.js';
 import { encodeSwissnum } from '../src/client/util.js';
@@ -1185,15 +1184,7 @@ test('op:untag with valid tagged value', async t => {
       encodeSwissnum('Tagged Provider'),
     );
 
-    // Use the helper to call the provider and untag the result in one pipelined operation
-    const untagHelper = makeUntagTestHelper(sessionA);
-    // Call the provider as a function and untag the result
-    const payload = await untagHelper.callAndUntag(
-      taggedProvider,
-      Symbol.for(''),
-      [],
-      'myTag',
-    );
+    const payload = await E.untag(E(taggedProvider)(), 'myTag');
 
     t.deepEqual(payload, { data: 42, nested: ['a', 'b'] });
   } finally {
@@ -1224,16 +1215,9 @@ test('op:untag with wrong tag rejects', async t => {
       encodeSwissnum('Tagged Provider'),
     );
 
-    // Use the helper to call the provider and untag with wrong tag
-    const untagHelper = makeUntagTestHelper(sessionA);
     const error = await t.throwsAsync(
       async () => {
-        await untagHelper.callAndUntag(
-          taggedProvider,
-          Symbol.for(''),
-          [],
-          'wrongTag',
-        );
+        await E.untag(E(taggedProvider)(), 'wrongTag');
       },
       {
         instanceOf: Error,
@@ -1272,16 +1256,9 @@ test('op:untag rejects non-tagged value', async t => {
       encodeSwissnum('Record Provider'),
     );
 
-    // Use the helper to call the provider and try to untag a non-tagged value
-    const untagHelper = makeUntagTestHelper(sessionA);
     const error = await t.throwsAsync(
       async () => {
-        await untagHelper.callAndUntag(
-          recordProvider,
-          Symbol.for(''),
-          [],
-          'someTag',
-        );
+        await E.untag(E(recordProvider)(), 'someTag');
       },
       {
         instanceOf: Error,
@@ -1320,13 +1297,8 @@ test('op:untag with nested payload containing remotable', async t => {
       encodeSwissnum('Tagged Provider'),
     );
 
-    // Use the helper to call the provider and untag the result
-    const untagHelper = makeUntagTestHelper(sessionA);
-    const payload = await untagHelper.callAndUntag(
-      taggedProvider,
-      Symbol.for(''),
-      [],
-      'wrapper',
+    const payload = /** @type {any} */ (
+      await E.untag(E(taggedProvider)(), 'wrapper')
     );
 
     // The payload should contain the remotable, which we can call

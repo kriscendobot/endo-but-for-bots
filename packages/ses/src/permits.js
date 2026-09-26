@@ -1738,6 +1738,7 @@ export const permitted = {
     applyMethodSendOnly: fn,
     get: fn,
     getSendOnly: fn,
+    untag: fn,
     prototype: '%PromisePrototype%',
     resolve: fn,
   },

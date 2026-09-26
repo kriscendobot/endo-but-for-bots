@@ -404,6 +404,31 @@ const makeMakeHandlerForRemoteReference = ({
 
         return internalPromise;
       },
+      untag(_o, tag, externalAnswerPromise) {
+        if (didUnplug()) {
+          return quietReject(didUnplug());
+        }
+        logger.info(`untag`, targetGetter(), tag);
+        const {
+          internalPromise,
+          answerPromise,
+          position: answerPosition,
+          resolver: resolveMeDesc,
+        } = takeNextRemoteAnswer(externalAnswerPromise);
+        send({
+          type: 'op:untag',
+          receiverDesc: targetGetter(),
+          tag,
+          answerPosition,
+        });
+        send({
+          type: 'op:listen',
+          to: answerPromise,
+          resolveMeDesc,
+          wantsPartial: false,
+        });
+        return internalPromise;
+      },
       applyFunction(_o, args, externalAnswerPromise) {
         if (didUnplug()) {
           return quietReject(didUnplug());

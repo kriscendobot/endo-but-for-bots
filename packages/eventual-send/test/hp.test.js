@@ -73,6 +73,26 @@ test('chained properties', async t => {
   await pr.p;
 });
 
+test('untag pipelines through an unresolved handled promise', async t => {
+  const calls = [];
+  const handler = {
+    untag(target, tag) {
+      calls.push([target, tag]);
+      return 'payload';
+    },
+  };
+  /** @type {any} */
+  let resolve;
+  const taggedP = new HandledPromise(r => (resolve = r), handler);
+
+  const payloadP = HandledPromise.untag(taggedP, 'example');
+  await Promise.resolve();
+  t.deepEqual(calls, [[taggedP, 'example']], 'sent before settlement');
+  t.is(await payloadP, 'payload');
+
+  resolve(undefined);
+});
+
 test('no local stalls', async t => {
   const log = [];
   const target = {
