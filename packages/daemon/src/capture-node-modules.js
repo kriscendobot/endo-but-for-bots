@@ -4,6 +4,8 @@
 /** @import { ERef } from '@endo/eventual-send' */
 /** @import { ReadableTree } from '@endo/platform/fs/lite/types' */
 
+import { makeArchiveFromMap } from '@endo/compartment-mapper/archive-lite.js';
+import { defaultParserForLanguage as archiveParserForLanguage } from '@endo/compartment-mapper/archive-parsers.js';
 import { captureFromMap } from '@endo/compartment-mapper/capture-lite.js';
 import { defaultParserForLanguage } from '@endo/compartment-mapper/import-parsers.js';
 import { mapNodeModules } from '@endo/compartment-mapper/node-modules.js';
@@ -84,7 +86,7 @@ const assertMapLocationsUnderRoot = (
 };
 
 /**
- * Capture a Node-style package graph from a `ReadableTree` or `Mount`.
+ * Map a Node-style package graph in a `ReadableTree` or `Mount`.
  *
  * `node-modules-with-map` reads a package compartment map from the tree root;
  * its compartment locations continue to name the original package directories
@@ -96,9 +98,9 @@ const assertMapLocationsUnderRoot = (
  *
  * @param {ERef<ReadableTree>} tree
  * @param {CaptureNodeModulesOptions} options
- * @returns {Promise<CaptureResult>}
+ * @returns {Promise<{ readPowers: ReadPowers, compartmentMap: PackageCompartmentMapDescriptor }>}
  */
-export const captureNodeModules = async (tree, options) => {
+const mapTree = async (tree, options) => {
   await null;
   const { layout, entry, root = defaultRoot } = options;
   // A mount the daemon backs canonicalizes package directories through its
@@ -163,8 +165,39 @@ export const captureNodeModules = async (tree, options) => {
     throw makeError(X`Unsupported node_modules layout ${q(layout)}`);
   }
 
+  return { readPowers, compartmentMap };
+};
+
+/**
+ * Capture a Node-style package graph from a `ReadableTree` or `Mount`
+ * (see `mapTree` for the layouts).
+ *
+ * @param {ERef<ReadableTree>} tree
+ * @param {CaptureNodeModulesOptions} options
+ * @returns {Promise<CaptureResult>}
+ */
+export const captureNodeModules = async (tree, options) => {
+  const { readPowers, compartmentMap } = await mapTree(tree, options);
   return captureFromMap(readPowers, compartmentMap, {
     parserForLanguage: defaultParserForLanguage,
   });
 };
 harden(captureNodeModules);
+
+/**
+ * Capture a Node-style package graph from a `ReadableTree` or `Mount` into
+ * source-only compartment-mapper archive bytes, which a worker's
+ * `makeArchive` method runs.  A module the map names but the tree cannot
+ * read fails the capture.
+ *
+ * @param {ERef<ReadableTree>} tree
+ * @param {CaptureNodeModulesOptions} options
+ * @returns {Promise<Uint8Array>}
+ */
+export const captureNodeModulesArchive = async (tree, options) => {
+  const { readPowers, compartmentMap } = await mapTree(tree, options);
+  return makeArchiveFromMap(readPowers, compartmentMap, {
+    parserForLanguage: archiveParserForLanguage,
+  });
+};
+harden(captureNodeModulesArchive);

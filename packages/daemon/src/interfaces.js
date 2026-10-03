@@ -52,6 +52,24 @@ const MakeCapletOptionsShape = M.splitRecord(
   },
 );
 
+const MakeFromTreeOptionsShape = M.splitRecord(
+  {},
+  {
+    powersName: NameOrPathShape,
+    resultName: NameOrPathShape,
+    env: EnvShape,
+    workerTrustedShims: M.arrayOf(M.string()),
+    layout: M.or(
+      'detect',
+      'archive',
+      'node-modules-with-map',
+      'node-modules-scan',
+      'package',
+    ),
+    entry: M.string(),
+  },
+);
+
 // Shared method guard for evaluate (used by both Host and Guest)
 // Both execute directly in a worker, differing only in namespace
 const EvaluateMethodGuard = M.call(
@@ -519,9 +537,10 @@ export const HostInterface = M.interface('EndoHost', {
     .returns(M.promise()),
   // Make a caplet from a ReadableTree or Mount laid out as a
   // compartment-mapper archive (compartment-map.json at root plus
-  // modules at their referenced paths).
+  // modules at their referenced paths), as node_modules in situ with a
+  // pre-generated map, or as node_modules in situ to scan.
   makeFromTree: M.call(M.or(NameOrPathShape, M.undefined()), NameOrPathShape)
-    .optional(MakeCapletOptionsShape)
+    .optional(MakeFromTreeOptionsShape)
     .returns(M.promise()),
   // Materialise a readable tree into a new scratch mount.
   stageTree: M.call(NameOrPathShape, NameOrPathShape).returns(M.promise()),
@@ -684,7 +703,6 @@ export const ChannelInvitationInterface = M.interface('EndoChannelInvitation', {
   help: M.call().optional(M.string()).returns(M.string()),
   join: M.call(M.string()).returns(M.promise()),
 });
-harden(ChannelInvitationInterface);
 
 export const AttenuatorInterface = M.interface('EndoChannelAttenuator', {
   setInvitationValidity: M.call(M.boolean()).returns(M.promise()),
@@ -692,7 +710,6 @@ export const AttenuatorInterface = M.interface('EndoChannelAttenuator', {
   getHeatConfig: M.call().returns(M.promise()),
   temporaryBan: M.call(M.number()).returns(M.promise()),
 });
-harden(AttenuatorInterface);
 
 export const InvitationInterface = M.interface('EndoInvitation', {
   accept: M.call(IdShape).optional(M.string()).returns(M.promise()),
