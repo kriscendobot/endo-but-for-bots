@@ -16,16 +16,21 @@
 //!   isDir(dirOrToken, path) -> boolean
 //!   openDir(dirOrToken, path) -> number (handle)
 //!   closeDir(handle) -> undefined
+//!   watchDirectory(dirOrToken, path) -> number (handle)
+//!   watchNext(handle, timeoutMs) -> string (JSON-encoded changes)
+//!   watchClose(handle) -> undefined
 //!   symlink(dirOrToken, target, linkName) -> undefined
 //!   link(dirOrToken, srcPath, dstPath) -> undefined
 
 use crate::ffi::*;
+use crate::powers::watch::{watch_directory, ChangeKind, DirectoryWatch};
 use crate::powers::HostPowers;
 use crate::worker_io::{arg_str, read_typed_array_bytes, set_result_string};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// Helper: get HostPowers from the machine context.
 ///
@@ -133,6 +138,21 @@ static DIR_MAP: Mutex<Option<HashMap<u32, cap_std::fs::Dir>>> = Mutex::new(None)
 
 fn get_dir_map() -> std::sync::MutexGuard<'static, Option<HashMap<u32, cap_std::fs::Dir>>> {
     let mut guard = DIR_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard
+}
+
+// ---------------------------------------------------------------------------
+// Handle-based directory watch registry
+// ---------------------------------------------------------------------------
+
+static NEXT_WATCH_HANDLE: AtomicU32 = AtomicU32::new(1);
+static WATCH_MAP: Mutex<Option<HashMap<u32, DirectoryWatch>>> = Mutex::new(None);
+
+fn get_watch_map() -> std::sync::MutexGuard<'static, Option<HashMap<u32, DirectoryWatch>>> {
+    let mut guard = WATCH_MAP.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Some(HashMap::new());
     }
@@ -863,6 +883,88 @@ pub unsafe extern "C" fn host_close_dir(the: *mut XsMachine) {
     map.as_mut().unwrap().remove(&handle);
 }
 
+/// `watchDirectory(dirOrToken, path) -> number | string`
+///
+/// Starts a capability-scoped watch over `path` within the resolved directory.
+/// The watch receives an open `Dir`, not a path recovered from its descriptor.
+pub unsafe extern "C" fn host_watch_directory(the: *mut XsMachine) {
+    let path = arg_str(the, 1);
+    let directory = resolve_dir(the, 0).and_then(|directory| {
+        if path.is_empty() {
+            Ok(directory)
+        } else {
+            directory
+                .open_dir(path)
+                .map_err(|error| format!("Error: {}", error))
+        }
+    });
+
+    match directory.and_then(|directory| {
+        watch_directory(&directory).map_err(|error| format!("Error: {}", error))
+    }) {
+        Ok(watch) => {
+            let handle = NEXT_WATCH_HANDLE.fetch_add(1, Ordering::SeqCst);
+            let mut map = get_watch_map();
+            map.as_mut().unwrap().insert(handle, watch);
+            fxInteger(the, &mut (*the).scratch, handle as i32);
+            *(*the).frame.add(1) = (*the).scratch;
+        }
+        Err(message) => set_result_string(the, &message),
+    }
+}
+
+/// `watchNext(handle, timeoutMs) -> string`
+///
+/// Waits for changes, returning a JSON array of `{ kind, name }` records.
+/// The host call is intentionally pull-shaped for this first backend; the
+/// watch itself remains capability-scoped and the JS adapter owns iteration.
+pub unsafe extern "C" fn host_watch_next(the: *mut XsMachine) {
+    let handle = fxToInteger(the, (*the).frame.sub(1)) as u32;
+    let timeout_ms = fxToInteger(the, (*the).frame.sub(2));
+    let timeout = if timeout_ms <= 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(timeout_ms as u64)
+    };
+
+    let mut map = get_watch_map();
+    let Some(watch) = map.as_mut().unwrap().get_mut(&handle) else {
+        set_result_string(the, "Error: invalid watch handle");
+        return;
+    };
+    match watch.poll(timeout) {
+        Ok(changes) => {
+            let json = changes
+                .iter()
+                .map(|change| {
+                    let kind = match change.kind {
+                        ChangeKind::Add => "add",
+                        ChangeKind::Remove => "remove",
+                        ChangeKind::Replace => "replace",
+                    };
+                    format!(
+                        "{{\"kind\":\"{}\",\"name\":{}}}",
+                        kind,
+                        serde_json::to_string(&change.name).expect("string serializes"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            set_result_string(the, &format!("[{}]", json));
+        }
+        Err(error) => set_result_string(the, &format!("Error: {}", error)),
+    }
+}
+
+/// `watchClose(handle) -> undefined`
+///
+/// Drops the watch and any platform-specific wakeup handle. Idempotent.
+pub unsafe extern "C" fn host_watch_close(the: *mut XsMachine) {
+    let handle = fxToInteger(the, (*the).frame.sub(1)) as u32;
+    let mut map = get_watch_map();
+    map.as_mut().unwrap().remove(&handle);
+}
+
 /// `symlink(dirOrToken, target, linkName) -> string | undefined`
 ///
 /// Creates a symlink at `linkName` pointing to `target` within the
@@ -936,6 +1038,9 @@ pub const CALLBACKS: &[crate::ffi::XsCallback] = &[
     host_maybe_read_file_bytes,
     host_append_file,
     host_stat,
+    host_watch_directory,
+    host_watch_next,
+    host_watch_close,
 ];
 
 /// Register all filesystem host functions on the machine.
@@ -970,6 +1075,9 @@ pub unsafe fn register(machine: &crate::Machine) {
     // Directory handles and link operations
     machine.define_function("openDir", host_open_dir, 2);
     machine.define_function("closeDir", host_close_dir, 1);
+    machine.define_function("watchDirectory", host_watch_directory, 2);
+    machine.define_function("watchNext", host_watch_next, 2);
+    machine.define_function("watchClose", host_watch_close, 1);
     machine.define_function("symlink", host_symlink, 3);
     machine.define_function("link", host_link, 3);
 }

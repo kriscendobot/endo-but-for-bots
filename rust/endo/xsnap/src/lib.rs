@@ -20,7 +20,7 @@ use std::ptr;
 /// Snapshot signature — must change when the host callback table
 /// layout changes.  Includes the XS version implicitly (the
 /// snapshot VERS atom carries it).
-pub const SNAPSHOT_SIGNATURE: &[u8] = b"endo-xs 1";
+pub const SNAPSHOT_SIGNATURE: &[u8] = b"endo-xs 2";
 
 /// Default machine creation parameters.
 /// Sized for a general-purpose worker — not microcontroller-constrained.
@@ -1057,6 +1057,99 @@ fn handle_envelope(machine: &Machine, data: &[u8]) -> EnvelopeAction {
     EnvelopeAction::Continue
 }
 
+/// Longest a promise-job drain may run without quiescing before the
+/// reactive pump checks for inbound envelopes anyway.
+///
+/// A microtask loop that re-queues itself forever (for example an idle
+/// directory watch polling the host between `await`s) never lets
+/// `fxHasPendingJobs()` report zero.  Without this slice the pump would
+/// drain it forever and never read the next envelope, so a CapTP
+/// `cancel()` or revoke could never arrive.
+const PUMP_FAIRNESS_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How the reactive pump ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PumpOutcome {
+    /// No promise jobs and no inbound envelopes remain.
+    Idle,
+    /// An envelope asked the worker to suspend.
+    Suspend,
+    /// The transport failed while polling for envelopes.
+    TransportError,
+    /// The crank exceeded its metering limit.
+    MeteringAbort,
+}
+
+/// Drain promise jobs and inbound envelopes until both are exhausted.
+///
+/// `fxHasPendingJobs()` is check-and-reset: it returns 1 if any promise
+/// job was queued since the last call, then clears the flag.  The pump
+/// runs `fxRunPromiseJobs` until no new jobs are queued, then drains
+/// inbound envelopes, and repeats while either produced work.  If the
+/// promise jobs do not quiesce within [`PUMP_FAIRNESS_SLICE`], the pump
+/// checks for envelopes before continuing, so a self-perpetuating
+/// microtask loop cannot starve message delivery.
+fn pump_reactive(machine: &Machine, label: &str) -> PumpOutcome {
+    loop {
+        // Drain ready promise jobs (multiple turns may be needed as
+        // resolving one promise can queue another).  Use the metered
+        // wrapper so that a metering abort (longjmp) stays within C
+        // and doesn't cross Rust stack frames.
+        let slice_start = std::time::Instant::now();
+        let mut jobs_pending = false;
+        loop {
+            if let Err(status) = machine.run_promise_jobs_metered() {
+                eprintln!(
+                    "{label}: metering abort (status {status}) after {} computrons",
+                    machine.current_computrons()
+                );
+                return PumpOutcome::MeteringAbort;
+            }
+            if unsafe { ffi::fxHasPendingJobs() } == 0 {
+                break;
+            }
+            if slice_start.elapsed() >= PUMP_FAIRNESS_SLICE {
+                jobs_pending = true;
+                break;
+            }
+        }
+
+        // Drain any envelopes that arrived while JS was running.
+        let mut got_envelope = false;
+        loop {
+            match worker_io::with_transport(|t| t.try_recv_raw_envelope()) {
+                Ok(Some(data)) => {
+                    got_envelope = true;
+                    if matches!(handle_envelope(machine, &data), EnvelopeAction::Suspend) {
+                        eprintln!("{label}: suspended (during pump)");
+                        return PumpOutcome::Suspend;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("{label}: try_recv error: {e}");
+                    return PumpOutcome::TransportError;
+                }
+            }
+        }
+
+        // Flush any debug output generated during this pump cycle
+        // (breakpoint hits, step responses, etc.).
+        flush_debug_outbound();
+
+        // Loop back if the fairness slice cut the drain short, if
+        // envelopes may have triggered promise jobs, or if new jobs
+        // were queued during envelope handling (e.g., by sendRawFrame
+        // callbacks).
+        if jobs_pending || got_envelope || unsafe { ffi::fxHasPendingJobs() } != 0 {
+            continue;
+        }
+
+        // Truly idle.
+        return PumpOutcome::Idle;
+    }
+}
+
 /// Handle a suspend request: stream snapshot to CAS, send back hash.
 ///
 /// The `cas_dir` payload tells the worker where the content-
@@ -1649,82 +1742,11 @@ pub fn run_xs_program(
             // Reactive pump: drain promise jobs and interleave with
             // non-blocking envelope dispatch so that CapTP round-trips
             // can complete without deadlocking.
-            //
-            // fxHasPendingJobs() is check-and-reset: returns 1 if any
-            // promise job was queued since the last call, then clears
-            // the flag. We loop `fxRunPromiseJobs` until no new jobs
-            // are queued, then drain inbound envelopes. If after
-            // draining we still have fresh jobs, repeat. When both
-            // promise jobs and envelopes are exhausted, break.
-            let mut metering_abort = false;
-            loop {
-                // Drain all ready promise jobs (multiple turns may be
-                // needed as resolving one promise can queue another).
-                // Use the metered wrapper so that a metering abort
-                // (longjmp) stays within C and doesn't cross Rust
-                // stack frames.
-                loop {
-                    match machine.run_promise_jobs_metered() {
-                        Ok(()) => {}
-                        Err(status) => {
-                            eprintln!(
-                                "{label}: metering abort (status {status}) \
-                                 after {} computrons",
-                                machine.current_computrons()
-                            );
-                            metering_abort = true;
-                            break;
-                        }
-                    }
-                    if unsafe { ffi::fxHasPendingJobs() } == 0 {
-                        break;
-                    }
-                }
-
-                if metering_abort {
-                    break;
-                }
-
-                // Drain any envelopes that arrived while JS was running.
-                let mut got_envelope = false;
-                loop {
-                    match worker_io::with_transport(|t| t.try_recv_raw_envelope()) {
-                        Ok(Some(data)) => {
-                            got_envelope = true;
-                            if matches!(handle_envelope(&machine, &data), EnvelopeAction::Suspend) {
-                                eprintln!("{label}: suspended (during pump)");
-                                break 'outer;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            eprintln!("{label}: try_recv error: {e}");
-                            break 'outer;
-                        }
-                    }
-                }
-
-                // Flush any debug output generated during this pump
-                // cycle (breakpoint hits, step responses, etc.).
-                flush_debug_outbound();
-
-                // If we processed envelopes, loop back to drain the
-                // promise jobs they may have triggered.
-                if got_envelope {
-                    continue;
-                }
-
-                // No envelopes and no ready promise jobs. Check if
-                // any new jobs were queued during envelope handling
-                // (e.g., by sendRawFrame callbacks).
-                if unsafe { ffi::fxHasPendingJobs() } != 0 {
-                    continue;
-                }
-
-                // Truly idle — break to the outer loop which will
-                // block for the next envelope.
-                break;
-            }
+            let metering_abort = match pump_reactive(&machine, label) {
+                PumpOutcome::Idle => false,
+                PumpOutcome::MeteringAbort => true,
+                PumpOutcome::Suspend | PumpOutcome::TransportError => break 'outer,
+            };
 
             // ---- Crank end ----
             let steps = machine.current_computrons();
@@ -2233,6 +2255,41 @@ mod tests {
                 assert!(s.contains("b.txt"), "expected b.txt in {}", s);
             }
             other => panic!("expected string, got {:?}", js_value_debug(&other)),
+        }
+    }
+
+    #[test]
+    fn fs_watch_dir() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = cap_std::fs::Dir::open_ambient_dir(
+            temporary.path(),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        std::fs::create_dir(temporary.path().join("watched")).unwrap();
+
+        let mut powers = powers::HostPowers::new();
+        powers.add_dir("test", directory);
+        let machine = new_machine_with_powers(&mut powers);
+
+        machine
+            .eval("var watch = watchDirectory('test', 'watched')")
+            .unwrap();
+        machine
+            .eval("writeFileText('test', 'watched/entry.txt', 'entry')")
+            .unwrap();
+
+        match machine.eval("watchNext(watch, 0)").unwrap() {
+            JsValue::String(changes) => {
+                assert_eq!(changes, "[{\"kind\":\"add\",\"name\":\"entry.txt\"}]");
+            }
+            other => panic!("expected watch changes, got {:?}", js_value_debug(&other)),
+        }
+
+        machine.eval("watchClose(watch)").unwrap();
+        match machine.eval("watchNext(watch, 0)").unwrap() {
+            JsValue::String(error) => assert_eq!(error, "Error: invalid watch handle"),
+            other => panic!("expected watch-handle error, got {:?}", js_value_debug(&other)),
         }
     }
 
@@ -3865,6 +3922,88 @@ mod tests {
         }
 
         debug::debug_reset();
+        worker_io::clear_transport();
+    }
+
+    /// Transport that delivers queued envelopes once the pump has
+    /// polled it a given number of times.
+    struct DelayedEnvelopeTransport {
+        polls_before_delivery: usize,
+        inbound: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl WorkerTransport for DelayedEnvelopeTransport {
+        fn init_handshake(&mut self) -> Result<worker_io::InitResult, std::io::Error> {
+            Ok(worker_io::InitResult::Init(0))
+        }
+        fn recv_raw_envelope(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
+            Ok(self.inbound.pop_front())
+        }
+        fn try_recv_raw_envelope(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
+            if self.polls_before_delivery > 0 {
+                self.polls_before_delivery -= 1;
+                return Ok(None);
+            }
+            Ok(self.inbound.pop_front())
+        }
+        fn send_raw_frame(&mut self, _data: &[u8]) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+        fn send_frame(&mut self, _payload: &[u8]) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+        fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
+            Ok(None)
+        }
+        fn daemon_handle(&self) -> envelope::Handle {
+            0
+        }
+    }
+
+    /// A microtask loop that re-queues itself until a host message
+    /// arrives (the shape of an idle directory watch) must not starve
+    /// envelope delivery: the pump has to read the envelope that ends
+    /// the loop, then report idle.
+    #[test]
+    fn pump_delivers_envelopes_to_never_quiescing_microtask_loop() {
+        let mut powers_store = powers::HostPowers::new();
+        let machine = new_machine_with_powers(&mut powers_store);
+
+        let stop = envelope::encode_envelope(&envelope::Envelope {
+            handle: 1,
+            verb: "deliver".to_string(),
+            payload: Vec::new(),
+            nonce: 0,
+        });
+        worker_io::install_transport(Box::new(DelayedEnvelopeTransport {
+            polls_before_delivery: 1,
+            inbound: std::collections::VecDeque::from(vec![stop]),
+        }));
+        machine.register_worker_io();
+
+        machine
+            .eval(
+                "var stopped = false; var finished = false; \
+                 globalThis.handleCommand = () => { stopped = true; }; \
+                 (async () => { \
+                   while (!stopped) { await null; } \
+                   finished = true; \
+                 })();",
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(pump_reactive(&machine, "test"), PumpOutcome::Idle);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "pump took {:?} to deliver the stopping envelope",
+            started.elapsed()
+        );
+        match machine.eval("finished").unwrap() {
+            JsValue::Boolean(finished) => assert!(finished, "loop should have observed the envelope"),
+            other => panic!("expected boolean, got {:?}", js_value_debug(&other)),
+        }
+
         worker_io::clear_transport();
     }
 

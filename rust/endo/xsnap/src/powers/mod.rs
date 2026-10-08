@@ -11,6 +11,7 @@ pub mod fs;
 pub mod modules;
 pub mod process;
 pub mod sqlite;
+pub mod watch;
 
 use cap_std::fs::Dir;
 use std::collections::HashMap;

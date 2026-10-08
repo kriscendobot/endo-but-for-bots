@@ -38,6 +38,9 @@
     hostExists: 'exists',
     hostIsDir: 'isDir',
     hostReadLink: 'readLink',
+    hostWatchDirectory: 'watchDirectory',
+    hostWatchNext: 'watchNext',
+    hostWatchClose: 'watchClose',
 
     // powers/process.rs
     hostGetPid: 'getPid',

@@ -2094,10 +2094,21 @@ export type FilePowers = {
    * `cancel()` closes the OS-level watcher handle and terminates
    * `events`.  `cancel()` is idempotent.
    *
-   * On platforms or filesystems where `fs.watch` is unavailable, the
-   * implementation logs to `console.error` and returns an `events`
-   * stream that terminates immediately so callers see end-of-stream
-   * rather than hang.
+   * The Node powers watch via `fs.watch`; on platforms or filesystems
+   * where `fs.watch` is unavailable they log to `console.error` and
+   * return an `events` stream that terminates immediately so callers
+   * see end-of-stream rather than hang.  The Rust/XS supervisor powers
+   * instead watch through a capability-scoped snapshot-diff backend
+   * (kqueue-accelerated on BSD-family hosts), so `events` stays live
+   * across changes rather than terminating immediately.  That backend
+   * is pull-shaped: while the directory is idle, `next()` polls the
+   * host in bounded slices until a change (or `cancel()`) occurs.  The
+   * XS worker's message pump interleaves inbound messages with those
+   * polls, so a `cancel()` or revoke sent from another vat still
+   * arrives.  The snapshot diff coalesces changes between polls: an
+   * entry added and removed within one poll is not reported, and a
+   * rewrite that keeps the same length and modification time is not
+   * reported as `replace`.
    */
   watchDirectory: (path: string) => {
     events: AsyncIterable<{
