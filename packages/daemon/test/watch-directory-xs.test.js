@@ -8,8 +8,13 @@ import { makeXsFilePowers } from '../src/bus-manager-rust-xs-powers.js';
  * globals.  These tests install deterministic stubs on `globalThis` so the JS
  * adapter — the async-iterator contract, the host error round-trip, and the
  * watch-handle lifecycle — is exercised in-process, without a live XS worker.
- * (The live path is covered by the Rust `fs_watch_dir` test; this pins the JS
- * glue that no supervisor test reaches.)
+ * (The live path is covered by the Rust `fs_watch_dir` and
+ * `pump_delivers_envelopes_to_never_quiescing_microtask_loop` tests in
+ * rust/endo/xsnap; this pins the JS glue that no supervisor test reaches.
+ * This repository's CI does not yet build the Rust supervisor or run its
+ * `cargo test` suite, so those tests run locally with
+ * `cargo test -p xsnap --lib` from rust/; wiring them into CI is a separate
+ * infrastructure change.)
  *
  * @param {import('ava').ExecutionContext} t
  * @param {{ hostWatchDirectory: (...args: any[]) => any, hostWatchNext: (...args: any[]) => any, hostWatchClose: (...args: any[]) => any }} stubs
@@ -157,15 +162,12 @@ test.serial('XS watchDirectory cancel and return() are idempotent', async t => {
 test.serial(
   'XS watchDirectory next() yields so a concurrent cancel() ends an idle watch',
   async t => {
-    // Regression pin for the daemon-liveness fix: hostWatchNext is a
-    // synchronous, blocking FFI call, so without a yield inside the poll loop
-    // next() would monopolize the single XS worker thread and no concurrent
-    // cancel() — nor the revoke signal followNameChanges races against next()
-    // in mount.js — could ever run, an uncancellable hang on an idle
-    // directory. With the poll-loop yield, a cancellation delivered as a
-    // microtask (the shape the revoke path uses) runs between polls and ends
-    // the stream. On the pre-fix synchronous loop next() never resolves and
-    // this test times out.
+    // Pins the JS half of idle-watch cancellation: next() awaits between
+    // blocking hostWatchNext polls, so a cancel() that runs as a microtask
+    // ends the stream. A cancel or revoke that arrives as a host message
+    // depends on the Rust pump interleaving envelopes with a never-quiescing
+    // microtask loop; that half is pinned by the xsnap test
+    // `pump_delivers_envelopes_to_never_quiescing_microtask_loop`.
     withHostWatchStubs(t, {
       hostWatchDirectory: () => 5,
       hostWatchNext: () => '[]', // idle: no change ever arrives
@@ -175,8 +177,8 @@ test.serial(
     const { events, cancel } = powers.watchDirectory('/root/idle');
     const iterator = events[Symbol.asyncIterator]();
     const pending = iterator.next();
-    // Deliver the cancel as a microtask, exactly as a resolved revoke signal
-    // would; the fixed next() drains microtasks between blocking polls.
+    // Deliver the cancel as a microtask; next() lets microtasks run between
+    // blocking polls.
     Promise.resolve().then(() => cancel());
     const result = await pending;
     t.true(result.done, 'a microtask-scheduled cancel ends the idle watch');

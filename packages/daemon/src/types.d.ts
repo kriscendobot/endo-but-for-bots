@@ -2101,10 +2101,14 @@ export type FilePowers = {
    * instead watch through a capability-scoped snapshot-diff backend
    * (kqueue-accelerated on BSD-family hosts), so `events` stays live
    * across changes rather than terminating immediately.  That backend
-   * is pull-shaped: while the directory is idle, `next()` holds the XS
-   * worker in host-bounded poll slices until a change (or `cancel()`)
-   * occurs, since the XS supervisor has no macrotask event loop to
-   * defer to; a host-driven async wakeup is a deferred follow-up.
+   * is pull-shaped: while the directory is idle, `next()` polls the
+   * host in bounded slices until a change (or `cancel()`) occurs.  The
+   * XS worker's message pump interleaves inbound messages with those
+   * polls, so a `cancel()` or revoke sent from another vat still
+   * arrives.  The snapshot diff coalesces changes between polls: an
+   * entry added and removed within one poll is not reported, and a
+   * rewrite that keeps the same length and modification time is not
+   * reported as `replace`.
    */
   watchDirectory: (path: string) => {
     events: AsyncIterable<{

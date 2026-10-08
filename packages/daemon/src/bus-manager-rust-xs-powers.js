@@ -467,13 +467,15 @@ export const makeXsFilePowers = () => {
             // that is already pending runs first.
             await null;
             while (!closed && buffered.length === 0) {
-              // `hostWatchNext` is a synchronous, blocking FFI call. The Rust
-              // backend sleeps/kqueue-waits up to the timeout). Poll once, then
-              // yield to the event loop before polling again, so this iterator
-              // never monopolizes the single XS worker thread: a concurrent
-              // cancel()/return() and any racing revoke signal can run between
-              // polls, keeping the watch cancellable and the vat responsive
-              // rather than frozen until the next change.
+              // `hostWatchNext` is a synchronous, blocking FFI call: the Rust
+              // backend sleeps (or kqueue-waits) up to the timeout. Poll once,
+              // then `await` before polling again. This loop never lets the
+              // promise-job queue empty, so on its own it would starve the XS
+              // worker's message pump; the Rust pump instead cuts each
+              // promise-job drain at a fairness slice and reads inbound
+              // envelopes before resuming (`pump_reactive` in
+              // rust/endo/xsnap/src/lib.rs). A cancel()/return() or a revoke
+              // arriving as a CapTP message therefore lands between polls.
               try {
                 const payload = hostWatchNext(handle, pollTimeoutMs);
                 if (

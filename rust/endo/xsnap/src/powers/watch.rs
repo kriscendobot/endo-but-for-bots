@@ -154,7 +154,14 @@ fn snapshot(directory: &Dir) -> io::Result<BTreeMap<String, EntryIdentity>> {
     let mut entries = BTreeMap::new();
     for entry in directory.entries()? {
         let entry = entry?;
-        let metadata = entry.metadata()?;
+        // An entry removed between listing and stat is a normal race for
+        // a watcher, not a failure: leave it out of this snapshot, and the
+        // next diff reports it as removed (or never saw it).
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let file_type = metadata.file_type();
         let kind = if file_type.is_dir() {
             EntryKind::Directory
@@ -286,6 +293,24 @@ impl Drop for DirectoryWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tolerates_dangling_symlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+        let mut watch = watch_directory(&directory).unwrap();
+
+        std::os::unix::fs::symlink("missing-target", temporary.path().join("dangling")).unwrap();
+        assert_eq!(
+            watch.poll(Duration::ZERO).unwrap(),
+            vec![Change {
+                kind: ChangeKind::Add,
+                name: "dangling".to_string(),
+            }]
+        );
+    }
 
     #[test]
     fn snapshot_diff_reports_add_replace_and_remove() {
