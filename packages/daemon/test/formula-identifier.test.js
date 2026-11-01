@@ -65,7 +65,7 @@ test('parseId rejects bare number', t => {
 
 test('assertFormulaNumber rejects invalid input', t => {
   t.throws(() => assertFormulaNumber('not-a-number'), {
-    message: /Invalid formula number/,
+    message: /Invalid formula address/,
   });
 });
 
@@ -75,7 +75,7 @@ test('assertFormulaNumber accepts valid input', t => {
 
 test('assertNodeNumber rejects invalid input', t => {
   t.throws(() => assertNodeNumber('not-a-number'), {
-    message: /Invalid node number/,
+    message: /Invalid peer key/,
   });
 });
 
@@ -86,5 +86,11 @@ test('assertNodeNumber accepts valid input', t => {
 test('assertValidId includes pet name in error message', t => {
   t.throws(() => assertValidId('bad-id', 'my-thing'), {
     message: /for pet name.*my-thing/,
+  });
+});
+
+test('parseId reports an invalid formula key', t => {
+  t.throws(() => parseId('bad-id'), {
+    message: /Invalid formula key/,
   });
 });

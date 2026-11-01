@@ -61,8 +61,10 @@ export const make = async (powers, context, { env } = {}) => {
     // delimiter to fit the subscription endpoint's 128-character identity.
     let sessionId;
     if (storedConfig.kind === 'subscription-responses') {
-      const { number, node } = parseLocator(await E(powers).locate('agent'));
-      sessionId = `${number}${node}`;
+      const { formulaAddress, peerKey } = parseLocator(
+        await E(powers).locate('agent'),
+      );
+      sessionId = `${formulaAddress}${peerKey}`;
     }
     // The token comes from the `SecretBlob` when one was delegated, so the
     // stored config carries no credential. Handing the loop a thunk rather

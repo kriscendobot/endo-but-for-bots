@@ -1,6 +1,6 @@
 // @ts-check
 
-/** @import { ConnectionHint, FormulaNumber, NodeNumber, FormulaIdentifier } from './types.js' */
+/** @import { ConnectionHint, FormulaAddress, FormulaKey, PeerKey } from './types.js' */
 
 import { makeError, q } from '@endo/errors';
 import { formatId, isValidNumber, parseId } from './formula-identifier.js';
@@ -40,13 +40,20 @@ import { isValidFormulaType } from './formula-type.js';
  */
 
 /**
- * Sentinel node number for locally-stored formula keys.
- * Analogous to 0.0.0.0 in networking — a "this host" placeholder.
- * All-zeros is never a valid Ed25519 public key.
- */
-export const LOCAL_NODE = /** @type {NodeNumber} */ ('0'.repeat(64));
-
-/**
+ * Terminology (see `designs/daemon-locator-terminology.md`):
+ *
+ * - **Peer key**: the 64-char hex Ed25519 public key of a peer (type
+ *   `PeerKey`, formerly "node number").
+ * - **Formula address**: the 64-char hex content address (SHA-256) or
+ *   capability address (random 256-bit) of a formula within a peer (type
+ *   `FormulaAddress`, formerly "formula number").
+ * - **Formula key**: `{formulaAddress}:{peerKey}` (type `FormulaKey`,
+ *   formerly "formula identifier"; the `id` in `parseId`/`formatId`).
+ * - **Connection hint**: a transport-prefixed address string telling a
+ *   peer how to reach the peer named by a peer key (type `ConnectionHint`).
+ * - **Locator**: an `endo://` URL combining a formula key, its formula
+ *   type, and zero or more connection hints.
+ *
  * The endo locator format:
  * ```
  * endo://{peerKey}/{formulaAddress}@{hint1}@{hint2}?type={formulaType}
@@ -60,7 +67,7 @@ export const LOCAL_NODE = /** @type {NodeNumber} */ ('0'.repeat(64));
  * - Each path component is URL-encoded so that `@`, `/`, and other
  *   reserved characters inside a component round-trip cleanly.
  * - The query string carries metadata.  `type={formulaType}` is required;
- *   `from={handleNumber}` and `fromNode={nodeNumber}` are used by
+ *   `from={handleAddress}` and `fromNode={peerKey}` are used by
  *   invitation locators.
  *
  * Example (no hints):
@@ -124,8 +131,19 @@ const encodePathComponents = components =>
   `/${components.map(encodeURIComponent).join('@')}`;
 
 /**
+ * @typedef {object} ParsedLocator
+ * @property {string} formulaType - The `type` query parameter.
+ * @property {PeerKey} peerKey - The URL host.
+ * @property {FormulaAddress} formulaAddress - The first path component.
+ * @property {ConnectionHint[]} hints - The remaining path components.
+ * @property {PeerKey} node - Legacy name for `peerKey`.
+ * @property {FormulaAddress} number - Legacy name for `formulaAddress`.
+ *   `node` and `number` match the `parseId`/`formatId` record shape.
+ */
+
+/**
  * @param {string} allegedLocator
- * @returns {{ formulaType: string, node: NodeNumber, number: FormulaNumber, hints: ConnectionHint[] }}
+ * @returns {ParsedLocator}
  */
 export const parseLocator = allegedLocator => {
   const errorPrefix = `Invalid locator ${q(allegedLocator)}:`;
@@ -139,18 +157,18 @@ export const parseLocator = allegedLocator => {
     throw makeError(`${errorPrefix} Invalid protocol.`);
   }
 
-  const node = url.host;
-  if (!isValidNumber(node)) {
-    throw makeError(`${errorPrefix} Invalid node identifier.`);
+  const host = url.host;
+  if (!isValidNumber(host)) {
+    throw makeError(`${errorPrefix} Invalid peer key.`);
   }
 
   const components = decodePathComponents(url.pathname);
   if (components.length === 0) {
-    throw makeError(`${errorPrefix} Missing formula number.`);
+    throw makeError(`${errorPrefix} Missing formula address.`);
   }
-  const [number, ...hints] = components;
-  if (!isValidNumber(number)) {
-    throw makeError(`${errorPrefix} Invalid id.`);
+  const [address, ...hints] = components;
+  if (!isValidNumber(address)) {
+    throw makeError(`${errorPrefix} Invalid formula address.`);
   }
 
   // Only `type`, `from`, and `fromNode` are recognized query parameters.
@@ -166,9 +184,16 @@ export const parseLocator = allegedLocator => {
     throw makeError(`${errorPrefix} Invalid type.`);
   }
 
-  const nodeNumber = /** @type {NodeNumber} */ (node);
-  const formulaNumber = /** @type {FormulaNumber} */ (number);
-  return { formulaType, node: nodeNumber, number: formulaNumber, hints };
+  const peerKey = /** @type {PeerKey} */ (host);
+  const formulaAddress = /** @type {FormulaAddress} */ (address);
+  return {
+    formulaType,
+    peerKey,
+    formulaAddress,
+    hints,
+    node: peerKey,
+    number: formulaAddress,
+  };
 };
 
 /** @param {string} allegedLocator */
@@ -181,8 +206,8 @@ export const assertValidLocator = allegedLocator => {
  *
  * Format: `endo://{peerKey}/{formulaAddress}?type={type}`
  *
- * @param {string} id - The full formula identifier.
- * @param {string} formulaType - The type of the formula with the given id.
+ * @param {string} id - The formula key.
+ * @param {string} formulaType - The type of the formula with the given key.
  */
 export const formatLocator = (id, formulaType) => {
   const { number, node } = parseId(id);
@@ -193,11 +218,15 @@ export const formatLocator = (id, formulaType) => {
 };
 
 /**
+ * Extract the formula key (`{formulaAddress}:{peerKey}`) from a locator,
+ * discarding its type and connection hints.
+ *
  * @param {string} locator
+ * @returns {FormulaKey}
  */
 export const idFromLocator = locator => {
-  const { number, node } = parseLocator(locator);
-  return formatId({ number, node });
+  const { formulaAddress, peerKey } = parseLocator(locator);
+  return formatId({ number: formulaAddress, node: peerKey });
 };
 
 /**
@@ -209,8 +238,8 @@ export const idFromLocator = locator => {
  * Each `<hint>` is URL-encoded so that `@`, `/`, and `?` inside a hint
  * (e.g., a hostname containing `@`) do not collide with the path syntax.
  *
- * @param {string} id - The full formula identifier.
- * @param {string} formulaType - The type of the formula with the given id.
+ * @param {string} id - The formula key.
+ * @param {string} formulaType - The type of the formula with the given key.
  * @param {ConnectionHint[]} hints - Connection hints.
  */
 export const formatLocatorWithHints = (id, formulaType, hints) => {
@@ -250,16 +279,17 @@ export const hintsFromLocator = locator => {
 export const addressesFromLocator = hintsFromLocator;
 
 /**
- * Convert an internal formula identifier to a locator for agent
- * consumption. Replaces the internal node with the agent's public key.
+ * Convert a formula key to a locator for agent consumption. Formula keys
+ * carry the actual peer key, so the agent's peer key is not substituted;
+ * the parameter is retained for signature compatibility.
  *
- * @param {FormulaIdentifier} id - Internal formula identifier.
+ * @param {FormulaKey} id - Formula key.
  * @param {string} formulaType - The type of the formula.
- * @param {NodeNumber} agentNodeNumber - The agent's public key.
+ * @param {PeerKey} _agentPeerKey - The agent's peer key (unused).
  * @param {ConnectionHint[]} [hints] - Optional connection hints.
  * @returns {string} A locator string.
  */
-export const externalizeId = (id, formulaType, agentNodeNumber, hints = []) => {
+export const externalizeId = (id, formulaType, _agentPeerKey, hints = []) => {
   if (hints.length > 0) {
     return formatLocatorWithHints(id, formulaType, hints);
   }
@@ -267,16 +297,17 @@ export const externalizeId = (id, formulaType, agentNodeNumber, hints = []) => {
 };
 
 /**
- * Convert a locator back to an internal formula identifier.
- * The node is preserved as-is since formula identifiers carry
- * actual node numbers (no sentinel normalization needed).
+ * Convert a locator back to a formula key.
+ * The peer key is preserved as-is since formula keys carry
+ * actual peer keys (no sentinel normalization needed).
+ * `addresses` is a legacy alias for `hints`.
  *
  * @param {string} locator - A locator string.
- * @returns {{ id: FormulaIdentifier, formulaType: string, hints: ConnectionHint[], addresses: ConnectionHint[] }}
+ * @returns {{ id: FormulaKey, formulaType: string, hints: ConnectionHint[], addresses: ConnectionHint[] }}
  */
 export const internalizeLocator = locator => {
-  const { number, node, formulaType, hints } = parseLocator(locator);
-  const id = formatId({ number, node });
+  const { formulaAddress, peerKey, formulaType, hints } = parseLocator(locator);
+  const id = formatId({ number: formulaAddress, node: peerKey });
   return { id, formulaType, hints, addresses: hints };
 };
 
@@ -304,7 +335,7 @@ export const internalizeLocator = locator => {
 // - `xt` (exact topic, required): `urn:endo-blob:{hash}` for a readable-blob or
 //   `urn:endo-tree:{hash}` for a readable-tree. The hash is the same SHA-256
 //   content address the CAS keys on (`store-sha256/`), so it is a 64-char
-//   lowercase-hex string — the same shape as a formula number.
+//   lowercase-hex string — the same shape as a formula address.
 // - `dn` (display name, optional, descriptive only).
 // - `xl` (exact length in bytes, optional, descriptive only).
 // - `ws` / `xs` / `as` / `tr` (registered source parameters): data-plane

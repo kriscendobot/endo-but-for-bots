@@ -59,13 +59,13 @@ test('assertValidLocator - invalid', t => {
     [undefined, /Invalid URL.$/u],
     [{}, /Invalid URL.$/u],
     [makeLocator({ protocol: 'foobar://' }), /Invalid protocol.$/u],
-    [makeLocator({ host: 'foobar' }), /Invalid node identifier.$/u],
-    [`endo://${validNode}/?type=${validType}`, /Missing formula number.$/u],
+    [makeLocator({ host: 'foobar' }), /Invalid peer key.$/u],
+    [`endo://${validNode}/?type=${validType}`, /Missing formula address.$/u],
     [
       `endo://${validNode}/${validId}?type=${validType}&foo=bar`,
       /Invalid search params.$/u,
     ],
-    [makeLocator({ number: 'foobar' }), /Invalid id.$/u],
+    [makeLocator({ number: 'foobar' }), /Invalid formula address.$/u],
     [makeLocator({ type: 'foobar' }), /Invalid type.$/u],
   ];
   for (const [locator, reason] of cases) {
@@ -75,11 +75,19 @@ test('assertValidLocator - invalid', t => {
 
 test('parseLocator', t => {
   t.deepEqual(parseLocator(makeLocator()), {
-    number: validId,
-    node: validNode,
     formulaType: validType,
+    peerKey: validNode,
+    formulaAddress: validId,
     hints: [],
+    node: validNode,
+    number: validId,
   });
+});
+
+test('parseLocator - legacy field names alias the new terminology', t => {
+  const parsed = parseLocator(makeLocator());
+  t.is(parsed.node, parsed.peerKey);
+  t.is(parsed.number, parsed.formulaAddress);
 });
 
 test('formatLocator', t => {
@@ -102,8 +110,8 @@ test('parseLocator - single connection hint', t => {
   const hint = 'tcp+netstring+json+captp0://127.0.0.1:54321';
   const locator = `endo://${validNode}/${validId}@${encodeURIComponent(hint)}?type=${validType}`;
   const parsed = parseLocator(locator);
-  t.is(parsed.number, validId);
-  t.is(parsed.node, validNode);
+  t.is(parsed.formulaAddress, validId);
+  t.is(parsed.peerKey, validNode);
   t.is(parsed.formulaType, validType);
   t.deepEqual(parsed.hints, [hint]);
 });
@@ -144,8 +152,8 @@ test('formatLocatorWithHints', t => {
   const locator = formatLocatorWithHints(id, validType, hints);
   t.true(locator.startsWith('endo://'));
   const parsed = parseLocator(locator);
-  t.is(parsed.number, validId);
-  t.is(parsed.node, validNode);
+  t.is(parsed.formulaAddress, validId);
+  t.is(parsed.peerKey, validNode);
   t.is(parsed.formulaType, validType);
   t.deepEqual(parsed.hints, hints);
   const extractedHints = hintsFromLocator(locator);
@@ -187,8 +195,8 @@ test('externalizeId formats locator from id', t => {
   const id = formatId({ number: formulaNumber, node: validNode });
   const locator = externalizeId(id, validType, validNode);
   const parsed = parseLocator(locator);
-  t.is(parsed.node, validNode);
-  t.is(parsed.number, formulaNumber);
+  t.is(parsed.peerKey, validNode);
+  t.is(parsed.formulaAddress, formulaNumber);
   t.is(parsed.formulaType, validType);
 });
 
@@ -199,7 +207,7 @@ test('externalizeId preserves remote node', t => {
   const remoteId = formatId({ number: formulaNumber, node: remoteNode });
   const locator = externalizeId(remoteId, validType, validNode);
   const parsed = parseLocator(locator);
-  t.is(parsed.node, remoteNode, 'remote node should be preserved');
+  t.is(parsed.peerKey, remoteNode, 'remote node should be preserved');
 });
 
 test('internalizeLocator preserves node', t => {
@@ -271,16 +279,16 @@ test('formatLocator round-trips through parseLocator', t => {
   const fmtId = formatId({ number: validId, node: validNode });
   const locator = formatLocator(fmtId, validType);
   const parsed = parseLocator(locator);
-  t.is(parsed.number, validId);
-  t.is(parsed.node, validNode);
+  t.is(parsed.formulaAddress, validId);
+  t.is(parsed.peerKey, validNode);
   t.is(parsed.formulaType, validType);
   t.deepEqual(parsed.hints, []);
 });
 
-test('parseLocator - rejects locator with no formula number', t => {
+test('parseLocator - rejects locator with no formula address', t => {
   const badLocator = `endo://${validNode}/?type=${validType}`;
   t.throws(() => parseLocator(badLocator), {
-    message: /Missing formula number/,
+    message: /Missing formula address/,
   });
 });
 
@@ -294,7 +302,7 @@ test('parseLocator - rejects unrecognized search params', t => {
 // Content locators (magnet URNs) — Phase 1: grammar and duality.
 
 // A SHA-256 content address is the same 64-char lowercase-hex shape as a
-// formula number.
+// formula address.
 const validHash = validId;
 const otherHash = 'a'.repeat(64);
 

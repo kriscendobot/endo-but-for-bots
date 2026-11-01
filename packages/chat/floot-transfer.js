@@ -90,8 +90,8 @@ export const importFlootObjects = async (powers, text) => {
       const existing = parseLocator(await E(directory).locate(key));
       const incoming = parseLocator(locator);
       if (
-        existing.number !== incoming.number ||
-        existing.node !== incoming.node
+        existing.formulaAddress !== incoming.formulaAddress ||
+        existing.peerKey !== incoming.peerKey
       )
         throw Error('Import destination already holds another object');
     } else {

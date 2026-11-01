@@ -36,13 +36,22 @@ export type PetName = string & { [PetNameBrand]: true };
 /** A validated special name (@-prefixed, e.g., '@self', '@host', '@endo') */
 export type SpecialName = string & { [SpecialNameBrand]: true };
 
-/** A 64-character hex string identifying a formula within a node */
+/**
+ * A 64-character hex string identifying a formula within a peer.
+ * Legacy name for `FormulaAddress`.
+ */
 export type FormulaNumber = string & { [FormulaNumberBrand]: true };
 
-/** A 64-character hex string (Ed25519 public key) identifying a node */
+/**
+ * A 64-character hex string (Ed25519 public key) identifying a peer.
+ * Legacy name for `PeerKey`.
+ */
 export type NodeNumber = string & { [NodeNumberBrand]: true };
 
-/** A full formula identifier in the format {FormulaNumber}:{NodeNumber} */
+/**
+ * A full formula key in the format {formulaAddress}:{peerKey}.
+ * Legacy name for `FormulaKey`.
+ */
 export type FormulaIdentifier = string & { [FormulaIdentifierBrand]: true };
 
 // Semantic aliases for the locator terminology (see
@@ -136,8 +145,11 @@ export type MignonicPowers = {
   };
 };
 
+/** The parts of a formula key, under their legacy field names. */
 export type IdRecord = {
+  /** The formula address. */
   number: FormulaNumber;
+  /** The peer key. */
   node: NodeNumber;
 };
 

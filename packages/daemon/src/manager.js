@@ -7769,8 +7769,8 @@ const makeDaemonCore = async (
     return acceptInvitationJobs.enqueue(async () => {
       const {
         formulaType,
-        number: invitationNumber,
-        node: peerKey,
+        formulaAddress: invitationNumber,
+        peerKey,
         hints,
       } = parseLocator(invitationLocator);
       // `parseLocator` only checks the type is a recognized locator type, not

@@ -1,6 +1,6 @@
 # EndoDirectory - A naming hub for managing pet names and references.
 
-A directory maps pet names to formula identifiers (internal references).
+A directory maps pet names to formula keys (internal references).
 Pet names are strings like "my-worker", "counter", or "index.html".
 Special names are @-prefixed like "@self", "@host", or "@agent".
 
@@ -21,9 +21,9 @@ Check if a pet name exists in this directory.
 
 ## identify(...petNamePath) -> Promise<string | undefined>
 
-Get the formula identifier for a pet name path.
+Get the formula key for a pet name path.
 Returns undefined if the name doesn't exist.
-Formula identifiers are internal references used by Endo.
+Formula keys ({formulaAddress}:{peerKey}) are internal references used by Endo.
 
 ## locate(...petNamePath) -> Promise<string | undefined>
 
@@ -49,7 +49,7 @@ List all pet names in this directory or a subdirectory.
 
 ## listIdentifiers(...petNamePath?) -> Promise<string[]>
 
-List all unique formula identifiers in this directory.
+List all unique formula keys in this directory.
 Multiple names may refer to the same identifier.
 
 ## followNameChanges() -> AsyncIterator
@@ -72,7 +72,7 @@ Useful for discovering what names exist for an object you have.
 
 ## storeIdentifier(petNameOrPath, formulaId) -> Promise<void>
 
-Store a formula identifier with a pet name.
+Store a formula key with a pet name.
 - storeIdentifier("my-name", id) stores id as "my-name"
 - storeIdentifier(["subdir", "name"], id) stores in a subdirectory
 Overwrites any existing value at that name.
@@ -304,7 +304,7 @@ A guest can:
 Special names available:
 - @self: This guest's own handle
 - @host: The host that created this guest
-- @agent: This guest's formula identifier
+- @agent: This guest's formula key
 
 Use help("methodName") for details on specific methods.
 
@@ -317,7 +317,7 @@ Get documentation for this interface or a specific method.
 
 ## reverseIdentify(formulaId) -> string[]
 
-Find all pet names that refer to a given formula identifier.
+Find all pet names that refer to a given formula key.
 Synchronous version of reverse lookup by identifier.
 
 ## define(source, slots) -> Promise<any>
@@ -492,7 +492,7 @@ Another host cannot claim the same directory during this daemon incarnation.
 A revived host formula cannot take over its earlier incarnation's claim either:
 cancellation does not establish that admitted cleanup has drained.
 The owner provides create, inspect, revise, client, stop, and remove methods.
-It retains exact formula identifiers; disposable directories and raw client
+It retains exact formula keys; disposable directories and raw client
 capabilities stay inside the daemon.
 The client method returns a forwarding facet for one session incarnation.
 Re-provide the owner after a daemon restart.
@@ -519,7 +519,7 @@ empty record when no environment was stored.
 Other formula types and cross-peer identifiers are rejected.
 This host-only method can reveal environment credentials; it is absent from the
 guest and diagnostics facets, and ordinary formula inspection omits these values.
-Use the formula identifier rather than a mutable pet name when verifying configuration.
+Use the formula key rather than a mutable pet name when verifying configuration.
 
 ## makeUnconfined(workerName, specifier, options?) -> Promise<any>
 
@@ -571,11 +571,12 @@ Get this node's peer information for sharing with others.
 
 Add information about a remote peer.
 peerInfo: { node: string, addresses: string[] }
+`node` is the peer key; `addresses` are its connection hints.
 
 ## locateWithHints(...petNamePath) -> Promise<string | undefined>
 
 Locate a formula and return a locator URL with connection hints.
-The returned locator includes network addresses from all registered netlayers,
+The returned locator includes connection hints from all registered netlayers,
 allowing remote peers to connect and access the value.
 Example: locateWithHints("my-channel") returns a shareable locator URL.
 
@@ -583,8 +584,8 @@ Example: locateWithHints("my-channel") returns a shareable locator URL.
 
 Adopt a value from a locator that includes connection hints.
 Parses the locator to extract peer info, establishes a connection if needed,
-and writes the formula ID into the local pet store.
-Example: adoptFromLocator("endo://node.../formula@hint?type=channel", "remote-channel")
+and writes the formula key into the local pet store.
+Example: adoptFromLocator("endo://{peerKey}/{formulaAddress}@{hint}?type=channel", "remote-channel")
 
 ## invite(correspondentName) -> Promise<Invitation>
 
@@ -827,6 +828,7 @@ Restore pinned values from persisted state.
 
 Add information about a remote peer.
 peerInfo: { node: string, addresses: string[] }
+`node` is the peer key; `addresses` are its connection hints.
 
 # ReadableTree - A read-only tree of files and subdirectories.
 

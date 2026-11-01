@@ -522,7 +522,7 @@ LLM-agent stack).*
 | [endo-reminder](endo-reminder.md) | 2026-07-10 | 2026-07-10 | In Progress |
 | [endoclaw-voice](endoclaw-voice.md) | 2026-03-03 | 2026-03-03 | Not Started |
 | [endoclaw-webhooks](endoclaw-webhooks.md) | 2026-03-03 | 2026-03-03 | Not Started |
-| [daemon-locator-terminology](daemon-locator-terminology.md) | 2026-02-24 | 2026-05-10 | In Progress |
+| [daemon-locator-terminology](daemon-locator-terminology.md) | 2026-02-24 | 2026-11-01 | **Complete** |
 | [daemon-os-sandbox-plugin](daemon-os-sandbox-plugin.md) | 2026-02-15 | 2026-03-19 | Superseded by [endo-posix-sandbox](endo-posix-sandbox.md) |
 | [endo-posix-sandbox](endo-posix-sandbox.md) | 2026-05-07 | 2026-05-07 | In Progress (Phase 3) |
 | [daemon-value-message](daemon-value-message.md) | 2026-03-02 | 2026-03-03 | **Complete** |
@@ -699,7 +699,7 @@ inventing implementation commitments.
 flowchart TD
     subgraph Daemon Core
         d256[daemon-256-bit-identifiers<br/><i>COMPLETE</i>]
-        dloc[daemon-locator-terminology<br/><i>IN PROGRESS</i>]
+        dloc[daemon-locator-terminology<br/><i>COMPLETE</i>]
         dnet[daemon-agent-network-identity<br/><i>IN PROGRESS</i>]
         d256 --> dloc
         d256 --> dnet
@@ -1222,7 +1222,7 @@ docker-selfhost, the rest of agent-tools) keep their places behind them.
 | ~~daemon-guest-bot-incarnation~~ | **Implemented** | Landed generically in [#1306](https://github.com/endojs/endo-but-for-bots/pull/1306): `provideGuest(..., { pins })` installs a caller-elected guest `@pins` directory, and every mailbox delivery best-effort reincarnates its values before publishing the message notification. A deployment pins an ordinary responder formulated with the guest as its powers; the earlier `GuestFormula.bot`, `EndoBot`, supervisor, startup scan, and daemon-level breaker proposal is retired. Design reconciliation remains in PR [#1227](https://github.com/endojs/endo-but-for-bots/pull/1227). |
 | **endo-claude-agents-capability** | Proposed | **Client-side bridge, top priority (carved 2026-09-03).** The provisioning half of the confined in-guest agent: a portable Endo capability for provisioning Claude-backed child guests without granting guests credentials, arbitrary host access, or authority over unrelated guest namespaces (namespace-scoped recursive factory facets, per-account-family credential sources, single-use per-child leases, durable revocation, fail-closed restart). Composes with `endo-claude` (#1015). Design in flight as PR [#1102](https://github.com/endojs/endo-but-for-bots/pull/1102) (open draft), requested in the minion.town #64 maintainer review; separates Endo's generic daemon/factory work from Minion Town's account UX/credential custody. |
 | filesystem-watchers | **Complete** | `EndoMount.followNameChanges` parity with `EndoDirectory`; Node `fs.watch` adapter on `FilePowers` |
-| daemon-locator-terminology | In Progress | Clean locator API; unblocked |
+| daemon-locator-terminology | **Complete** | Peer key / formula address / formula key / connection hint terminology across `locator.js`, `formula-identifier.js`, types, help, and callers; `parseLocator` returns `peerKey`/`formulaAddress` with legacy `node`/`number` aliases |
 | daemon-rename-to-manager | In Progress | Rename `daemon.js`/`Daemon`/`MignonicPowers` to `manager.js`/`Manager`/`WorkerPowers` to align JS with Rust `endor` nomenclature |
 | daemon-xs-worker-snapshot | In Progress | XS heap snapshot/restore; Phases 1-2 implemented — streaming CAS write/read, suspend/resume supervisor integration, CBOR control verbs; 12 passing tests; Phase 2 integration test and ephemeral GC roots remaining |
 | endo-reminder (supersedes endoclaw-timer) | Not Started | **Strategic:** Core capability concern — SES removes `setTimeout`/`setInterval`; the message scheduler is the only way agents get scheduled execution. Prerequisite for proactive behavior. Redrafted per PR #609 review as the unconfined plugin `@endo/reminder` over the virtual file system. |

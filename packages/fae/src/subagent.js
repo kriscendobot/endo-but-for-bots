@@ -298,7 +298,10 @@ export const isSameFormula = (leftLocator, rightLocator) => {
   try {
     const left = parseLocator(leftLocator);
     const right = parseLocator(rightLocator);
-    return left.number === right.number && left.node === right.node;
+    return (
+      left.formulaAddress === right.formulaAddress &&
+      left.peerKey === right.peerKey
+    );
   } catch {
     return false;
   }

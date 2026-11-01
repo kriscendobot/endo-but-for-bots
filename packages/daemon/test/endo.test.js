@@ -2576,8 +2576,8 @@ test('guest facet receives a message for host', async t => {
   const hostLocatorFromGuest = await E(guest).locate('@host');
 
   // The guest externalized 'from' with its own key, so the host inbox
-  // sees the guest's self-locator.  The 'to' was the host's self-ID
-  // (LOCAL_NODE) and gets externalized with the host's key.
+  // sees the guest's self-locator.  The 'to' was the host's own formula
+  // key and gets externalized with the host's peer key.
   const hostInbox = await E(host).listMessages();
   t.deepEqual(
     hostInbox.map(({ type, from, to }) => ({
@@ -5664,10 +5664,14 @@ test('host and guest present different locators for the same value', async t => 
   // Both agents locate the same value.
   const guestLocator = await E(guest).locate('answer');
 
-  // The underlying formula number must be the same.
+  // The underlying formula address must be the same.
   const hostParsed = parseLocator(hostLocator);
   const guestParsed = parseLocator(guestLocator);
-  t.is(hostParsed.number, guestParsed.number, 'same formula number');
+  t.is(
+    hostParsed.formulaAddress,
+    guestParsed.formulaAddress,
+    'same formula address',
+  );
   t.is(hostParsed.formulaType, guestParsed.formulaType, 'same formula type');
 
   // The node (peer key) is the same because the value formula was
@@ -5675,8 +5679,8 @@ test('host and guest present different locators for the same value', async t => 
   // formulas (host, guest, handle, store) carry per-agent keys,
   // but daemon-level formulas (values, evals) use localNodeNumber.
   t.is(
-    hostParsed.node,
-    guestParsed.node,
+    hostParsed.peerKey,
+    guestParsed.peerKey,
     'daemon-level values share the same peer key',
   );
 });
@@ -5770,10 +5774,14 @@ test('locate produces locators with connection hints from agent NETS', async t =
   // Both locators point to the same daemon-level formula.
   const hostParsed = parseLocator(hostLocator);
   const guestParsed = parseLocator(guestLocator);
-  t.is(hostParsed.number, guestParsed.number, 'same formula number');
   t.is(
-    hostParsed.node,
-    guestParsed.node,
+    hostParsed.formulaAddress,
+    guestParsed.formulaAddress,
+    'same formula address',
+  );
+  t.is(
+    hostParsed.peerKey,
+    guestParsed.peerKey,
     'daemon-level values share the same peer key',
   );
 });
@@ -5835,8 +5843,8 @@ testNeedsNodeWorker('invite, accept, and send mail', async t => {
   // knows the real type, while the receiver sees it as 'remote').
   const expectedParsed = parseLocator(expectedSalutationsLocator);
   const actualParsed = parseLocator(salutationsLocator);
-  t.is(actualParsed.number, expectedParsed.number);
-  t.is(actualParsed.node, expectedParsed.node);
+  t.is(actualParsed.formulaAddress, expectedParsed.formulaAddress);
+  t.is(actualParsed.peerKey, expectedParsed.peerKey);
 });
 
 testNeedsNodeWorker('guest invites a guest and they exchange mail', async t => {
@@ -5950,12 +5958,12 @@ testNeedsNodeWorker(
     const guestAHandleId = await E(host).identify('guest-a-handle');
     const guestBHandleId = await E(host).identify('guest-b-handle');
     t.is(
-      parseLocator(await E(guestB).locate('to-a')).number,
+      parseLocator(await E(guestB).locate('to-a')).formulaAddress,
       parseId(guestAHandleId).number,
       "acceptor's 'to-a' is the inviting guest's own handle",
     );
     t.is(
-      parseLocator(await E(guestA).locate('to-b')).number,
+      parseLocator(await E(guestA).locate('to-b')).formulaAddress,
       parseId(guestBHandleId).number,
       "inviter's 'to-b' is the accepting guest's own handle",
     );
@@ -6015,7 +6023,7 @@ testNeedsNodeWorker(
     await E(guestB).accept(await E(invAB).locate(), 'contact');
     const guestAHandleId = await E(host).identify('guest-a-handle');
     t.is(
-      parseLocator(await E(guestB).locate('contact')).number,
+      parseLocator(await E(guestB).locate('contact')).formulaAddress,
       parseId(guestAHandleId).number,
       "'contact' initially names A's handle",
     );
@@ -6034,7 +6042,7 @@ testNeedsNodeWorker(
       'a spent invitation is rejected',
     );
     t.is(
-      parseLocator(await E(guestB).locate('contact')).number,
+      parseLocator(await E(guestB).locate('contact')).formulaAddress,
       parseId(guestAHandleId).number,
       "'contact' still names A's handle after the rejected accept",
     );
@@ -6132,7 +6140,7 @@ testNeedsNodeWorker(
       "'contact' remains bound after the duplicate race",
     );
     t.is(
-      parseLocator(contactLocator).number,
+      parseLocator(contactLocator).formulaAddress,
       parseId(guestAHandleId).number,
       "'contact' still names A's handle after the losing duplicate rolled back",
     );
@@ -6314,10 +6322,10 @@ testNeedsNodeWorker('adopt from remote message', async t => {
     m => m.type === 'package' && m.strings && m.strings[0] === 'Take this',
   );
   t.truthy(msg, 'B should have received the package message');
-  // The externalized locator and the raw ID share the same formula number.
+  // The externalized locator and the raw ID share the same formula address.
   const actualParsed = parseLocator(msg.ids[0]);
   const expectedParsed = parseId(expectedId);
-  t.is(actualParsed.number, expectedParsed.number);
+  t.is(actualParsed.formulaAddress, expectedParsed.number);
 
   await E(hostB).adopt(msg.number, 'shared', ['my-shared']);
 

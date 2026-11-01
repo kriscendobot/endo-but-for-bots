@@ -439,14 +439,16 @@ $ENDO_SOCK_PATH        # Unix domain socket for CapTP
 
 ### 8.1 Root File Format
 
-Plain text containing a formula identifier followed by a newline:
+Plain text containing a formula key followed by a newline:
 
 ```
-{formulaNumber}:{nodeNumber}\n
+{formulaAddress}:{peerKey}\n
 ```
 
-Where `formulaNumber` and `nodeNumber` are each 64-character lowercase hex
+Where `formulaAddress` and `peerKey` are each 64-character lowercase hex
 strings (SHA-256 hash and Ed25519 public key respectively).
+See `designs/daemon-locator-terminology.md` for the terminology; older
+documents call these the formula number and node number.
 
 ### 8.2 PID File Format
 

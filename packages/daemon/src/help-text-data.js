@@ -8,11 +8,11 @@ export const helpTextEntries = harden([
   [
     'EndoDirectory',
     {
-      '': 'EndoDirectory - A naming hub for managing pet names and references.\n\nA directory maps pet names to formula identifiers (internal references).\nPet names are strings like "my-worker", "counter", or "index.html".\nSpecial names are @-prefixed like "@self", "@host", or "@agent".\n\nUse lookup() to get a value by name, list() to see available names,\nand storeIdentifier() or storeLocator() to store new references.',
+      '': 'EndoDirectory - A naming hub for managing pet names and references.\n\nA directory maps pet names to formula keys (internal references).\nPet names are strings like "my-worker", "counter", or "index.html".\nSpecial names are @-prefixed like "@self", "@host", or "@agent".\n\nUse lookup() to get a value by name, list() to see available names,\nand storeIdentifier() or storeLocator() to store new references.',
       help: 'help(methodName?) -> string\nGet documentation for this interface or a specific method.\n- help() returns an overview of the interface\n- help("lookup") returns documentation for the lookup method',
       has: 'has(...petNamePath) -> Promise<boolean>\nCheck if a pet name exists in this directory.\n- has("counter") checks if "counter" exists\n- has("subdir", "value") checks if "value" exists in subdirectory "subdir"',
       identify:
-        "identify(...petNamePath) -> Promise<string | undefined>\nGet the formula identifier for a pet name path.\nReturns undefined if the name doesn't exist.\nFormula identifiers are internal references used by Endo.",
+        "identify(...petNamePath) -> Promise<string | undefined>\nGet the formula key for a pet name path.\nReturns undefined if the name doesn't exist.\nFormula keys ({formulaAddress}:{peerKey}) are internal references used by Endo.",
       locate:
         'locate(...petNamePath) -> Promise<string | undefined>\nGet a locator string for a pet name path.\nLocators include the formula type and can be used for reverse lookups.',
       reverseLocate:
@@ -21,7 +21,7 @@ export const helpTextEntries = harden([
         'followLocatorNameChanges(locator) -> AsyncIterator\nSubscribe to name changes for a specific locator.\nYields events when names are added or removed for the locator.\nUse with for-await-of to receive updates.',
       list: 'list(...petNamePath?) -> Promise<string[]>\nList all pet names in this directory or a subdirectory.\n- list() returns names in this directory\n- list("subdir") returns names in the subdirectory "subdir"',
       listIdentifiers:
-        'listIdentifiers(...petNamePath?) -> Promise<string[]>\nList all unique formula identifiers in this directory.\nMultiple names may refer to the same identifier.',
+        'listIdentifiers(...petNamePath?) -> Promise<string[]>\nList all unique formula keys in this directory.\nMultiple names may refer to the same identifier.',
       followNameChanges:
         'followNameChanges() -> AsyncIterator\nSubscribe to all name changes in this directory.\nFirst yields existing names, then yields diffs as names change.\nUse with for-await-of to receive updates.',
       lookup:
@@ -29,7 +29,7 @@ export const helpTextEntries = harden([
       reverseLookup:
         'reverseLookup(value) -> Promise<string[]>\nFind all pet names that refer to a given value.\nUseful for discovering what names exist for an object you have.',
       storeIdentifier:
-        'storeIdentifier(petNameOrPath, formulaId) -> Promise<void>\nStore a formula identifier with a pet name.\n- storeIdentifier("my-name", id) stores id as "my-name"\n- storeIdentifier(["subdir", "name"], id) stores in a subdirectory\nOverwrites any existing value at that name.',
+        'storeIdentifier(petNameOrPath, formulaId) -> Promise<void>\nStore a formula key with a pet name.\n- storeIdentifier("my-name", id) stores id as "my-name"\n- storeIdentifier(["subdir", "name"], id) stores in a subdirectory\nOverwrites any existing value at that name.',
       storeLocator:
         'storeLocator(petNameOrPath, locator) -> Promise<void>\nStore an endo:// locator with a pet name.\n- storeLocator("my-name", locator) stores locator as "my-name"\n- storeLocator(["subdir", "name"], locator) stores in a subdirectory\nThe locator must be an endo:// URL. Overwrites any existing value.',
       remove:
@@ -99,10 +99,10 @@ export const helpTextEntries = harden([
   [
     'EndoGuest',
     {
-      '': 'EndoGuest - A confined agent with directory and mail capabilities.\n\nA guest can:\n- Manage pet names for values (directory operations)\n- Send and receive messages (mail operations)\n- Request capabilities from its host\n\nSpecial names available:\n- @self: This guest\'s own handle\n- @host: The host that created this guest\n- @agent: This guest\'s formula identifier\n\nUse help("methodName") for details on specific methods.',
+      '': 'EndoGuest - A confined agent with directory and mail capabilities.\n\nA guest can:\n- Manage pet names for values (directory operations)\n- Send and receive messages (mail operations)\n- Request capabilities from its host\n\nSpecial names available:\n- @self: This guest\'s own handle\n- @host: The host that created this guest\n- @agent: This guest\'s formula key\n\nUse help("methodName") for details on specific methods.',
       help: 'help(methodName?) -> string\nGet documentation for this interface or a specific method.\n- help() returns an overview of the guest capabilities\n- help("request") returns documentation for the request method\n- help("send") returns documentation for send method',
       reverseIdentify:
-        'reverseIdentify(formulaId) -> string[]\nFind all pet names that refer to a given formula identifier.\nSynchronous version of reverse lookup by identifier.',
+        'reverseIdentify(formulaId) -> string[]\nFind all pet names that refer to a given formula key.\nSynchronous version of reverse lookup by identifier.',
       define:
         'define(source, slots) -> Promise<any>\nPropose code with named capability slots for the host to endow.\nThe guest specifies code and named slots with descriptions.\nThe host sees the code and slot descriptions, then decides which capabilities\nto provide for each slot using the endow() command.\n\n- source: JavaScript code to evaluate\n- slots: Record of slot descriptions, e.g. { counter: { label: "A counter to increment" } }\n\nThe host reviews the code and slots, then calls endow() to bind capabilities\nand trigger evaluation. This separates code proposal from capability binding.\n\nExample: define("E(counter).incr()", { counter: { label: "A counter capability" } })',
       form: 'form(recipientName, description, fields) -> Promise<void>\nSend a structured form to another agent.\nThe form appears in the recipient\'s inbox. They can submit values using submit().\n\n- recipientName: Pet name of the recipient (e.g., "@host")\n- description: Human-readable description of the form\n- fields: Array of field definitions, e.g. [{ name: "email", label: "Your email" }]\n\nExample: form("@host", "Configure settings", [{ name: "name", label: "Your name" }])',
@@ -144,11 +144,11 @@ export const helpTextEntries = harden([
       provideWorker:
         'provideWorker(petNamePath) -> Promise<EndoWorker>\nCreate or retrieve a worker for running code.\nWorkers are isolated JavaScript environments.',
       provideSessionOwner:
-        "provideSessionOwner(recordsPath) -> Promise<SessionOwner>\nProvide an administrative session owner backed by a private local directory.\nMissing directory parents are created inside the daemon.\nRepeated calls share the owner and refuse a changed directory binding.\nAnother host cannot claim the same directory during this daemon incarnation.\nA revived host formula cannot take over its earlier incarnation's claim either:\ncancellation does not establish that admitted cleanup has drained.\nThe owner provides create, inspect, revise, client, stop, and remove methods.\nIt retains exact formula identifiers; disposable directories and raw client\ncapabilities stay inside the daemon.\nThe client method returns a forwarding facet for one session incarnation.\nRe-provide the owner after a daemon restart.\nCancelling its host or original directory fences the owner and its client facets,\nbut does not prove that native resources have been cleaned up.",
+        "provideSessionOwner(recordsPath) -> Promise<SessionOwner>\nProvide an administrative session owner backed by a private local directory.\nMissing directory parents are created inside the daemon.\nRepeated calls share the owner and refuse a changed directory binding.\nAnother host cannot claim the same directory during this daemon incarnation.\nA revived host formula cannot take over its earlier incarnation's claim either:\ncancellation does not establish that admitted cleanup has drained.\nThe owner provides create, inspect, revise, client, stop, and remove methods.\nIt retains exact formula keys; disposable directories and raw client\ncapabilities stay inside the daemon.\nThe client method returns a forwarding facet for one session incarnation.\nRe-provide the owner after a daemon restart.\nCancelling its host or original directory fences the owner and its client facets,\nbut does not prove that native resources have been cleaned up.",
       evaluate:
         'evaluate(workerName, source, codeNames, petNames, resultName?) -> Promise<any>\nEvaluate JavaScript code in a worker with named endowments.\n- workerName: Worker to use (undefined for new worker)\n- source: JavaScript code string\n- codeNames: Names visible in the code\n- petNames: Pet names providing values for those names\n- resultName: Optional name to store the result\n\nExample: evaluate(undefined, "x + y", ["x", "y"], ["a", "b"], ["result"])\n  Runs "x + y" where x=lookup("a"), y=lookup("b"), stores result as "result"',
       getFormulaEnvironment:
-        "getFormulaEnvironment(identifier) -> Promise<Record<string, string>>\nRead a local caplet formula's persisted construction environment without reviving it.\nSupports make-unconfined, make-archive, and make-from-tree formulas, returning an\nempty record when no environment was stored.\nOther formula types and cross-peer identifiers are rejected.\nThis host-only method can reveal environment credentials; it is absent from the\nguest and diagnostics facets, and ordinary formula inspection omits these values.\nUse the formula identifier rather than a mutable pet name when verifying configuration.",
+        "getFormulaEnvironment(identifier) -> Promise<Record<string, string>>\nRead a local caplet formula's persisted construction environment without reviving it.\nSupports make-unconfined, make-archive, and make-from-tree formulas, returning an\nempty record when no environment was stored.\nOther formula types and cross-peer identifiers are rejected.\nThis host-only method can reveal environment credentials; it is absent from the\nguest and diagnostics facets, and ordinary formula inspection omits these values.\nUse the formula key rather than a mutable pet name when verifying configuration.",
       makeUnconfined:
         "makeUnconfined(workerName, specifier, options?) -> Promise<any>\nLoad and instantiate an unconfined module (has access to Node.js APIs).\n- workerName: Worker to use (undefined for new worker)\n- specifier: Module path or URL\n- options: Optional object with:\n  - powersName: Pet name of the powers to grant (default: '@none')\n  - resultName: Pet name or path to store the result\n  - env: Environment variables as { KEY: \"value\" } record\n\nThe module's make(powers, context, { env }) function is called.",
       makeArchive:
@@ -162,11 +162,11 @@ export const helpTextEntries = harden([
       getPeerInfo:
         "getPeerInfo() -> Promise<{node: string, addresses: string[]}>\nGet this node's peer information for sharing with others.",
       addPeerInfo:
-        'addPeerInfo(peerInfo) -> Promise<void>\nAdd information about a remote peer.\npeerInfo: { node: string, addresses: string[] }',
+        'addPeerInfo(peerInfo) -> Promise<void>\nAdd information about a remote peer.\npeerInfo: { node: string, addresses: string[] }\n`node` is the peer key; `addresses` are its connection hints.',
       locateWithHints:
-        'locateWithHints(...petNamePath) -> Promise<string | undefined>\nLocate a formula and return a locator URL with connection hints.\nThe returned locator includes network addresses from all registered netlayers,\nallowing remote peers to connect and access the value.\nExample: locateWithHints("my-channel") returns a shareable locator URL.',
+        'locateWithHints(...petNamePath) -> Promise<string | undefined>\nLocate a formula and return a locator URL with connection hints.\nThe returned locator includes connection hints from all registered netlayers,\nallowing remote peers to connect and access the value.\nExample: locateWithHints("my-channel") returns a shareable locator URL.',
       adoptFromLocator:
-        'adoptFromLocator(locator, petNameOrPath) -> Promise<void>\nAdopt a value from a locator that includes connection hints.\nParses the locator to extract peer info, establishes a connection if needed,\nand writes the formula ID into the local pet store.\nExample: adoptFromLocator("endo://node.../formula@hint?type=channel", "remote-channel")',
+        'adoptFromLocator(locator, petNameOrPath) -> Promise<void>\nAdopt a value from a locator that includes connection hints.\nParses the locator to extract peer info, establishes a connection if needed,\nand writes the formula key into the local pet store.\nExample: adoptFromLocator("endo://{peerKey}/{formulaAddress}@{hint}?type=channel", "remote-channel")',
       invite:
         "invite(correspondentName) -> Promise<Invitation>\nMint a single-use invitation and bind the correspondent under correspondentName\nonce they accept. Hand the returned invitation's locate() string to the invitee\nout of band.",
       accept:
@@ -235,7 +235,7 @@ export const helpTextEntries = harden([
       revivePins:
         'revivePins() -> Promise<void>\nRestore pinned values from persisted state.',
       addPeerInfo:
-        'addPeerInfo(peerInfo) -> Promise<void>\nAdd information about a remote peer.\npeerInfo: { node: string, addresses: string[] }',
+        'addPeerInfo(peerInfo) -> Promise<void>\nAdd information about a remote peer.\npeerInfo: { node: string, addresses: string[] }\n`node` is the peer key; `addresses` are its connection hints.',
     },
   ],
   [

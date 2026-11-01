@@ -126,7 +126,7 @@ const sameParty = (left, right) => {
   try {
     const a = parseLocator(left);
     const b = parseLocator(right);
-    return a.node === b.node && a.number === b.number;
+    return a.peerKey === b.peerKey && a.formulaAddress === b.formulaAddress;
   } catch {
     return false;
   }

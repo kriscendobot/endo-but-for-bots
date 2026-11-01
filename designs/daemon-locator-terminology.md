@@ -3,9 +3,38 @@
 | | |
 |---|---|
 | **Created** | 2026-02-24 |
-| **Updated** | 2026-05-10 |
+| **Updated** | 2026-11-01 |
 | **Author** | Kris Kowal (prompted) |
-| **Status** | In Progress |
+| **Status** | Complete |
+
+## Implementation Status (2026-11-01)
+
+Landed:
+
+- Types: `PeerKey`, `FormulaAddress`, `FormulaKey`, `ConnectionHint`,
+  `PeerLocator`, and `FormulaLocator` in `packages/daemon/src/types.d.ts`.
+  `NodeNumber`, `FormulaNumber`, and `FormulaIdentifier` remain as the
+  branded base types and are documented as the legacy names.
+- `@`-delimited, URL-encoded connection hints in the locator path;
+  `parseLocator` returns `hints`; `formatLocatorWithHints` and
+  `hintsFromLocator` (with deprecated aliases `formatLocatorForSharing`
+  and `addressesFromLocator`); `locateWithHints` on `EndoHost`.
+- Terminology rename: `parseLocator` also returns `peerKey` and
+  `formulaAddress`, with `node` and `number` kept as aliases so that no
+  existing caller breaks.  In-repo callers (`manager.js`, `@endo/chat`,
+  `@endo/fae`, `@endo/workflow`, `@endo/spaces-util`, and the daemon
+  tests) read the new field names.  Validation errors say "peer key",
+  "formula address", and "formula key" instead of "node identifier",
+  "formula number", and "formula identifier".  `formula-identifier.js`,
+  `locator.js`, `help.md`, and `docs/daemon-binary-spec.md` document the
+  new terms.
+- The `parseId`/`formatId` record keeps its `number`/`node` field names,
+  per the invariant below that no existing method signature changes.
+
+Retired: the `LOCAL_NODE` sentinel.  The SQLite migration removed
+LOCAL_NODE normalization, and formula keys now carry the actual peer key.
+The unused `LOCAL_NODE` export was dropped from `locator.js`.
+§ LOCAL_NODE Normalization below is kept as history only.
 
 ## Current State
 
@@ -188,6 +217,11 @@ locator-with-hints operations.
 ---
 
 ## LOCAL_NODE Normalization
+
+> **Retired.** This section describes a scheme that the SQLite migration
+> removed.  Formula keys now carry the actual peer key, `externalizeId`
+> does not substitute the agent's key, and `internalizeLocator` does not
+> normalize.  The section is kept for history.
 
 ### Motivation
 
